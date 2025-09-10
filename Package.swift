@@ -6,6 +6,7 @@ let package = Package(
     name: "UntoldEngine",
     platforms: [
         .macOS(.v14),
+        .iOS(.v14),
     ],
     products: [
         // Library product for the engine

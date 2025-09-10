@@ -17,16 +17,16 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     public var gameUpdateCallback: ((_ deltaTime: Float) -> Void)?
     public var handleInputCallback: (() -> Void)?
 
-    override public init() {
+    public init( metalView: MTKView? = nil) {
         // Initialize the metal view
-        metalView = MTKView()
+        self.metalView = metalView ?? MTKView()
 
         Logger.addSink(LogStore.shared)
         super.init()
     }
 
-    public static func create() -> UntoldRenderer? {
-        let renderer = UntoldRenderer()
+    public static func create(metalView: MTKView? = nil) -> UntoldRenderer? {
+        let renderer = UntoldRenderer( metalView: metalView )
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             assertionFailure("Metal device is not available.")
@@ -48,9 +48,10 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         renderInfo.commandQueue = commandQueue
         renderInfo.colorPixelFormat = .rgba16Float
         renderInfo.depthPixelFormat = renderer.metalView.depthStencilPixelFormat
-        renderInfo.viewPort = simd_float2(
-            Float(renderer.metalView.drawableSize.width), Float(renderer.metalView.drawableSize.height)
-        )
+        // If it's zero add default value to avoid crashes
+        let w = renderer.metalView.drawableSize.width > 0 ? renderer.metalView.drawableSize.width : 1920
+        let h = renderer.metalView.drawableSize.height > 0 ? renderer.metalView.drawableSize.height : 1080
+        renderInfo.viewPort = simd_float2(Float(w), Float(h))
         renderInfo.fence = renderInfo.device.makeFence()
         renderInfo.bufferAllocator = MTKMeshBufferAllocator(device: renderInfo.device)
         renderInfo.textureLoader = MTKTextureLoader(device: renderInfo.device)
@@ -84,6 +85,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     }
 
     public func initResources() {
+        
         initBufferResources()
 
         initTextureResources()
