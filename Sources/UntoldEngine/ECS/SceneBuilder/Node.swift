@@ -11,7 +11,10 @@ public protocol Node {
 //    associatedtype Body: Node
 //    @SceneBuilder @MainActor var body: Self.Body { get }
     
-    var entity: EntityID { get }
+    init( entityID: EntityID? )
+    
+    var entityID: EntityID { get }
+    func getEntityID( entityID: inout EntityID?) -> Self
     
     func translateBy ( x: Float, y: Float, z: Float ) -> Self
     func rotateBy(angle: Float, axis: [Axis] ) -> Self
@@ -28,10 +31,16 @@ public protocol Node {
 
 extension Node {
 //    public var body: some Node { self }
+        
+    @inlinable
+    public func getEntityID( entityID eid: inout EntityID?) -> Self {
+        eid = self.entityID
+        return self
+    }
     
     @inlinable
     public func translateBy ( x: Float, y: Float, z: Float ) -> Self {
-        UntoldEngine.translateBy(entityId: entity, position: simd_float3(x, y, x))
+        UntoldEngine.translateBy(entityId: entityID, position: simd_float3(x, y, x))
         return self
     }
     
@@ -49,29 +58,29 @@ extension Node {
             }
         }
         
-        UntoldEngine.rotateBy(entityId: entity, angle: angle, axis: simd_float3(x, y, z))
+        UntoldEngine.rotateBy(entityId: entityID, angle: angle, axis: simd_float3(x, y, z))
         return self
     }
     
     public func scaleTo(x:Float = 0, y:Float = 0, z:Float = 0) -> Self {
-        UntoldEngine.scaleTo(entityId: entity, scale: simd_float3( x, y, z))
+        UntoldEngine.scaleTo(entityId: entityID, scale: simd_float3( x, y, z))
         return self
     }
     
     public func setAnimations ( resource:String, name:String ) -> Self {
-        setEntityAnimations(entityId: entity, filename: resource.filename, withExtension: resource.extensionName, name: "running")
+        setEntityAnimations(entityId: entityID, filename: resource.filename, withExtension: resource.extensionName, name: "running")
         return self
     }
         
     @inlinable
     public func changeAnimation ( name:String, withPause pause: Bool = false ) -> Self {
-        UntoldEngine.changeAnimation(entityId: entity, name: name, withPause: pause )
+        UntoldEngine.changeAnimation(entityId: entityID, name: name, withPause: pause )
         return self
     }
     
     @inlinable
     public func setEntityKinetics() -> Self {
-        UntoldEngine.setEntityKinetics(entityId: entity)
+        UntoldEngine.setEntityKinetics(entityId: entityID)
         return self
     }
 }

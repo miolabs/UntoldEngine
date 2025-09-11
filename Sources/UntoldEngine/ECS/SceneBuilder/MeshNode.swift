@@ -11,36 +11,39 @@ import simd
 
 public struct MeshNode: Node
 {
-    public let entity: EntityID
+    public let entityID: EntityID
     public var subNodes: [Node] = []
 
+    public init(entityID: EntityID? = nil) {
+        self.entityID = entityID ?? createEntity()
+    }
+    
     public init (resource: String) {
         self.init(resource: resource) { }
     }
     
-    public init (resource: String, @SceneBuilder content: @escaping () -> [any Node]) {
-        let entity = createEntity()
-        setEntityMesh(entityId: entity, filename: resource.filename, withExtension: resource.extensionName)
-        registerTransformComponent(entityId: entity)
-        registerSceneGraphComponent(entityId: entity)
+    public init (entityID: EntityID? = nil, resource: String, @SceneBuilder content: @escaping () -> [any Node]) {
+        self.init(entityID: entityID)
         
-        self.entity = entity
+        setEntityMesh(entityId: self.entityID, filename: resource.filename, withExtension: resource.extensionName)
+        registerTransformComponent(entityId: self.entityID)
+        registerSceneGraphComponent(entityId: self.entityID)
         
         subNodes = content()
         for n in subNodes {
-            setParent(childId: n.entity, parentId: entity)
+            setParent(childId: n.entityID, parentId: self.entityID)
         }
     }
     
     public func materialData( roughness: Float = 0, metallic:Float = 0, emissive:(Float, Float, Float) = (0,0,0), baseColor:(Float, Float, Float, Float) = (0,0,0,0), baseColorResource:String? = nil) -> Self {
         
-        updateMaterialColor(entityId: entity, color: colorFromSimd(simd_float4(baseColor.0, baseColor.1, baseColor.2, baseColor.3)))
-        updateMaterialRoughness(entityId: entity, roughness: roughness)
-        updateMaterialMetallic(entityId: entity, metallic: metallic)
-        updateMaterialEmmisive(entityId: entity, emmissive: simd_float3(emissive.0, emissive.1, emissive.2))
+        updateMaterialColor(entityId: entityID, color: colorFromSimd(simd_float4(baseColor.0, baseColor.1, baseColor.2, baseColor.3)))
+        updateMaterialRoughness(entityId: entityID, roughness: roughness)
+        updateMaterialMetallic(entityId: entityID, metallic: metallic)
+        updateMaterialEmmisive(entityId: entityID, emmissive: simd_float3(emissive.0, emissive.1, emissive.2))
 
         if let baseColorURL = baseColorResource != nil ? getResourceURL(forResource: baseColorResource!.filename, withExtension: baseColorResource!.extensionName) : nil {
-            updateMaterialTexture(entityId: entity, textureType: .baseColor, path: baseColorURL)
+            updateMaterialTexture(entityId: entityID, textureType: .baseColor, path: baseColorURL)
         }
 
 //        if let roughnessURL = materialData.roughnessURL {
