@@ -1,20 +1,74 @@
 # Contributing Guidelines
 
-I'm excited to have you contribute to the Untold Engine! To maintain consistency and quality, please follow these guidelines when submitting a pull request (PR). Submissions that do not adhere to these guidelines will not be approved.
+Thank you for your interest in contributing! 
+ 
+The vision for Untold Engine is to continually shape a 3D engine that is **stable, performant and developer-friendly**.
+As maintainer, my focus is on **performance, testing, quality control, and API design**.  
+Contributors are encouraged to expand features, fix bugs, improve documentation, and enhance usability — always keeping the vision in mind.  
 
-### Required Contributions for New System Support
+---
 
-When adding new features or systems to the Untold Engine, your PR must include the following:
+## Maintainer Responsibilities  
 
-1. Unit Tests
-- Requirement: All new systems must include XCTests to validate their functionality.
-- Why: Tests ensure stability and prevent regressions when making future changes.
-- Example: Provide unit tests that cover edge cases, typical use cases, and failure scenarios.
+The Untold Engine is guided by a clear vision: To be a stable, performant, and developer-friendly 3D engine that empowers creativity, removes friction, and makes game development feel effortless.
 
-2. How-To Guide
-- Requirement: Every new system must include a how-to guide explaining its usage.
-- Why: This helps users understand how to integrate and utilize the feature effectively.
-- Format: Use the structure outlined below to ensure consistency and clarity.
+## Guiding Principles
+
+To achieve this vision, we follow these principles:
+
+- The engine strives to remain stable and crash-free.
+- The codebase is backed by unit tests.
+- We profile continuously to prevent regressions (visual and performance).
+- The API must remain clear and user-friendly.
+- We always think about the developer first—removing friction so they can focus on their games.
+
+As the maintainer, my primary focus is to ensure the project stays true to this vision.  
+
+### What I Focus On  
+- **Performance** → keeping the renderer and systems lean, efficient, and optimized for Apple hardware.  
+- **Testing & Stability** → maintaining a reliable codebase with proper testing practices.  
+- **Quality Control** → reviewing PRs for clarity, readability, and adherence to coding standards.  
+- **API Design** → ensuring that the engine’s API remains logical, intuitive, and consistent.  
+
+### What Contributors Are Encouraged to Focus On  
+- **Features** → adding or improving systems, tools, and workflows.  
+- **Bug Fixes** → addressing open issues and fixing edge cases.  
+- **Documentation** → clarifying how things work and providing examples.  
+- **Editor & Usability** → enhancing the UI, workflows, and overall developer experience.  
+
+### Decision Making  
+All contributions are welcome, but acceptance will be guided by the project’s vision and the priorities above.  
+PRs that align with clarity, performance, or creativity — while keeping the engine stable and simple — are more likely to be accepted.   
+
+These guidelines aren’t here to block you, but to make sure every contribution keeps the engine stable, clear, and useful for everyone.
+
+## Pull Request Guidelines
+
+- **One feature or bug fix per PR**  
+  Each Pull Request should focus on a single feature, bug fix, or documentation improvement.  
+  This keeps the history clean and makes it easier to track down issues later.  
+
+- **Commit hygiene**  
+  - Keep commits meaningful (avoid "misc changes" or "fix stuff").  
+  - Squash commits if needed, but do not mix unrelated features in the same commit.  
+  - If your PR touches multiple files, make sure they all relate to the same feature or fix.  
+
+✅ Example:  
+- Good: *“Add PhysicsSystem with gravity integration”*  
+- Bad: *“Added PhysicsSystem + fixed rendering bug + updated docs”*  
+
+---
+
+## Required Contributions for New System Support
+
+For **new systems or major features**, your PR must include:
+
+- **Unit Tests** → Validate functionality and cover edge cases.  
+- **How-To Guide** → A step-by-step markdown guide explaining how to use the system.  
+
+This ensures new features are stable, documented, and accessible to all users.  
+
+👉 Note: For small fixes or incremental features, a How-To is not required.
 
 ---
 
@@ -61,4 +115,16 @@ Your guide must follow this structure:
 - Make sure your code follows the [formatting guidelines](Formatting.md).
 
 ---
+
+## Questions & Discussions
+
+To keep communication clear and accessible for everyone:
+
+- 💡 Use **[GitHub Discussions](https://github.com/untoldengine/UntoldEngine/discussions)** for feature proposals, ideas, or general questions.  
+- 🐞 Use **[GitHub Issues](https://github.com/untoldengine/UntoldEngine/issues)** for bugs or concrete tasks that need tracking.  
+
+This way, conversations stay organized, visible to the community, and future contributors can benefit from past discussions.  
+
+---
+
 Thank you for contributing to the Untold Engine! Following these guidelines will ensure that your work aligns with the project's goals and provides value to users.
