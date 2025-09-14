@@ -18,8 +18,8 @@ public struct MeshNode: Node
         self.entityID = entityID ?? createEntity()
     }
     
-    public init (resource: String) {
-        self.init(resource: resource) { }
+    public init (entityID: EntityID? = nil, resource: String) {
+        self.init(entityID: entityID, resource: resource) { }
     }
     
     public init (entityID: EntityID? = nil, resource: String, @SceneBuilder content: @escaping () -> [any Node]) {
