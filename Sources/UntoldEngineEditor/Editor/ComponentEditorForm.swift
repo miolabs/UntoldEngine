@@ -7,6 +7,7 @@
 #if canImport(AppKit)
 import Foundation
 import SwiftUI
+import UntoldEngine
 
 // 1) Describe the fields you want to render
 public enum EditorField {

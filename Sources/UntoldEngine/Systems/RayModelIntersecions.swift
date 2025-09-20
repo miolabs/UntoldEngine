@@ -79,12 +79,12 @@ func createAccelerationStructures(_: Bool) {
     var entities: [EntityID] = []
 
     // only ray cast gizmo components
-    if gizmoActive, inputSystem.keyState.shiftPressed == false {
-        let gizmoId = getComponentId(for: GizmoComponent.self)
-        entities = queryEntitiesWithComponentIds([transformId, renderId, gizmoId], in: scene)
-    } else {
+//    if gizmoActive, inputSystem.keyState.shiftPressed == false {
+//        let gizmoId = getComponentId(for: GizmoComponent.self)
+//        entities = queryEntitiesWithComponentIds([transformId, renderId, gizmoId], in: scene)
+//    } else {
         entities = visibleEntityIds
-    }
+//    }
 
     // Iterate over the entities found by the component query
     for (i, entityId) in entities.enumerated() {
@@ -237,7 +237,7 @@ func initRayPickerCompute() {
     #endif
 }
 
-func cleanUpAccelStructures() {
+public func cleanUpAccelStructures() {
     // clean up all acceleration structures resources
     accelStructResources.primitiveAccelerationStructures.removeAll()
     accelStructResources.instanceTransforms.removeAll()
@@ -258,7 +258,7 @@ func prepareUserHitRayAccelStructures() {
     createInstanceAccelerationStructures()
 }
 
-func executeRayVsModelHit(
+public func executeRayVsModelHit(
     _ commandBuffer: MTLCommandBuffer, _ origin: simd_float3, _ direction: simd_float3
 ) {
     // prepare acceleration structure

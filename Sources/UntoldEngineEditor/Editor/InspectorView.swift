@@ -7,6 +7,7 @@
 #if canImport(AppKit)
 import simd
 import SwiftUI
+import UntoldEngine
 
 public struct ComponentOption_Editor: Identifiable {
     public let id: Int

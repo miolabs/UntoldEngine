@@ -6,6 +6,7 @@
 //
 #if canImport(AppKit)
 import SwiftUI
+import UntoldEngine
 
 struct SceneHierarchyView: View {
     @ObservedObject var selectionManager: SelectionManager

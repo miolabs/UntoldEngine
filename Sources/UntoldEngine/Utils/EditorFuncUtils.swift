@@ -8,7 +8,7 @@
 import Foundation
 import SwiftUI
 
-func bindingForWrapMode(entityId: EntityID, textureType: TextureType, onChange: @escaping () -> Void) -> Binding<WrapMode> {
+public func bindingForWrapMode(entityId: EntityID, textureType: TextureType, onChange: @escaping () -> Void) -> Binding<WrapMode> {
     Binding<WrapMode>(
         get: {
             guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId),

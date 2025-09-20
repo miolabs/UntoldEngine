@@ -48,9 +48,9 @@ public func getDistanceFromPath(for entityId: EntityID, path: [simd_float3]) -> 
 // Low-Level Steering Behaviors
 
 func seek(entityId: EntityID, targetPosition: simd_float3, maxSpeed: Float) -> simd_float3 {
-    if gameMode == false {
-        return simd_float3(0.0, 0.0, 0.0)
-    }
+//    if gameMode == false {
+//        return simd_float3(0.0, 0.0, 0.0)
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return simd_float3(0.0, 0.0, 0.0)
@@ -71,9 +71,9 @@ func seek(entityId: EntityID, targetPosition: simd_float3, maxSpeed: Float) -> s
 }
 
 public func flee(entityId: EntityID, threatPosition: simd_float3, maxSpeed: Float) -> simd_float3 {
-    if gameMode == false {
-        return simd_float3(0.0, 0.0, 0.0)
-    }
+//    if gameMode == false {
+//        return simd_float3(0.0, 0.0, 0.0)
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return simd_float3(0.0, 0.0, 0.0)
@@ -94,9 +94,9 @@ public func flee(entityId: EntityID, threatPosition: simd_float3, maxSpeed: Floa
 }
 
 public func arrive(entityId: EntityID, targetPosition: simd_float3, maxSpeed: Float, slowingRadius: Float) -> simd_float3 {
-    if gameMode == false {
-        return simd_float3(0.0, 0.0, 0.0)
-    }
+//    if gameMode == false {
+//        return simd_float3(0.0, 0.0, 0.0)
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return simd_float3(0.0, 0.0, 0.0)
@@ -132,9 +132,9 @@ public func pursuit(entityId: EntityID, targetEntity: EntityID, maxSpeed: Float)
         return simd_float3(0.0, 0.0, 0.0)
     }
 
-    if gameMode == false {
-        return simd_float3(0.0, 0.0, 0.0)
-    }
+//    if gameMode == false {
+//        return simd_float3(0.0, 0.0, 0.0)
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return simd_float3(0.0, 0.0, 0.0)
@@ -160,9 +160,9 @@ public func evade(entityId: EntityID, threatEntity: EntityID, maxSpeed: Float) -
         return simd_float3(0.0, 0.0, 0.0)
     }
 
-    if gameMode == false {
-        return simd_float3(0.0, 0.0, 0.0)
-    }
+//    if gameMode == false {
+//        return simd_float3(0.0, 0.0, 0.0)
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return simd_float3(0.0, 0.0, 0.0)
@@ -181,9 +181,9 @@ public func evade(entityId: EntityID, threatEntity: EntityID, maxSpeed: Float) -
 }
 
 public func alignOrientation(entityId: EntityID, targetDirection _: simd_float3, deltaTime: Float, turnSpeed: Float) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -236,9 +236,9 @@ public func alignOrientation(entityId: EntityID, targetDirection _: simd_float3,
 }
 
 public func orbit(entityId: EntityID, centerPosition: simd_float3, radius: Float, maxSpeed: Float, deltaTime: Float, turnSpeed: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -277,9 +277,9 @@ public func orbit(entityId: EntityID, centerPosition: simd_float3, radius: Float
 
 // movement helper functions
 public func steerSeek(entityId: EntityID, targetPosition: simd_float3, maxSpeed: Float, deltaTime: Float, turnSpeed: Float = 1.0, weight: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -312,9 +312,9 @@ public func steerSeek(entityId: EntityID, targetPosition: simd_float3, maxSpeed:
 }
 
 public func steerArrive(entityId: EntityID, targetPosition: simd_float3, maxSpeed: Float, slowingRadius: Float, deltaTime: Float, turnSpeed: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -346,9 +346,9 @@ public func steerArrive(entityId: EntityID, targetPosition: simd_float3, maxSpee
 }
 
 public func steerWithWASD(entityId: EntityID, maxSpeed: Float, deltaTime: Float, turnSpeed: Float = 1.0, weight: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -399,9 +399,9 @@ public func steerWithWASD(entityId: EntityID, maxSpeed: Float, deltaTime: Float,
 }
 
 public func steerFlee(entityId: EntityID, threatPosition: simd_float3, maxSpeed: Float, deltaTime: Float, turnSpeed: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -434,9 +434,9 @@ public func steerFlee(entityId: EntityID, threatPosition: simd_float3, maxSpeed:
 }
 
 public func steerPursuit(entityId: EntityID, targetEntity: EntityID, maxSpeed: Float, deltaTime: Float, turnSpeed: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -480,9 +480,9 @@ public func steerPursuit(entityId: EntityID, targetEntity: EntityID, maxSpeed: F
 }
 
 public func steerFollowPath(entityId: EntityID, path: [simd_float3], maxSpeed: Float, deltaTime: Float, turnSpeed: Float = 1.0, waypointThreshold: Float = 0.5, weight: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return
@@ -527,9 +527,9 @@ public func steerFollowPath(entityId: EntityID, path: [simd_float3], maxSpeed: F
 }
 
 public func steerAvoidObstacles(entityId: EntityID, obstacles: [EntityID], avoidanceRadius: Float, maxSpeed: Float, deltaTime: Float, turnSpeed: Float = 1.0) {
-    if gameMode == false {
-        return
-    }
+//    if gameMode == false {
+//        return
+//    }
 
     if isPhysicsComponentPaused(entityId: entityId) {
         return

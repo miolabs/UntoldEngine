@@ -12,32 +12,39 @@ import ModelIO
 import simd
 
 public struct RenderInfo {
-    var perspectiveSpace = simd_float4x4.init(1.0)
-    var device: MTLDevice!
-    var fence: MTLFence!
-    var library: MTLLibrary!
-    var commandQueue: MTLCommandQueue!
-    var bufferAllocator: MTKMeshBufferAllocator!
-    var textureLoader: MTKTextureLoader!
-    var renderPassDescriptor: MTLRenderPassDescriptor!
-    var offscreenRenderPassDescriptor: MTLRenderPassDescriptor!
-    var postProcessRenderPassDescriptor: MTLRenderPassDescriptor!
-    var shadowRenderPassDescriptor: MTLRenderPassDescriptor!
-    var gizmoRenderPassDescriptor: MTLRenderPassDescriptor!
-    var deferredRenderPassDescriptor: MTLRenderPassDescriptor!
-    var ssaoRenderPassDescriptor: MTLRenderPassDescriptor!
-    var ssaoBlurRenderPassDescriptor: MTLRenderPassDescriptor!
-    var iblOffscreenRenderPassDescriptor: MTLRenderPassDescriptor!
-    var colorPixelFormat: MTLPixelFormat!
-    var depthPixelFormat: MTLPixelFormat!
-    var viewPort: simd_float2!
+    public var perspectiveSpace = simd_float4x4.init(1.0)
+    public var device: MTLDevice!
+    public var fence: MTLFence!
+    public var library: MTLLibrary!
+    public var commandQueue: MTLCommandQueue!
+    public var bufferAllocator: MTKMeshBufferAllocator!
+    public var textureLoader: MTKTextureLoader!
+    public var renderPassDescriptor: MTLRenderPassDescriptor!
+    public var offscreenRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var postProcessRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var shadowRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var gizmoRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var deferredRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var ssaoRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var ssaoBlurRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var iblOffscreenRenderPassDescriptor: MTLRenderPassDescriptor!
+    public var colorPixelFormat: MTLPixelFormat!
+    public var depthPixelFormat: MTLPixelFormat!
+    public var viewPort: simd_float2!
 }
 
 public struct RenderPipeline {
-    var pipelineState: MTLRenderPipelineState?
-    var depthState: MTLDepthStencilState?
-    var success: Bool = false
-    var name: String?
+    public var pipelineState: MTLRenderPipelineState?
+    public var depthState: MTLDepthStencilState?
+    public var success: Bool = false
+    public var name: String?
+    
+    public init(pipelineState: MTLRenderPipelineState? = nil, depthState: MTLDepthStencilState? = nil, success: Bool = false, name: String? = nil) {
+        self.pipelineState = pipelineState
+        self.depthState = depthState
+        self.success = success
+        self.name = name
+    }
 }
 
 public struct ComputePipeline {
@@ -70,19 +77,19 @@ public struct BufferResources {
     var voxelUniforms: MTLBuffer?
 
     // composite quad
-    var quadVerticesBuffer: MTLBuffer?
-    var quadTexCoordsBuffer: MTLBuffer?
-    var quadIndexBuffer: MTLBuffer?
+    public var quadVerticesBuffer: MTLBuffer?
+    public var quadTexCoordsBuffer: MTLBuffer?
+    public var quadIndexBuffer: MTLBuffer?
 
     // bounding box
-    var boundingBoxBuffer: MTLBuffer?
+    public var boundingBoxBuffer: MTLBuffer?
 
     // ray tracing uniform
     var rayTracingUniform: MTLBuffer?
     var accumulationBuffer: MTLBuffer?
 
     // ray model
-    var rayModelInstanceBuffer: MTLBuffer?
+    public var rayModelInstanceBuffer: MTLBuffer?
 
     // ssao kernel
     var ssaoKernelBuffer: MTLBuffer?
@@ -115,7 +122,7 @@ public struct TextureResources {
     var positionMap: MTLTexture?
     var materialMap: MTLTexture?
     var emissiveMap: MTLTexture?
-    var depthMap: MTLTexture?
+    public var depthMap: MTLTexture?
 
     // deferred
     var deferredColorMap: MTLTexture?
@@ -168,7 +175,7 @@ public struct AccelStructResources {
     var primitiveAccelerationStructures: [MTLAccelerationStructure] = []
     var instanceTransforms: [MTLPackedFloat4x3] = []
     var accelerationStructIndex: [UInt32] = []
-    var entityIDIndex: [EntityID] = []
+    public var entityIDIndex: [EntityID] = []
     var instanceAccelerationStructure: MTLAccelerationStructure?
     var instanceBuffer: MTLBuffer?
     var mask: [Int32] = []

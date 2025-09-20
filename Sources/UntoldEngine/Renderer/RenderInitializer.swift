@@ -13,7 +13,7 @@ import simd
 
 // Helper creation functions
 
-func createPipeline(
+public func createPipeline(
     vertexShader: String,
     fragmentShader: String?,
     vertexDescriptor: MTLVertexDescriptor?,
@@ -159,7 +159,8 @@ func createTexture(
     let texture = device.makeTexture(descriptor: descriptor)
     texture?.label = label
 
-    DebugTextureRegistry.register(name: label, texture: texture!)
+    //TODO: Check with the editor logging system
+//    DebugTextureRegistry.register(name: label, texture: texture!)
 
     return texture
 }
@@ -882,7 +883,7 @@ func createModelVertexDescriptor() -> MTLVertexDescriptor? {
     return vertexDescriptor
 }
 
-func createGizmoVertexDescriptor() -> MTLVertexDescriptor? {
+public func createGizmoVertexDescriptor() -> MTLVertexDescriptor? {
     // tell the gpu how data is organized
     vertexDescriptor.gizmo = MDLVertexDescriptor()
 
@@ -991,7 +992,7 @@ func createPreCompositeVertexDescriptor() -> MTLVertexDescriptor {
     return vertexDescriptor
 }
 
-func createDebugVertexDescriptor() -> MTLVertexDescriptor {
+public func createDebugVertexDescriptor() -> MTLVertexDescriptor {
     // set the vertex descriptor
     let vertexDescriptor = MTLVertexDescriptor()
 
@@ -1139,7 +1140,9 @@ func initSSAOResources() {
     textureResources.ssaoNoiseTexture = generateSSAONoiseTexture(device: renderInfo.device)
 }
 
-func initRenderPipelines() {
+public typealias InitRenderPipelinesCallback = () -> Void
+    
+public func initRenderPipelines() {
     // Grid Pipeline
     if let gridPipe = createPipeline(
         vertexShader: "vertexGridShader",
@@ -1191,18 +1194,6 @@ func initRenderPipelines() {
         name: "Light Pipeline"
     ) {
         lightPipeline = lightPipe
-    }
-
-    // Gizmo Pipeline
-    if let gizmoPipe = createPipeline(
-        vertexShader: "vertexGizmoShader",
-        fragmentShader: "fragmentGizmoShader",
-        vertexDescriptor: createGizmoVertexDescriptor(),
-        colorFormats: [renderInfo.colorPixelFormat],
-        depthFormat: renderInfo.depthPixelFormat,
-        name: "Gizmo Pipeline"
-    ) {
-        gizmoPipeline = gizmoPipe
     }
 
     // Geometry Pipeline
@@ -1280,19 +1271,6 @@ func initRenderPipelines() {
         name: "Pre-Composite Pipeline"
     ) {
         preCompositePipeline = preCompositePipe
-    }
-
-    if let debugPipe = createPipeline(
-        vertexShader: "vertexDebugShader",
-        fragmentShader: "fragmentDebugShader",
-        vertexDescriptor: createDebugVertexDescriptor(),
-        colorFormats: [.bgra8Unorm_srgb],
-        depthFormat: renderInfo.depthPixelFormat,
-        depthCompareFunction: .less,
-        depthEnabled: false,
-        name: "Debug Pipeline"
-    ) {
-        debuggerPipeline = debugPipe
     }
 
     if let tonePipe = createPipeline(

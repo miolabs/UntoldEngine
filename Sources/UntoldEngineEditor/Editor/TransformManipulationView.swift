@@ -7,6 +7,7 @@
 #if canImport(AppKit)
 import Foundation
 import SwiftUI
+import UntoldEngine
 
 struct ModeButton: View {
     let icon: String

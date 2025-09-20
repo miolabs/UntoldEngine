@@ -7,6 +7,7 @@
 #if canImport(AppKit)
 import SwiftUI
 import UniformTypeIdentifiers
+import UntoldEngine
 
 enum AssetCategory: String, CaseIterable {
     case models = "Models"

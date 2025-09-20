@@ -9,6 +9,8 @@ import AppKit
 import Foundation
 import simd
 import UniformTypeIdentifiers
+import UntoldEngine
+import CShaderTypes
 
 struct SceneData: Codable {
     var entities: [EntityData] = []
@@ -100,49 +102,49 @@ struct CameraData: Codable {
     var up: simd_float3 = .init(0.0, 1.0, 0.0)
 }
 
-struct EnvironmentData: Codable {
-    var applyIBL: Bool? = nil
-    var renderEnvironment: Bool? = nil
-    var hdr: String? = nil
-    var ambientIntensity: Float? = nil
+public struct EnvironmentData: Codable {
+    public var applyIBL: Bool? = nil
+    public var renderEnvironment: Bool? = nil
+    public var hdr: String? = nil
+    public var ambientIntensity: Float? = nil
 }
 
 struct MaterialData: Codable {
-    var baseColorValue: simd_float4 = .zero
-    var emissiveValue: simd_float3 = .zero
-    var roughnessValue: Float = 1.0
-    var metallicValue: Float = 0.0
-    var baseColorURL: URL? = nil
-    var roughnessURL: URL? = nil
-    var metallicURL: URL? = nil
-    var normalURL: URL? = nil
+    public var baseColorValue: simd_float4 = .zero
+    public var emissiveValue: simd_float3 = .zero
+    public var roughnessValue: Float = 1.0
+    public var metallicValue: Float = 0.0
+    public var baseColorURL: URL? = nil
+    public var roughnessURL: URL? = nil
+    public var metallicURL: URL? = nil
+    public var normalURL: URL? = nil
 }
 
 struct EntityData: Codable {
-    var uuid: UUID = .init() // Unique identifier for this entity
-    var parentUUID: UUID? = nil // UUID of the parent entity, if any
-    var name: String = "" // entity name
-    var assetName: String = "" // asset name in 3D software
-    var assetURL: URL = .init(fileURLWithPath: "")
-    var position: simd_float3 = .zero
-    var axisOfRotations: simd_float3 = .zero
-    var scale: simd_float3 = .one
-    var animations: [URL] = []
-    var mass: Float = .init(1.0)
-    var lightData: LightData? = nil
-    var cameraData: CameraData? = nil
-    var materialData: MaterialData? = nil
-    var hasRenderingComponent: Bool = false
-    var hasAnimationComponent: Bool = false
-    var hasLocalTransformComponent: Bool = false
-    var hasKineticComponent: Bool = false
-    var hasDirLightComponent: Bool?
-    var hasPointLightComponent: Bool?
-    var hasSpotLightComponent: Bool?
-    var hasAreaLightComponent: Bool?
-    var hasCameraComponent: Bool?
+    public var uuid: UUID = .init() // Unique identifier for this entity
+    public var parentUUID: UUID? = nil // UUID of the parent entity, if any
+    public var name: String = "" // entity name
+    public var assetName: String = "" // asset name in 3D software
+    public var assetURL: URL = .init(fileURLWithPath: "")
+    public var position: simd_float3 = .zero
+    public var axisOfRotations: simd_float3 = .zero
+    public var scale: simd_float3 = .one
+    public var animations: [URL] = []
+    public var mass: Float = .init(1.0)
+    public var lightData: LightData? = nil
+    public var cameraData: CameraData? = nil
+    public var materialData: MaterialData? = nil
+    public var hasRenderingComponent: Bool = false
+    public var hasAnimationComponent: Bool = false
+    public var hasLocalTransformComponent: Bool = false
+    public var hasKineticComponent: Bool = false
+    public var hasDirLightComponent: Bool?
+    public var hasPointLightComponent: Bool?
+    public var hasSpotLightComponent: Bool?
+    public var hasAreaLightComponent: Bool?
+    public var hasCameraComponent: Bool?
 
-    var customComponents: [String: Data]? = nil
+    public var customComponents: [String: Data]? = nil
 }
 
 func serializeScene() -> SceneData {

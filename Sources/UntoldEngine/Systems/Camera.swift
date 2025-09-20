@@ -9,26 +9,10 @@
 import Foundation
 import simd
 
+public typealias GetMainCameraCallback = () -> EntityID
+
 public func getMainCamera() -> EntityID {
-    if gameMode == true {
-        return findGameCamera()
-    } else {
-        return findSceneCamera()
-    }
-}
-
-public func findSceneCamera() -> EntityID {
-    for entityId in scene.getAllEntities() {
-        if hasComponent(entityId: entityId, componentType: CameraComponent.self), hasComponent(entityId: entityId, componentType: SceneCameraComponent.self) {
-            return entityId
-        }
-    }
-
-    // if scene camera was not found, then create one
-
-    let sceneCamera = createEntity()
-    createSceneCamera(entityId: sceneCamera)
-    return sceneCamera
+    return findGameCamera()
 }
 
 public func findGameCamera() -> EntityID {
@@ -45,7 +29,7 @@ public func findGameCamera() -> EntityID {
     return gameCamera
 }
 
-func createSceneCamera(entityId: EntityID) {
+public func createSceneCamera(entityId: EntityID) {
     setEntityName(entityId: entityId, name: "Scene Camera")
     registerComponent(entityId: entityId, componentType: CameraComponent.self)
     registerComponent(entityId: entityId, componentType: SceneCameraComponent.self)
@@ -55,7 +39,7 @@ func createSceneCamera(entityId: EntityID) {
                  up: cameraUpDefault)
 }
 
-func createGameCamera(entityId: EntityID) {
+public func createGameCamera(entityId: EntityID) {
     setEntityName(entityId: entityId, name: "Game Camera")
     registerComponent(entityId: entityId, componentType: CameraComponent.self)
 
@@ -64,7 +48,7 @@ func createGameCamera(entityId: EntityID) {
                  up: cameraUpDefault)
 }
 
-func resetCameraToDefaultTransform(entityId: EntityID) {
+public func resetCameraToDefaultTransform(entityId: EntityID) {
     guard scene.get(component: CameraComponent.self, for: entityId) != nil else {
         handleError(.noActiveCamera)
         return

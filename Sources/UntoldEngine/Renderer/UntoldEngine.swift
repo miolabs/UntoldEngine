@@ -12,22 +12,45 @@ import MetalKit
 import simd
 import Spatial
 
+public  protocol UntoldRendererDelegate : NSObjectProtocol
+{
+    func willDraw(in view: MTKView) -> Void
+    func didDraw(in view: MTKView) -> Void
+}
+
 public class UntoldRenderer: NSObject, MTKViewDelegate {
     public let metalView: MTKView
     public var gameUpdateCallback: ((_ deltaTime: Float) -> Void)?
     public var handleInputCallback: (() -> Void)?
+    
+    public weak var delegate: UntoldRendererDelegate? = nil
+    
+    var updateRenderingSystemCallback: UpdateRenderingSystemCallback
+    var getMainCameraCallback: GetMainCameraCallback
+    var initRenderPipelinesCallback: InitRenderPipelinesCallback
 
-    override public init() {
+    public init( updateRenderingSystemCallback: @escaping UpdateRenderingSystemCallback = updateRenderingSystem,
+                 getMainCameraCallback: GetMainCameraCallback = getMainCamera,
+                 initRenderPipelinesCallback: InitRenderPipelinesCallback = initRenderPipelines ) {
         // Initialize the metal view
         metalView = MTKView()
-        #if canImport(AppKit)
+        
+        self.updateRenderingSystemCallback = updateRenderingSystemCallback
+        self.getMainCameraCallback = getMainCamera
+        self.initRenderPipelinesCallback = initRenderPipelines
+
+        #if canImport(AppKit)        
         Logger.addSink(LogStore.shared)
         #endif
         super.init()
     }
 
-    public static func create() -> UntoldRenderer? {
-        let renderer = UntoldRenderer()
+    public static func create( updateRenderingSystemCallback: @escaping UpdateRenderingSystemCallback = updateRenderingSystem,
+                               getMainCameraCallback: GetMainCameraCallback = getMainCamera,
+                               initRenderPipelinesCallback: InitRenderPipelinesCallback = initRenderPipelines ) -> UntoldRenderer? {
+        let renderer = UntoldRenderer( updateRenderingSystemCallback: updateRenderingSystemCallback,
+                                       getMainCameraCallback: getMainCameraCallback,
+                                       initRenderPipelinesCallback: initRenderPipelines )
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             assertionFailure("Metal device is not available.")
@@ -98,14 +121,10 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         let light = createEntity()
         setEntityName(entityId: light, name: "Directional Light")
         createDirLight(entityId: light)
-        // initialize ray vs model pipeline
-        initRayPickerCompute()
-
+        
         // init ssao kernels
         initSSAOResources()
-
-        loadLightDebugMeshes()
-
+        
         initFrustumCulllingCompute()
 
         Logger.log(message: "Untold Engine Starting")
@@ -157,6 +176,8 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     }
 
     public func draw(in view: MTKView) {
+        delegate?.willDraw(in: view)
+        
         if needsFinalizeDestroys {
             needsFinalizeDestroys = false
 
@@ -166,7 +187,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        if getMainCamera() == .invalid {
+        if getMainCameraCallback() == .invalid {
             handleError(.noGameCamera)
             return
         }
@@ -174,35 +195,24 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         // call the update call before the render
         frameCount += 1
 
-        if hotReload {
-            // updateRayKernelPipeline()
-            updateShadersAndPipeline()
-
-            hotReload = false
-        }
-
         // calculate delta time for frame
         calculateDeltaTime()
         traverseSceneGraph()
+        
         // process Input - Handle user input before updating game states
-        if gameMode == true {
-            handleInputCallback?() // if game mode
+        handleInputCallback?()
 
-            updateAnimationSystem(deltaTime: timeSinceLastUpdate)
+        updateAnimationSystem(deltaTime: timeSinceLastUpdate)
 
-            // Fixed‐timestep physics
-            physicsAccumulator += timeSinceLastUpdate
-            let maxSteps = 5
-            var steps = 0
-            while physicsAccumulator >= fixedStep, steps < maxSteps {
-                updatePhysicsSystem(deltaTime: fixedStep)
-                updateCustomSystems(deltaTime: fixedStep)
-                physicsAccumulator -= fixedStep
-                steps += 1
-            }
-
-        } else {
-            handleSceneInput() // if scene mode
+        // Fixed‐timestep physics
+        physicsAccumulator += timeSinceLastUpdate
+        let maxSteps = 5
+        var steps = 0
+        while physicsAccumulator >= fixedStep, steps < maxSteps {
+            updatePhysicsSystem(deltaTime: fixedStep)
+            updateCustomSystems(deltaTime: fixedStep)
+            physicsAccumulator -= fixedStep
+            steps += 1
         }
 
         // update game states and logic
@@ -210,6 +220,8 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
 
         // render
         updateRenderingSystem(in: view)
+        
+        delegate?.didDraw(in: view)
     }
 
     public func mtkView(_ mtkView: MTKView, drawableSizeWillChange size: CGSize) {
@@ -469,7 +481,6 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             break
         }
 #endif
-    }
-
-   
+    }   
 }
+

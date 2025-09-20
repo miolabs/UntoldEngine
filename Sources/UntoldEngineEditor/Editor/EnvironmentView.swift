@@ -7,6 +7,8 @@
 #if canImport(AppKit)
 import simd
 import SwiftUI
+import UntoldEngine
+
 
 func addIBL(asset: Asset?) {
     let selectedCategory: AssetCategory = .hdr

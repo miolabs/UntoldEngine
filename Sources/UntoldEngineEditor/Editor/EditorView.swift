@@ -1,6 +1,8 @@
 #if canImport(AppKit)
 import MetalKit
 import SwiftUI
+import UntoldEngine
+
 
 public struct Asset: Identifiable {
     public let id = UUID()
@@ -46,7 +48,11 @@ public struct EditorView: View {
                 }
 
                 VStack {
-                    SceneView(mtkView: mtkView) // Scene placeholder (Metal integration later)
+                    SceneView(mtkView: mtkView)
+                        .customSetup {
+                            // initialize ray vs model pipeline
+                            initRayPickerCompute()
+                        }
                     TransformManipulationToolbar(controller: editorController!, showAssetBrowser: $showAssetBrowser)
                     if showAssetBrowser {
                         TabView {

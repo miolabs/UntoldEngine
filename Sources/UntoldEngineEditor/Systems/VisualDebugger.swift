@@ -7,6 +7,7 @@
 
 import Foundation
 import Metal
+import UntoldEngine
 
 struct DebugTextureEntry {
     let name: String

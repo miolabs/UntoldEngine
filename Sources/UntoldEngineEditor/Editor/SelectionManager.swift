@@ -6,6 +6,7 @@
 //
 #if canImport(AppKit)
 import Foundation
+import UntoldEngine
 
 protocol SelectionDelegate: AnyObject {
     func didSelectEntity(_ entityId: EntityID)

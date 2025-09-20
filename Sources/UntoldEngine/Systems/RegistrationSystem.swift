@@ -409,12 +409,12 @@ func removeEntityScenegraph(entityId: EntityID) {
     scene.remove(component: ScenegraphComponent.self, from: entityId)
 }
 
-func registerTransformComponent(entityId: EntityID) {
+public func registerTransformComponent(entityId: EntityID) {
     registerComponent(entityId: entityId, componentType: LocalTransformComponent.self)
     registerComponent(entityId: entityId, componentType: WorldTransformComponent.self)
 }
 
-func registerSceneGraphComponent(entityId: EntityID) {
+public func registerSceneGraphComponent(entityId: EntityID) {
     registerComponent(entityId: entityId, componentType: ScenegraphComponent.self)
 }
 
@@ -539,9 +539,9 @@ public func findEntity(name: String) -> EntityID? {
  }
  */
 
-var customComponentEncoderMap: [ObjectIdentifier: (EntityID) -> Data?] = [:]
-var customComponentDecoderMap: [String: (EntityID, Data) -> Void] = [:]
-var customComponentTypeNameById: [ObjectIdentifier: String] = [:]
+public var customComponentEncoderMap: [ObjectIdentifier: (EntityID) -> Data?] = [:]
+public var customComponentDecoderMap: [String: (EntityID, Data) -> Void] = [:]
+public var customComponentTypeNameById: [ObjectIdentifier: String] = [:]
 
 public func encodeCustomComponent<T: Component & Codable>(
     type: T.Type,
@@ -567,7 +567,7 @@ public func encodeCustomComponent<T: Component & Codable>(
     }
 }
 
-func loadRawMesh(
+public func loadRawMesh(
     name: String,
     filename: String,
     withExtension: String
