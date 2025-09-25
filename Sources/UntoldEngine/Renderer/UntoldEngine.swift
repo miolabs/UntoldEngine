@@ -98,18 +98,16 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
 
         shadowSystem = ShadowSystem()
 
-        let sceneCamera = createEntity()
-        createSceneCamera(entityId: sceneCamera)
-
-        let gameCamera = createEntity()
-        setEntityName(entityId: gameCamera, name: "Main Camera")
-        createGameCamera(entityId: gameCamera)
-
-        CameraSystem.shared.activeCamera = gameCamera
-        
-        let light = createEntity()
-        setEntityName(entityId: light, name: "Directional Light")
-        createDirLight(entityId: light)
+//        let sceneCamera = createEntity()
+//        createSceneCamera(entityId: sceneCamera)
+//
+//        let gameCamera = createEntity()
+//        setEntityName(entityId: gameCamera, name: "Main Camera")
+//        createGameCamera(entityId: gameCamera)
+          
+//        let light = createEntity()
+//        setEntityName(entityId: light, name: "Directional Light")
+//        createDirLight(entityId: light)
         
         // init ssao kernels
         initSSAOResources()

@@ -35,10 +35,11 @@ public func destroyEntity(entityId: EntityID) {
     }
 }
 
-public func destroyAllEntities() {
+public func destroyAllEntities( removeSceneCamera: Bool = false ) {
     let toDestroy = scene.getAllEntities()
 
     for entity in toDestroy {
+        if hasComponent(entityId: entity, componentType: SceneCameraComponent.self) { continue }
         destroyEntity(entityId: entity)
     }
 }

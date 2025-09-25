@@ -23,6 +23,8 @@ struct EditorSceneView: View, UntoldRendererDelegate {
                 let sceneCamera = createEntity()
                 createSceneCamera(entityId: sceneCamera)
                 
+                CameraSystem.shared.activeCamera = sceneCamera
+                
                 // initialize ray vs model pipeline
                 initRayPickerCompute()
                 // Load Debug meshes and other editor / debug resources

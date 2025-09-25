@@ -114,8 +114,6 @@ public struct EditorView: View {
             activeEntity = .invalid
             selectionManager.objectWillChange.send()
             sceneGraphModel.refreshHierarchy()
-            
-            CameraSystem.shared.activeCamera = findGameCamera()
         }
     }
 
