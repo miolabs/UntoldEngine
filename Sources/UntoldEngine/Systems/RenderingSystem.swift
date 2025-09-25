@@ -126,7 +126,7 @@ public func buildGameModeGraph() -> RenderGraphResult {
             id: horID,
             dependencies: [previousPassID],
             execute: RenderPasses.executePostProcess(
-                blurPipeline,
+                PipelineManager.shared.renderPipelinesByType[.blur]!,
                 source: horSource,
                 destination: horDestination,
                 customization: makeBlurCustomization(direction: simd_float2(1.0, 0.0), radius: blurRadius)
@@ -139,7 +139,7 @@ public func buildGameModeGraph() -> RenderGraphResult {
             id: verID,
             dependencies: [horID],
             execute: RenderPasses.executePostProcess(
-                blurPipeline,
+                PipelineManager.shared.renderPipelinesByType[.blur]!,
                 source: horDestination,
                 destination: textureResources.blurTextureVer!,
                 customization: makeBlurCustomization(direction: simd_float2(0.0, 1.0), radius: blurRadius)
@@ -198,7 +198,7 @@ func colorCorrectionCustomization(encoder: MTLRenderCommandEncoder) {
 }
 
 var colorCorrectionRenderPass = RenderPasses.executePostProcess(
-    colorCorrectionPipeline,
+    PipelineManager.shared.renderPipelinesByType[.colorCorrection]!,
     source: textureResources.tonemapTexture!,
     destination: textureResources.colorCorrectionTexture!,
     customization: colorCorrectionCustomization
@@ -247,7 +247,7 @@ func colorGradingCustomization(encoder: MTLRenderCommandEncoder) {
 }
 
 var colorGradingRenderPass = RenderPasses.executePostProcess(
-    colorGradingPipeline,
+    PipelineManager.shared.renderPipelinesByType[.colorGrading]!,
     source: textureResources.bloomCompositeTexture!,
     destination: textureResources.colorGradingTexture!,
     customization: colorGradingCustomization
@@ -278,7 +278,7 @@ func makeBlurCustomization(direction: simd_float2, radius: Float) -> (MTLRenderC
 }
 
 var bloomThresholdRenderPass = RenderPasses.executePostProcess(
-    bloomThresholdPipeline,
+    PipelineManager.shared.renderPipelinesByType[.bloomThreshold]!,
     source: textureResources.chromaticAberrationTexture!,
     destination: textureResources.bloomThresholdTextuture!,
     customization: bloomThresholdCustomization
@@ -307,7 +307,7 @@ func bloomThresholdCustomization(encoder: MTLRenderCommandEncoder) {
 }
 
 var bloomCompositeRenderPass = RenderPasses.executePostProcess(
-    bloomCompositePipeline,
+    PipelineManager.shared.renderPipelinesByType[.bloomComposite]!,
     source: textureResources.blurTextureVer!,
     destination: textureResources.bloomCompositeTexture!,
     customization: bloomCompositeCustomization
@@ -330,7 +330,7 @@ func bloomCompositeCustomization(encoder: MTLRenderCommandEncoder) {
 }
 
 var vignetteRenderPass = RenderPasses.executePostProcess(
-    vignettePipeline,
+    PipelineManager.shared.renderPipelinesByType[.vignette]!,
     source: textureResources.colorGradingTexture!,
     destination: textureResources.vignetteTexture!,
     customization: vignetteCustomization
@@ -369,7 +369,7 @@ func vignetteCustomization(encoder: MTLRenderCommandEncoder) {
 }
 
 var chromaticAberrationRenderPass = RenderPasses.executePostProcess(
-    chromaticAberrationPipeline,
+    PipelineManager.shared.renderPipelinesByType[.chromaticAberration]!,
     source: textureResources.depthOfFieldTexture!,
     destination: textureResources.chromaticAberrationTexture!,
     customization: chromaticAberrationCustomization
@@ -396,7 +396,7 @@ func chromaticAberrationCustomization(encoder: MTLRenderCommandEncoder) {
 }
 
 var depthOfFieldRenderPass = RenderPasses.executePostProcess(
-    depthOfFieldPipeline,
+    PipelineManager.shared.renderPipelinesByType[.depthOfField]!,
     source: textureResources.deferredColorMap!,
     destination: textureResources.depthOfFieldTexture!,
     customization: depthOfFieldCustomization

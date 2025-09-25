@@ -1,29 +1,27 @@
 //
-//  RenderInitializer.swift
+//  RenderPipeLines.swift
 //  UntoldEngine
 //
-//  Created by Javier Segura Perez on 15/9/25.
+//  Created by Javier Segura Perez on 24/9/25.
 //
 
 import UntoldEngine
 
-public func initEditorRenderPipelines()
-{
-    initRenderPipelines()
-    
-    // Gizmo Pipeline
-    if let gizmoPipe = createPipeline(
+// MARK: Gizmo Pipeline
+public func InitGizmoPipeline() -> RenderPipeline? {
+    return CreatePipeline(
         vertexShader: "vertexGizmoShader",
         fragmentShader: "fragmentGizmoShader",
         vertexDescriptor: createGizmoVertexDescriptor(),
         colorFormats: [renderInfo.colorPixelFormat],
         depthFormat: renderInfo.depthPixelFormat,
         name: "Gizmo Pipeline"
-    ) {
-        gizmoPipeline = gizmoPipe
-    }
-    
-    if let debugPipe = createPipeline(
+    )
+}
+
+// MARK: Debug Pipeline
+public func InitDebugPipeline() -> RenderPipeline? {
+    return CreatePipeline(
         vertexShader: "vertexDebugShader",
         fragmentShader: "fragmentDebugShader",
         vertexDescriptor: createDebugVertexDescriptor(),
@@ -32,8 +30,17 @@ public func initEditorRenderPipelines()
         depthCompareFunction: .less,
         depthEnabled: false,
         name: "Debug Pipeline"
-    ) {
-        debuggerPipeline = debugPipe
-    }
+    )
+}
 
+extension RenderPipelineType {
+    public static let gizmo : RenderPipelineType = "gizmo"
+    public static let debug : RenderPipelineType = "debug"
+}
+
+public func EditorDefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)] {
+    return DefaultPipeLines() + [
+        ( .gizmo, InitGizmoPipeline),
+        ( .debug, InitDebugPipeline)
+    ]
 }

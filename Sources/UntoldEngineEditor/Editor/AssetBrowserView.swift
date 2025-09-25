@@ -225,8 +225,8 @@ struct AssetBrowserView: View {
         panel.allowsMultipleSelection = false
 
         if panel.runModal() == .OK, let selectedURL = panel.urls.first {
-            assetBasePath = selectedURL
-            EditorAssetBasePath.shared.basePath = assetBasePath
+            LoadingSystem.shared.assetBasePath = selectedURL
+            EditorAssetBasePath.shared.basePath = selectedURL
         }
     }
 
@@ -243,6 +243,9 @@ struct AssetBrowserView: View {
         guard let basePath = assetBasePath else { return }
         // Supported categories must match your enum/string values
         guard ["Models", "Animations", "HDR", "Materials"].contains(selectedCategory) else { return }
+        guard let path = LoadingSystem.shared.assetBasePath else {
+            return
+        }
 
         let fm = FileManager.default
         let categoryRoot = basePath.appendingPathComponent(selectedCategory!, isDirectory: true)
@@ -311,7 +314,7 @@ struct AssetBrowserView: View {
     // MARK: - Load Assets
 
     private func loadAssets() {
-        guard let basePath = assetBasePath else { return }
+        guard let basePath = LoadingSystem.shared.assetBasePath else { return }
 
         var groupedAssets: [String: [Asset]] = [:]
 

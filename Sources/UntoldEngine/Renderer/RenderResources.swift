@@ -33,26 +33,6 @@ public struct RenderInfo {
     public var viewPort: simd_float2!
 }
 
-public struct RenderPipeline {
-    public var pipelineState: MTLRenderPipelineState?
-    public var depthState: MTLDepthStencilState?
-    public var success: Bool = false
-    public var name: String?
-    
-    public init(pipelineState: MTLRenderPipelineState? = nil, depthState: MTLDepthStencilState? = nil, success: Bool = false, name: String? = nil) {
-        self.pipelineState = pipelineState
-        self.depthState = depthState
-        self.success = success
-        self.name = name
-    }
-}
-
-public struct ComputePipeline {
-    var pipelineState: MTLComputePipelineState?
-    var success: Bool = false
-    var name: String?
-}
-
 public struct MeshShaderPipeline {
     var depthState: MTLDepthStencilState?
     var pipelineState: MTLRenderPipelineState?
@@ -111,8 +91,8 @@ public struct TripleBufferResources {
 }
 
 public struct VertexDescriptors {
-    var model: MDLVertexDescriptor!
-    var gizmo: MDLVertexDescriptor!
+    public var model: MDLVertexDescriptor!
+    public var gizmo: MDLVertexDescriptor!
 }
 
 public struct TextureResources {

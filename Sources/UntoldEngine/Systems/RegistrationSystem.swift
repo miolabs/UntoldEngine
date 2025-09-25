@@ -73,7 +73,7 @@ private func setEntityMeshCommon(
     entityName _: String?,
     assetName: String?
 ) {
-    guard let url = getResourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
+    guard let url = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
         handleError(.filenameNotFound, filename)
         return
     }
@@ -157,7 +157,7 @@ public func setEntityMesh(entityId: EntityID, filename: String, withExtension: S
 }
 
 public func loadScene(filename: String, withExtension: String) {
-    guard let url: URL = getResourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
+    guard let url: URL = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
         handleError(.filenameNotFound, filename)
         return
     }
@@ -220,7 +220,7 @@ func removeEntityMesh(entityId: EntityID) {
 }
 
 public func setEntitySkeleton(entityId: EntityID, filename: String, withExtension: String) {
-    guard let url: URL = getResourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
+    guard let url: URL = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
         handleError(.filenameNotFound, filename)
         return
     }
@@ -308,8 +308,10 @@ public func setEntityAnimations(entityId: EntityID, filename: String, withExtens
             animationComponent.animationClips[name] = animationClip
         }
     }
-
-    guard let url: URL = getResourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
+    
+    // BUG: Strange bug in xcode using swift 5.10 compiler. It crashes if these 2 lines are together
+    let resourceURL = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension)
+    guard let url = resourceURL else {
         handleError(.filenameNotFound, filename)
         return
     }
@@ -572,7 +574,7 @@ public func loadRawMesh(
     filename: String,
     withExtension: String
 ) -> [Mesh] {
-    guard let url = getResourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
+    guard let url = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
         handleError(.filenameNotFound, filename)
         return []
     }

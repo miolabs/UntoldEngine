@@ -9,10 +9,10 @@ import Foundation
 import simd
 import UntoldEngine
 
-func createGizmo(name: String) {
+func CreateGizmo(name: String) {
     var gizmoName: String = name
 
-    removeGizmo()
+    RemoveGizmo()
 
     if activeEntity == .invalid {
         return
@@ -45,8 +45,7 @@ func createGizmo(name: String) {
     gizmoActive = true
 }
 
-func processGizmoAction(entityId: EntityID) {
-#if canImport(AppKit)
+func ProcessGizmoAction(entityId: EntityID) {
     if entityId == .invalid {
         return
     }
@@ -86,10 +85,9 @@ func processGizmoAction(entityId: EntityID) {
         editorController?.activeMode = .none
         editorController?.activeAxis = .none
     }
-#endif
 }
 
-func hitGizmoToolAxis(entityId: EntityID) -> Bool {
+func HitGizmoToolAxis(entityId: EntityID) -> Bool {
     if entityId == .invalid {
         return false
     }
@@ -110,7 +108,7 @@ func hitGizmoToolAxis(entityId: EntityID) -> Bool {
     }
 }
 
-func removeGizmo() {
+func RemoveGizmo() {
     if parentEntityIdGizmo != .invalid {
         destroyEntity(entityId: parentEntityIdGizmo)
         parentEntityIdGizmo = .invalid

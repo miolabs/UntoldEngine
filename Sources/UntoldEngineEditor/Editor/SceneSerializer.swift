@@ -372,7 +372,7 @@ func serializeScene() -> SceneData {
     sceneData.ssao = SSAOData(radius: SSAOParams.shared.radius, bias: SSAOParams.shared.bias, intensity: SSAOParams.shared.intensity, enabled: SSAOParams.shared.enabled)
 
     // save asset base path
-    sceneData.assetBasePath = assetBasePath
+    sceneData.assetBasePath = LoadingSystem.shared.assetBasePath
 
     return sceneData
 }

@@ -8,14 +8,6 @@
 import Foundation
 import UntoldEngine
 
-public func getEditorMainCamera() -> EntityID {
-    if gameMode == true {
-        return findGameCamera()
-    } else {
-        return findSceneCamera()
-    }
-}
-
 public func findSceneCamera() -> EntityID {
     for entityId in scene.getAllEntities() {
         if hasComponent(entityId: entityId, componentType: CameraComponent.self), hasComponent(entityId: entityId, componentType: SceneCameraComponent.self) {

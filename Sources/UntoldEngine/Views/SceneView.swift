@@ -8,12 +8,6 @@
 import MetalKit
 import SwiftUI
 
-public protocol SceneViewRenderProtocol : NSObjectProtocol
-{
-    func resourcesDidLoad() -> Void
-}
-
-
 #if os(macOS)
 typealias ViewRepresentable = NSViewRepresentable
 #else
@@ -25,8 +19,9 @@ public struct SceneView: ViewRepresentable {
     private var mtkView: MTKView
     private var renderer: UntoldRenderer?
     
-    public init() {
-        self.renderer = UntoldRenderer.create()
+    //TODO: Maybe we should thow an error on init instead of allowing nil renderer value
+    public init( renderer: UntoldRenderer? = nil) {
+        self.renderer = renderer ?? UntoldRenderer.create()
         self.mtkView = self.renderer!.metalView
         self.renderer?.initResources()
     }
@@ -45,7 +40,8 @@ public struct SceneView: ViewRepresentable {
     public func updateUIView(_: MTKView, context _: Context) {}
 #endif
     
-    public func customSetup( block: @escaping () -> Void ) {
+    public func onInit( block: @escaping () -> Void ) -> Self {
         block()
+        return self
     }
 }

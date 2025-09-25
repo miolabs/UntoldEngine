@@ -9,15 +9,31 @@
 import Foundation
 import simd
 
-public typealias GetMainCameraCallback = () -> EntityID
-
-public func getMainCamera() -> EntityID {
-    return findGameCamera()
+public final class CameraSystem
+{
+    // Thread-safe shared instance
+    public static let shared: CameraSystem = { return CameraSystem() }()
+    
+    var _activeCamera: EntityID? = nil
+    public var activeCamera: EntityID? {
+        get { return _activeCamera }
+        set { _activeCamera = newValue }
+    }
+    
+    public func findCamera( forComponentType componentType: (some Any).Type) -> EntityID {
+        for entityId in scene.getAllEntities() {
+            if hasComponent(entityId: entityId, componentType: CameraComponent.self), !hasComponent(entityId: entityId, componentType: componentType ) {
+                return entityId
+            }
+        }
+        
+        return .invalid
+    }
 }
 
 public func findGameCamera() -> EntityID {
     for entityId in scene.getAllEntities() {
-        if hasComponent(entityId: entityId, componentType: CameraComponent.self), !hasComponent(entityId: entityId, componentType: SceneCameraComponent.self) {
+        if hasComponent(entityId: entityId, componentType: CameraComponent.self), !hasComponent(entityId: entityId, componentType: CameraComponent.self) {
             return entityId
         }
     }
@@ -29,19 +45,19 @@ public func findGameCamera() -> EntityID {
     return gameCamera
 }
 
-public func createSceneCamera(entityId: EntityID) {
-    setEntityName(entityId: entityId, name: "Scene Camera")
+public func createGameCamera(entityId: EntityID) {
+    setEntityName(entityId: entityId, name: "Game Camera")
     registerComponent(entityId: entityId, componentType: CameraComponent.self)
-    registerComponent(entityId: entityId, componentType: SceneCameraComponent.self)
 
     cameraLookAt(entityId: entityId,
                  eye: cameraDefaultEye, target: cameraTargetDefault,
                  up: cameraUpDefault)
 }
 
-public func createGameCamera(entityId: EntityID) {
-    setEntityName(entityId: entityId, name: "Game Camera")
+public func createSceneCamera(entityId: EntityID) {
+    setEntityName(entityId: entityId, name: "Scene Camera")
     registerComponent(entityId: entityId, componentType: CameraComponent.self)
+    registerComponent(entityId: entityId, componentType: SceneCameraComponent.self)
 
     cameraLookAt(entityId: entityId,
                  eye: cameraDefaultEye, target: cameraTargetDefault,
@@ -249,7 +265,7 @@ public func moveCameraWithInput(entityId: EntityID, input: (w: Bool, a: Bool, s:
         return
     }
 
-    if inputSystem.cameraControlMode == .orbiting {
+    if InputSystem.shared.cameraControlMode == .orbiting {
         return
     }
 

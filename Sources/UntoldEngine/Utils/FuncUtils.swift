@@ -37,7 +37,7 @@ public func loadTexture(
         MTKTextureLoader.Option.SRGB: NSNumber(value: isSRGB),
     ]
 
-    guard let url = getResourceURL(forResource: textureName, withExtension: withExtension, subResource: nil) else {
+    guard let url = LoadingSystem.shared.resourceURL(forResource: textureName, withExtension: withExtension, subResource: nil) else {
         throw LoadError.textureCreationFailed
     }
 
@@ -165,14 +165,14 @@ public func basicFollow(_ entityId: EntityID, _ offset: simd_float3, _: Float) {
 
     let position = localTransformComponent.position
 
-    guard let cameraComponent = scene.get(component: CameraComponent.self, for: getMainCamera()) else {
+    guard let camera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: camera) else {
         handleError(.noActiveCamera)
         return
     }
 
     // update camera position based on target position
     cameraComponent.localPosition = position + offset
-    updateCameraViewMatrix(entityId: getMainCamera())
+    updateCameraViewMatrix(entityId: camera)
 }
 
 public func getKeyFromValue(forValue value: EntityID, in dictionary: [String: EntityID]) -> String? {
@@ -438,7 +438,7 @@ func quaternionDerivative(q: simd_quatf, omega: simd_float3) -> simd_quatf {
 }
 
 public func isWASDPressed() -> Bool {
-    let isPressed: Bool = inputSystem.keyState.aPressed || inputSystem.keyState.wPressed || inputSystem.keyState.sPressed || inputSystem.keyState.dPressed
+    let isPressed: Bool = InputSystem.shared.keyState.aPressed || InputSystem.shared.keyState.wPressed || InputSystem.shared.keyState.sPressed || InputSystem.shared.keyState.dPressed
 
     return isPressed
 }
@@ -451,6 +451,12 @@ public func getAllGameEntities() -> [EntityID] {
     var entityList: [EntityID] = []
     let entities: [EntityID] = scene.getAllEntities()
 
+    // More swifty way to filter
+//    return entities.filter { entityId in
+//        // Gizmo component should be an editor component only?
+//        ( hasComponent(entityId: entityId, componentType: SceneCameraComponent.self) || hasComponent(entityId: entityId, componentType: GizmoComponent.self) ) == false
+//    }
+        
     for entityId in entities {
         if hasComponent(entityId: entityId, componentType: SceneCameraComponent.self) || hasComponent(entityId: entityId, componentType: GizmoComponent.self) {
             continue
@@ -466,6 +472,11 @@ public func getAllGameEntitiesWithMeshes() -> [EntityID] {
     let transformId = getComponentId(for: WorldTransformComponent.self)
     let renderId = getComponentId(for: RenderComponent.self)
     let entities = queryEntitiesWithComponentIds([transformId, renderId], in: scene)
+
+    // More swifty way to filter an array an return
+//    return entities.filter { entityId in
+//        hasComponent(entityId: entityId, componentType: GizmoComponent.self) == false
+//    }
 
     for entityId in entities {
         if hasComponent(entityId: entityId, componentType: GizmoComponent.self) {
@@ -539,7 +550,7 @@ public func updateMaterialTexture(entityId: EntityID, textureType: TextureType, 
         MTKTextureLoader.Option.generateMipmaps: true,
     ]
 
-    guard let url = getResourceURL(forResource: textureName, withExtension: withExtension, subResource: subResource) else {
+    guard let url = LoadingSystem.shared.resourceURL(forResource: textureName, withExtension: withExtension, subResource: subResource) else {
         return
     }
 

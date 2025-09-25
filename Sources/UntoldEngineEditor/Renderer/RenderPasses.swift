@@ -23,7 +23,7 @@ enum EditorRenderPasses
             handleError(.pipelineStateNulled, gizmoPipeline.name!)
             return
         }
-        guard let cameraComponent = scene.get(component: CameraComponent.self, for: getMainCamera()) else {
+        guard let camera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: camera) else {
             handleError(.noActiveCamera)
             return
         }
@@ -75,7 +75,12 @@ enum EditorRenderPasses
                 continue
             }
 
-            let distanceToCamera = length(getCameraPosition(entityId: getMainCamera()) - getPosition(entityId: parentEntityIdGizmo))
+            guard let camera = CameraSystem.shared.activeCamera else {
+                handleError(.noActiveCamera, entityId)
+                continue
+            }
+            
+            let distanceToCamera = length(getCameraPosition(entityId: camera) - getPosition(entityId: parentEntityIdGizmo))
 
             let worldScale = (distanceToCamera * tan(fov * 0.5)) * (gizmoDesiredScreenSize / renderInfo.viewPort.y)
 
@@ -180,6 +185,11 @@ enum EditorRenderPasses
             return
         }
 
+        guard let outlinePipeline = PipelineManager.shared.renderPipelinesByType[ .outline ] else {
+            handleError(.pipelineStateNulled, "outlinePipeline is nil")
+            return
+        }
+        
         if outlinePipeline.success == false {
             handleError(.pipelineStateNulled, outlinePipeline.name!)
             return
@@ -333,6 +343,11 @@ enum EditorRenderPasses
             return
         }
 
+        guard let hightlightPipeline = PipelineManager.shared.renderPipelinesByType[ .highlight ] else {
+            handleError(.pipelineStateNulled, "highlightPipeline is nil")
+            return
+        }
+        
         if hightlightPipeline.success == false {
             handleError(.pipelineStateNulled, hightlightPipeline.name!)
             return
@@ -446,6 +461,11 @@ enum EditorRenderPasses
             return
         }
 
+        guard let lightVisualPipeline = PipelineManager.shared.renderPipelinesByType[ .lightVisual ] else {
+            handleError(.pipelineStateNulled, "lightVisualPipeline is nil")
+            return
+        }
+        
         if lightVisualPipeline.success == false {
             handleError(.pipelineStateNulled, lightVisualPipeline.name!)
             return

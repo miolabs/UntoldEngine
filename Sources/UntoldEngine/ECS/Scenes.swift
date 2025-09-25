@@ -133,6 +133,11 @@ public struct Scene {
             return nil
         }
 
+        guard exists(entityId) else {
+            handleError(.entityMissing, entityId)
+            return nil
+        }
+        
         let e = entities[Int(entityIndex)]
         guard e.entityId == entityId, !e.freed else {
             handleError(.entityMissing, entityId)

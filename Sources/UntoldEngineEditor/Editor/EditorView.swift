@@ -13,8 +13,6 @@ public struct Asset: Identifiable {
 }
 
 public struct EditorView: View {
-    var mtkView: MTKView
-
     @State private var editor_entities: [EntityID] = getAllGameEntities()
     @StateObject private var selectionManager = SelectionManager()
     @StateObject private var sceneGraphModel = SceneGraphModel()
@@ -22,12 +20,19 @@ public struct EditorView: View {
     @State private var selectedAsset: Asset? = nil
     @State private var isPlaying = false
     @State private var showAssetBrowser = false
+    
+    var renderer: UntoldRenderer?
 
-    public init(mtkView: MTKView) {
-        self.mtkView = mtkView
+    public init() {
         let sharedSelectionManager = SelectionManager()
         _selectionManager = StateObject(wrappedValue: sharedSelectionManager)
         editorController = EditorController(selectionManager: sharedSelectionManager)
+        renderer = UntoldRenderer.create( configuration: .editor )
+        
+        if let v = renderer?.metalView, let controller = editorController {
+            renderer?.setupCallbacks( gameUpdate: { deltaTime in }, handleInput: controller.handleSceneInput )
+            editorController?.registerInputEvents( inView: v )
+        }
     }
 
     public var body: some View {
@@ -48,11 +53,7 @@ public struct EditorView: View {
                 }
 
                 VStack {
-                    SceneView(mtkView: mtkView)
-                        .customSetup {
-                            // initialize ray vs model pipeline
-                            initRayPickerCompute()
-                        }
+                    EditorSceneView( renderer: renderer! )
                     TransformManipulationToolbar(controller: editorController!, showAssetBrowser: $showAssetBrowser)
                     if showAssetBrowser {
                         TabView {
@@ -113,12 +114,14 @@ public struct EditorView: View {
             activeEntity = .invalid
             selectionManager.objectWillChange.send()
             sceneGraphModel.refreshHierarchy()
+            
+            CameraSystem.shared.activeCamera = findGameCamera()
         }
     }
 
     private func editor_clearScene() {
         destroyAllEntities()
-        removeGizmo()
+        RemoveGizmo()
         EditorComponentsState.shared.clear()
 
         let light = createEntity()
@@ -175,7 +178,7 @@ public struct EditorView: View {
     }
 
     private func editor_addNewEntity() {
-        removeGizmo()
+        RemoveGizmo()
 
         let entityId = createEntity()
 
@@ -200,7 +203,7 @@ public struct EditorView: View {
         editor_entities = getAllGameEntities()
         activeEntity = .invalid
         selectionManager.selectedEntity = nil
-        removeGizmo()
+        RemoveGizmo()
         sceneGraphModel.refreshHierarchy()
     }
 
@@ -277,9 +280,7 @@ public struct EditorView: View {
         let withExtension = selectedAsset?.path.pathExtension
         setEntityMesh(entityId: selectionManager.selectedEntity!, filename: filename!, withExtension: withExtension!)
 
-        let mainCamera = getMainCamera()
-
-        guard let cameraComponent = scene.get(component: CameraComponent.self, for: mainCamera) else {
+        guard let mainCamera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: mainCamera) else {
             handleError(.noActiveCamera)
             return
         }

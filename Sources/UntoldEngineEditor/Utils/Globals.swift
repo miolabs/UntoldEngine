@@ -28,7 +28,6 @@ var editorController: EditorController?
 public let boundingBoxVertexCount = 24
 
 // Gizmo active
-var gizmoActive: Bool = false
 var activeHitGizmoEntity: EntityID = .invalid
 var parentEntityIdGizmo: EntityID = .invalid
 
@@ -38,8 +37,6 @@ var spawnDistance: Float = 2.0
 
 // gizmo
 var gizmoPipeline = RenderPipeline()
-
-public var editorInputSystem = EditorInputSystem()
 
 // Visual Debugger
 enum DebugSelection: Int {
@@ -56,3 +53,4 @@ var areaLightDebugMesh: [Mesh] = []
 var dirLightDebugMesh: [Mesh] = []
 
 var debuggerPipeline = RenderPipeline()
+

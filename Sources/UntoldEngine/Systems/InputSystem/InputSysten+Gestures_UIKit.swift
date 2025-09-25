@@ -1,23 +1,25 @@
 //
-//  InputSystemUIKit.swift
-//  Untold Engine
-//  Created by Harold Serrano on 10/19/25.
-//  Copyright © 2024 Untold Engine Studios. All rights reserved.
+//  InputSysten+GesturesUIKit.swift
+//  UntoldEngine
+//
+//  Created by Javier Segura Perez on 24/9/25.
 //
 
-#if os(iOS)
+#if !os(macOS)
 import UIKit
 
-extension InputSystem {
-    public func setupGestureRecognizers(view: UIView) {
+extension InputSystem
+{
+    func registerGestureEvents( forView view: View ) {
         let pan   = UIPanGestureRecognizer(target: self, action: #selector(handlePanUIKit(_:)))
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinchUIKit(_:)))
         view.addGestureRecognizer(pan)
         view.addGestureRecognizer(pinch)
     }
     
-    public func setupEventMonitors() {}
-
+    // TODO: Implement this!
+    func unregisterGestureEvents( fromView view: View ) { }
+    
     @objc private func handlePanUIKit(_ gr: UIPanGestureRecognizer) {
         guard let view = gr.view else { return }
         let t = gr.translation(in: view)
@@ -36,6 +38,8 @@ extension InputSystem {
             panDelta = .zero ; initialPanLocation = nil ; currentPanGestureState = .ended
         default: break
         }
+        
+        delegate?.didUpdateKeyState( keyState )
     }
 
     @objc private func handlePinchUIKit(_ gr: UIPinchGestureRecognizer) {
@@ -50,7 +54,9 @@ extension InputSystem {
             previousScale = 1 ; currentPinchGestureState = .ended
         default: break
         }
+        
+        delegate?.didUpdateKeyState( keyState )
     }
 }
-#endif
 
+#endif

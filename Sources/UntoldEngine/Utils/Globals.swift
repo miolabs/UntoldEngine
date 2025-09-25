@@ -28,12 +28,11 @@ var maxNumPointLights: Int = 100
 var maxNumSpotLights: Int = 100
 var maxAreaLights: Int = 100
 public var scene: Scene = .init()
-public var inputSystem = InputSystem()
 var shadowSystem: ShadowSystem!
 
 public var renderInfo = RenderInfo()
 
-var vertexDescriptor = VertexDescriptors()
+public var vertexDescriptor = VertexDescriptors()
 public var bufferResources = BufferResources()
 var tripleBufferResources = TripleBufferResources()
 public var textureResources = TextureResources()
@@ -66,34 +65,34 @@ let shadowResolution: simd_int2 = .init(8192, 8192)
 public var accelStructResources = AccelStructResources()
 
 // pipelines
-var gridPipeline = RenderPipeline()
-var modelPipeline = RenderPipeline()
-var lightPipeline = RenderPipeline()
-var compositePipeline = RenderPipeline()
-var preCompositePipeline = RenderPipeline()
-var shadowPipeline = RenderPipeline()
-var environmentPipeline = RenderPipeline()
-var iblPrefilterPipeline = RenderPipeline()
-var postProcessPipeline = RenderPipeline()
-var lightingPipeline = RenderPipeline()
-var geometryPipeline = RenderPipeline()
-public var lightVisualPipeline = RenderPipeline()
-var rayCompositePipeline = RenderPipeline()
-public var hightlightPipeline = RenderPipeline()
+//var gridPipeline = RenderPipeline()
+//var modelPipeline = RenderPipeline()
+//var lightPipeline = RenderPipeline()
+//var compositePipeline = RenderPipeline()
+//var preCompositePipeline = RenderPipeline()
+//var shadowPipeline = RenderPipeline()
+//var environmentPipeline = RenderPipeline()
+//var iblPrefilterPipeline = RenderPipeline()
+//var postProcessPipeline = RenderPipeline()
+//var lightingPipeline = RenderPipeline()
+//var geometryPipeline = RenderPipeline()
+//var lightVisualPipeline = RenderPipeline()
+//var rayCompositePipeline = RenderPipeline()
+//var hightlightPipeline = RenderPipeline()
 
 // Post-process
-var tonemappingPipeline = RenderPipeline()
-var colorGradingPipeline = RenderPipeline()
-var colorCorrectionPipeline = RenderPipeline()
-var blurPipeline = RenderPipeline()
-var bloomThresholdPipeline = RenderPipeline()
-var bloomCompositePipeline = RenderPipeline()
-var vignettePipeline = RenderPipeline()
-var chromaticAberrationPipeline = RenderPipeline()
-var depthOfFieldPipeline = RenderPipeline()
-var ssaoPipeline = RenderPipeline()
-var ssaoBlurPipeline = RenderPipeline()
-public var outlinePipeline = RenderPipeline()
+//var tonemappingPipeline = RenderPipeline()
+//var colorGradingPipeline = RenderPipeline()
+//var colorCorrectionPipeline = RenderPipeline()
+//var blurPipeline = RenderPipeline()
+//var bloomThresholdPipeline = RenderPipeline()
+//var bloomCompositePipeline = RenderPipeline()
+//var vignettePipeline = RenderPipeline()
+//var chromaticAberrationPipeline = RenderPipeline()
+//var depthOfFieldPipeline = RenderPipeline()
+//var ssaoPipeline = RenderPipeline()
+//var ssaoBlurPipeline = RenderPipeline()
+//var outlinePipeline = RenderPipeline()
 
 var rayTracingPipeline = ComputePipeline()
 var rayModelIntersectPipeline = ComputePipeline()
@@ -158,7 +157,10 @@ public enum TextureType: String, CaseIterable, Identifiable {
     }
 }
 
-var visualDebug: Bool = false
+// Gizmo active
+public var gizmoActive: Bool = false
+
+public var visualDebug: Bool = false
 
 #if os(iOS)
 public var gameMode: Bool = true
@@ -188,16 +190,6 @@ public enum InertiaTensorType: Int {
     case spherical
     case cylindrical
 }
-
-// Editor
-
-public var enableEditor: Bool = true
-public var assetBasePath: URL?
-
-var activeEntity: EntityID = .invalid
-#if os(macOS)
-var editorController: EditorController?
-#endif
 
 // Transform Manipulation mode
 public enum TransformManipulationMode {
@@ -309,9 +301,9 @@ var physicsAccumulator: Float = 0
 var ssaoKernelSize: Int = 64
 
 // Camera defaults
-let cameraDefaultEye: simd_float3 = .init(0.0, 1.0, 4.0)
-let cameraTargetDefault: simd_float3 = .init(0.0, 0.0, -2.0)
-let cameraUpDefault: simd_float3 = .init(0.0, 1.0, 0.0)
+public let cameraDefaultEye: simd_float3 = .init(0.0, 1.0, 4.0)
+public let cameraTargetDefault: simd_float3 = .init(0.0, 0.0, -2.0)
+public let cameraUpDefault: simd_float3 = .init(0.0, 1.0, 0.0)
 
 // Culling
 public struct EntityAABB {
@@ -327,7 +319,5 @@ struct VisibleEntity { var index: UInt32; var version: UInt32 }
 var visibleEntityIds: [EntityID] = []
 var tripleVisibleEntities = TripleCPUBuffer<EntityID>(inFlight: 3, initialCapacity: MAX_ENTITIES)
 var cullFrameIndex: Int = 0
-var needsFinalizeDestroys: Bool = false
+public var needsFinalizeDestroys: Bool = false
 var hasPendingDestroys: Bool = false
-
-public var assetBasePath: URL?

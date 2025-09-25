@@ -168,7 +168,7 @@ func initFrustumCulllingCompute() {
     let numBlocks = (Int32(MAX_ENTITIES) + BLOCK_SIZE - 1) / BLOCK_SIZE
 
     // Create Pipelines
-    createComputePipeline(
+    CreateComputePipeline(
         into: &frustumCullingPipeline,
         device: renderInfo.device,
         library: renderInfo.library,
@@ -176,13 +176,13 @@ func initFrustumCulllingCompute() {
         pipelineName: "Frustum Culling pipe"
     )
 
-    createComputePipeline(into: &reduceScanMarkVisiblePipeline, device: renderInfo.device, library: renderInfo.library, functionName: "markVisibleAABB", pipelineName: "Mark Visible")
+    CreateComputePipeline(into: &reduceScanMarkVisiblePipeline, device: renderInfo.device, library: renderInfo.library, functionName: "markVisibleAABB", pipelineName: "Mark Visible")
 
-    createComputePipeline(into: &reduceScanLocalScanPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "scanLocalExclusive", pipelineName: "Reduce Scan Local")
+    CreateComputePipeline(into: &reduceScanLocalScanPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "scanLocalExclusive", pipelineName: "Reduce Scan Local")
 
-    createComputePipeline(into: &reduceScanBlockScanPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "scanBlockSumsExclusive", pipelineName: "Reduce Scan Block")
+    CreateComputePipeline(into: &reduceScanBlockScanPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "scanBlockSumsExclusive", pipelineName: "Reduce Scan Block")
 
-    createComputePipeline(into: &reduceScanScatterCompactedPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "scatterCompacted", pipelineName: "Stream and compact")
+    CreateComputePipeline(into: &reduceScanScatterCompactedPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "scatterCompacted", pipelineName: "Stream and compact")
 
     // Make and allocate buffers
     tripleBufferResources.frustumPlane = TripleBuffer<simd_float4>(device: renderInfo.device, initialCapacity: planeCount)
@@ -216,7 +216,7 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         return
     }
 
-    guard let cameraComponent = scene.get(component: CameraComponent.self, for: getMainCamera()) else {
+    guard let camera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: camera) else {
         handleError(.noActiveCamera)
         return
     }
@@ -387,7 +387,7 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         return
     }
 
-    guard let cameraComponent = scene.get(component: CameraComponent.self, for: getMainCamera()) else {
+    guard let camera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: camera) else {
         handleError(.noActiveCamera)
         return
     }

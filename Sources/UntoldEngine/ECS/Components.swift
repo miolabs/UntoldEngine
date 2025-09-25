@@ -199,7 +199,7 @@ public class ScenegraphComponent: Component {
     public required init() {}
 }
 
-public class CameraComponent: Component {
+open class CameraComponent: Component {
 
     public var viewSpace = simd_float4x4.init(1.0)
     public var xAxis: simd_float3 = .init(0.0, 0.0, 0.0)
@@ -219,6 +219,7 @@ public class CameraComponent: Component {
     public required init() {}
 }
 
+// TODO: Review if this components should be in the editor package
 public class SceneCameraComponent: Component {
     public required init() {}
 }

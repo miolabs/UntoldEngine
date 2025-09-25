@@ -10,11 +10,10 @@ import SwiftUI
 import MetalKit
 import UntoldEngine
 
+
 // AppDelegate: Boiler plate code -- Handles everything – Renderer, Metal setup, and GameScene initialization
-class AppDelegate: NSObject, NSApplicationDelegate, UntoldRendererDelegate {
-        
+class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
-    var renderer: UntoldRenderer!
 
     func applicationDidFinishLaunching(_: Notification) {
         print("Launching Untold Engine Editor v0.2")
@@ -30,19 +29,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UntoldRendererDelegate {
         window.title = "Untold Engine Editor v0.2"
         window.center()
 
-        // Step 2. Initialize the renderer and connect metal content
-        guard let renderer = UntoldRenderer.create( updateRenderingSystemCallback: updateEditorRenderingSystem ) else {
-            print("Failed to initialize the renderer.")
-            return
-        }
-        
-        renderer.delegate = self
-        window.contentView = renderer.metalView
-
-        self.renderer = renderer
-
-        renderer.initResources()
-
         // Step 3. Create the game scene and connect callbacks
 //        gameScene = GameScene()
 //        renderer.setupCallbacks(
@@ -50,14 +36,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UntoldRendererDelegate {
 //            handleInput: { [weak self] in self?.gameScene.handleInput() }
 //        )
 
-        if enableEditor {
-            if #available(macOS 13.0, *) {
-                let hostingView = NSHostingView(rootView: EditorView(mtkView: renderer.metalView))
-                window.contentView = hostingView
-            } else {
-                // Fallback on earlier versions
-            }
-        }
+        let hostingView = NSHostingView(rootView: EditorView())
+        window.contentView = hostingView
 
         window.makeKeyAndOrderFront(nil)
         NSApp.setActivationPolicy(.regular)
@@ -66,22 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UntoldRendererDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
         true
-    }
-    
-    func willDraw(in view: MTKView) {
-        if hotReload {
-            // updateRayKernelPipeline()
-            updateShadersAndPipeline()
-
-            hotReload = false
-        }
-    }
-    
-    func didDraw(in view: MTKView) { }
-
-    func resourcesDidLoad() {
-        loadLightDebugMeshes()
-    }
+    }    
 }
 
 // Entry point
@@ -91,3 +56,4 @@ let delegate = AppDelegate()
 app.delegate = delegate
 
 app.run()
+

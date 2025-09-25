@@ -4,42 +4,14 @@
 //
 //  Created by Harold Serrano on 2/22/25.
 //
-#if canImport(AppKit)
+
 import Foundation
 import UntoldEngine
 
-protocol SelectionDelegate: AnyObject {
+protocol SelectionDelegate: InputSystemDelegate
+{    
     func didSelectEntity(_ entityId: EntityID)
     func resetActiveAxis()
-}
-
-class EditorController: SelectionDelegate, ObservableObject {
-    let selectionManager: SelectionManager
-    var isEnabled: Bool = false
-    @Published var activeMode: TransformManipulationMode = .none
-    @Published var activeAxis: TransformAxis = .none
-
-    init(selectionManager: SelectionManager) {
-        self.selectionManager = selectionManager
-        inputSystem.selectionDelegate = self
-        isEnabled = true
-    }
-
-    func didSelectEntity(_ entityId: EntityID) {
-        DispatchQueue.main.async {
-            self.selectionManager.selectEntity(entityId: entityId)
-        }
-    }
-
-    func resetActiveAxis() {
-        activeAxis = .none
-    }
-
-    func refreshInspector() {
-        DispatchQueue.main.async {
-            self.selectionManager.objectWillChange.send()
-        }
-    }
 }
 
 class SceneGraphModel: ObservableObject {
@@ -62,22 +34,6 @@ class SceneGraphModel: ObservableObject {
     }
 }
 
-public class EditorComponentsState: ObservableObject {
-    public static let shared = EditorComponentsState()
-
-    @Published public var components: [EntityID: [ObjectIdentifier: ComponentOption_Editor]] = [:]
-
-    func clear() {
-        components.removeAll()
-    }
-}
-
-public class EditorAssetBasePath: ObservableObject {
-    public static let shared = EditorAssetBasePath()
-
-    @Published public var basePath: URL? = assetBasePath
-}
-
 class SelectionManager: ObservableObject {
     @Published var selectedEntity: EntityID? = .invalid
 
@@ -92,10 +48,9 @@ class SelectionManager: ObservableObject {
 
             updateBoundingBoxBuffer(min: localTransform.boundingBox.min, max: localTransform.boundingBox.max)
 
-            createGizmo(name: "translateGizmo")
+            CreateGizmo(name: "translateGizmo")
         } else {
             activeEntity = .invalid
         }
     }
 }
-#endif
