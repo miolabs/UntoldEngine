@@ -12,7 +12,7 @@ extension EditorController
 {
     func registerInputEvents( inView view: AppView ) {
         InputSystem.shared.registerKeyboardEvents( )
-//        InputSystem.shared.registerMouseEvents( )
+        InputSystem.shared.registerMouseEvents( )
         InputSystem.shared.registerGameControllerEvents( )
         InputSystem.shared.registerGestureEvents( inView: view )
         InputSystem.shared.registerMouseClickEvent( inView: view )
@@ -36,7 +36,7 @@ extension EditorController
         moveCameraWithInput(entityId: findSceneCamera(), input: input, speed: 1, deltaTime: 0.1)
 
         // Editor is optional; only gate editor logic with this flag
-        let isEditorEnabled = editorController?.isEnabled ?? (editorController != nil)
+        let isEditorEnabled = editorController?.isEnabled ?? false
 
         // Only proceed into gizmo/editor handling if:
         //  - editor exists/enabled
