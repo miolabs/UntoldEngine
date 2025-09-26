@@ -28,7 +28,7 @@ extension RenderPasses
             handleError(.pipelineStateNulled, gizmoPipeline.name!)
             return
         }
-        guard let cameraComponent = scene.get(component: CameraComponent.self, for: findGameCamera()) else {
+        guard let cameraComponent = scene.get(component: CameraComponent.self, for: findSceneCamera()) else {
             handleError(.noActiveCamera)
             return
         }
@@ -42,7 +42,6 @@ extension RenderPasses
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
         else {
             handleError(.renderPassCreationFailed, "Gizmo Pass")
-
             return
         }
 
