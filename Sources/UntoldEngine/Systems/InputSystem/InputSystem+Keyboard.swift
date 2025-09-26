@@ -117,7 +117,7 @@ extension InputSystem
         default: break
         }
         
-        delegate?.didUpdateKeyState( keyState )
+        delegate?.didUpdateKeyState( )
     }
     
     func keyReleased(_ keyCode: UInt16) {
@@ -139,7 +139,7 @@ extension InputSystem
         default: break
         }
         
-        delegate?.didUpdateKeyState( keyState )
+        delegate?.didUpdateKeyState( )
     }
     
     #endif

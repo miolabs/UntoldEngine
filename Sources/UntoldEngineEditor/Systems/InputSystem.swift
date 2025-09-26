@@ -51,7 +51,7 @@ extension InputSystem
         }
     }
     
-    func getRaycastedEntity(currentLocation: NSPoint, view: NSView) -> (entityId: EntityID, hit: Bool) {
+    public func getRaycastedEntity(currentLocation: NSPoint, view: AppView) -> (entityId: EntityID, hit: Bool) {
         var hitEntityId: EntityID = .invalid
         var hitEntity = false
 

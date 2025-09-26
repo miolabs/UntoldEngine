@@ -32,8 +32,9 @@ extension InputSystem
         handlePanGesture(gestureRecognizer, in: gestureRecognizer.view!)
     }
     
-    public func handlePinchGesture(_ gestureRecognizer: NSMagnificationGestureRecognizer, in _: NSView) {
+    public func handlePinchGesture(_ gestureRecognizer: NSMagnificationGestureRecognizer, in view: NSView) {
         let currentScale = gestureRecognizer.magnification
+        gestureView = view
 
         if gestureRecognizer.state == .began {
             // store the initial scale
@@ -55,39 +56,38 @@ extension InputSystem
             currentPinchGestureState = .ended
         }
         
-        delegate?.didUpdateKeyState( keyState )
+        delegate?.didUpdateKeyState( )
     }
     
     public func handlePanGesture(_ gestureRecognizer: NSPanGestureRecognizer, in view: NSView) {
         let currentPanLocation = gestureRecognizer.translation(in: view)
-//        let currentLocation = gestureRecognizer.location(in: view)
-
+        let currentLocation = gestureRecognizer.location(in: view)
+        gestureView = view
+        
         switch gestureRecognizer.state {
         case .began:
             // Store the initial touch location and perform any initial setup
             initialPanLocation = currentPanLocation
+            initialLocation = currentLocation
             currentPanGestureState = .began
 
         case .changed:
-            // Calculate the deltas from the initial touch location
-            var deltaX = currentPanLocation.x - initialPanLocation.x
-            var deltaY = currentPanLocation.y - initialPanLocation.y
+            // Camera orbit pan (unaffected by editor being absent/disabled)
+            var deltaX = currentPanLocation.x - (initialPanLocation?.x ?? currentPanLocation.x)
+            var deltaY = currentPanLocation.y - (initialPanLocation?.y ?? currentPanLocation.y)
 
+            // Lock to dominant axis; invert X for your orbit convention
             if abs(deltaX) < abs(deltaY) {
                 deltaX = 0.0
             } else {
                 deltaY = 0.0
-                deltaX = -1.0 * deltaX
+                deltaX = -deltaX
             }
 
-            if abs(deltaX) <= 1.0 {
-                deltaX = 0.0
-            }
-
-            if abs(deltaY) <= 1.0 {
-                deltaY = 0.0
-            }
-
+            // Dead zone
+            if abs(deltaX) <= 1.0 { deltaX = 0.0 }
+            if abs(deltaY) <= 1.0 { deltaY = 0.0 }
+            
             // Add your code for touch moved here
             panDelta = simd_float2(Float(deltaX), Float(deltaY))
             currentPanGestureState = .changed
@@ -98,12 +98,11 @@ extension InputSystem
             panDelta = simd_float2(0, 0)
             initialPanLocation = nil
             currentPanGestureState = .ended
-            cameraControlMode = .idle
         
         default: break
         }
         
-        delegate?.didUpdateKeyState( keyState )
+        delegate?.didUpdateKeyState( )
     }
 
 }

@@ -45,7 +45,7 @@ func CreateGizmo(name: String) {
     gizmoActive = true
 }
 
-func ProcessGizmoAction(entityId: EntityID) {
+func processGizmoAction(entityId: EntityID) {
     if entityId == .invalid {
         return
     }

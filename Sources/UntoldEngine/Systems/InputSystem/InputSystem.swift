@@ -19,7 +19,7 @@ public enum CameraControlMode { case idle, orbiting, moving }
 
 public protocol InputSystemDelegate : AnyObject
 {
-    func didUpdateKeyState(_ keyState: KeyState)
+    func didUpdateKeyState()
 }
 
 public final class InputSystem
@@ -44,6 +44,9 @@ public final class InputSystem
     public var mouseDeltaX: Float = 0, mouseDeltaY: Float = 0, mouseActive: Bool = false
 
     public var initialPanLocation: CGPoint!
+    public var initialLocation: CGPoint!
+    public var gestureView: AppView?
+    
     public var panDelta: simd_float2 = .init(0, 0)
     public var scrollDelta: simd_float2 = .init(0, 0)
 

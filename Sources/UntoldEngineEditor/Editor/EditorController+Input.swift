@@ -253,7 +253,9 @@ extension EditorController
         }
     }
     
-    func didUpdateKeyState(_ keyState: KeyState) {
+    func didUpdateKeyState() {
+        let keyState = InputSystem.shared.keyState
+        
         if keyState.xPressed { activeAxis = .x }
         if keyState.yPressed { activeAxis = .y }
         if keyState.zPressed { activeAxis = .z }
@@ -264,6 +266,47 @@ extension EditorController
         if keyState.lPressed && keyState.shiftPressed {
             visualDebug = !visualDebug
             currentDebugSelection = DebugSelection.normalOutput
+        }
+        
+        // Camera is required for any pan handling
+        guard let cameraComponent = scene.get(component: CameraComponent.self, for: findSceneCamera()) else {
+            handleError(.noActiveCamera)
+            return
+        }
+        
+        let isEditorEnabled = editorController?.isEnabled ?? false
+        
+        switch InputSystem.shared.currentPanGestureState {
+        case .began:
+            setOrbitOffset(entityId: findSceneCamera(), uTargetOffset: length(cameraComponent.localPosition))
+            InputSystem.shared.cameraControlMode = .orbiting
+            
+            // Editor-only: hit-test gizmo if editor/gizmo mode is active
+            if gizmoActive, isEditorEnabled, let v = InputSystem.shared.gestureView {
+                let (hitEntityId, hit) = InputSystem.shared.getRaycastedEntity(currentLocation: InputSystem.shared.initialPanLocation, view: v)
+                if hit {
+                    activeHitGizmoEntity = hitEntityId
+                } else {
+                    activeHitGizmoEntity = .invalid
+                    editorController?.activeMode = .none
+                    editorController?.activeAxis = .none
+                }
+            }
+        case .changed:
+            if isEditorEnabled {
+                processGizmoAction(entityId: activeHitGizmoEntity)
+                    if activeHitGizmoEntity != .invalid {
+                    // While dragging a gizmo, skip camera orbit updates
+                    return
+                }
+            }
+            
+            orbitAround(entityId: findSceneCamera(), uPosition: InputSystem.shared.panDelta * 0.005)
+            
+        case .ended:
+        InputSystem.shared.cameraControlMode = .idle
+            
+        default: break
         }
     }
 }

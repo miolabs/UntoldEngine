@@ -260,8 +260,6 @@ public func executeRayVsModelHit(
     _ commandBuffer: MTLCommandBuffer, _ origin: simd_float3, _ direction: simd_float3
 ) {
     // prepare acceleration structure
-    prepareUserHitRayAccelStructures()
-
     if rayModelIntersectPipeline.success == false {
         handleError(.pipelineStateNulled, rayModelIntersectPipeline.name!)
         return

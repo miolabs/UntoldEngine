@@ -23,15 +23,25 @@ struct EditorSceneView: View, UntoldRendererDelegate {
                 let sceneCamera = createEntity()
                 createSceneCamera(entityId: sceneCamera)
                 
+                let gameCamera = createEntity()
+                setEntityName(entityId: gameCamera, name: "Main Camera")
+                createGameCamera(entityId: gameCamera)
+                  
+                let light = createEntity()
+                setEntityName(entityId: light, name: "Directional Light")
+                createDirLight(entityId: light)
+                
                 CameraSystem.shared.activeCamera = sceneCamera
                 
-                // initialize ray vs model pipeline
+                // Initialize ray vs model pipeline
                 initRayPickerCompute()
+                
                 // Load Debug meshes and other editor / debug resources
                 loadLightDebugMeshes()
             }
     }
     
+    // UntoldRenderer delegate functions
     func willDraw(in view: MTKView) {
         if hotReload {
             // updateRayKernelPipeline()
@@ -40,8 +50,5 @@ struct EditorSceneView: View, UntoldRendererDelegate {
         }
     }
     
-    func didDraw(in view: MTKView) {
-        
-    }
-
+    func didDraw(in view: MTKView) { }
 }

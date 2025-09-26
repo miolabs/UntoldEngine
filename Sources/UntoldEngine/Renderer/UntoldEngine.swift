@@ -97,17 +97,6 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         initSizeableResources() //TODO: Find a better name function
 
         shadowSystem = ShadowSystem()
-
-//        let sceneCamera = createEntity()
-//        createSceneCamera(entityId: sceneCamera)
-//
-//        let gameCamera = createEntity()
-//        setEntityName(entityId: gameCamera, name: "Main Camera")
-//        createGameCamera(entityId: gameCamera)
-          
-//        let light = createEntity()
-//        setEntityName(entityId: light, name: "Directional Light")
-//        createDirLight(entityId: light)
         
         // init ssao kernels
         initSSAOResources()

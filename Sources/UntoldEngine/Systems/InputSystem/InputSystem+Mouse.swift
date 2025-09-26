@@ -49,7 +49,7 @@ extension InputSystem
         default: break
         }
         
-        delegate?.didUpdateKeyState( keyState )
+        delegate?.didUpdateKeyState( )
     }
 
     public func leftMouseUp(_ event: NSEvent) {
@@ -60,7 +60,7 @@ extension InputSystem
         default: break
         }
         
-        delegate?.didUpdateKeyState( keyState )
+        delegate?.didUpdateKeyState( )
     }
 
     public func handleMouseScroll(_ event: NSEvent) {
@@ -93,7 +93,7 @@ extension InputSystem
             // camera.moveCameraAlongAxis(uDelta: delta)
         }
         
-        delegate?.didUpdateKeyState( keyState )
+        delegate?.didUpdateKeyState( )
     }
     
     public func leftMouseDragged(_ delta: simd_float2) {
@@ -124,7 +124,7 @@ extension InputSystem
         mouseActive = ( mouseDeltaX != 0.0 || mouseDeltaY != 0.0 )
         
         if mouseActive {
-            delegate?.didUpdateKeyState( keyState )
+            delegate?.didUpdateKeyState( )
         }
     }
     #endif
