@@ -8,50 +8,55 @@
 import MetalKit
 import UntoldEngine
 
-func updateEditorRenderingSystem(in view: MTKView) {
+func EditorUpdateRenderingSystem(view: MTKView) {
+    
     if let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() {
-        if let renderPassDescriptor = view.currentRenderPassDescriptor {
-            renderInfo.renderPassDescriptor = renderPassDescriptor
-
+            
             executeFrustumCulling(commandBuffer)
+            
+            if let renderPassDescriptor = view.currentRenderPassDescriptor {
+                renderInfo.renderPassDescriptor = renderPassDescriptor
 
-            // build a render graph
-            var (graph, preCompID) = gameMode ? buildGameModeGraph() : buildEditModeGraph()
+                commandBuffer.label = "Rendering Command Buffer"
+                
+                // build a render graph
+                var (graph, preCompID) = gameMode ? buildGameModeGraph() : buildEditModeGraph()
 
-            if visualDebug == false {
-                let compositePass = RenderPass(
-                    id: "composite", dependencies: [preCompID], execute: RenderPasses.compositeExecution
-                )
+                if visualDebug == false {
+                    let compositePass = RenderPass(
+                        id: "composite", dependencies: [preCompID], execute: RenderPasses.compositeExecution
+                    )
 
-                graph[compositePass.id] = compositePass
-            } else {
-                let debugPass = RenderPass(
-                    id: "debug", dependencies: [preCompID], execute: EditorRenderPasses.debuggerExecution
-                )
+                    graph[compositePass.id] = compositePass
+                } else {
+                    let debugPass = RenderPass(
+                        id: "debug", dependencies: [preCompID], execute: RenderPasses.debuggerExecution
+                    )
 
-                graph[debugPass.id] = debugPass
+                    graph[debugPass.id] = debugPass
+                }
+
+                // sorted it
+                let sortedPasses = try! topologicalSortGraph(graph: graph)
+
+                // execute it
+                executeGraph(graph, sortedPasses, commandBuffer)
             }
 
-            // sorted it
-            let sortedPasses = try! topologicalSortGraph(graph: graph)
-
-            // execute it
-            executeGraph(graph, sortedPasses, commandBuffer)
-        }
-
-        if let drawable = view.currentDrawable {
-            commandBuffer.present(drawable)
-        }
-
-        commandBuffer.addCompletedHandler { _ in
-
-            DispatchQueue.main.async {
-                needsFinalizeDestroys = true
+            if let drawable = view.currentDrawable {
+                commandBuffer.present(drawable)
             }
-        }
 
-        commandBuffer.commit()
-    }
+            commandBuffer.addCompletedHandler { _ in
+
+                DispatchQueue.main.async {
+                    needsFinalizeDestroys = true
+                    visibleEntityIds = tripleVisibleEntities.snapshotForRead(frame: cullFrameIndex)
+                }
+            }
+
+            commandBuffer.commit()
+        }
 }
 
 func buildEditModeGraph() -> RenderGraphResult {
@@ -85,17 +90,13 @@ func buildEditModeGraph() -> RenderGraphResult {
     let lightPass = RenderPass(id: "lightPass", dependencies: [modelPass.id, shadowPass.id], execute: RenderPasses.lightExecution)
     graph[lightPass.id] = lightPass
 
-    let highlightPass = RenderPass(
-        id: "outline", dependencies: [modelPass.id], execute: EditorRenderPasses.highlightExecution
-    )
+    let highlightPass = RenderPass(id: "outline", dependencies: [modelPass.id], execute: RenderPasses.highlightExecution)
     graph[highlightPass.id] = highlightPass
 
-    let lightVisualsPass = RenderPass(id: "lightVisualPass", dependencies: [highlightPass.id], execute: EditorRenderPasses.lightVisualPass)
-
+    let lightVisualsPass = RenderPass(id: "lightVisualPass", dependencies: [highlightPass.id], execute: RenderPasses.lightVisualPass)
     graph[lightVisualsPass.id] = lightVisualsPass
 
-    let gizmoPass = RenderPass(id: "gizmo", dependencies: [lightVisualsPass.id], execute: EditorRenderPasses.gizmoExecution)
-
+    let gizmoPass = RenderPass(id: "gizmo", dependencies: [lightVisualsPass.id], execute: RenderPasses.gizmoExecution)
     graph[gizmoPass.id] = gizmoPass
 
     let preCompPass = RenderPass(

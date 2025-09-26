@@ -33,8 +33,7 @@ class EditorController: SelectionDelegate, ObservableObject
 
     init(selectionManager: SelectionManager) {
         self.selectionManager = selectionManager
-        isEnabled = true
-        InputSystem.shared.delegate = self
+        isEnabled = true        
     }
 
     func refreshInspector() {
@@ -52,18 +51,5 @@ class EditorController: SelectionDelegate, ObservableObject
     func resetActiveAxis() {
         activeAxis = .none
     }
-    
-    func didUpdateKeyState(_ keyState: KeyState) {
-        if keyState.xPressed { activeAxis = .x }
-        if keyState.yPressed { activeAxis = .y }
-        if keyState.zPressed { activeAxis = .z }
-        if keyState.rPressed && keyState.shiftPressed { hotReload = !hotReload }
-        if keyState.pPressed { gameMode = !gameMode }
-        if keyState.onePressed { currentDebugSelection = DebugSelection.normalOutput }
-        if keyState.twoPressed { currentDebugSelection = DebugSelection.iblOutput }
-        if keyState.lPressed && keyState.shiftPressed {
-            visualDebug = !visualDebug
-            currentDebugSelection = DebugSelection.normalOutput
-        }
-    }
+
 }

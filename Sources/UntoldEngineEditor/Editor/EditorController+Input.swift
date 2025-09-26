@@ -12,10 +12,12 @@ extension EditorController
 {
     func registerInputEvents( inView view: AppView ) {
         InputSystem.shared.registerKeyboardEvents( )
-        //InputSystem.shared.registerMouseEvents( )
+//        InputSystem.shared.registerMouseEvents( )
         InputSystem.shared.registerGameControllerEvents( )
         InputSystem.shared.registerGestureEvents( inView: view )
         InputSystem.shared.registerMouseClickEvent( inView: view )
+        
+        InputSystem.shared.delegate = self
     }
     
     func handleSceneInput() {
@@ -248,6 +250,20 @@ extension EditorController
 
         default:
             break
+        }
+    }
+    
+    func didUpdateKeyState(_ keyState: KeyState) {
+        if keyState.xPressed { activeAxis = .x }
+        if keyState.yPressed { activeAxis = .y }
+        if keyState.zPressed { activeAxis = .z }
+        if keyState.rPressed && keyState.shiftPressed { hotReload = !hotReload }
+        if keyState.pPressed { gameMode = !gameMode }
+        if keyState.onePressed { currentDebugSelection = DebugSelection.normalOutput }
+        if keyState.twoPressed { currentDebugSelection = DebugSelection.iblOutput }
+        if keyState.lPressed && keyState.shiftPressed {
+            visualDebug = !visualDebug
+            currentDebugSelection = DebugSelection.normalOutput
         }
     }
 }

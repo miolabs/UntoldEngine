@@ -11,20 +11,24 @@ public struct UntoldRendererConfig
 {
     var metalView: MTKView?
     var initRenderPipelineBlocks: [ (RenderPipelineType, RenderPipelineInitBlock) ]
+    var updateRenderingSystemCallback: UpdateRenderingSystemCallback
     
-//    var updateRenderingSystemCallback: UpdateRenderingSystemCallback
-//    var initRenderPipelinesCallback: InitRenderPipelinesCallback
-    
-    public init(metalView: MTKView? = nil, initPipelineBlocks: [(RenderPipelineType, RenderPipelineInitBlock)]) {
+    public init(
+        metalView: MTKView? = nil,
+        initPipelineBlocks: [(RenderPipelineType, RenderPipelineInitBlock)],
+        updateRenderingSystemCallback: @escaping UpdateRenderingSystemCallback
+    ) {
         self.metalView = metalView
         self.initRenderPipelineBlocks = initPipelineBlocks
+        self.updateRenderingSystemCallback = updateRenderingSystemCallback
     }
 }
 
 extension UntoldRendererConfig {
     public static var `default`: UntoldRendererConfig {
         return UntoldRendererConfig(
-            initPipelineBlocks: DefaultPipeLines()
+            initPipelineBlocks: DefaultPipeLines(),
+            updateRenderingSystemCallback: UpdateRenderingSystem
         )
     }
 }

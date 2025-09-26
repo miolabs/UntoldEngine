@@ -11,7 +11,7 @@ import Metal
 import MetalKit
 import UntoldEngine
 
-enum EditorRenderPasses
+extension RenderPasses
 {
     static let gizmoExecution: (MTLCommandBuffer) -> Void = { commandBuffer in
 
@@ -19,11 +19,16 @@ enum EditorRenderPasses
             return
         }
 
+        guard let gizmoPipeline = PipelineManager.shared.renderPipelinesByType[ .gizmo ] else {
+            handleError(.pipelineStateNulled, "gizmoPipeline is nil")
+            return
+        }
+        
         if gizmoPipeline.success == false {
             handleError(.pipelineStateNulled, gizmoPipeline.name!)
             return
         }
-        guard let camera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: camera) else {
+        guard let cameraComponent = scene.get(component: CameraComponent.self, for: findGameCamera()) else {
             handleError(.noActiveCamera)
             return
         }
@@ -557,6 +562,11 @@ enum EditorRenderPasses
     
     public static let debuggerExecution: (MTLCommandBuffer) -> Void = { commandBuffer in
 
+        guard let debuggerPipeline = PipelineManager.shared.renderPipelinesByType[ .lightVisual ] else {
+            handleError(.pipelineStateNulled, "debuggerPipeline is nil")
+            return
+        }
+        
         if !debuggerPipeline.success {
             handleError(.pipelineStateNulled, debuggerPipeline.name!)
             return

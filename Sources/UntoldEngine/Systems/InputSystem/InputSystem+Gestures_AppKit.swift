@@ -15,6 +15,7 @@ extension InputSystem
         // Pinch gesture
         let pinchGesture = NSMagnificationGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         view.addGestureRecognizer(pinchGesture)
+        
         // Pan gesture
         let panGesture = NSPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         view.addGestureRecognizer(panGesture)
@@ -59,7 +60,7 @@ extension InputSystem
     
     public func handlePanGesture(_ gestureRecognizer: NSPanGestureRecognizer, in view: NSView) {
         let currentPanLocation = gestureRecognizer.translation(in: view)
-        let currentLocation = gestureRecognizer.location(in: view)
+//        let currentLocation = gestureRecognizer.location(in: view)
 
         switch gestureRecognizer.state {
         case .began:

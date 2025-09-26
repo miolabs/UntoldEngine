@@ -650,8 +650,7 @@ public enum RenderPasses {
 
         // set the states for the pipeline
         renderPassDescriptor.colorAttachments[0].loadAction = .load
-        // clearColor is only used when loadAction == .clear.
-//        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(1.0, 1.0, 1.0, 1.0)
+        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(1.0, 1.0, 1.0, 1.0)
         renderPassDescriptor.colorAttachments[0].storeAction = .store
 
         // clear it so that it doesn't have any effect on the final output
@@ -1056,8 +1055,7 @@ public enum RenderPasses {
         )
 
         // TODO: Check why the game mode is pass here
-//        var isGameMode = gameMode
-        var isGameMode = true
+        var isGameMode = gameMode
         renderEncoder.setFragmentBytes(&isGameMode, length: MemoryLayout<Bool>.size, index: Int(lightPassGameModeIndex.rawValue))
 
         // set the draw command
@@ -1160,19 +1158,19 @@ public enum RenderPasses {
 
         // TODO: check how to split for the editor
         // clear it so that it doesn't have any effect on the final output
-//        if gameMode == false {
-//            renderInfo.offscreenRenderPassDescriptor.depthAttachment.loadAction = .load
-//            renderInfo.deferredRenderPassDescriptor.colorAttachments[0]
-//                .loadAction = .load
-//
-//            renderInfo.gizmoRenderPassDescriptor.colorAttachments[0].loadAction = .load
-//        } else {
+        if gameMode == false {
+            renderInfo.offscreenRenderPassDescriptor.depthAttachment.loadAction = .load
+            renderInfo.deferredRenderPassDescriptor.colorAttachments[0]
+                .loadAction = .load
+
+            renderInfo.gizmoRenderPassDescriptor.colorAttachments[0].loadAction = .load
+        } else {
             renderInfo.postProcessRenderPassDescriptor.depthAttachment.loadAction = .load
             renderInfo.postProcessRenderPassDescriptor.colorAttachments[0]
                 .loadAction = .load
 
             renderInfo.gizmoRenderPassDescriptor.colorAttachments[0].loadAction = .clear
-//        }
+        }
 
         // set your encoder here
         guard
@@ -1183,7 +1181,7 @@ public enum RenderPasses {
         }
         
         defer {
-            // Make sure no matter what we end the encoding at the end of the function
+            // Make sure no matter what, we end the encoding at the function exit
             renderEncoder.popDebugGroup()
             renderEncoder.endEncoding()
         }
@@ -1204,16 +1202,16 @@ public enum RenderPasses {
         )
 
         //TODO: Check how the editor affects with
-//        if gameMode == false {
-//            renderEncoder.setFragmentTexture(
-//                renderInfo.deferredRenderPassDescriptor.colorAttachments[0].texture,
-//                index: 0
-//            )
-//
-//            renderEncoder.setFragmentTexture(
-//                renderInfo.offscreenRenderPassDescriptor.depthAttachment.texture, index: 2
-//            )
-//        } else {
+        if gameMode == false {
+            renderEncoder.setFragmentTexture(
+                renderInfo.deferredRenderPassDescriptor.colorAttachments[0].texture,
+                index: 0
+            )
+
+            renderEncoder.setFragmentTexture(
+                renderInfo.offscreenRenderPassDescriptor.depthAttachment.texture, index: 2
+            )
+        } else {
             renderEncoder.setFragmentTexture(
                 renderInfo.postProcessRenderPassDescriptor.colorAttachments[0].texture,
                 index: 0
@@ -1222,12 +1220,11 @@ public enum RenderPasses {
             renderEncoder.setFragmentTexture(
                 renderInfo.postProcessRenderPassDescriptor.depthAttachment.texture, index: 2
             )
-//        }
+        }
 
         renderEncoder.setFragmentTexture(renderInfo.gizmoRenderPassDescriptor.colorAttachments[0].texture, index: 3)
 
-//        var isGameMode = gameMode
-        var isGameMode = true
+        var isGameMode = gameMode
         renderEncoder.setFragmentBytes(&isGameMode, length: MemoryLayout<Bool>.size, index: 3)
 
         // set the draw command

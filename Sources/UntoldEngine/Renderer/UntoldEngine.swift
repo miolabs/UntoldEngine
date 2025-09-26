@@ -207,7 +207,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         gameUpdateCallback?(timeSinceLastUpdate)
 
         // render
-        updateRenderingSystem(in: view)
+        configuration.updateRenderingSystemCallback(view)
         
         delegate?.didDraw(in: view)
     }

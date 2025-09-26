@@ -10,7 +10,9 @@ import UntoldEngine
 extension UntoldRendererConfig {
     public static var editor: UntoldRendererConfig {
         return UntoldRendererConfig(
-            initPipelineBlocks: EditorDefaultPipeLines()
+            initPipelineBlocks: EditorDefaultPipeLines(),
+            updateRenderingSystemCallback: EditorUpdateRenderingSystem
+            
         )
     }
 }

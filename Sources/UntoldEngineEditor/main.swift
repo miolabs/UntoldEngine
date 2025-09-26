@@ -11,7 +11,7 @@ import MetalKit
 import UntoldEngine
 
 
-// AppDelegate: Boiler plate code -- Handles everything – Renderer, Metal setup, and GameScene initialization
+// AppDelegate: Boiler plate code
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
 
@@ -28,14 +28,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.title = "Untold Engine Editor v0.2"
         window.center()
-
-        // Step 3. Create the game scene and connect callbacks
-//        gameScene = GameScene()
-//        renderer.setupCallbacks(
-//            gameUpdate: { [weak self] deltaTime in self?.gameScene.update(deltaTime: deltaTime) },
-//            handleInput: { [weak self] in self?.gameScene.handleInput() }
-//        )
-
+    
         let hostingView = NSHostingView(rootView: EditorView())
         window.contentView = hostingView
 

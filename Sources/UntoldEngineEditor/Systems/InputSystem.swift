@@ -14,7 +14,7 @@ import UntoldEngine
 
 extension InputSystem
 {
-    public func registerMouseClickEvent( inView view: AppView) {
+    public func registerMouseClickEvent( inView view: AppView) {        
         // Click gesture
         let rightClickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleRightClick(_:)))
         view.addGestureRecognizer(rightClickGesture)

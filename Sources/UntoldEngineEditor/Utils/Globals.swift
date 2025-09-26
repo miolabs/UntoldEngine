@@ -35,9 +35,6 @@ let gizmoDesiredScreenSize: Float = 500.0 // pixels
 
 var spawnDistance: Float = 2.0
 
-// gizmo
-var gizmoPipeline = RenderPipeline()
-
 // Visual Debugger
 enum DebugSelection: Int {
     case normalOutput
@@ -51,6 +48,4 @@ var spotLightDebugMesh: [Mesh] = []
 var pointLightDebugMesh: [Mesh] = []
 var areaLightDebugMesh: [Mesh] = []
 var dirLightDebugMesh: [Mesh] = []
-
-var debuggerPipeline = RenderPipeline()
 

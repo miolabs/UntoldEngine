@@ -10,7 +10,7 @@ import MetalKit
 
 public typealias UpdateRenderingSystemCallback = (MTKView) -> Void
 
-public func updateRenderingSystem(in view: MTKView) {
+public func UpdateRenderingSystem(view: MTKView) {
     if let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() {
         
         executeFrustumCulling(commandBuffer)

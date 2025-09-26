@@ -78,7 +78,7 @@ extension InputSystem
             keyState.shiftPressed = true
         } else {
             keyState.shiftPressed = false
-        }
+        }                
 
         // Control key
         if event.modifierFlags.contains(.control) {
