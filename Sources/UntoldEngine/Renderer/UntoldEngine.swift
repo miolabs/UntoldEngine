@@ -179,8 +179,9 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         // process Input - Handle user input before updating game states
         handleInputCallback?()
 
-        updateAnimationSystem(deltaTime: timeSinceLastUpdate)
+        AnimationSystem.shared.update(timeSinceLastUpdate)
 
+        // TODO: Should be this moving to Physics system?
         // Fixed‐timestep physics
         physicsAccumulator += timeSinceLastUpdate
         let maxSteps = 5

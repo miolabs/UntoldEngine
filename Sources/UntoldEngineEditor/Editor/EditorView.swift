@@ -32,6 +32,8 @@ public struct EditorView: View {
             renderer?.setupCallbacks( gameUpdate: { deltaTime in }, handleInput: controller.handleSceneInput )
             editorController?.registerInputEvents( inView: v )
         }
+        
+        AnimationSystem.shared.isEnabled = isPlaying
     }
 
     public var body: some View {
@@ -212,6 +214,7 @@ public struct EditorView: View {
     private func editor_handlePlayToggle(_ isPlaying: Bool) {
         self.isPlaying = isPlaying
         gameMode = !gameMode
+        AnimationSystem.shared.isEnabled = isPlaying
     }
 
     private func editor_createDirLight() {
