@@ -29,26 +29,10 @@ extension InputSystem
         let currentLocation = gestureRecognizer.location(in: view)
         let (entityId, hit) = getRaycastedEntity(currentLocation: currentLocation, view: view)
 
-        if HitGizmoToolAxis(entityId: entityId) {
-            return
-        }
+        if HitGizmoToolAxis(entityId: entityId) { return }
 
-        gizmoActive = false
-        RemoveGizmo()
-        editorController?.activeMode = .none
-        editorController?.activeAxis = .none
-        activeHitGizmoEntity = .invalid
-
-        if hit {
-            activeEntity = entityId
-
-            (delegate as? SelectionDelegate)?.didSelectEntity(activeEntity)
-            (delegate as? SelectionDelegate)?.resetActiveAxis()
-
-        } else {
-            activeEntity = .invalid
-            RemoveGizmo()
-        }
+        (delegate as? SelectionDelegate)?.didSelectEntity(hit == true ? entityId : .invalid)
+        (delegate as? SelectionDelegate)?.resetActiveAxis()
     }
     
     public func getRaycastedEntity(currentLocation: NSPoint, view: AppView) -> (entityId: EntityID, hit: Bool) {

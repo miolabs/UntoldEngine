@@ -119,7 +119,6 @@ public struct EditorView: View {
 
     private func editor_clearScene() {
         destroyAllEntities()
-        RemoveGizmo()
         EditorComponentsState.shared.clear()
 
         let light = createEntity()
@@ -176,8 +175,6 @@ public struct EditorView: View {
     }
 
     private func editor_addNewEntity() {
-        RemoveGizmo()
-
         let entityId = createEntity()
 
         let name = generateEntityName()
@@ -201,7 +198,6 @@ public struct EditorView: View {
         editor_entities = getAllGameEntities()
         activeEntity = .invalid
         selectionManager.selectedEntity = nil
-        RemoveGizmo()
         sceneGraphModel.refreshHierarchy()
     }
 

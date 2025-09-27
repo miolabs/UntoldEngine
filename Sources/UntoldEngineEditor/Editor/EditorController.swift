@@ -44,6 +44,7 @@ class EditorController: SelectionDelegate, ObservableObject
         
     func didSelectEntity(_ entityId: EntityID) {
         DispatchQueue.main.async {
+            self.activeMode = .none
             self.selectionManager.selectEntity(entityId: entityId)
         }
     }

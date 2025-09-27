@@ -31,11 +31,11 @@ struct ModeButton: View {
                 activeMode = mode
 
                 if activeMode == .translate {
-                    CreateGizmo(name: "translateGizmo")
+                    createGizmo(name: "translateGizmo")
                 } else if activeMode == .rotate {
-                    CreateGizmo(name: "rotateGizmo")
+                    createGizmo(name: "rotateGizmo")
                 } else if activeMode == .scale {
-                    CreateGizmo(name: "scaleGizmo")
+                    createGizmo(name: "scaleGizmo")
                 }
             }
         }) {

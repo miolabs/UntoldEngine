@@ -9,10 +9,8 @@ import Foundation
 import simd
 import UntoldEngine
 
-func CreateGizmo(name: String) {
+func createGizmo(name: String) {
     var gizmoName: String = name
-
-    RemoveGizmo()
 
     if activeEntity == .invalid {
         return
@@ -108,11 +106,12 @@ func HitGizmoToolAxis(entityId: EntityID) -> Bool {
     }
 }
 
-func RemoveGizmo() {
+func removeGizmo() {
     if parentEntityIdGizmo != .invalid {
         destroyEntity(entityId: parentEntityIdGizmo)
-        parentEntityIdGizmo = .invalid
     }
-
+    
+    // Always reset the parentEntityIdGizmo here because can happen that  destroyAllEntities function can remove the mesh, but doesn't reset this var
+    parentEntityIdGizmo = .invalid
     gizmoActive = false
 }

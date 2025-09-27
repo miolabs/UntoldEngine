@@ -62,6 +62,10 @@ public func createSceneCamera(entityId: EntityID) {
     cameraLookAt(entityId: entityId,
                  eye: cameraDefaultEye, target: cameraTargetDefault,
                  up: cameraUpDefault)
+        
+    // TODO: This should be part of the editor code
+    // set default active camera as soon as is created.
+    CameraSystem.shared.activeCamera = entityId
 }
 
 public func resetCameraToDefaultTransform(entityId: EntityID) {

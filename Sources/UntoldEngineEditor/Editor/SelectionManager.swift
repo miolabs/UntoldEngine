@@ -41,16 +41,21 @@ class SelectionManager: ObservableObject {
 
     func selectEntity(entityId: EntityID) {
         selectedEntity = entityId
-
+        
+        activeHitGizmoEntity = .invalid
+        activeEntity = .invalid
+        removeGizmo()
+        
+        if entityId == .invalid { return }
+        
         if hasComponent(entityId: entityId, componentType: RenderComponent.self), hasComponent(entityId: entityId, componentType: LocalTransformComponent.self) {
             activeEntity = entityId
+            
             guard let localTransform = scene.get(component: LocalTransformComponent.self, for: activeEntity) else { return }
-
+            
             updateBoundingBoxBuffer(min: localTransform.boundingBox.min, max: localTransform.boundingBox.max)
-
-            CreateGizmo(name: "translateGizmo")
-        } else {
-            activeEntity = .invalid
+            
+            createGizmo(name: "translateGizmo")
         }
     }
 }
