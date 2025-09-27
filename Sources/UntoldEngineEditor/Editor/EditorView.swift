@@ -1,4 +1,3 @@
-#if canImport(AppKit)
 import MetalKit
 import SwiftUI
 import UntoldEngine
@@ -290,4 +289,3 @@ public struct EditorView: View {
         translateTo(entityId: selectionManager.selectedEntity!, position: spawnPosition)
     }
 }
-#endif

@@ -4,15 +4,11 @@
 //
 //  Created by Harold Serrano on 3/6/25.
 //
-#if canImport(AppKit)
-import AppKit
 import Foundation
 import simd
-import UniformTypeIdentifiers
-import UntoldEngine
 import CShaderTypes
 
-struct SceneData: Codable {
+public struct SceneData: Codable {
     var entities: [EntityData] = []
     var environment: EnvironmentData? = nil
     var assetBasePath: URL? = nil
@@ -147,7 +143,7 @@ struct EntityData: Codable {
     public var customComponents: [String: Data]? = nil
 }
 
-func serializeScene() -> SceneData {
+public func serializeScene() -> SceneData {
     var sceneData = SceneData()
     var entityIdToUUID: [EntityID: UUID] = [:]
 
@@ -377,53 +373,6 @@ func serializeScene() -> SceneData {
     return sceneData
 }
 
-func saveScene(sceneData: SceneData) {
-    let savePanel = NSSavePanel()
-    savePanel.title = "Save Scene"
-    savePanel.allowedContentTypes = [UTType.json]
-    savePanel.nameFieldStringValue = "untitled.json"
-    savePanel.canCreateDirectories = true
-    savePanel.isExtensionHidden = false
-
-    savePanel.begin { result in
-        if result == .OK, let url = savePanel.url {
-            do {
-                let encoder = JSONEncoder()
-
-                encoder.outputFormatting = .prettyPrinted
-
-                let jsonData = try encoder.encode(sceneData)
-                try jsonData.write(to: url)
-                print("Scene saved to \(url.path)")
-            } catch {
-                print("Failed to save scene: \(error)")
-            }
-        }
-    }
-}
-
-func loadGameScene() -> SceneData? {
-    let openPanel = NSOpenPanel()
-    openPanel.title = "Open Scene"
-    openPanel.allowedContentTypes = [UTType.json]
-    openPanel.allowsMultipleSelection = false
-
-    if openPanel.runModal() == .OK, let url = openPanel.url {
-        let decoder = JSONDecoder()
-
-        do {
-            let jsonData = try Data(contentsOf: url)
-            let sceneData = try decoder.decode(SceneData.self, from: jsonData)
-            Logger.log(message: "Scene loaded from \(url.path)")
-            return sceneData
-        } catch {
-            Logger.log(message: "Failed to load scene: \(error)")
-        }
-    }
-
-    return nil
-}
-
 func loadGameScene(from url: URL) -> SceneData? {
     // Normalize to a file URL if needed
     let fileURL = url.isFileURL ? url : URL(fileURLWithPath: url.path)
@@ -439,7 +388,7 @@ func loadGameScene(from url: URL) -> SceneData? {
     }
 }
 
-func deserializeScene(sceneData: SceneData) {
+public func deserializeScene(sceneData: SceneData) {
     var uuidToEntityMap: [UUID: EntityID] = [:]
 
     if let env = sceneData.environment {
@@ -450,8 +399,6 @@ func deserializeScene(sceneData: SceneData) {
         hdrURL = env.hdr ?? "teatro_massimo_2k.hdr"
         generateHDR(hdrURL)
     }
-
-    EditorAssetBasePath.shared.basePath = LoadingSystem.shared.assetBasePath
 
     if let colorGrading = sceneData.colorGrading {
         ColorGradingParams.shared.brightness = colorGrading.brightness
@@ -768,4 +715,3 @@ func deserializeScene(sceneData: SceneData) {
         setParent(childId: childId, parentId: parentId)
     }
 }
-#endif

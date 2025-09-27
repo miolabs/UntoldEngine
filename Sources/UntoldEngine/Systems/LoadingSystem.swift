@@ -79,5 +79,11 @@ public final class LoadingSystem
             subdirectory: folders.joined(separator: "/")
         )
     }
+}
 
+public func playSceneAt(url: URL) {
+    if let scene = loadGameScene(from: url) {
+        destroyAllEntities()
+        deserializeScene(sceneData: scene)
+    }
 }
