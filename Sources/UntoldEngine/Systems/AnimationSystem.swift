@@ -157,6 +157,10 @@ private func updateAnimationSystem(deltaTime: Float) {
             continue
         }
 
+        if animationPolicyAllowsPlayback(animationComponent) == false {
+            continue
+        }
+
         if isAnimationComponentPaused(entityId: entity) {
             continue
         }
@@ -169,6 +173,14 @@ private func updateAnimationSystem(deltaTime: Float) {
             for: animationClip,
             skeleton: skeletonComponent.skeleton
         )
+
+        // Preserve the pose displayed last frame (post-transition offsets)
+        // for velocity estimation when the next transition begins. Swapping
+        // the buffers avoids any copy; the sampler fully overwrites
+        // localPose below.
+        swap(&animationComponent.previousPose, &animationComponent.localPose)
+        animationComponent.hasPreviousPose = animationComponent.hasSampledPose
+
         animationComponent.sampler.sample(
             compiledClip,
             time: animationComponent.currentTime,
@@ -176,6 +188,27 @@ private func updateAnimationSystem(deltaTime: Float) {
             speed: animationClip.speed,
             into: &animationComponent.localPose
         )
+
+        // Root motion runs on the raw sampled pose, before transition
+        // offsets: deltas come from the clip, transitions blend grounded
+        // poses.
+        applyRootMotion(
+            entityId: entity,
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            compiledClip: compiledClip,
+            clipDuration: animationClip.duration,
+            clipSpeed: animationClip.speed
+        )
+
+        // Transitions decay in real time, independent of playback speed.
+        animationComponent.transition.apply(
+            to: &animationComponent.localPose,
+            deltaTime: deltaTime
+        )
+        animationComponent.hasSampledPose = true
+        animationComponent.lastSampleDeltaTime = deltaTime
+
         skeletonComponent.skeleton.updateWorldPose(
             from: animationComponent.localPose,
             localScales: compiledClip.restScales
@@ -188,6 +221,46 @@ private func updateAnimationSystem(deltaTime: Float) {
             }
         }
     }
+}
+
+/// Resolves whether an animation component may advance this frame given its
+/// per-entity policy. The global `AnimationSystem.isEnabled` toggle has
+/// already been applied by the time the update loop runs (disabled swaps in
+/// a dummy update), so `.inherit` and `.forceOn` both animate here; they
+/// diverge once per-view control exists, where `.forceOn` overrides a
+/// view-level pause and `.inherit` honors it.
+func animationPolicyAllowsPlayback(_ animationComponent: AnimationComponent) -> Bool {
+    switch animationComponent.policy {
+    case .inherit, .forceOn:
+        return true
+    case .forceOff:
+        return false
+    }
+}
+
+/// Sets the animation policy for the entity (or its descendants that carry
+/// an `AnimationComponent`, matching how the other animation APIs resolve
+/// hierarchical assets).
+public func setAnimationPolicy(entityId: EntityID, policy: AnimationPolicy) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.policy = policy
+    }
+}
+
+public func getAnimationPolicy(entityId: EntityID) -> AnimationPolicy {
+    let targetEntityId = resolveEntityWithAnimationComponent(entityId: entityId) ?? entityId
+    guard let animationComponent = scene.get(component: AnimationComponent.self, for: targetEntityId) else {
+        handleError(.noAnimationComponent, entityId)
+        return .inherit
+    }
+
+    return animationComponent.policy
 }
 
 public func pauseAnimationComponent(entityId: EntityID, isPaused: Bool) {
@@ -214,7 +287,14 @@ public func isAnimationComponentPaused(entityId: EntityID) -> Bool {
     }
 }
 
-public func changeAnimation(entityId: EntityID, name: String, withPause: Bool = false) {
+/// Switches the entity to the named clip.
+///
+/// With a positive `transitionHalflife`, the switch is inertialized: the
+/// offset between the pose on screen and the incoming clip is captured and
+/// decayed to zero with a critically damped spring, so the character eases
+/// into the new clip instead of popping. `transitionHalflife: 0` reproduces
+/// a hard cut. Playback restarts at the beginning of the new clip.
+public func changeAnimation(entityId: EntityID, name: String, transitionHalflife: Float = 0.1, withPause: Bool = false) {
     guard hasAnyAnimationComponent(entityId: entityId) else {
         handleError(.noAnimationComponent, entityId)
         return
@@ -226,10 +306,125 @@ public func changeAnimation(entityId: EntityID, name: String, withPause: Bool = 
         return
     }
 
-    for (_, animationComponent, animationClip) in matchingComponents {
+    for (targetEntityId, animationComponent, animationClip) in matchingComponents {
+        beginAnimationTransition(
+            entityId: targetEntityId,
+            animationComponent: animationComponent,
+            to: animationClip,
+            halflife: transitionHalflife
+        )
         animationComponent.currentAnimation = animationClip
+        animationComponent.currentTime = 0
         animationComponent.pause = withPause
+        // Re-baseline root motion on the new clip; the first frame after a
+        // switch contributes no delta.
+        animationComponent.rootMotion.resetHistory()
     }
+}
+
+/// Enables or disables root motion for the entity (or its descendants that
+/// carry an `AnimationComponent`). While enabled, the root joint's
+/// horizontal translation and yaw drive the entity transform instead of the
+/// pose; vertical motion, pitch, and roll stay in the pose. By default the
+/// skeleton's first parentless joint is the root; pass `rootJointPath` to
+/// designate a different joint.
+public func setRootMotionEnabled(entityId: EntityID, enabled: Bool, rootJointPath: String? = nil) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.rootMotion.isEnabled = enabled
+        animationComponent.rootMotion.rootJointPath = rootJointPath
+        animationComponent.rootMotion.resolvedRootIndex = nil
+        animationComponent.rootMotion.resetHistory()
+    }
+}
+
+public func isRootMotionEnabled(entityId: EntityID) -> Bool {
+    let targetEntityId = resolveEntityWithAnimationComponent(entityId: entityId) ?? entityId
+    guard let animationComponent = scene.get(component: AnimationComponent.self, for: targetEntityId) else {
+        handleError(.noAnimationComponent, entityId)
+        return false
+    }
+
+    return animationComponent.rootMotion.isEnabled
+}
+
+/// Captures inertialization offsets for a clip switch. Falls back to a hard
+/// cut (no transition) when there is nothing to blend from: no clip playing,
+/// no pose displayed yet, no skeleton, or a zero halflife.
+private func beginAnimationTransition(
+    entityId: EntityID,
+    animationComponent: AnimationComponent,
+    to clip: AnimationClip,
+    halflife: Float
+) {
+    guard halflife > 0,
+          animationComponent.currentAnimation != nil,
+          animationComponent.hasSampledPose,
+          let skeleton = scene.get(component: SkeletonComponent.self, for: entityId)?.skeleton
+    else {
+        animationComponent.transition.cancel()
+        return
+    }
+
+    let compiledClip = animationComponent.compiledClip(for: clip, skeleton: skeleton)
+    guard compiledClip.jointCount == animationComponent.localPose.jointCount else {
+        animationComponent.transition.cancel()
+        return
+    }
+
+    // Sample the incoming clip at its start and one small step later to
+    // estimate its initial velocity. The component sampler rebinds to the
+    // new clip here, which it would do on the next frame anyway.
+    let velocityStep: Float = 1.0 / 60.0
+    animationComponent.sampler.sample(
+        compiledClip,
+        time: 0,
+        duration: clip.duration,
+        speed: clip.speed,
+        into: &animationComponent.transition.scratchTarget
+    )
+    animationComponent.sampler.sample(
+        compiledClip,
+        time: velocityStep,
+        duration: clip.duration,
+        speed: clip.speed,
+        into: &animationComponent.transition.scratchTargetNext
+    )
+
+    // With root motion enabled the displayed pose is grounded, so the
+    // incoming clip's samples must be grounded too — otherwise the captured
+    // offset would reintroduce the horizontal root displacement.
+    if animationComponent.rootMotion.isEnabled,
+       let rootIndex = resolveRootMotionJointIndex(
+           state: &animationComponent.rootMotion,
+           skeleton: skeleton,
+           compiledClip: compiledClip
+       )
+    {
+        stripRootMotion(from: &animationComponent.transition.scratchTarget, rootIndex: rootIndex)
+        stripRootMotion(from: &animationComponent.transition.scratchTargetNext, rootIndex: rootIndex)
+    }
+
+    // Copy the scratch poses out (COW, no allocation) so the mutating
+    // begin() call does not overlap a read of the same property.
+    let targetPose = animationComponent.transition.scratchTarget
+    let targetNext = animationComponent.transition.scratchTargetNext
+
+    animationComponent.transition.begin(
+        halflife: halflife,
+        sourcePose: animationComponent.localPose,
+        sourcePrevious: animationComponent.previousPose,
+        hasSourcePrevious: animationComponent.hasPreviousPose,
+        sourceDeltaTime: animationComponent.lastSampleDeltaTime,
+        targetPose: targetPose,
+        targetNext: targetNext,
+        targetDeltaTime: velocityStep
+    )
 }
 
 public func setAnimationPlaybackSpeed(entityId: EntityID, speed: Float) {
