@@ -200,6 +200,7 @@ public class AnimationComponent: Component {
     var hasPreviousPose = false
     var lastSampleDeltaTime: Float = 0
     var transition = PoseTransition()
+    var rootMotion = RootMotionState()
 
     public required init() {}
 
@@ -215,6 +216,7 @@ public class AnimationComponent: Component {
         hasPreviousPose = false
         lastSampleDeltaTime = 0
         transition = PoseTransition()
+        rootMotion = RootMotionState()
     }
 
     func getAllAnimationClips() -> [String] {
