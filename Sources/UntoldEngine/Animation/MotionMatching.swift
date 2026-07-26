@@ -72,6 +72,10 @@ struct MotionMatchingState {
     var descriptor: MotionMatchingDescriptor?
     var database: MotionDatabase?
 
+    /// The gameplay handle whose transform expresses the character's world
+    /// position and heading (see RootMotionState.anchorEntity).
+    var anchorEntity: EntityID = .invalid
+
     /// World-space goal, set by gameplay every frame (or whenever it
     /// changes).
     var desiredVelocity = simd_float3.zero
@@ -128,9 +132,13 @@ func updateMotionMatching(
     }
     guard let database = animationComponent.motionMatching.database else { return }
 
-    // Entity's character frame: its world yaw (the pose root is grounded
-    // when root motion is on, so the entity transform carries heading).
-    let entityRotation = getRotationQuaternion(entityId: entityId)
+    let anchor = animationComponent.motionMatching.anchorEntity == .invalid
+        ? entityId
+        : animationComponent.motionMatching.anchorEntity
+
+    // Character frame: the gameplay handle's world yaw (the pose root is
+    // grounded when root motion is on, so that transform carries heading).
+    let entityRotation = getRotationQuaternion(entityId: anchor)
     let entityYaw = yawTwist(
         simd_length_squared(entityRotation.vector) < 1e-8
             ? simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -176,6 +184,7 @@ func updateMotionMatching(
 
     guard let query = buildMotionMatchingQuery(
         entityId: entityId,
+        anchorEntity: anchor,
         animationComponent: animationComponent,
         skeleton: skeleton,
         database: database,
@@ -212,6 +221,7 @@ func updateMotionMatching(
 
 private func buildMotionMatchingQuery(
     entityId: EntityID,
+    anchorEntity: EntityID,
     animationComponent: AnimationComponent,
     skeleton: Skeleton,
     database: MotionDatabase,
@@ -234,7 +244,7 @@ private func buildMotionMatchingQuery(
 
     let leftFoot = inverseRootYaw.act(positions[database.leftFootIndex] - rootHorizontal)
     let rightFoot = inverseRootYaw.act(positions[database.rightFootIndex] - rootHorizontal)
-    let worldPosition = getPosition(entityId: entityId)
+    let worldPosition = getPosition(entityId: anchorEntity)
 
     // Velocities are world-space finite differences rotated into the
     // character frame — the entity's own travel is part of a foot's

@@ -358,6 +358,7 @@ public func setRootMotionEnabled(entityId: EntityID, enabled: Bool, rootJointPat
     for (_, animationComponent) in animationComponents {
         animationComponent.rootMotion.isEnabled = enabled
         animationComponent.rootMotion.rootJointPath = rootJointPath
+        animationComponent.rootMotion.anchorEntity = entityId
         animationComponent.rootMotion.resolvedRootIndex = nil
         animationComponent.rootMotion.resetHistory()
     }
@@ -430,6 +431,7 @@ public func setMotionMatching(entityId: EntityID, descriptor: MotionMatchingDesc
 
     for (_, animationComponent) in animationComponents {
         animationComponent.motionMatching.descriptor = descriptor
+        animationComponent.motionMatching.anchorEntity = entityId
         animationComponent.motionMatching.reset()
     }
 }
@@ -443,6 +445,9 @@ public func setMotionMatchingEnabled(entityId: EntityID, enabled: Bool) {
 
     for (_, animationComponent) in animationComponents {
         animationComponent.motionMatching.isEnabled = enabled
+        if animationComponent.motionMatching.anchorEntity == .invalid {
+            animationComponent.motionMatching.anchorEntity = entityId
+        }
     }
 }
 

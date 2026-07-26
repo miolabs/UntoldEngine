@@ -29,6 +29,12 @@ import simd
 struct RootMotionState {
     var isEnabled = false
 
+    /// Entity whose transform receives the extracted deltas — the entity
+    /// the public API was called on (the gameplay handle). Hierarchical
+    /// assets keep their AnimationComponent on a skinned descendant, but
+    /// games move the asset root.
+    var anchorEntity: EntityID = .invalid
+
     /// Optional joint-path override; by default the skeleton's first
     /// parentless joint drives root motion.
     var rootJointPath: String?
@@ -146,6 +152,10 @@ func applyRootMotion(
     let translationTime = wrappedChannelTime(channelTime, lastKeyTime: channel.translationTimes.last)
     let rotationTime = wrappedChannelTime(channelTime, lastKeyTime: channel.rotationTimes.last)
 
+    let motionEntity = animationComponent.rootMotion.anchorEntity == .invalid
+        ? entityId
+        : animationComponent.rootMotion.anchorEntity
+
     if animationComponent.rootMotion.hasPreviousSample {
         var delta = translation - animationComponent.rootMotion.previousTranslation
         if translationTime < animationComponent.rootMotion.previousTranslationTime {
@@ -159,21 +169,21 @@ func applyRootMotion(
         yawDelta = wrapAngle(yawDelta)
 
         let horizontal = simd_float3(delta.x, 0, delta.z)
-        if scene.get(component: LocalTransformComponent.self, for: entityId) != nil {
+        if scene.get(component: LocalTransformComponent.self, for: motionEntity) != nil {
             // LocalTransformComponent's default rotation is the zero
             // quaternion (simd_quatf()), which rotates every vector to zero
             // — treat it as identity so deltas survive on never-rotated
             // entities.
-            var entityRotation = getRotationQuaternion(entityId: entityId)
+            var entityRotation = getRotationQuaternion(entityId: motionEntity)
             if simd_length_squared(entityRotation.vector) < 1e-8 {
                 entityRotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
             }
             if simd_length_squared(horizontal) > 0 {
-                translateBy(entityId: entityId, position: entityRotation.act(horizontal))
+                translateBy(entityId: motionEntity, position: entityRotation.act(horizontal))
             }
             if yawDelta != 0 {
                 let yawRotation = simd_quatf(angle: yawDelta, axis: simd_float3(0, 1, 0))
-                rotateTo(entityId: entityId, rotation: simd_normalize(entityRotation * yawRotation))
+                rotateTo(entityId: motionEntity, rotation: simd_normalize(entityRotation * yawRotation))
             }
         }
     }

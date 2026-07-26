@@ -252,3 +252,46 @@ final class AnimationMotionMatchingTests: XCTestCase {
         XCTAssertFalse(isMotionMatchingEnabled(entityId: entityId))
     }
 }
+
+extension AnimationMotionMatchingTests {
+    /// Hierarchical assets (setEntityMeshAsync) carry their
+    /// AnimationComponent on a scenegraph child while the game drives the
+    /// root. Root motion deltas and the character frame must anchor to the
+    /// entity the public API was called on, not the component's entity.
+    @MainActor
+    func testHierarchicalAssetAnchorsMotionToAPIEntity() {
+        let root = createEntity()
+        registerComponent(entityId: root, componentType: LocalTransformComponent.self)
+        registerComponent(entityId: root, componentType: WorldTransformComponent.self)
+        registerComponent(entityId: root, componentType: ScenegraphComponent.self)
+        defer { destroyEntity(entityId: root) }
+
+        // Reparent the fixture entity (which carries all the components)
+        // under the root, then call every API on the root — like a game.
+        setParent(childId: entityId, parentId: root)
+
+        setRootMotionEnabled(entityId: root, enabled: true)
+        setMotionMatching(entityId: root, descriptor: MotionMatchingDescriptor(
+            leftFootPath: "root/foot_l",
+            rightFootPath: "root/foot_r",
+            weights: MotionMatchingWeights(footVelocity: 0.5)
+        ))
+        setMotionMatchingEnabled(entityId: root, enabled: true)
+        setMotionMatchingGoal(entityId: root, desiredVelocity: simd_float3(0, 0, 1))
+
+        var time: Float = 0
+        while time < 1.5 {
+            AnimationSystem.shared.update(deltaTime)
+            time += deltaTime
+        }
+
+        XCTAssertGreaterThan(
+            getLocalPosition(entityId: root).z, 0.3,
+            "Root motion must move the API entity (the gameplay handle)"
+        )
+        XCTAssertEqual(
+            simd_length(getLocalPosition(entityId: entityId)), 0, accuracy: 1e-4,
+            "The component's child entity must not drift inside the asset"
+        )
+    }
+}
