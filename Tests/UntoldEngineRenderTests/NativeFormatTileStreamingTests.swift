@@ -28,12 +28,14 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
         MemoryBudgetManager.shared.enabled = true
         MemoryBudgetManager.shared.geometryBudget = 512 * 1024 * 1024
         MemoryBudgetManager.shared.textureBudget = 256 * 1024 * 1024
+        ColorLUTParams.shared.clear()
     }
 
     override func tearDown() async throws {
         GeometryStreamingSystem.shared.reset()
         GeometryStreamingSystem.shared.enabled = false
         MemoryBudgetManager.shared.clear()
+        ColorLUTParams.shared.clear()
         LoadingSystem.shared.resourceURLFn = getResourceURL
         destroyAllEntities()
         try await super.tearDown()
@@ -55,7 +57,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     func testLoadTileAndReloadUntoldManifestPayload() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
         let tileComp = try XCTUnwrap(scene.get(component: TileComponent.self, for: tileEntityId))
@@ -105,7 +107,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     func testLoadHLODAndLODLevel_acceptUntoldPayloads() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: true)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
         let tileComp = try XCTUnwrap(scene.get(component: TileComponent.self, for: tileEntityId))
@@ -193,28 +195,28 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
         XCTAssertEqual(far, 750.0, accuracy: 0.001)
     }
 
-    func testTileManifestSkipsSceneAuthoredLightsAndCamerasByDefault() throws {
+    func testTileManifestSkipsSceneAuthoredLightsAndCamerasByDefault() async throws {
         let fixture = try makeUntoldTileSceneFixture(
             includeHLOD: false,
             includeLOD: false,
             includeScenePayload: true
         )
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         XCTAssertNil(findEntity(named: "Manifest Key Light"))
         XCTAssertNil(findEntity(named: "Manifest Camera"))
     }
 
-    func testTileManifestRegistersSceneAuthoredLightsAndCamerasWhenRequested() throws {
+    func testTileManifestRegistersSceneAuthoredLightsAndCamerasWhenRequested() async throws {
         let fixture = try makeUntoldTileSceneFixture(
             includeHLOD: false,
             includeLOD: false,
             includeScenePayload: true
         )
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
         let sceneAuthoredExpectation = expectation(description: "scene authored loaded")
         loadSceneAuthored(url: fixture.manifestURL) { _ in sceneAuthoredExpectation.fulfill() }
-        wait(for: [sceneAuthoredExpectation], timeout: 5.0)
+        await fulfillment(of: [sceneAuthoredExpectation], timeout: 5.0)
 
         let lightEntityId = try XCTUnwrap(findEntity(named: "Manifest Key Light"))
         let light = try XCTUnwrap(scene.get(component: LightComponent.self, for: lightEntityId))
@@ -249,6 +251,36 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
         XCTAssertEqual(far, 750.0, accuracy: 0.001)
     }
 
+    func testSceneAuthoredManifestInstallsAndResetsColorLUT() async throws {
+        let fixture = try makeUntoldTileSceneFixture(
+            includeHLOD: false,
+            includeLOD: false,
+            includeColorLUT: true
+        )
+        let installed = await loadSceneManifestFromURL(fixture.manifestURL)
+        XCTAssertTrue(installed)
+
+        let active = ColorLUTParams.shared.snapshot()
+        XCTAssertTrue(active.enabled)
+        XCTAssertEqual(active.lutTexture?.pixelFormat, .rgba16Float)
+        XCTAssertEqual(active.lutTexture?.width, 16)
+        XCTAssertEqual(active.lutTexture?.height, 4)
+        XCTAssertEqual(active.lutTexture?.mipmapLevelCount, 1)
+        XCTAssertEqual(active.lutSize, 4)
+
+        let noLUTFixture = try makeUntoldTileSceneFixture(
+            includeHLOD: false,
+            includeLOD: false
+        )
+        let reset = await loadSceneManifestFromURL(noLUTFixture.manifestURL)
+        XCTAssertTrue(reset)
+
+        let cleared = ColorLUTParams.shared.snapshot()
+        XCTAssertFalse(cleared.enabled)
+        XCTAssertNil(cleared.lutTexture)
+        XCTAssertEqual(cleared.lutSize, 0)
+    }
+
     // MARK: - Parse timeout — clock starts after download, not before
 
     /// Verifies the parse-timeout fix: `parseStartTime` is 0 immediately after
@@ -261,7 +293,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     /// and that it advances before the tile reaches `.parsed`.
     func testParseStartTimeIsZeroOnDispatchThenNonZeroBeforeParse() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -305,9 +337,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     ///   camera at world (9, 0, 0):
     ///     scale 0.1  → effective camera at (90, 0, 0) → dist to tile AABB = 89 m > 86 → BLOCKED
     ///     scale 1.0  → effective camera at  (9, 0, 0) → dist to tile AABB =  8 m ≤ 86 → DISPATCHED
-    func testTiledScene_scaleDownViaSceneRootTransform_reducesEffectiveStreamingRadius() throws {
+    func testTiledScene_scaleDownViaSceneRootTransform_reducesEffectiveStreamingRadius() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -360,7 +392,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     /// mesh-root child entity is destroyed synchronously.
     func testForceUnloadAllParsedTiles_unloadsParsedTileAndDestroysDescendants() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -385,7 +417,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     /// because forceUnloadAllParsedTiles iterates loadedHLODEntities independently.
     func testForceUnloadAllParsedTiles_unloadsResidentHLOD() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -407,7 +439,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     /// A resident per-tile LOD level is unloaded even when the full tile itself is not .parsed.
     func testForceUnloadAllParsedTiles_unloadsResidentLODLevels() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: true)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -434,9 +466,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     ///
     /// State is injected directly (same technique as the timeout-guard tests) to make the
     /// test deterministic — we need the tile to be in .parsing when the call fires.
-    func testForceUnloadAllParsedTiles_cancelsParsingSoSuccessPathCannotFire() throws {
+    func testForceUnloadAllParsedTiles_cancelsParsingSoSuccessPathCannotFire() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -468,9 +500,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     }
 
     /// When no tiles are loaded, forceUnloadAllParsedTiles must be a safe no-op.
-    func testForceUnloadAllParsedTiles_isNoOpWhenNothingIsLoaded() throws {
+    func testForceUnloadAllParsedTiles_isNoOpWhenNothingIsLoaded() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
         XCTAssertEqual(scene.get(component: TileComponent.self, for: tileEntityId)?.state, .unloaded,
@@ -489,7 +521,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     /// loads until the slow distance-based unload pass completed (10+ seconds).
     func testForceUnloadAllParsedTiles_tileIsReloadableImmediatelyAfterSessionTransition() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -521,7 +553,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     func testHLOD_loadIsNoOpWhenAlreadyLoaded() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -545,7 +577,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     func testHLOD_cancelDuringLoading() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -571,7 +603,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     func testHLOD_unloadedAfterFullTileIsRenderVisible() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -600,9 +632,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
         XCTAssertNil(releasedTC.hlodEntityId, "HLOD entity reference must be nil after LOD0 handoff")
     }
 
-    func testHLOD_doubleUnloadIsNoOp() throws {
+    func testHLOD_doubleUnloadIsNoOp() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -617,7 +649,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     func testHLOD_lastTransitionTimeSetOnLoad() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
         let beforeLoad = CFAbsoluteTimeGetCurrent()
@@ -635,7 +667,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     func testHLOD_lastTransitionTimeUpdatedOnUnload() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: true, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -662,9 +694,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     /// Injects stuck-parse state directly (no real hung parse needed) and
     /// verifies the timeout guard transitions the tile to .failed with retry bookkeeping.
-    func testTimeoutGuard_transitionsParsingToFailed() throws {
+    func testTimeoutGuard_transitionsParsingToFailed() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -692,9 +724,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     }
 
     /// A tile that was .unloading when the timeout fires should go to .unloaded, not .failed.
-    func testTimeoutGuard_transitionsUnloadingToUnloaded() throws {
+    func testTimeoutGuard_transitionsUnloadingToUnloaded() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -719,9 +751,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
 
     /// The guard requires parseStartTime > 0.  When it is 0 (download still in flight)
     /// the guard must not fire even with a zero-second threshold.
-    func testTimeoutGuard_doesNotFireWhenParseStartTimeIsZero() throws {
+    func testTimeoutGuard_doesNotFireWhenParseStartTimeIsZero() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -748,9 +780,9 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
     }
 
     /// A parse that just started must not be timed out even if the threshold is very low.
-    func testTimeoutGuard_doesNotFireBeforeThreshold() throws {
+    func testTimeoutGuard_doesNotFireBeforeThreshold() async throws {
         let fixture = try makeUntoldTileSceneFixture(includeHLOD: false, includeLOD: false)
-        try loadSceneManifest(at: fixture.manifestURL)
+        try await loadSceneManifest(at: fixture.manifestURL)
 
         let tileEntityId = try XCTUnwrap(findEntity(named: fixture.tileID))
 
@@ -775,7 +807,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
         tileComp.parseStartTime = 0
     }
 
-    private func loadSceneManifest(at manifestURL: URL) throws {
+    private func loadSceneManifest(at manifestURL: URL) async throws {
         let expectation = XCTestExpectation(description: "Manifest loaded")
         let manifestStem = manifestURL.deletingPathExtension().path
         var didSucceed = false
@@ -788,7 +820,7 @@ final class NativeFormatTileStreamingTests: BaseRenderSetup {
             expectation.fulfill()
         }
 
-        wait(for: [expectation], timeout: 5.0)
+        await fulfillment(of: [expectation], timeout: 5.0)
         XCTAssertTrue(didSucceed, "Tile manifest should load successfully")
     }
 
@@ -825,7 +857,8 @@ private struct UntoldTileSceneFixture {
 private func makeUntoldTileSceneFixture(
     includeHLOD: Bool,
     includeLOD: Bool,
-    includeScenePayload: Bool = false
+    includeScenePayload: Bool = false,
+    includeColorLUT: Bool = false
 ) throws -> UntoldTileSceneFixture {
     guard let sourceUntoldURL = Bundle.module.url(forResource: "redplayer", withExtension: "untold") else {
         throw NSError(domain: "NativeFormatTileStreamingTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to locate redplayer.untold in test resources"])
@@ -893,6 +926,45 @@ private func makeUntoldTileSceneFixture(
         ],
         "tiles": [tileEntry],
     ]
+
+    if includeColorLUT {
+        let lutSize = 4
+        let width = lutSize * lutSize
+        let payloadSize = width * lutSize * 8
+        let writer = UntoldBinaryWriter()
+        NativeTexHeader(
+            flags: NativeTexFlags.hasAlpha,
+            width: UInt32(width),
+            height: UInt32(lutSize),
+            mipCount: 1,
+            pixelFormat: NativeTexFormat.rgba16FloatPixelFormat,
+            blockWidth: 1,
+            blockHeight: 1,
+            payloadOffset: NativeTexFormat.payloadOffset(mipCount: 1),
+            totalPayloadSize: UInt32(payloadSize)
+        ).encode(to: writer)
+        NativeTexMipEntry(
+            byteOffset: 0,
+            byteSize: UInt32(payloadSize),
+            widthPx: UInt32(width),
+            heightPx: UInt32(lutSize)
+        ).encode(to: writer)
+        writer.writeData(Data(count: payloadSize))
+        let lutFileName = "gradelut_test.utex"
+        try writer.data.write(to: fixtureRoot.appendingPathComponent(lutFileName))
+
+        manifest["colorLUT"] = [
+            "lutUri": lutFileName,
+            "lutSize": lutSize,
+            "viewTransform": "AgX",
+            "look": "Medium High Contrast",
+            "displayDevice": "sRGB",
+            "exposure": 0.0,
+            "gamma": 1.0,
+            "shaperMinStops": -10.0,
+            "shaperMaxStops": 6.0,
+        ]
+    }
 
     if includeScenePayload {
         let keyLightRows: [[Float]] = [

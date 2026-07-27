@@ -64,14 +64,18 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from untoldexplorer import (
+    ColorManagementBake,
     ProgressCallback,
     ProgressReporter,
+    bake_color_management_lut,
     clear_scene,
     export_objects_to_untold,
     extract_scene_payload_from_objects,
     import_usd_asset,
     load_blend_scene,
+    stage_hdr_assets_for_output,
     validate_bake_resolution,
+    validate_lut_size,
 )
 
 
@@ -115,6 +119,7 @@ def _manifest_light_payload(light):
         "intensity": float(light.intensity),
         "position": _manifest_vec(light.position),
         "radius": float(light.radius),
+        "range": float(getattr(light, "range", 0.0)),
         "direction": _manifest_vec(light.direction),
         "falloff": float(light.falloff),
         "right": _manifest_vec(light.right),
@@ -124,6 +129,8 @@ def _manifest_light_payload(light):
         "area_size": _manifest_vec(light.area_size),
         "source_power": float(light.source_power),
         "source_exposure": float(light.source_exposure),
+        "casts_shadow": bool(getattr(light, "casts_shadow", False)),
+        "uses_radiometric_units": True,
         "local_transform_rows": _manifest_matrix_rows(light.local_transform_rows),
     }
 
@@ -140,6 +147,28 @@ def _manifest_camera_payload(camera):
         "far_clip": float(camera.far_clip),
         "aspect_ratio": float(camera.aspect_ratio),
         "local_transform_rows": _manifest_matrix_rows(camera.local_transform_rows),
+    }
+
+
+def _manifest_color_management_payload(bake, manifest_dir=None):
+    if bake is None:
+        return None
+    lut_uri = bake.lut_texture.uri
+    if manifest_dir is not None and bake.lut_texture.source_path is not None:
+        lut_uri = os.path.relpath(
+            bake.lut_texture.source_path,
+            Path(manifest_dir),
+        ).replace(os.sep, "/")
+    return {
+        "lutUri": lut_uri,
+        "lutSize": bake.lut_size,
+        "viewTransform": bake.view_transform,
+        "look": bake.look,
+        "displayDevice": bake.display_device,
+        "exposure": float(bake.exposure),
+        "gamma": float(bake.gamma),
+        "shaperMinStops": float(bake.shaper_min_stops),
+        "shaperMaxStops": float(bake.shaper_max_stops),
     }
 
 
@@ -185,6 +214,8 @@ BAKE_CACHE = True                # Skip re-baking materials unchanged since the 
                                   # Cache location follows source_asset_path (shared across all tiles from one
                                   # --input source); falls back to being scoped per-tile-output when no --input
                                   # source path is known (e.g. addon exports operating on an already-open scene).
+BAKE_COLOR_MANAGEMENT = False   # Bake the scene's View Transform/Look/Exposure/Gamma into a LUT (see --bake-color-management).
+COLOR_LUT_SIZE = 32             # Grid size (N) for the NxNxN color-grading LUT.
 
 # Tile footprint in Blender world units.
 # Start at 10 and tune with DRY_RUN=True.  Rule of thumb: set to 2–3× the
@@ -4654,6 +4685,21 @@ def run():
     else:
         print("DRY_RUN enabled: no files will be written.")
 
+    # Color management is scene-wide (one View Transform per Blender scene), so
+    # bake it once here rather than per-tile.
+    color_management_bake = None
+    if BAKE_COLOR_MANAGEMENT and (not DRY_RUN or DRY_RUN_WRITE_MANIFEST):
+        print_export_stage("Bake color management")
+        color_management_bake = bake_color_management_lut(COLOR_LUT_SIZE, Path(output_dir) / "Textures")
+
+    # The world/studio-light HDR environment is scene-wide too, so stage it
+    # once here rather than per-tile -- same reasoning as color management.
+    staged_hdr_assets: list[Path] = []
+    if not DRY_RUN or DRY_RUN_WRITE_MANIFEST:
+        print_export_stage("Stage HDR environment")
+        hdr_asset_path = Path(source_scene_path) if source_scene_path else Path(output_dir)
+        staged_hdr_assets = stage_hdr_assets_for_output(Path(output_dir), hdr_asset_path)
+
     # ------------------------------------------------------------------
     # Gather objects and compute world bounds
     # ------------------------------------------------------------------
@@ -4915,6 +4961,7 @@ def run():
         "scene_bounds": {"min": list(sb_usd["min"]), "max": list(sb_usd["max"])},
         "scene_lights": scene_lights,
         "scene_cameras": scene_cameras,
+        "colorLUT": _manifest_color_management_payload(color_management_bake, model_dir),
         "streaming_profile": {
             "requested": SCENE_STREAMING_PROFILE,
             "resolved": resolved_profile,
@@ -5782,6 +5829,21 @@ def parse_args(argv):
         help="Disable the persistent bake cache and force every divergent material to be re-baked.",
     )
     parser.add_argument(
+        "--bake-color-management",
+        action="store_true",
+        help=(
+            "Bake the scene's active View Transform/Look/Exposure/Gamma into a scene-wide "
+            "RGBA16Float LUT referenced from the manifest's colorLUT key so Untold can "
+            "closely reproduce Blender's canonical sRGB display transform."
+        ),
+    )
+    parser.add_argument(
+        "--color-lut-size",
+        type=int,
+        default=None,
+        help="Grid size (N) for the NxNxN color-grading LUT (default: 32).",
+    )
+    parser.add_argument(
         "--quadtree",
         action="store_true",
         help=(
@@ -5893,6 +5955,8 @@ def apply_cli_overrides(args):
     global BAKE_MATERIALS
     global BAKE_RESOLUTION
     global BAKE_CACHE
+    global BAKE_COLOR_MANAGEMENT
+    global COLOR_LUT_SIZE
     global SAMPLE_MODE
     global SAMPLE_FRACTION
     global PERIMETER_MODE
@@ -5963,6 +6027,10 @@ def apply_cli_overrides(args):
         BAKE_RESOLUTION = validate_bake_resolution(args.bake_resolution)
     if getattr(args, "no_bake_cache", False):
         BAKE_CACHE = False
+    if getattr(args, "bake_color_management", False):
+        BAKE_COLOR_MANAGEMENT = True
+    if getattr(args, "color_lut_size", None) is not None:
+        COLOR_LUT_SIZE = validate_lut_size(args.color_lut_size)
     if getattr(args, "sample", False):
         SAMPLE_MODE = True
     if getattr(args, "sample_fraction", None) is not None:

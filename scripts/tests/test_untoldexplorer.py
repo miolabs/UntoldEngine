@@ -122,6 +122,27 @@ class UntoldExplorerTests(unittest.TestCase):
         self.assertIsNotNone(texture)
         self.assertEqual(texture.channel, u.TEXTURE_CHANNEL_A)
 
+    def test_unique_hdr_destination_name_deduplicates_collisions(self) -> None:
+        context = u.HDRStagingContext()
+
+        first = u.unique_hdr_destination_name("forest.exr", context)
+        second = u.unique_hdr_destination_name("forest.exr", context)
+        third = u.unique_hdr_destination_name("forest.exr", context)
+
+        self.assertEqual(first, "forest.exr")
+        self.assertTrue(second.startswith("forest_"))
+        self.assertTrue(second.endswith(".exr"))
+        self.assertNotEqual(second, first)
+        self.assertNotEqual(third, second)
+
+    def test_hdr_staging_key_prefers_resolved_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "forest.exr"
+            key = u.hdr_staging_key(path, "IgnoredImage", "fallback")
+
+        self.assertTrue(key.startswith("path:"))
+        self.assertIn("forest.exr", key)
+
     def test_normalize_and_pack_helpers_use_fallbacks_and_clamping(self) -> None:
         self.assertEqual(u.normalize3((0.0, 0.0, 0.0), (1.0, 2.0, 3.0)), (1.0, 2.0, 3.0))
         self.assertEqual(u.pack_snorm10(2.0), 511)
@@ -177,6 +198,142 @@ class UntoldExplorerTests(unittest.TestCase):
         px, py, pz = struct.unpack_from("<fff", writer.data, 0)
         self.assertEqual((px, py, pz), (1.0, 2.0, 3.0))
         self.assertEqual(writer.data[-4:], bytes([255, 128, 0, 64]))
+
+    def test_set_scene_color_management_raw_forces_raw_despite_broken_enum_introspection(self) -> None:
+        # Regression test: bl_rna.properties[...].enum_items.keys() returns a
+        # placeholder ('NONE') instead of the config's real dynamic enum
+        # values in this environment, which used to make every "is this a
+        # valid option" guard silently false -- so _set_scene_color_management_raw
+        # never actually assigned Raw/Standard/None at all, leaving whatever
+        # View Transform the scene already had (e.g. AgX) untouched. The fix
+        # attempts the assignment directly instead of pre-checking via that
+        # introspection.
+        class _FakeViewSettings:
+            def __init__(self, valid_view_transforms, valid_looks, view_transform, look):
+                self._valid_view_transforms = valid_view_transforms
+                self._valid_looks = valid_looks
+                self.view_transform = view_transform
+                self.look = look
+                self.exposure = 0.5
+                self.gamma = 1.2
+
+            def __setattr__(self, name, value):
+                if name == "view_transform" and hasattr(self, "_valid_view_transforms") and value not in self._valid_view_transforms:
+                    raise TypeError(f"enum {value!r} not in {self._valid_view_transforms}")
+                if name == "look" and hasattr(self, "_valid_looks") and value not in self._valid_looks:
+                    raise TypeError(f"enum {value!r} not in {self._valid_looks}")
+                object.__setattr__(self, name, value)
+
+        class _FakeDisplaySettings:
+            def __init__(self, valid_devices, display_device):
+                self._valid_devices = valid_devices
+                self.display_device = display_device
+
+            def __setattr__(self, name, value):
+                if name == "display_device" and hasattr(self, "_valid_devices") and value not in self._valid_devices:
+                    raise TypeError(f"enum {value!r} not in {self._valid_devices}")
+                object.__setattr__(self, name, value)
+
+        class _FakeScene:
+            def __init__(self, view_settings, display_settings):
+                self.view_settings = view_settings
+                self.display_settings = display_settings
+
+        # Scene supports "Raw" -- must end up set to "Raw", not left at "AgX".
+        scene_with_raw = _FakeScene(
+            _FakeViewSettings(("AgX", "Raw", "Standard"), ("AgX - Base Contrast", "None"), "AgX", "AgX - Base Contrast"),
+            _FakeDisplaySettings(("sRGB", "None"), "sRGB"),
+        )
+        u._set_scene_color_management_raw(scene_with_raw)
+        self.assertEqual(scene_with_raw.view_settings.view_transform, "Raw")
+        self.assertEqual(scene_with_raw.view_settings.look, "None")
+        self.assertEqual(scene_with_raw.view_settings.exposure, 0.0)
+        self.assertEqual(scene_with_raw.view_settings.gamma, 1.0)
+
+        # Scene has no "Raw" option -- must fall back to "Standard", not be left unset.
+        scene_without_raw = _FakeScene(
+            _FakeViewSettings(("AgX", "Standard"), ("AgX - Base Contrast",), "AgX", "AgX - Base Contrast"),
+            _FakeDisplaySettings(("sRGB", "Display P3"), "sRGB"),
+        )
+        u._set_scene_color_management_raw(scene_without_raw)
+        self.assertEqual(scene_without_raw.view_settings.view_transform, "Standard")
+
+    def test_lut_shaper_decode_is_monotonic_and_anchors_middle_gray(self) -> None:
+        # t=0.5 with the default -10..+6 stop range lands 8 stops below the
+        # midpoint's own reference, not exactly at 0.18 -- what matters is that
+        # decode is monotonically increasing and passes through known stops.
+        anchor_t = (0.0 - u._LUT_SHAPER_MIN_STOPS) / (u._LUT_SHAPER_MAX_STOPS - u._LUT_SHAPER_MIN_STOPS)
+        self.assertAlmostEqual(u._lut_shaper_decode(anchor_t), u._LUT_SHAPER_MIDDLE_GRAY, places=5)
+
+        values = [u._lut_shaper_decode(i / 100) for i in range(101)]
+        self.assertEqual(values, sorted(values))
+        self.assertLess(values[0], u._LUT_SHAPER_MIDDLE_GRAY)
+        self.assertGreater(values[-1], u._LUT_SHAPER_MIDDLE_GRAY)
+
+    def test_identity_lut_grid_pixels_row_order_survives_blenders_vertical_flip(self) -> None:
+        # Regression test: Blender's `image.pixels` buffer is bottom-up, but
+        # `image.save_render()` flips vertically when writing a top-down PNG.
+        # build_identity_lut_grid_pixels must pre-compensate so that after that
+        # flip, PNG/texture row g still holds green-axis grid index g (the
+        # convention the runtime LUT sampler assumes). This test simulates the
+        # flip directly on the returned buffer rather than actually saving a
+        # PNG through Blender.
+        lut_size = 4
+        width = lut_size * lut_size
+        pixels = u.build_identity_lut_grid_pixels(lut_size)
+        self.assertEqual(len(pixels), width * lut_size * 4)
+
+        def buffer_pixel(px: int, py: int) -> tuple[float, float, float, float]:
+            idx = (py * width + px) * 4
+            return tuple(pixels[idx : idx + 4])
+
+        # Simulate save_render's vertical flip: post-flip row g == buffer row (lut_size - 1 - g).
+        def post_flip_pixel(px: int, g: int) -> tuple[float, float, float, float]:
+            return buffer_pixel(px, lut_size - 1 - g)
+
+        expected_green = [u._lut_shaper_decode(i / (lut_size - 1)) for i in range(lut_size)]
+        for g in range(lut_size):
+            # px=0 -> r index 0 within tile b=0; green channel (index 1) must
+            # equal expected_green[g] once the flip is undone.
+            _, green, _, _ = post_flip_pixel(0, g)
+            self.assertAlmostEqual(green, expected_green[g], places=5)
+
+    def test_rgba16f_utex_preserves_precision_orientation_and_format(self) -> None:
+        # Two bottom-up Blender rows. The native payload must reverse them so
+        # Metal row zero contains the image's top row.
+        bottom_row = [0.001, 0.002, 0.003, 1.0, 0.004, 0.005, 0.006, 1.0]
+        top_row = [0.501, 0.502, 0.503, 1.0, 0.504, 0.505, 0.506, 1.0]
+        data = u.build_rgba16f_utex_bytes(bottom_row + top_row, 2, 2)
+        width, height, decoded = u.decode_rgba16f_utex_bytes(data)
+
+        self.assertEqual((width, height), (2, 2))
+        header = struct.unpack_from(u._UTEX_HEADER_FMT, data, 0)
+        self.assertEqual(header[6], u._UTEX_RGBA16_FLOAT_PIXEL_FORMAT)
+        self.assertEqual((header[7], header[8]), (1, 1))
+        for actual, expected in zip(decoded[:8], top_row):
+            self.assertAlmostEqual(actual, expected, delta=0.0003)
+        for actual, expected in zip(decoded[8:], bottom_row):
+            self.assertAlmostEqual(actual, expected, delta=0.0003)
+
+    def test_color_lut_filename_is_content_addressed(self) -> None:
+        first = u.color_lut_filename(b"first LUT")
+        self.assertEqual(first, u.color_lut_filename(b"first LUT"))
+        self.assertNotEqual(first, u.color_lut_filename(b"second LUT"))
+        self.assertTrue(first.startswith("gradelut_"))
+        self.assertTrue(first.endswith(".utex"))
+
+    def test_cpu_lut_sampler_matches_identity_grid_at_grid_points(self) -> None:
+        lut_size = 4
+        source = u.build_identity_lut_grid_pixels(lut_size)
+        data = u.build_rgba16f_utex_bytes(source, lut_size * lut_size, lut_size)
+        _, _, pixels = u.decode_rgba16f_utex_bytes(data)
+        values = [u._lut_shaper_decode(index / (lut_size - 1)) for index in range(lut_size)]
+
+        for red_index, green_index, blue_index in ((0, 0, 0), (1, 2, 3), (3, 1, 2)):
+            color = (values[red_index], values[green_index], values[blue_index])
+            sampled = u.sample_color_lut_pixels(pixels, lut_size, color)
+            for actual, expected in zip(sampled, color):
+                self.assertAlmostEqual(actual, expected, delta=0.006)
 
     def test_write_header_uses_fixed_header_size(self) -> None:
         writer = u.BinaryWriter()
@@ -357,9 +514,11 @@ class UntoldExplorerTests(unittest.TestCase):
 
         self.assertEqual(lights[1].entity_name, "Spot")
         self.assertEqual(lights[1].light_type, u.LIGHT_TYPE_SPOT)
-        self.assertAlmostEqual(lights[1].outer_cone, 40.0)
-        self.assertAlmostEqual(lights[1].inner_cone, 30.0)
+        self.assertAlmostEqual(lights[1].outer_cone, 20.0)
+        self.assertAlmostEqual(lights[1].inner_cone, 15.0)
         self.assertAlmostEqual(lights[1].radius, 6.0)
+        self.assertEqual(lights[1].range, 0.0)
+        self.assertTrue(lights[1].casts_shadow)
 
         self.assertEqual(lights[2].entity_name, "Area")
         self.assertEqual(lights[2].light_type, u.LIGHT_TYPE_AREA)
@@ -383,6 +542,19 @@ class UntoldExplorerTests(unittest.TestCase):
         self.assertAlmostEqual(cameras[0].near_clip, 0.05)
         self.assertAlmostEqual(cameras[0].far_clip, 750.0)
         self.assertAlmostEqual(cameras[0].aspect_ratio, 1.6)
+
+    def test_blender_light_shadow_and_custom_distance_are_exported_independently(self) -> None:
+        light = FakeData(
+            type="POINT",
+            shadow_soft_size=0.25,
+            use_shadow=False,
+            use_custom_distance=True,
+            cutoff_distance=14.0,
+        )
+
+        self.assertAlmostEqual(u._blender_light_radius(light, u.LIGHT_TYPE_POINT), 0.25)
+        self.assertAlmostEqual(u._blender_light_influence_range(light, u.LIGHT_TYPE_POINT), 14.0)
+        self.assertFalse(u._blender_light_casts_shadow(light))
 
     def test_normalize_blender_path_and_blender_required(self) -> None:
         resolved = u.normalize_blender_path("./scripts/../scripts/untoldexplorer.py")
@@ -827,36 +999,6 @@ class MaterialGraphAnalysisTests(unittest.TestCase):
         material = _make_material("ok_mat", [output, principled, tex])
         self.assertEqual(u.material_bake_plan(material), {})
 
-    def test_png_needs_conversion_flags_indexed_grayscale_and_16bit(self) -> None:
-        def make_png_header(bit_depth: int, color_type: int) -> bytes:
-            # Magic + chunk length (unused) + "IHDR" + width + height + bit_depth + color_type.
-            # _png_ihdr only reads the first 26 bytes, so the rest of a real PNG isn't needed.
-            return (
-                b"\x89PNG\r\n\x1a\n"
-                + b"\x00\x00\x00\x0d"
-                + b"IHDR"
-                + b"\x00\x00\x04\x00\x00\x00\x04\x00"  # 1024x1024
-                + bytes([bit_depth, color_type])
-            )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cases = [
-                ("rgb_8bit.png", 8, 2, False),       # standard RGB — no conversion
-                ("rgba_8bit.png", 8, 6, False),      # standard RGBA — no conversion
-                ("gray_8bit.png", 8, 0, True),       # grayscale — Metal maps to R-only
-                ("gray_alpha.png", 8, 4, True),      # grayscale+alpha — same issue
-                ("indexed_1bit.png", 1, 3, True),    # palette — not direct color samples
-                ("indexed_8bit.png", 8, 3, True),    # palette — not direct color samples
-                ("rgb_16bit.png", 16, 2, True),      # 16-bit — Metal has no sRGB 16-bit format
-            ]
-            for filename, bit_depth, color_type, expected in cases:
-                path = Path(tmpdir) / filename
-                path.write_bytes(make_png_header(bit_depth, color_type))
-                self.assertEqual(
-                    u._png_needs_conversion(path), expected,
-                    f"{filename} (bit_depth={bit_depth}, color_type={color_type})",
-                )
-
     def test_material_node_tree_fingerprint_deterministic_and_sensitive(self) -> None:
         mix = FakeNode("ShaderNodeMix")
         mix.name = "Mix"
@@ -931,6 +1073,108 @@ class MaterialGraphAnalysisTests(unittest.TestCase):
     def test_resolution_for_material_clamps_override_above_max(self) -> None:
         mat = self._FakeMaterialWithProps("mat", {"untold_bake_resolution": 999999})
         self.assertEqual(u._resolution_for_material(mat, 1024), u.MAX_BAKE_RESOLUTION)
+
+    def test_next_power_of_two(self) -> None:
+        self.assertEqual(u._next_power_of_two(0), 1)
+        self.assertEqual(u._next_power_of_two(1), 1)
+        self.assertEqual(u._next_power_of_two(2), 2)
+        self.assertEqual(u._next_power_of_two(3), 4)
+        self.assertEqual(u._next_power_of_two(4096), 4096)
+        self.assertEqual(u._next_power_of_two(4097), 8192)
+
+    def test_max_upstream_image_dimension_direct_texture(self) -> None:
+        image = FakeData(filepath="t.png", library=None, size=(2048, 1024), name="t")
+        tex = FakeNode("ShaderNodeTexImage", image=image)
+        tex.name = "tex"
+        principled, _ = _make_principled_output(tex)
+        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 2048)
+
+    def test_max_upstream_image_dimension_through_mix_node(self) -> None:
+        """Mirrors a real AO-multiplied-into-diffuse setup: Base Color is fed by a
+        Mix blending a high-res photo texture with a lower-res AO map. The largest
+        of the two source textures should win, regardless of the node sitting
+        between them and the Principled BSDF."""
+        base_color_image = FakeData(filepath="base.tga", library=None, size=(4096, 4096), name="base")
+        base_color_tex = FakeNode("ShaderNodeTexImage", image=base_color_image)
+        base_color_tex.name = "Base Color Tex"
+        ao_image = FakeData(filepath="ao.png", library=None, size=(2048, 2048), name="ao")
+        ao_tex = FakeNode("ShaderNodeTexImage", image=ao_image)
+        ao_tex.name = "AO Tex"
+
+        mix_input_a = FakeSocket("A")
+        mix_input_a.link_from(base_color_tex, "Color")
+        mix_input_b = FakeSocket("B")
+        mix_input_b.link_from(ao_tex, "Color")
+        mix = FakeNode("ShaderNodeMix", inputs={"A": mix_input_a, "B": mix_input_b})
+        mix.name = "Mix"
+
+        principled, _ = _make_principled_output(mix, "Result")
+        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 4096)
+
+    def test_max_upstream_image_dimension_no_texture_upstream(self) -> None:
+        mix = FakeNode("ShaderNodeMix")
+        mix.name = "Mix"
+        principled, _ = _make_principled_output(mix, "Result")
+        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 0)
+
+    def test_max_upstream_image_dimension_unlinked_socket(self) -> None:
+        principled, _ = _make_principled_output(None)
+        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 0)
+
+    def test_resolution_for_material_auto_detects_from_source_texture(self) -> None:
+        image = FakeData(filepath="t.tga", library=None, size=(4096, 4096), name="t")
+        tex = FakeNode("ShaderNodeTexImage", image=image)
+        tex.name = "tex"
+        mix_input = FakeSocket("A")
+        mix_input.link_from(tex, "Color")
+        mix = FakeNode("ShaderNodeMix", inputs={"A": mix_input})
+        mix.name = "Mix"
+        principled, output = _make_principled_output(mix, "Result")
+        material = _make_material("bed_mat", [output, principled, mix, tex])
+        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
+
+        self.assertEqual(u._resolution_for_material(material, 1024, plan), 4096)
+
+    def test_resolution_for_material_auto_detected_rounds_up_to_power_of_two(self) -> None:
+        image = FakeData(filepath="t.tga", library=None, size=(3000, 3000), name="t")
+        tex = FakeNode("ShaderNodeTexImage", image=image)
+        tex.name = "tex"
+        principled, output = _make_principled_output(tex)
+        material = _make_material("odd_res_mat", [output, principled, tex])
+        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
+
+        self.assertEqual(u._resolution_for_material(material, 1024, plan), 4096)
+
+    def test_resolution_for_material_auto_detected_never_below_default(self) -> None:
+        image = FakeData(filepath="t.png", library=None, size=(512, 512), name="t")
+        tex = FakeNode("ShaderNodeTexImage", image=image)
+        tex.name = "tex"
+        principled, output = _make_principled_output(tex)
+        material = _make_material("small_tex_mat", [output, principled, tex])
+        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
+
+        self.assertEqual(u._resolution_for_material(material, 1024, plan), 1024)
+
+    def test_resolution_for_material_falls_back_to_default_without_plan(self) -> None:
+        image = FakeData(filepath="t.tga", library=None, size=(4096, 4096), name="t")
+        tex = FakeNode("ShaderNodeTexImage", image=image)
+        tex.name = "tex"
+        principled, output = _make_principled_output(tex)
+        material = _make_material("no_plan_mat", [output, principled, tex])
+
+        self.assertEqual(u._resolution_for_material(material, 1024, None), 1024)
+        self.assertEqual(u._resolution_for_material(material, 1024, {}), 1024)
+
+    def test_resolution_for_material_override_takes_precedence_over_auto_detected(self) -> None:
+        image = FakeData(filepath="t.tga", library=None, size=(4096, 4096), name="t")
+        tex = FakeNode("ShaderNodeTexImage", image=image)
+        tex.name = "tex"
+        principled, output = _make_principled_output(tex)
+        mat = self._FakeMaterialWithProps("mat", {"untold_bake_resolution": 2048})
+        mat.node_tree = FakeData(nodes=[output, principled, tex])
+        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
+
+        self.assertEqual(u._resolution_for_material(mat, 1024, plan), 2048)
 
     def test_material_bake_cache_put_then_get_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

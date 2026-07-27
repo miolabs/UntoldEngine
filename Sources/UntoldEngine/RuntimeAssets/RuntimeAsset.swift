@@ -37,8 +37,12 @@ public struct RuntimeLightSource: Sendable, Equatable {
     public var color: SIMD3<Float>
     public var intensity: Float
     public var position: SIMD3<Float>
+    /// Physical source radius used for near-field regularization and shadow softness.
     public var radius: Float
+    /// Optional influence cutoff in scene units. Zero means no authored cutoff.
+    public var range: Float
     public var direction: SIMD3<Float>
+    /// Legacy artistic falloff retained for older assets and procedural lights.
     public var falloff: Float
     public var right: SIMD3<Float>
     public var innerCone: Float
@@ -47,6 +51,8 @@ public struct RuntimeLightSource: Sendable, Equatable {
     public var areaSize: SIMD2<Float>
     public var sourcePower: Float
     public var sourceExposure: Float
+    public var castsShadow: Bool
+    public var usesRadiometricUnits: Bool
     public var localTransform: simd_float4x4
 
     public init(
@@ -56,6 +62,7 @@ public struct RuntimeLightSource: Sendable, Equatable {
         intensity: Float = 1.0,
         position: SIMD3<Float> = .zero,
         radius: Float = 1.0,
+        range: Float = 0.0,
         direction: SIMD3<Float> = SIMD3<Float>(0, -1, 0),
         falloff: Float = 0.5,
         right: SIMD3<Float> = SIMD3<Float>(1, 0, 0),
@@ -65,6 +72,8 @@ public struct RuntimeLightSource: Sendable, Equatable {
         areaSize: SIMD2<Float> = SIMD2<Float>(1, 1),
         sourcePower: Float = 1.0,
         sourceExposure: Float = 0.0,
+        castsShadow: Bool = false,
+        usesRadiometricUnits: Bool = false,
         localTransform: simd_float4x4 = matrix_identity_float4x4
     ) {
         self.name = name
@@ -73,6 +82,7 @@ public struct RuntimeLightSource: Sendable, Equatable {
         self.intensity = intensity
         self.position = position
         self.radius = radius
+        self.range = range
         self.direction = direction
         self.falloff = falloff
         self.right = right
@@ -82,6 +92,8 @@ public struct RuntimeLightSource: Sendable, Equatable {
         self.areaSize = areaSize
         self.sourcePower = sourcePower
         self.sourceExposure = sourceExposure
+        self.castsShadow = castsShadow
+        self.usesRadiometricUnits = usesRadiometricUnits
         self.localTransform = localTransform
     }
 }
@@ -131,8 +143,8 @@ public struct RuntimeTextureReference: Sendable, Equatable {
     public var width: Int?
     public var height: Int?
     public var mipCount: Int?
-    /// Compressed format of the source asset. When `isASTCNative` is true the
-    /// engine loads the texture via NativeTextureLoader instead of MTKTextureLoader.
+    /// GPU format of the source asset. Native `.utex` formats are loaded via
+    /// NativeTextureLoader instead of MTKTextureLoader.
     public var textureFormat: UntoldTextureFormat
 
     public init(
@@ -153,6 +165,34 @@ public struct RuntimeTextureReference: Sendable, Equatable {
         self.height = height
         self.mipCount = mipCount
         self.textureFormat = textureFormat
+    }
+}
+
+/// Scene-wide color-management bake resolved from an asset's
+/// `UntoldColorManagementRecordV1`. At most one per `RuntimeAsset` — applied
+/// by the scene-authored payload loader, not by individual mesh loads.
+public struct RuntimeColorManagement: Sendable, Equatable {
+    public var lutTexture: RuntimeTextureReference?
+    public var exposure: Float
+    public var gamma: Float
+    public var shaperMinStops: Float
+    public var shaperMaxStops: Float
+    public var lutSize: Int
+
+    public init(
+        lutTexture: RuntimeTextureReference? = nil,
+        exposure: Float = 0.0,
+        gamma: Float = 1.0,
+        shaperMinStops: Float = -10.0,
+        shaperMaxStops: Float = 6.0,
+        lutSize: Int = 0
+    ) {
+        self.lutTexture = lutTexture
+        self.exposure = exposure
+        self.gamma = gamma
+        self.shaperMinStops = shaperMinStops
+        self.shaperMaxStops = shaperMaxStops
+        self.lutSize = lutSize
     }
 }
 
@@ -448,6 +488,7 @@ public struct RuntimeAsset: Sendable, Equatable {
     public var nodes: [RuntimeAssetNode]
     public var lights: [RuntimeLightSource]
     public var cameras: [RuntimeCameraSource]
+    public var colorManagement: RuntimeColorManagement?
     public var animationClips: [RuntimeAnimationClip]
     public var meshGroups: [RuntimeMeshGroup]
 
@@ -460,6 +501,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         nodes: [RuntimeAssetNode] = [],
         lights: [RuntimeLightSource] = [],
         cameras: [RuntimeCameraSource] = [],
+        colorManagement: RuntimeColorManagement? = nil,
         animationClips: [RuntimeAnimationClip] = [],
         meshGroups: [RuntimeMeshGroup]
     ) {
@@ -471,6 +513,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         self.nodes = nodes
         self.lights = lights
         self.cameras = cameras
+        self.colorManagement = colorManagement
         self.animationClips = animationClips
         self.meshGroups = meshGroups
     }
@@ -484,6 +527,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         nodes: [RuntimeAssetNode],
         lights: [RuntimeLightSource] = [],
         cameras: [RuntimeCameraSource] = [],
+        colorManagement: RuntimeColorManagement? = nil,
         animationClips: [RuntimeAnimationClip] = []
     ) {
         self.sourceURL = sourceURL
@@ -494,6 +538,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         self.nodes = nodes
         self.lights = lights
         self.cameras = cameras
+        self.colorManagement = colorManagement
         self.animationClips = animationClips
         meshGroups = nodes.compactMap { node in
             guard !node.primitives.isEmpty else { return nil }
