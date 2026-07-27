@@ -68,6 +68,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             nodes: nodes,
             lights: makeRuntimeLights(decoded: decoded),
             cameras: makeRuntimeCameras(decoded: decoded),
+            colorManagement: makeRuntimeColorManagement(decoded: decoded, baseURL: url.deletingLastPathComponent()),
             animationClips: animationClips
         )
     }
@@ -140,15 +141,21 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
 
     private func makeRuntimeLights(decoded: UntoldDecodedAsset) throws -> [RuntimeLightSource] {
         try decoded.lights.map { record in
-            try RuntimeLightSource(
+            let usesRadiometricUnits = record.flags & UntoldLightFlags.radiometric != 0
+            let hasCustomDistance = record.flags & UntoldLightFlags.customDistance != 0
+            let castsShadow = usesRadiometricUnits
+                ? record.flags & UntoldLightFlags.castsShadow != 0
+                : record.lightType == .directional
+            return try RuntimeLightSource(
                 name: decoded.string(at: record.nameOffset),
                 kind: runtimeLightKind(from: record.lightType),
                 color: record.color,
                 intensity: record.intensity,
                 position: record.position,
                 radius: record.radius,
+                range: usesRadiometricUnits && hasCustomDistance ? max(record.falloff, 0.0) : 0.0,
                 direction: record.direction,
-                falloff: record.falloff,
+                falloff: usesRadiometricUnits ? 0.5 : record.falloff,
                 right: record.right,
                 innerCone: record.innerCone,
                 up: record.up,
@@ -156,6 +163,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 areaSize: record.areaSize,
                 sourcePower: record.sourcePower,
                 sourceExposure: record.sourceExposure,
+                castsShadow: castsShadow,
+                usesRadiometricUnits: usesRadiometricUnits,
                 localTransform: record.localTransform
             )
         }
@@ -176,6 +185,51 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 localTransform: record.localTransform
             )
         }
+    }
+
+    private func makeRuntimeColorManagement(decoded: UntoldDecodedAsset, baseURL: URL) throws -> RuntimeColorManagement? {
+        guard let record = decoded.colorManagement else { return nil }
+        guard (2 ... 64).contains(record.lutSize),
+              record.shaperMinStops.isFinite,
+              record.shaperMaxStops.isFinite,
+              record.shaperMaxStops > record.shaperMinStops,
+              record.exposure.isFinite,
+              record.gamma.isFinite,
+              record.gamma > 0
+        else {
+            throw UntoldValidationError.invalidColorManagementRecord
+        }
+
+        guard record.lutTextureIndex != UntoldFormat.invalidIndex,
+              Int(record.lutTextureIndex) < decoded.textures.count
+        else {
+            throw UntoldValidationError.invalidMaterialIndex(record.lutTextureIndex)
+        }
+        let textureRecord = decoded.textures[Int(record.lutTextureIndex)]
+        guard textureRecord.textureFormat == .rgba16Float,
+              textureRecord.mipCount == 1,
+              textureRecord.flags & UntoldTextureFlags.lut != 0
+        else {
+            throw UntoldValidationError.invalidColorManagementRecord
+        }
+        let expectedWidth = record.lutSize * record.lutSize
+        guard textureRecord.width == expectedWidth, textureRecord.height == record.lutSize else {
+            throw UntoldValidationError.invalidColorManagementTextureDimensions(
+                expectedWidth: expectedWidth,
+                expectedHeight: record.lutSize,
+                actualWidth: textureRecord.width,
+                actualHeight: textureRecord.height
+            )
+        }
+
+        return try RuntimeColorManagement(
+            lutTexture: textureReference(at: record.lutTextureIndex, decoded: decoded, baseURL: baseURL, isSRGB: false),
+            exposure: record.exposure,
+            gamma: record.gamma,
+            shaperMinStops: record.shaperMinStops,
+            shaperMaxStops: record.shaperMaxStops,
+            lutSize: Int(record.lutSize)
+        )
     }
 
     private func runtimeLightKind(from lightType: UntoldLightType) -> RuntimeLightSourceKind {

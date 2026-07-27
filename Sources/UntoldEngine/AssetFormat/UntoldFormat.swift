@@ -53,6 +53,7 @@ public enum UntoldChunkType: UInt32, Sendable {
     case edgeIndexData = 18
     case lightTable = 19
     case cameraTable = 20
+    case colorManagementTable = 21
 }
 
 public enum UntoldCompressionType: UInt32, Sendable {
@@ -79,6 +80,7 @@ public enum UntoldTextureFormat: UInt32, Sendable {
     case astc5x5 = 5
     case astc6x6 = 6
     case astc8x8 = 7
+    case rgba16Float = 8
 
     /// True for formats stored in the engine-native .utex container and uploaded
     /// directly to Metal without passing through MTKTextureLoader or CGImage.
@@ -88,6 +90,23 @@ public enum UntoldTextureFormat: UInt32, Sendable {
         default: false
         }
     }
+
+    /// True when the referenced file is an engine-native `.utex` container.
+    public var isNativeContainer: Bool {
+        isASTCNative || self == .rgba16Float
+    }
+}
+
+/// Bits of `UntoldTextureRefRecordV1.flags` set by the exporter (see
+/// TEXTURE_FLAG_* in scripts/untoldexplorer.py). Most are informational only
+/// today; `lut` is the one the runtime currently acts on, to identify the
+/// color-grading LUT texture regardless of filename.
+public enum UntoldTextureFlags {
+    public static let srgb: UInt32 = 1 << 0
+    public static let normalMap: UInt32 = 1 << 1
+    public static let lut: UInt32 = 1 << 2
+    public static let emissive: UInt32 = 1 << 6
+    public static let occlusion: UInt32 = 1 << 7
 }
 
 public enum UntoldTextureChannel: UInt32, Sendable, Equatable {
@@ -106,6 +125,18 @@ public enum UntoldLightType: UInt32, Sendable {
     case point = 2
     case spot = 3
     case area = 4
+}
+
+/// Bits stored in `UntoldLightRecordV1.flags`.
+///
+/// `radiometric` also gives the legacy `falloff` float a new, compatible
+/// meaning: it stores an optional influence range in scene units (zero means
+/// automatic/unbounded). Records without this bit retain the old artistic
+/// attenuation behavior.
+public enum UntoldLightFlags {
+    public static let castsShadow: UInt32 = 1 << 0
+    public static let radiometric: UInt32 = 1 << 1
+    public static let customDistance: UInt32 = 1 << 2
 }
 
 public struct UntoldAABB: Sendable, Equatable {
@@ -412,6 +443,8 @@ public struct UntoldLightRecordV1: Sendable, Equatable {
     public var position: SIMD3<Float>
     public var radius: Float
     public var direction: SIMD3<Float>
+    /// Legacy artistic falloff, or influence range when
+    /// `UntoldLightFlags.radiometric` is set.
     public var falloff: Float
     public var right: SIMD3<Float>
     public var innerCone: Float
@@ -505,6 +538,41 @@ public struct UntoldCameraRecordV1: Sendable, Equatable {
         self.right = right
         self.aspectRatio = aspectRatio
         self.localTransform = localTransform
+    }
+}
+
+/// Scene-wide color-management bake (see ColorManagementRecord in
+/// scripts/untoldexplorer.py). At most one per file — the LUT reproduces
+/// the source scene's View Transform/Look/Exposure/Gamma for a canonical sRGB
+/// display target, captured through Blender rather than reimplemented.
+public struct UntoldColorManagementRecordV1: Sendable, Equatable {
+    public var lutTextureIndex: UInt32
+    public var viewTransformNameOffset: UInt32
+    public var lookNameOffset: UInt32
+    public var exposure: Float
+    public var gamma: Float
+    public var shaperMinStops: Float
+    public var shaperMaxStops: Float
+    public var lutSize: UInt32
+
+    public init(
+        lutTextureIndex: UInt32 = UntoldFormat.invalidIndex,
+        viewTransformNameOffset: UInt32 = UntoldFormat.invalidIndex,
+        lookNameOffset: UInt32 = UntoldFormat.invalidIndex,
+        exposure: Float = 0.0,
+        gamma: Float = 1.0,
+        shaperMinStops: Float = -10.0,
+        shaperMaxStops: Float = 6.0,
+        lutSize: UInt32 = 0
+    ) {
+        self.lutTextureIndex = lutTextureIndex
+        self.viewTransformNameOffset = viewTransformNameOffset
+        self.lookNameOffset = lookNameOffset
+        self.exposure = exposure
+        self.gamma = gamma
+        self.shaperMinStops = shaperMinStops
+        self.shaperMaxStops = shaperMaxStops
+        self.lutSize = lutSize
     }
 }
 
