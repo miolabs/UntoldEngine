@@ -148,6 +148,13 @@ private func registerComponentCleanupHandlers() {
         removeEntityKinetics(entityId: entityId)
     }
 
+    ComponentRegistry.register(componentType: ColliderComponent.self, handlerId: "physicsBody", priority: 30) { entityId in
+        removeEntityPhysicsBody(entityId: entityId)
+    }
+    ComponentRegistry.register(componentType: RigidBodyComponent.self, handlerId: "physicsBody", priority: 30) { entityId in
+        removeEntityPhysicsBody(entityId: entityId)
+    }
+
     ComponentRegistry.register(componentType: LightComponent.self, handlerId: "light", priority: 30) { entityId in
         removeEntityLight(entityId: entityId)
     }
@@ -2767,6 +2774,16 @@ func removeEntityKinetics(entityId: EntityID) {
 
     if scene.get(component: PhysicsComponents.self, for: entityId) != nil {
         scene.remove(component: PhysicsComponents.self, from: entityId)
+    }
+}
+
+func removeEntityPhysicsBody(entityId: EntityID) {
+    if scene.get(component: ColliderComponent.self, for: entityId) != nil {
+        scene.remove(component: ColliderComponent.self, from: entityId)
+    }
+
+    if scene.get(component: RigidBodyComponent.self, for: entityId) != nil {
+        scene.remove(component: RigidBodyComponent.self, from: entityId)
     }
 }
 

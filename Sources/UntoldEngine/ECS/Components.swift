@@ -150,6 +150,28 @@ public class KineticComponent: Component {
     }
 }
 
+public class ColliderComponent: Component {
+    public var shape: PhysicsColliderShape = .sphere(radius: 0.5)
+    public var localOffset: simd_float3 = .zero
+    public var friction: Float = 0.5
+    public var restitution: Float = 0.0
+    public var isTrigger: Bool = false
+
+    public required init() {}
+}
+
+public class RigidBodyComponent: Component {
+    public var motionType: PhysicsMotionType = .dynamic
+    public var mass: Float = 1.0
+    public var layer: UInt32 = 0
+    public var collisionMask: UInt32 = .max
+    public var gravityScale: Float = 1.0
+    public var initialLinearVelocity: simd_float3 = .zero
+    public var initialAngularVelocity: simd_float3 = .zero
+
+    public required init() {}
+}
+
 public class SkeletonComponent: Component {
     var skeleton: Skeleton!
 
