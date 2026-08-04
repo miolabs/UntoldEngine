@@ -161,8 +161,16 @@ public class SkeletonComponent: Component {
 }
 
 /// How a `DeformationComponent` entity's skin vertices are deformed each frame.
+/// - `lbs`: linear blend skinning (compute-pass port of the legacy path).
+/// - `dqs`: dual-quaternion skinning — fixes candy-wrapper collapse and
+///   volume loss at twisting joints.
+/// - `ddm`: Direct Delta Mush — smoothed rigid fit per vertex; needs a
+///   one-time per-mesh bake that runs in the background, falling back to
+///   `lbs` until ready.
 public enum SkinningMode: String, CaseIterable, Sendable {
     case lbs
+    case dqs
+    case ddm
 }
 
 /// GPU-written deformed vertex streams for one mesh, produced by the

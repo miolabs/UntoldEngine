@@ -129,11 +129,41 @@ typedef enum{
     deformationPassOutNormalIndex,
     deformationPassOutTangentIndex,
     deformationPassParamsIndex,
+    deformationPassOmegaIndex,
 }DeformationPassBufferIndices;
 
 typedef struct{
     unsigned int vertexCount;
 }DeformationPassParams;
+
+// Per-joint rigid transform + scale for dual-quaternion skinning, converted
+// from the joint matrix palette by the deformDualQuatPalette kernel.
+typedef struct{
+    simd_float4 real;   // rotation quaternion (x, y, z, w)
+    simd_float4 dual;   // 0.5 * translation ⊗ real
+    simd_float4 scale;  // per-axis scale factored out of the matrix, w unused
+}JointDualQuat;
+
+typedef enum{
+    dualQuatPaletteJointTransformIndex,
+    dualQuatPaletteOutIndex,
+    dualQuatPaletteParamsIndex,
+}DualQuatPaletteBufferIndices;
+
+typedef struct{
+    unsigned int jointCount;
+}DualQuatPaletteParams;
+
+// One Direct Delta Mush precomputed matrix per (vertex, influencing joint):
+// the upper triangle of the symmetric 4x4 smoothed homogeneous outer-product
+// sum, in row-major order [a00,a01,a02,a03,a11,a12,a13,a22,a23,a33].
+// Four entries per vertex; jointIndex 0xFFFFFFFF marks an unused slot.
+typedef struct{
+    unsigned int jointIndex;
+    float m[10];
+}DDMOmegaEntry;
+
+#define DDM_OMEGAS_PER_VERTEX 4
 
 
 typedef enum{
