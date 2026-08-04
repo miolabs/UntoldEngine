@@ -136,6 +136,9 @@ private func registerComponentCleanupHandlers() {
     ComponentRegistry.register(componentType: SkeletonComponent.self, handlerId: "mesh", priority: 20) { entityId in
         removeEntityMesh(entityId: entityId)
     }
+    ComponentRegistry.register(componentType: DeformationComponent.self, handlerId: "deformation", priority: 20) { entityId in
+        removeEntityDeformation(entityId: entityId)
+    }
 
     ComponentRegistry.register(componentType: AnimationComponent.self, handlerId: "animation", priority: 30) { entityId in
         removeEntityAnimations(entityId: entityId)
@@ -2752,6 +2755,11 @@ func removeEntityMesh(entityId: EntityID) {
         skeletonComponent.cleanUp()
         scene.remove(component: SkeletonComponent.self, from: entityId)
         removedAnyResourceOwner = true
+    }
+
+    if let deformationComponent = scene.get(component: DeformationComponent.self, for: entityId) {
+        deformationComponent.cleanUp()
+        scene.remove(component: DeformationComponent.self, from: entityId)
     }
 
     guard removedAnyResourceOwner else {

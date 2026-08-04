@@ -160,6 +160,57 @@ public class SkeletonComponent: Component {
     }
 }
 
+/// How a `DeformationComponent` entity's skin vertices are deformed each frame.
+public enum SkinningMode: String, CaseIterable, Sendable {
+    case lbs
+}
+
+/// GPU-written deformed vertex streams for one mesh, produced by the
+/// deformation compute pass and consumed by the render passes in place of the
+/// base position/normal/tangent streams.
+final class MeshDeformationBuffers {
+    let positions: MTLBuffer
+    let normals: MTLBuffer
+    let tangents: MTLBuffer
+    let vertexCount: Int
+
+    init?(device: MTLDevice, vertexCount: Int, label: String) {
+        let length = vertexCount * MemoryLayout<simd_float4>.stride
+        guard vertexCount > 0,
+              let positions = device.makeBuffer(length: length, options: .storageModePrivate),
+              let normals = device.makeBuffer(length: length, options: .storageModePrivate),
+              let tangents = device.makeBuffer(length: length, options: .storageModePrivate)
+        else {
+            return nil
+        }
+        positions.label = "\(label) deformed positions"
+        normals.label = "\(label) deformed normals"
+        tangents.label = "\(label) deformed tangents"
+        self.positions = positions
+        self.normals = normals
+        self.tangents = tangents
+        self.vertexCount = vertexCount
+    }
+}
+
+/// Opts an entity's skinned meshes into the deformation compute pass.
+/// Entities without this component keep the legacy vertex-shader skinning path.
+public class DeformationComponent: Component {
+    public var skinningMode: SkinningMode = .lbs
+
+    /// Deformed streams per mesh, keyed by the mesh's MTKMesh identity and
+    /// filled lazily by the deformation pass. Nil entries (pass not run yet,
+    /// e.g. a graph without the deformation node) leave draws on the legacy
+    /// vertex-shader path.
+    var meshDeformations: [ObjectIdentifier: MeshDeformationBuffers] = [:]
+
+    public required init() {}
+
+    func cleanUp() {
+        meshDeformations.removeAll()
+    }
+}
+
 /// Per-entity animation control policy.
 ///
 /// Layered animation control (see upstream discussion #801): the global

@@ -118,6 +118,23 @@ typedef enum{
     modelPassFragmentSTScaleIndex,
 }ModelPassFragmentBufferIndices;
 
+typedef enum{
+    deformationPassInPositionIndex,
+    deformationPassInNormalIndex,
+    deformationPassInTangentIndex,
+    deformationPassJointIdIndex,
+    deformationPassJointWeightsIndex,
+    deformationPassJointTransformIndex,
+    deformationPassOutPositionIndex,
+    deformationPassOutNormalIndex,
+    deformationPassOutTangentIndex,
+    deformationPassParamsIndex,
+}DeformationPassBufferIndices;
+
+typedef struct{
+    unsigned int vertexCount;
+}DeformationPassParams;
+
 
 typedef enum{
     prePassGizmoBufferIndex,

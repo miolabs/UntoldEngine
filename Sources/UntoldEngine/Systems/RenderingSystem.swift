@@ -214,6 +214,7 @@ private typealias CompiledRenderGraphResult = (
 let gameModeReservedPassIDs: Set<String> = [
     "environment",
     "grid",
+    "deformation",
     "shadow",
     "batchedShadow",
     "spotShadow",
@@ -328,8 +329,15 @@ private func buildGameModeGraphWithCompilation() throws -> CompiledRenderGraphRe
         ?? beforeShadowsAnchor
     let shadowDependency = beforeShadowsID.map { [$0] } ?? []
 
+    // Deformation compute pass: skins DeformationComponent meshes into their
+    // deformed vertex buffers before any pass that draws them.
+    let deformationPass = RenderPass(
+        id: "deformation", dependencies: shadowDependency, execute: DeformationSystem.executeDeformationPass
+    )
+    builder.addPass(deformationPass)
+
     let shadowPass = RenderPass(
-        id: "shadow", dependencies: shadowDependency, execute: RenderPasses.shadowExecution
+        id: "shadow", dependencies: [deformationPass.id], execute: RenderPasses.shadowExecution
     )
     builder.addPass(shadowPass)
 
