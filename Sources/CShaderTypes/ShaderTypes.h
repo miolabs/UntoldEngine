@@ -130,11 +130,36 @@ typedef enum{
     deformationPassOutTangentIndex,
     deformationPassParamsIndex,
     deformationPassOmegaIndex,
+    deformationPassMorphPositionDeltaIndex,
+    deformationPassMorphNormalDeltaIndex,
 }DeformationPassBufferIndices;
 
 typedef struct{
     unsigned int vertexCount;
+    unsigned int hasMorphDeltas;
 }DeformationPassParams;
+
+// One sparse morph delta entry; must match UntoldMorphSparseEntryV1 (16 B).
+// Delta components are float16 bit patterns.
+typedef struct{
+    unsigned int vertexIndex;
+    unsigned short dPosition[3];
+    unsigned short dNormal[3];
+}MorphSparseEntry;
+
+typedef enum{
+    morphPassEntriesIndex,
+    morphPassPositionDeltaIndex,
+    morphPassNormalDeltaIndex,
+    morphPassParamsIndex,
+}MorphPassBufferIndices;
+
+typedef struct{
+    unsigned int entryOffset;
+    unsigned int entryCount;
+    unsigned int vertexCount;
+    float weightTimesScale;
+}MorphPassParams;
 
 // Per-joint rigid transform + scale for dual-quaternion skinning, converted
 // from the joint matrix palette by the deformDualQuatPalette kernel.

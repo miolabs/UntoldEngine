@@ -60,6 +60,9 @@ public struct UntoldChunkType: RawRepresentable, Hashable, Sendable, Equatable {
     public static let lightTable = UntoldChunkType(rawValue: 19)
     public static let cameraTable = UntoldChunkType(rawValue: 20)
     public static let colorManagementTable = UntoldChunkType(rawValue: 21)
+    public static let morphTargetTable = UntoldChunkType(rawValue: 22)
+    public static let morphTargetData = UntoldChunkType(rawValue: 23)
+    public static let morphDriverTable = UntoldChunkType(rawValue: 24)
 
     public static let firstPluginChunkRawValue: UInt32 = 0x8000
 
@@ -770,5 +773,81 @@ public struct UntoldPBRStaticVertexV1: Sendable, Equatable {
         self.uv0 = uv0
         self.uv1 = uv1
         self.color0 = color0
+    }
+}
+
+/// One morph target (blend shape) belonging to a mesh record. Entries live in
+/// the shared `morphTargetData` chunk as a contiguous run.
+public struct UntoldMorphTargetRecordV1: Sendable, Equatable {
+    /// Bit 0: entries carry normal deltas in addition to position deltas.
+    public static let flagHasNormalDeltas: UInt32 = 1 << 0
+
+    public var meshRecordIndex: UInt32
+    public var nameOffset: UInt32
+    public var flags: UInt32
+    public var firstEntryIndex: UInt32
+    public var entryCount: UInt32
+    public var positionScale: Float
+
+    public init(
+        meshRecordIndex: UInt32,
+        nameOffset: UInt32,
+        flags: UInt32 = 0,
+        firstEntryIndex: UInt32,
+        entryCount: UInt32,
+        positionScale: Float = 1.0
+    ) {
+        self.meshRecordIndex = meshRecordIndex
+        self.nameOffset = nameOffset
+        self.flags = flags
+        self.firstEntryIndex = firstEntryIndex
+        self.entryCount = entryCount
+        self.positionScale = positionScale
+    }
+}
+
+/// One sparse morph delta: a mesh-local vertex index plus float16 position
+/// and normal deltas (normal deltas zero when the target has none). 16 bytes.
+public struct UntoldMorphSparseEntryV1: Sendable, Equatable {
+    public static let byteSize = 16
+
+    public var vertexIndex: UInt32
+    /// float16 bit patterns.
+    public var dPosition: SIMD3<UInt16>
+    public var dNormal: SIMD3<UInt16>
+
+    public init(vertexIndex: UInt32, dPosition: SIMD3<UInt16>, dNormal: SIMD3<UInt16> = .zero) {
+        self.vertexIndex = vertexIndex
+        self.dPosition = dPosition
+        self.dNormal = dNormal
+    }
+}
+
+/// Pose-space driver metadata for a morph target: the target reaches full
+/// weight when the named joint's rest-relative rotation matches
+/// `poseRotation`, falling off over `radius` (quaternion geodesic distance).
+/// Authored in Blender via shape-key custom properties; evaluated by the
+/// pose-space deformation runtime.
+public struct UntoldMorphDriverRecordV1: Sendable, Equatable {
+    public var targetIndex: UInt32
+    public var jointPathOffset: UInt32
+    public var kernelType: UInt32
+    public var poseRotation: SIMD4<Float>
+    public var radius: Float
+    public var reserved0: UInt32
+
+    public init(
+        targetIndex: UInt32,
+        jointPathOffset: UInt32,
+        kernelType: UInt32 = 0,
+        poseRotation: SIMD4<Float>,
+        radius: Float
+    ) {
+        self.targetIndex = targetIndex
+        self.jointPathOffset = jointPathOffset
+        self.kernelType = kernelType
+        self.poseRotation = poseRotation
+        self.radius = radius
+        reserved0 = 0
     }
 }

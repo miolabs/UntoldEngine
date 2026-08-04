@@ -782,3 +782,84 @@ public extension UntoldBinaryReader {
         return simd_float4x4(columns: (c0, c1, c2, c3))
     }
 }
+
+extension UntoldMorphTargetRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
+    public func encode(to writer: UntoldBinaryWriter) {
+        writer.writeUInt32LE(meshRecordIndex)
+        writer.writeUInt32LE(nameOffset)
+        writer.writeUInt32LE(flags)
+        writer.writeUInt32LE(firstEntryIndex)
+        writer.writeUInt32LE(entryCount)
+        writer.writeFloat32LE(positionScale)
+    }
+
+    public static func decode(from reader: UntoldBinaryReader) throws -> UntoldMorphTargetRecordV1 {
+        try UntoldMorphTargetRecordV1(
+            meshRecordIndex: reader.readUInt32LE(),
+            nameOffset: reader.readUInt32LE(),
+            flags: reader.readUInt32LE(),
+            firstEntryIndex: reader.readUInt32LE(),
+            entryCount: reader.readUInt32LE(),
+            positionScale: reader.readFloat32LE()
+        )
+    }
+}
+
+extension UntoldMorphSparseEntryV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
+    public func encode(to writer: UntoldBinaryWriter) {
+        writer.writeUInt32LE(vertexIndex)
+        writer.writeUInt16LE(dPosition.x)
+        writer.writeUInt16LE(dPosition.y)
+        writer.writeUInt16LE(dPosition.z)
+        writer.writeUInt16LE(dNormal.x)
+        writer.writeUInt16LE(dNormal.y)
+        writer.writeUInt16LE(dNormal.z)
+    }
+
+    public static func decode(from reader: UntoldBinaryReader) throws -> UntoldMorphSparseEntryV1 {
+        try UntoldMorphSparseEntryV1(
+            vertexIndex: reader.readUInt32LE(),
+            dPosition: SIMD3<UInt16>(
+                reader.readUInt16LE(),
+                reader.readUInt16LE(),
+                reader.readUInt16LE()
+            ),
+            dNormal: SIMD3<UInt16>(
+                reader.readUInt16LE(),
+                reader.readUInt16LE(),
+                reader.readUInt16LE()
+            )
+        )
+    }
+}
+
+extension UntoldMorphDriverRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
+    public func encode(to writer: UntoldBinaryWriter) {
+        writer.writeUInt32LE(targetIndex)
+        writer.writeUInt32LE(jointPathOffset)
+        writer.writeUInt32LE(kernelType)
+        writer.writeFloat32LE(poseRotation.x)
+        writer.writeFloat32LE(poseRotation.y)
+        writer.writeFloat32LE(poseRotation.z)
+        writer.writeFloat32LE(poseRotation.w)
+        writer.writeFloat32LE(radius)
+        writer.writeUInt32LE(reserved0)
+    }
+
+    public static func decode(from reader: UntoldBinaryReader) throws -> UntoldMorphDriverRecordV1 {
+        var record = try UntoldMorphDriverRecordV1(
+            targetIndex: reader.readUInt32LE(),
+            jointPathOffset: reader.readUInt32LE(),
+            kernelType: reader.readUInt32LE(),
+            poseRotation: SIMD4<Float>(
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE()
+            ),
+            radius: reader.readFloat32LE()
+        )
+        record.reserved0 = try reader.readUInt32LE()
+        return record
+    }
+}

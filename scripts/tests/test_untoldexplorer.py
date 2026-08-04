@@ -1312,6 +1312,35 @@ class MaterialGraphAnalysisTests(unittest.TestCase):
         lines = u.material_fidelity_report_lines([mesh])
         self.assertEqual(lines, ["Material fidelity report: 1 supported, 0 bakeable, 0 unbakeable"])
 
+    def test_write_morph_target_record_layout_matches_runtime(self) -> None:
+        writer = u.BinaryWriter()
+        u.write_morph_target_record(writer, 3, 42, u.MORPH_FLAG_HAS_NORMAL_DELTAS, 7, 100, 1.5)
+        self.assertEqual(len(writer.data), 24)
+        mesh_index, name_offset, flags, first_entry, entry_count, scale = struct.unpack(
+            "<5If", writer.data
+        )
+        self.assertEqual(
+            (mesh_index, name_offset, flags, first_entry, entry_count), (3, 42, 1, 7, 100)
+        )
+        self.assertAlmostEqual(scale, 1.5)
+
+    def test_write_morph_driver_record_layout_matches_runtime(self) -> None:
+        writer = u.BinaryWriter()
+        u.write_morph_driver_record(writer, 2, 9, 0, (0.1, 0.2, 0.3, 0.9), 0.75)
+        self.assertEqual(len(writer.data), 36)
+        target_index, joint_offset, kernel = struct.unpack_from("<3I", writer.data, 0)
+        pose = struct.unpack_from("<4f", writer.data, 12)
+        radius, reserved = struct.unpack_from("<fI", writer.data, 28)
+        self.assertEqual((target_index, joint_offset, kernel), (2, 9, 0))
+        self.assertAlmostEqual(pose[3], 0.9, places=5)
+        self.assertAlmostEqual(radius, 0.75)
+        self.assertEqual(reserved, 0)
+
+    def test_morph_entry_dtype_is_sixteen_bytes(self) -> None:
+        self.assertEqual(u.MORPH_ENTRY_SIZE, 16)
+        if u._MORPH_DTYPE is not None:
+            self.assertEqual(u._MORPH_DTYPE.itemsize, 16)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -264,6 +264,89 @@ final class NativeFormatTests: XCTestCase {
         }
     }
 
+    func testMorphTargetChunksRoundtripThroughRuntimeLoader() throws {
+        // One morph target on mesh 0 with two sparse entries, plus a driver
+        // record. Assembled through the generic extra-chunk path.
+        let entryWriter = UntoldBinaryWriter()
+        let entries = [
+            UntoldMorphSparseEntryV1(
+                vertexIndex: 0,
+                dPosition: SIMD3<UInt16>(
+                    Float16(0.25).bitPattern, Float16(-0.5).bitPattern, Float16(1.0).bitPattern
+                )
+            ),
+            UntoldMorphSparseEntryV1(
+                vertexIndex: 2,
+                dPosition: SIMD3<UInt16>(
+                    Float16(0.125).bitPattern, Float16(0).bitPattern, Float16(-0.25).bitPattern
+                )
+            ),
+        ]
+        for entry in entries {
+            entry.encode(to: entryWriter)
+        }
+
+        let targetWriter = UntoldBinaryWriter()
+        let target = UntoldMorphTargetRecordV1(
+            meshRecordIndex: 0,
+            nameOffset: UntoldFormat.invalidIndex,
+            firstEntryIndex: 0,
+            entryCount: 2,
+            positionScale: 1.0
+        )
+        target.encode(to: targetWriter)
+
+        let driverWriter = UntoldBinaryWriter()
+        let driver = UntoldMorphDriverRecordV1(
+            targetIndex: 0,
+            jointPathOffset: UntoldFormat.invalidIndex,
+            poseRotation: SIMD4<Float>(0, 0, 0, 1),
+            radius: 0.8
+        )
+        driver.encode(to: driverWriter)
+
+        let fixture = makeTinyFixture(pluginChunks: [
+            (.morphTargetTable, targetWriter.data, 1),
+            (.morphTargetData, entryWriter.data, 2),
+            (.morphDriverTable, driverWriter.data, 1),
+        ])
+
+        let decoded = try UntoldReader().readAsset(from: fixture.fileData)
+        XCTAssertEqual(decoded.morphTargets, [target])
+        XCTAssertEqual(decoded.morphDrivers, [driver])
+
+        let loaded = try NativeFormatLoader().loadAssetSync(from: writeFixtureToTemporaryFile(fixture.fileData))
+        let primitive = try XCTUnwrap(loaded.nodes.first?.primitives.first)
+        XCTAssertEqual(primitive.morphTargets.count, 1)
+        let runtimeTarget = try XCTUnwrap(primitive.morphTargets.first)
+        XCTAssertEqual(runtimeTarget.entryCount, 2)
+        XCTAssertEqual(runtimeTarget.entryData, entryWriter.data)
+        XCTAssertNil(runtimeTarget.driver, "Driver without a joint path must be dropped")
+    }
+
+    func testRejectsMorphTargetWithInvalidMeshIndex() throws {
+        let targetWriter = UntoldBinaryWriter()
+        UntoldMorphTargetRecordV1(
+            meshRecordIndex: 7,
+            nameOffset: UntoldFormat.invalidIndex,
+            firstEntryIndex: 0,
+            entryCount: 0,
+            positionScale: 1.0
+        ).encode(to: targetWriter)
+
+        let fixture = makeTinyFixture(pluginChunks: [
+            (.morphTargetTable, targetWriter.data, 1),
+            (.morphTargetData, Data(), 0),
+        ])
+
+        XCTAssertThrowsError(try UntoldReader().readAsset(from: fixture.fileData)) { error in
+            XCTAssertEqual(
+                error as? UntoldValidationError,
+                .invalidMorphTargetMesh(targetIndex: 0, meshRecordIndex: 7)
+            )
+        }
+    }
+
     func testUnknownCoreChunkTypeIsIgnored() throws {
         // A core-range chunk type this runtime does not know (e.g. one added by a
         // newer format revision) must not prevent the rest of the asset from loading.

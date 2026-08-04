@@ -40,4 +40,7 @@ public enum UntoldValidationError: Error, Sendable, Equatable {
     )
     case invalidPluginChunkHeader
     case unsupportedPluginChunkVersion(UInt32)
+    case invalidMorphTargetMesh(targetIndex: Int, meshRecordIndex: UInt32)
+    case invalidMorphTargetEntryRange(targetIndex: Int, entryEnd: UInt64, totalEntries: UInt64)
+    case invalidMorphDriverTarget(UInt32)
 }

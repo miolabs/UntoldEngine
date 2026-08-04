@@ -206,6 +206,10 @@ final class MeshDeformationBuffers {
 public class DeformationComponent: Component {
     public var skinningMode: SkinningMode = .lbs
 
+    /// Active morph-target weights by target name (see
+    /// `setEntityMorphTargetWeight`); zero-weight targets are removed.
+    var morphWeights: [String: Float] = [:]
+
     /// Deformed streams per mesh, keyed by the mesh's MTKMesh identity and
     /// filled lazily by the deformation pass. Nil entries (pass not run yet,
     /// e.g. a graph without the deformation node) leave draws on the legacy
@@ -216,6 +220,7 @@ public class DeformationComponent: Component {
 
     func cleanUp() {
         meshDeformations.removeAll()
+        morphWeights.removeAll()
     }
 }
 

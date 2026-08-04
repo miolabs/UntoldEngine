@@ -124,6 +124,18 @@ public final class UntoldReader: @unchecked Sendable {
             from: data,
             entries: chunks
         )
+        let morphTargets = try decodeTableIfPresent(
+            UntoldMorphTargetRecordV1.self,
+            chunkType: .morphTargetTable,
+            from: data,
+            entries: chunks
+        )
+        let morphDrivers = try decodeTableIfPresent(
+            UntoldMorphDriverRecordV1.self,
+            chunkType: .morphDriverTable,
+            from: data,
+            entries: chunks
+        )
         let pluginChunks = try decodePluginChunks(from: data, entries: chunks)
 
         let decoded = UntoldDecodedAsset(
@@ -145,6 +157,8 @@ public final class UntoldReader: @unchecked Sendable {
             animationChannels: animationChannels,
             translationKeyframes: translationKeyframes,
             rotationKeyframes: rotationKeyframes,
+            morphTargets: morphTargets,
+            morphDrivers: morphDrivers,
             pluginChunks: pluginChunks
         )
         try validateDecodedAsset(decoded)
@@ -333,6 +347,32 @@ public final class UntoldReader: @unchecked Sendable {
                 throw UntoldValidationError.invalidVertexDataRange(offset: skin.jointWeightDataOffset, size: UInt64(skin.vertexCount) * 16, chunkSize: jointWeightChunk.uncompressedSize)
             }
         }
+
+        if !asset.morphTargets.isEmpty {
+            guard let morphDataChunk = asset.chunks.first(where: { $0.chunkType == .morphTargetData }) else {
+                throw UntoldValidationError.missingRequiredChunk(.morphTargetData)
+            }
+            let totalEntries = morphDataChunk.uncompressedSize / UInt64(UntoldMorphSparseEntryV1.byteSize)
+            for (targetIndex, target) in asset.morphTargets.enumerated() {
+                guard target.meshRecordIndex < UInt32(asset.meshes.count) else {
+                    throw UntoldValidationError.invalidMorphTargetMesh(
+                        targetIndex: targetIndex, meshRecordIndex: target.meshRecordIndex
+                    )
+                }
+                let entryEnd = UInt64(target.firstEntryIndex) + UInt64(target.entryCount)
+                guard entryEnd <= totalEntries else {
+                    throw UntoldValidationError.invalidMorphTargetEntryRange(
+                        targetIndex: targetIndex, entryEnd: entryEnd, totalEntries: totalEntries
+                    )
+                }
+            }
+        }
+
+        for driver in asset.morphDrivers {
+            guard driver.targetIndex < UInt32(asset.morphTargets.count) else {
+                throw UntoldValidationError.invalidMorphDriverTarget(driver.targetIndex)
+            }
+        }
     }
 
     private func indexElementSize(for indexType: UntoldIndexType) -> UInt64 {
@@ -503,6 +543,8 @@ public struct UntoldDecodedAsset: Sendable {
     public let animationChannels: [UntoldAnimationChannelRecordV1]
     public let translationKeyframes: [UntoldTranslationKeyframeRecordV1]
     public let rotationKeyframes: [UntoldRotationKeyframeRecordV1]
+    public let morphTargets: [UntoldMorphTargetRecordV1]
+    public let morphDrivers: [UntoldMorphDriverRecordV1]
     public let pluginChunks: [UntoldPluginChunk]
 
     public init(
@@ -524,6 +566,8 @@ public struct UntoldDecodedAsset: Sendable {
         animationChannels: [UntoldAnimationChannelRecordV1],
         translationKeyframes: [UntoldTranslationKeyframeRecordV1],
         rotationKeyframes: [UntoldRotationKeyframeRecordV1],
+        morphTargets: [UntoldMorphTargetRecordV1] = [],
+        morphDrivers: [UntoldMorphDriverRecordV1] = [],
         pluginChunks: [UntoldPluginChunk] = []
     ) {
         self.header = header
@@ -544,6 +588,8 @@ public struct UntoldDecodedAsset: Sendable {
         self.animationChannels = animationChannels
         self.translationKeyframes = translationKeyframes
         self.rotationKeyframes = rotationKeyframes
+        self.morphTargets = morphTargets
+        self.morphDrivers = morphDrivers
         self.pluginChunks = pluginChunks
     }
 

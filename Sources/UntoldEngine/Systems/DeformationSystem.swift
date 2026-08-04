@@ -27,6 +27,29 @@ final class DeformationSystem: @unchecked Sendable {
     var skinDQSPipeline = ComputePipeline()
     var skinDDMPipeline = ComputePipeline()
     var dualQuatPalettePipeline = ComputePipeline()
+    var morphClearPipeline = ComputePipeline()
+    var morphAccumulatePipeline = ComputePipeline()
+
+    /// Per-vertex accumulated morph deltas, one pair of float4 buffers per
+    /// morphing mesh. Keyed by mesh identity.
+    final class MorphDeltaBuffers {
+        let positions: MTLBuffer
+        let normals: MTLBuffer
+
+        init?(device: MTLDevice, vertexCount: Int, label: String) {
+            let length = vertexCount * MemoryLayout<simd_float4>.stride
+            guard vertexCount > 0,
+                  let positions = device.makeBuffer(length: length, options: .storageModePrivate),
+                  let normals = device.makeBuffer(length: length, options: .storageModePrivate)
+            else { return nil }
+            positions.label = "\(label) morph position deltas"
+            normals.label = "\(label) morph normal deltas"
+            self.positions = positions
+            self.normals = normals
+        }
+    }
+
+    private var morphDeltaBuffers: [ObjectIdentifier: MorphDeltaBuffers] = [:]
 
     /// Per-skin dual-quaternion palettes, rebuilt on the GPU each frame from
     /// the joint matrix palette. Keyed by mesh identity.
@@ -79,6 +102,20 @@ final class DeformationSystem: @unchecked Sendable {
             functionName: "deformDualQuatPalette",
             pipelineName: "Deformation DualQuat Palette pipe"
         )
+        createComputePipeline(
+            into: &morphClearPipeline,
+            device: device,
+            library: library,
+            functionName: "deformClearMorphDeltas",
+            pipelineName: "Deformation Morph Clear pipe"
+        )
+        createComputePipeline(
+            into: &morphAccumulatePipeline,
+            device: device,
+            library: library,
+            functionName: "deformMorphAccumulate",
+            pipelineName: "Deformation Morph Accumulate pipe"
+        )
     }
 
     static let executeDeformationPass: RenderPasses.RenderPassExecution = { commandBuffer in
@@ -110,13 +147,21 @@ final class DeformationSystem: @unchecked Sendable {
                     for: mesh, in: deformationComponent, device: commandBuffer.device
                 ) else { continue }
 
+                let morphDeltas = encodeMorphAccumulation(
+                    encoder: encoder,
+                    mesh: mesh,
+                    component: deformationComponent,
+                    device: commandBuffer.device
+                )
+
                 switch effectiveMode(for: deformationComponent, mesh: mesh, device: commandBuffer.device) {
                 case .lbs:
                     guard let pipeline = skinLBSPipeline.pipelineState else { continue }
                     encoder.setComputePipelineState(pipeline)
                     encodeSkin(
                         encoder: encoder, pipeline: pipeline, mesh: mesh,
-                        jointTransformBuffer: jointTransformBuffer, omegaBuffer: nil, output: buffers
+                        jointTransformBuffer: jointTransformBuffer, omegaBuffer: nil,
+                        morphDeltas: morphDeltas, output: buffers
                     )
                 case .dqs:
                     guard let skinPipeline = skinDQSPipeline.pipelineState,
@@ -130,7 +175,8 @@ final class DeformationSystem: @unchecked Sendable {
                     encoder.setComputePipelineState(skinPipeline)
                     encodeSkin(
                         encoder: encoder, pipeline: skinPipeline, mesh: mesh,
-                        jointTransformBuffer: palette, omegaBuffer: nil, output: buffers
+                        jointTransformBuffer: palette, omegaBuffer: nil,
+                        morphDeltas: morphDeltas, output: buffers
                     )
                 case .ddm:
                     guard let pipeline = skinDDMPipeline.pipelineState,
@@ -139,7 +185,8 @@ final class DeformationSystem: @unchecked Sendable {
                     encoder.setComputePipelineState(pipeline)
                     encodeSkin(
                         encoder: encoder, pipeline: pipeline, mesh: mesh,
-                        jointTransformBuffer: jointTransformBuffer, omegaBuffer: omegas, output: buffers
+                        jointTransformBuffer: jointTransformBuffer, omegaBuffer: omegas,
+                        morphDeltas: morphDeltas, output: buffers
                     )
                 }
             }
@@ -318,12 +365,80 @@ final class DeformationSystem: @unchecked Sendable {
         return buffers
     }
 
+    /// Clears and re-accumulates the mesh's morph deltas for every active
+    /// weight. Returns nil (and skips all dispatches) when the mesh has no
+    /// morph targets or every weight is zero.
+    private func encodeMorphAccumulation(
+        encoder: MTLComputeCommandEncoder,
+        mesh: Mesh,
+        component: DeformationComponent,
+        device: MTLDevice
+    ) -> MorphDeltaBuffers? {
+        guard let morphTargets = mesh.morphTargets,
+              let clearPipeline = morphClearPipeline.pipelineState,
+              let accumulatePipeline = morphAccumulatePipeline.pipelineState
+        else { return nil }
+
+        let activeTargets = morphTargets.targets
+            .compactMap { target -> (MorphTargetSet.Target, Float)? in
+                guard let weight = component.morphWeights[target.name], abs(weight) > 1e-4 else {
+                    return nil
+                }
+                return (target, weight)
+            }
+            .sorted { abs($0.1) > abs($1.1) }
+            .prefix(maxActiveMorphTargets)
+        guard !activeTargets.isEmpty else { return nil }
+
+        let vertexCount = mesh.metalKitMesh.vertexCount
+        let key = ObjectIdentifier(mesh.metalKitMesh)
+        let deltas: MorphDeltaBuffers
+        if let existing = morphDeltaBuffers[key] {
+            deltas = existing
+        } else {
+            guard let allocated = MorphDeltaBuffers(device: device, vertexCount: vertexCount, label: mesh.name) else {
+                return nil
+            }
+            morphDeltaBuffers[key] = allocated
+            deltas = allocated
+        }
+
+        let width = clearPipeline.threadExecutionWidth
+        encoder.setComputePipelineState(clearPipeline)
+        encoder.setBuffer(deltas.positions, offset: 0, index: Int(morphPassPositionDeltaIndex.rawValue))
+        encoder.setBuffer(deltas.normals, offset: 0, index: Int(morphPassNormalDeltaIndex.rawValue))
+        var clearParams = MorphPassParams(entryOffset: 0, entryCount: 0, vertexCount: UInt32(vertexCount), weightTimesScale: 0)
+        encoder.setBytes(&clearParams, length: MemoryLayout<MorphPassParams>.stride, index: Int(morphPassParamsIndex.rawValue))
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (vertexCount + width - 1) / width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+
+        encoder.setComputePipelineState(accumulatePipeline)
+        encoder.setBuffer(morphTargets.entryBuffer, offset: 0, index: Int(morphPassEntriesIndex.rawValue))
+        for (target, weight) in activeTargets {
+            var params = MorphPassParams(
+                entryOffset: UInt32(target.entryOffset),
+                entryCount: UInt32(target.entryCount),
+                vertexCount: UInt32(vertexCount),
+                weightTimesScale: weight * target.positionScale
+            )
+            encoder.setBytes(&params, length: MemoryLayout<MorphPassParams>.stride, index: Int(morphPassParamsIndex.rawValue))
+            encoder.dispatchThreadgroups(
+                MTLSize(width: (target.entryCount + width - 1) / width, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+            )
+        }
+        return deltas
+    }
+
     private func encodeSkin(
         encoder: MTLComputeCommandEncoder,
         pipeline: MTLComputePipelineState,
         mesh: Mesh,
         jointTransformBuffer: MTLBuffer,
         omegaBuffer: MTLBuffer?,
+        morphDeltas: MorphDeltaBuffers?,
         output: MeshDeformationBuffers
     ) {
         let vertexBuffers = mesh.metalKitMesh.vertexBuffers
@@ -355,11 +470,24 @@ final class DeformationSystem: @unchecked Sendable {
         if let omegaBuffer {
             encoder.setBuffer(omegaBuffer, offset: 0, index: Int(deformationPassOmegaIndex.rawValue))
         }
+        if let morphDeltas {
+            encoder.setBuffer(morphDeltas.positions, offset: 0, index: Int(deformationPassMorphPositionDeltaIndex.rawValue))
+            encoder.setBuffer(morphDeltas.normals, offset: 0, index: Int(deformationPassMorphNormalDeltaIndex.rawValue))
+        } else {
+            // The kernels declare the delta buffers; give the argument table a
+            // valid (never dereferenced) binding when the mesh has no morphs.
+            var zero = simd_float4.zero
+            encoder.setBytes(&zero, length: MemoryLayout<simd_float4>.stride, index: Int(deformationPassMorphPositionDeltaIndex.rawValue))
+            encoder.setBytes(&zero, length: MemoryLayout<simd_float4>.stride, index: Int(deformationPassMorphNormalDeltaIndex.rawValue))
+        }
         encoder.setBuffer(output.positions, offset: 0, index: Int(deformationPassOutPositionIndex.rawValue))
         encoder.setBuffer(output.normals, offset: 0, index: Int(deformationPassOutNormalIndex.rawValue))
         encoder.setBuffer(output.tangents, offset: 0, index: Int(deformationPassOutTangentIndex.rawValue))
 
-        var params = DeformationPassParams(vertexCount: UInt32(output.vertexCount))
+        var params = DeformationPassParams(
+            vertexCount: UInt32(output.vertexCount),
+            hasMorphDeltas: morphDeltas != nil ? 1 : 0
+        )
         encoder.setBytes(
             &params,
             length: MemoryLayout<DeformationPassParams>.stride,
@@ -389,6 +517,47 @@ public func setEntityDeformation(entityId: EntityID, skinningMode: SkinningMode 
         else { continue }
         component.skinningMode = skinningMode
     }
+}
+
+/// Upper bound on morph targets accumulated per mesh per frame; the
+/// strongest weights win.
+let maxActiveMorphTargets = 16
+
+/// Sets the weight of a named morph target on `entityId`'s meshes (resolved
+/// through the hierarchy like `setEntityDeformation`). Weights persist until
+/// changed; zero removes the target from the active set. Requires a
+/// DeformationComponent — morphs are applied by the deformation pass.
+public func setEntityMorphTargetWeight(entityId: EntityID, name: String, weight: Float) {
+    guard scene.exists(entityId) else { return }
+    for targetEntityId in resolveAnimationBindingTargetEntities(entityId: entityId) {
+        guard let component = scene.get(component: DeformationComponent.self, for: targetEntityId) else {
+            continue
+        }
+        if abs(weight) > 1e-6 {
+            component.morphWeights[name] = weight
+        } else {
+            component.morphWeights.removeValue(forKey: name)
+        }
+    }
+}
+
+/// Names of every morph target carried by `entityId`'s meshes (resolved
+/// through the hierarchy), in mesh order.
+public func entityMorphTargetNames(entityId: EntityID) -> [String] {
+    guard scene.exists(entityId) else { return [] }
+    var names: [String] = []
+    for targetEntityId in resolveAnimationBindingTargetEntities(entityId: entityId) {
+        guard let renderComponent = scene.get(component: RenderComponent.self, for: targetEntityId) else {
+            continue
+        }
+        for mesh in renderComponent.mesh {
+            guard let morphTargets = mesh.morphTargets else { continue }
+            for name in morphTargets.targetNames where !names.contains(name) {
+                names.append(name)
+            }
+        }
+    }
+    return names
 }
 
 /// Returns `entityId` (and its resolved skeleton entities) to the legacy

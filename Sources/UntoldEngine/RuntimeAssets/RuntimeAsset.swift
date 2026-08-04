@@ -415,6 +415,7 @@ public struct RuntimeMeshPrimitive: Sendable, Equatable {
     public var edgeIndexCount: Int
     public var material: RuntimeMaterialSource?
     public var skin: RuntimeSkinBinding?
+    public var morphTargets: [RuntimeMorphTarget]
     public var estimatedGPUBytes: Int
 
     public init(
@@ -433,6 +434,7 @@ public struct RuntimeMeshPrimitive: Sendable, Equatable {
         edgeIndexCount: Int = 0,
         material: RuntimeMaterialSource? = nil,
         skin: RuntimeSkinBinding? = nil,
+        morphTargets: [RuntimeMorphTarget] = [],
         estimatedGPUBytes: Int = 0
     ) {
         self.name = name
@@ -450,7 +452,51 @@ public struct RuntimeMeshPrimitive: Sendable, Equatable {
         self.edgeIndexCount = edgeIndexCount
         self.material = material
         self.skin = skin
+        self.morphTargets = morphTargets
         self.estimatedGPUBytes = estimatedGPUBytes
+    }
+}
+
+/// Pose-space driver metadata carried alongside a morph target (evaluated by
+/// the PSD runtime; ignored when absent).
+public struct RuntimeMorphDriver: Sendable, Equatable {
+    public var jointPath: String
+    public var poseRotation: simd_float4
+    public var radius: Float
+    public var kernelType: UInt32
+
+    public init(jointPath: String, poseRotation: simd_float4, radius: Float, kernelType: UInt32 = 0) {
+        self.jointPath = jointPath
+        self.poseRotation = poseRotation
+        self.radius = radius
+        self.kernelType = kernelType
+    }
+}
+
+/// One morph target of a mesh primitive: sparse float16 deltas over the
+/// primitive's vertices (raw `UntoldMorphSparseEntryV1` records).
+public struct RuntimeMorphTarget: Sendable, Equatable {
+    public var name: String
+    public var hasNormalDeltas: Bool
+    public var positionScale: Float
+    public var entryCount: Int
+    public var entryData: Data
+    public var driver: RuntimeMorphDriver?
+
+    public init(
+        name: String,
+        hasNormalDeltas: Bool = false,
+        positionScale: Float = 1.0,
+        entryCount: Int,
+        entryData: Data,
+        driver: RuntimeMorphDriver? = nil
+    ) {
+        self.name = name
+        self.hasNormalDeltas = hasNormalDeltas
+        self.positionScale = positionScale
+        self.entryCount = entryCount
+        self.entryData = entryData
+        self.driver = driver
     }
 }
 

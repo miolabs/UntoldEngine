@@ -29,6 +29,8 @@ kernel void deformSkinLBS(
     device simd_float4 *outPositions [[buffer(deformationPassOutPositionIndex)]],
     device simd_float4 *outNormals [[buffer(deformationPassOutNormalIndex)]],
     device simd_float4 *outTangents [[buffer(deformationPassOutTangentIndex)]],
+    const device simd_float4 *morphPositionDeltas [[buffer(deformationPassMorphPositionDeltaIndex)]],
+    const device simd_float4 *morphNormalDeltas [[buffer(deformationPassMorphNormalDeltaIndex)]],
     constant DeformationPassParams &params [[buffer(deformationPassParamsIndex)]],
     uint vid [[thread_position_in_grid]])
 {
@@ -39,6 +41,15 @@ kernel void deformSkinLBS(
     simd_float4 position = inPositions[vid];
     simd_float4 normal = inNormals[vid];
     simd_float4 tangent = inTangents[vid];
+
+    if (params.hasMorphDeltas != 0) {
+        position.xyz += morphPositionDeltas[vid].xyz;
+        float3 morphedNormal = normal.xyz + morphNormalDeltas[vid].xyz;
+        float morphedLength = length(morphedNormal);
+        if (morphedLength > 0.0f) {
+            normal.xyz = morphedNormal / morphedLength;
+        }
+    }
 
     ushort4 joints = jointIndices[vid];
     simd_float4 weights = jointWeights[vid];
@@ -184,6 +195,8 @@ kernel void deformSkinDQS(
     device simd_float4 *outPositions [[buffer(deformationPassOutPositionIndex)]],
     device simd_float4 *outNormals [[buffer(deformationPassOutNormalIndex)]],
     device simd_float4 *outTangents [[buffer(deformationPassOutTangentIndex)]],
+    const device simd_float4 *morphPositionDeltas [[buffer(deformationPassMorphPositionDeltaIndex)]],
+    const device simd_float4 *morphNormalDeltas [[buffer(deformationPassMorphNormalDeltaIndex)]],
     constant DeformationPassParams &params [[buffer(deformationPassParamsIndex)]],
     uint vid [[thread_position_in_grid]])
 {
@@ -194,6 +207,15 @@ kernel void deformSkinDQS(
     simd_float4 position = inPositions[vid];
     simd_float4 normal = inNormals[vid];
     simd_float4 tangent = inTangents[vid];
+
+    if (params.hasMorphDeltas != 0) {
+        position.xyz += morphPositionDeltas[vid].xyz;
+        float3 morphedNormal = normal.xyz + morphNormalDeltas[vid].xyz;
+        float morphedLength = length(morphedNormal);
+        if (morphedLength > 0.0f) {
+            normal.xyz = morphedNormal / morphedLength;
+        }
+    }
 
     ushort4 joints = jointIndices[vid];
     simd_float4 weights = jointWeights[vid];
@@ -321,6 +343,8 @@ kernel void deformSkinDDM(
     device simd_float4 *outPositions [[buffer(deformationPassOutPositionIndex)]],
     device simd_float4 *outNormals [[buffer(deformationPassOutNormalIndex)]],
     device simd_float4 *outTangents [[buffer(deformationPassOutTangentIndex)]],
+    const device simd_float4 *morphPositionDeltas [[buffer(deformationPassMorphPositionDeltaIndex)]],
+    const device simd_float4 *morphNormalDeltas [[buffer(deformationPassMorphNormalDeltaIndex)]],
     constant DeformationPassParams &params [[buffer(deformationPassParamsIndex)]],
     uint vid [[thread_position_in_grid]])
 {
@@ -331,6 +355,15 @@ kernel void deformSkinDDM(
     simd_float4 position = inPositions[vid];
     simd_float4 normal = inNormals[vid];
     simd_float4 tangent = inTangents[vid];
+
+    if (params.hasMorphDeltas != 0) {
+        position.xyz += morphPositionDeltas[vid].xyz;
+        float3 morphedNormal = normal.xyz + morphNormalDeltas[vid].xyz;
+        float morphedLength = length(morphedNormal);
+        if (morphedLength > 0.0f) {
+            normal.xyz = morphedNormal / morphedLength;
+        }
+    }
 
     simd_float4x4 psi = simd_float4x4(0.0f);
     bool hasInfluence = false;
@@ -379,4 +412,52 @@ kernel void deformSkinDDM(
     outPositions[vid] = simd_float4(skinnedPosition, position.w);
     outNormals[vid] = simd_float4(skinnedNormal, normal.w);
     outTangents[vid] = simd_float4(skinnedTangent, tangent.w);
+}
+
+// MARK: - Morph targets
+
+kernel void deformClearMorphDeltas(
+    device simd_float4 *positionDeltas [[buffer(morphPassPositionDeltaIndex)]],
+    device simd_float4 *normalDeltas [[buffer(morphPassNormalDeltaIndex)]],
+    constant MorphPassParams &params [[buffer(morphPassParamsIndex)]],
+    uint vid [[thread_position_in_grid]])
+{
+    if (vid >= params.vertexCount) {
+        return;
+    }
+    positionDeltas[vid] = simd_float4(0.0f);
+    normalDeltas[vid] = simd_float4(0.0f);
+}
+
+// Accumulates one target's sparse deltas, scaled by weight. Entries within a
+// target touch unique vertices, so threads never collide inside a dispatch;
+// consecutive target dispatches are ordered by Metal's hazard tracking.
+kernel void deformMorphAccumulate(
+    const device MorphSparseEntry *entries [[buffer(morphPassEntriesIndex)]],
+    device simd_float4 *positionDeltas [[buffer(morphPassPositionDeltaIndex)]],
+    device simd_float4 *normalDeltas [[buffer(morphPassNormalDeltaIndex)]],
+    constant MorphPassParams &params [[buffer(morphPassParamsIndex)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= params.entryCount) {
+        return;
+    }
+    MorphSparseEntry entry = entries[params.entryOffset + tid];
+    if (entry.vertexIndex >= params.vertexCount) {
+        return;
+    }
+
+    float3 dPosition = float3(
+        (float)as_type<half>(entry.dPosition[0]),
+        (float)as_type<half>(entry.dPosition[1]),
+        (float)as_type<half>(entry.dPosition[2])
+    );
+    float3 dNormal = float3(
+        (float)as_type<half>(entry.dNormal[0]),
+        (float)as_type<half>(entry.dNormal[1]),
+        (float)as_type<half>(entry.dNormal[2])
+    );
+
+    positionDeltas[entry.vertexIndex].xyz += dPosition * params.weightTimesScale;
+    normalDeltas[entry.vertexIndex].xyz += dNormal * params.weightTimesScale;
 }

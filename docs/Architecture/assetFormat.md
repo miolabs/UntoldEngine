@@ -20,10 +20,13 @@ V1 supports:
 - skeletal rigs (skeleton hierarchy, bind/rest poses)
 - skinning (joint indices and weights per vertex)
 - animation clips (translation and rotation keyframe channels)
-
-Not yet supported:
-
-- blend shapes / morph targets
+- morph targets / blend shapes (chunks 22-24: per-mesh target table, sparse
+  float16 position/normal deltas over exported vertices, and optional
+  pose-space driver records referencing skeleton joint paths). Exported from
+  Blender shape keys with `--export-shapekeys`; drivers are authored via
+  `untold_driver_joint` / `untold_driver_pose` / `untold_driver_radius`
+  custom properties on the shape key (or `<key>_untold_driver_*` on the mesh
+  object where shape-key IDProperties are unavailable).
 
 The design goals are:
 

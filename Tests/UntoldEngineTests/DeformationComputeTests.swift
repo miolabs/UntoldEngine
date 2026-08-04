@@ -114,7 +114,7 @@ final class DeformationComputeTests: XCTestCase {
         encoder.setBuffer(outPositions, offset: 0, index: Int(deformationPassOutPositionIndex.rawValue))
         encoder.setBuffer(outNormals, offset: 0, index: Int(deformationPassOutNormalIndex.rawValue))
         encoder.setBuffer(outTangents, offset: 0, index: Int(deformationPassOutTangentIndex.rawValue))
-        var params = DeformationPassParams(vertexCount: UInt32(vertexCount))
+        var params = DeformationPassParams(vertexCount: UInt32(vertexCount), hasMorphDeltas: 0)
         encoder.setBytes(
             &params,
             length: MemoryLayout<DeformationPassParams>.stride,
@@ -333,6 +333,118 @@ final class DeformationComputeTests: XCTestCase {
         }
     }
 
+    /// Clear + accumulate + LBS with identity joints must yield base + delta.
+    func testMorphAccumulateAppliesWeightedDeltas() throws {
+        let context = try makeKernelContext()
+        let clearPipeline = try context.device.makeComputePipelineState(
+            function: XCTUnwrap(context.library.makeFunction(name: "deformClearMorphDeltas"))
+        )
+        let accumulatePipeline = try context.device.makeComputePipelineState(
+            function: XCTUnwrap(context.library.makeFunction(name: "deformMorphAccumulate"))
+        )
+        let skinPipeline = try context.device.makeComputePipelineState(
+            function: XCTUnwrap(context.library.makeFunction(name: "deformSkinLBS"))
+        )
+
+        let vertexCount = 8
+        let positions = (0 ..< vertexCount).map { simd_float4(Float($0), 0, 0, 1) }
+        let normals = [simd_float4](repeating: simd_float4(0, 0, 1, 0), count: vertexCount)
+        let tangents = [simd_float4](repeating: simd_float4(1, 0, 0, 1), count: vertexCount)
+        let jointIndices = [simd_ushort4](repeating: .init(0, 0, 0, 0), count: vertexCount)
+        let jointWeights = [simd_float4](repeating: simd_float4(1, 0, 0, 0), count: vertexCount)
+        let jointMatrices = [matrix_identity_float4x4]
+
+        let delta = simd_float3(0.5, -0.25, 1.0)
+        var entries = [MorphSparseEntry]()
+        entries.append(MorphSparseEntry(
+            vertexIndex: 3,
+            dPosition: (Float16(delta.x).bitPattern, Float16(delta.y).bitPattern, Float16(delta.z).bitPattern),
+            dNormal: (0, 0, 0)
+        ))
+        let weight: Float = 0.5
+
+        func makeBuffer(_ data: [some Any]) throws -> MTLBuffer {
+            try data.withUnsafeBytes { bytes in
+                try XCTUnwrap(context.device.makeBuffer(
+                    bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared
+                ))
+            }
+        }
+        let deltaLength = vertexCount * MemoryLayout<simd_float4>.stride
+        let positionDeltas = try XCTUnwrap(context.device.makeBuffer(length: deltaLength, options: .storageModeShared))
+        let normalDeltas = try XCTUnwrap(context.device.makeBuffer(length: deltaLength, options: .storageModeShared))
+        let entryBuffer = try makeBuffer(entries)
+
+        let inPositions = try makeBuffer(positions)
+        let inNormals = try makeBuffer(normals)
+        let inTangents = try makeBuffer(tangents)
+        let inJointIndices = try makeBuffer(jointIndices)
+        let inJointWeights = try makeBuffer(jointWeights)
+        let inJointMatrices = try makeBuffer(jointMatrices)
+        let outPositions = try XCTUnwrap(context.device.makeBuffer(length: deltaLength, options: .storageModeShared))
+        let outNormals = try XCTUnwrap(context.device.makeBuffer(length: deltaLength, options: .storageModeShared))
+        let outTangents = try XCTUnwrap(context.device.makeBuffer(length: deltaLength, options: .storageModeShared))
+
+        let commandBuffer = try XCTUnwrap(context.commandQueue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+
+        encoder.setComputePipelineState(clearPipeline)
+        encoder.setBuffer(positionDeltas, offset: 0, index: Int(morphPassPositionDeltaIndex.rawValue))
+        encoder.setBuffer(normalDeltas, offset: 0, index: Int(morphPassNormalDeltaIndex.rawValue))
+        var clearParams = MorphPassParams(entryOffset: 0, entryCount: 0, vertexCount: UInt32(vertexCount), weightTimesScale: 0)
+        encoder.setBytes(&clearParams, length: MemoryLayout<MorphPassParams>.stride, index: Int(morphPassParamsIndex.rawValue))
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: vertexCount, height: 1, depth: 1)
+        )
+
+        encoder.setComputePipelineState(accumulatePipeline)
+        encoder.setBuffer(entryBuffer, offset: 0, index: Int(morphPassEntriesIndex.rawValue))
+        var accumulateParams = MorphPassParams(
+            entryOffset: 0, entryCount: 1, vertexCount: UInt32(vertexCount), weightTimesScale: weight
+        )
+        encoder.setBytes(&accumulateParams, length: MemoryLayout<MorphPassParams>.stride, index: Int(morphPassParamsIndex.rawValue))
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+        )
+
+        encoder.setComputePipelineState(skinPipeline)
+        encoder.setBuffer(inPositions, offset: 0, index: Int(deformationPassInPositionIndex.rawValue))
+        encoder.setBuffer(inNormals, offset: 0, index: Int(deformationPassInNormalIndex.rawValue))
+        encoder.setBuffer(inTangents, offset: 0, index: Int(deformationPassInTangentIndex.rawValue))
+        encoder.setBuffer(inJointIndices, offset: 0, index: Int(deformationPassJointIdIndex.rawValue))
+        encoder.setBuffer(inJointWeights, offset: 0, index: Int(deformationPassJointWeightsIndex.rawValue))
+        encoder.setBuffer(inJointMatrices, offset: 0, index: Int(deformationPassJointTransformIndex.rawValue))
+        encoder.setBuffer(positionDeltas, offset: 0, index: Int(deformationPassMorphPositionDeltaIndex.rawValue))
+        encoder.setBuffer(normalDeltas, offset: 0, index: Int(deformationPassMorphNormalDeltaIndex.rawValue))
+        encoder.setBuffer(outPositions, offset: 0, index: Int(deformationPassOutPositionIndex.rawValue))
+        encoder.setBuffer(outNormals, offset: 0, index: Int(deformationPassOutNormalIndex.rawValue))
+        encoder.setBuffer(outTangents, offset: 0, index: Int(deformationPassOutTangentIndex.rawValue))
+        var skinParams = DeformationPassParams(vertexCount: UInt32(vertexCount), hasMorphDeltas: 1)
+        encoder.setBytes(&skinParams, length: MemoryLayout<DeformationPassParams>.stride, index: Int(deformationPassParamsIndex.rawValue))
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: vertexCount, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertEqual(commandBuffer.status, .completed)
+
+        let gpuPositions = outPositions.contents().bindMemory(to: simd_float4.self, capacity: vertexCount)
+        for vertexIndex in 0 ..< vertexCount {
+            var expected = positions[vertexIndex]
+            if vertexIndex == 3 {
+                expected += simd_float4(delta * weight, 0)
+            }
+            XCTAssertLessThan(
+                simd_reduce_max(simd_abs(gpuPositions[vertexIndex] - expected)), 2e-3,
+                "vertex \(vertexIndex) morph mismatch"
+            )
+        }
+    }
+
     // MARK: - Shared kernel harness
 
     private struct KernelContext {
@@ -430,7 +542,7 @@ final class DeformationComputeTests: XCTestCase {
         encoder.setBuffer(outPositions, offset: 0, index: Int(deformationPassOutPositionIndex.rawValue))
         encoder.setBuffer(outNormals, offset: 0, index: Int(deformationPassOutNormalIndex.rawValue))
         encoder.setBuffer(outTangents, offset: 0, index: Int(deformationPassOutTangentIndex.rawValue))
-        var params = DeformationPassParams(vertexCount: UInt32(vertexCount))
+        var params = DeformationPassParams(vertexCount: UInt32(vertexCount), hasMorphDeltas: 0)
         encoder.setBytes(
             &params,
             length: MemoryLayout<DeformationPassParams>.stride,
