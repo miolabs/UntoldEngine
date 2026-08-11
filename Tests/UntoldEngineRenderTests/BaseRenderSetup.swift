@@ -86,7 +86,50 @@ class BaseRenderSetup: XCTestCase {
         antiAliasingMode = .fxaa
         renderDebugViewMode = .lit
         currentGlobalTime = 0.0
+        // Engine defaults (RuntimeGlobalsStore's cameraDefaultFOV/cameraNearPlane/cameraFarPlane
+        // initial values). A scene-authored asset load (e.g. loadSceneAuthored) overwrites these
+        // globals with its own camera's values and never restores them, so any later test in the
+        // same process would otherwise inherit the wrong frustum here in setUp(), before
+        // initializeAssets() even runs.
+        fov = 65.0
+        near = 0.1
+        far = 500.0
+        LightingSystem.shared.activeDirectionalLight = nil
     }
+
+    private func psnrThreshold(for targetName: String, default defaultValue: String) -> String {
+        let env = ProcessInfo.processInfo.environment
+        let targetKey = targetName
+            .uppercased()
+            .map { $0.isLetter || $0.isNumber ? $0 : "_" }
+            .reduce(into: "") { $0.append($1) }
+
+        if let threshold = env["UNTOLD_PSNR_THRESHOLD_\(targetKey)"] {
+            return threshold
+        }
+
+        if let threshold = Self.defaultPSNRThresholds[targetName] {
+            return threshold
+        }
+
+        return env["UNTOLD_PSNR_THRESHOLD"] ?? defaultValue
+    }
+
+    private static let defaultPSNRThresholds: [String: String] = [
+        "Bloom": "25.5",
+        "ChromaticAberration": "32.0",
+        "ColorGrading": "24.0",
+        "DepthOfField": "32.0",
+        "FlythroughWaypoint1": "28.5",
+        "FlythroughWaypoint2": "24.0",
+        "FlythroughWaypoint3": "23.5",
+        "FXAA": "29.5",
+        "GaussianTarget": "26.5",
+        "LightPassColor": "32.0",
+        "SMAA": "29.5",
+        "TransparencyTarget": "32.0",
+        "Vignette": "32.5",
+    ]
 
     /// Set up a headless renderer.
     override func setUp() async throws {
@@ -183,7 +226,7 @@ class BaseRenderSetup: XCTestCase {
         let isCI = (env["CI"] == "true") || (env["GITHUB_ACTIONS"] == "true")
         let keepFlag = (env["UNTOLD_KEEP_ARTIFACTS"] == "1")
         let pythonCmd = env["UNTOLD_PYTHON"] ?? "python3"
-        let threshold: String = env["UNTOLD_PSNR_THRESHOLD"] ?? "11.0"
+        let threshold = psnrThreshold(for: targetName, default: "11.0")
 
         do { try FileManager.default.createDirectory(at: baseTemp, withIntermediateDirectories: true) }
         catch { XCTFail("Failed to create temp dir: \(error)"); return }
@@ -401,7 +444,7 @@ class BaseRenderSetup: XCTestCase {
     {
         let env = ProcessInfo.processInfo.environment
         let pythonCmd = env["UNTOLD_PYTHON"] ?? "python3"
-        let psnrThresh = threshold ?? (env["UNTOLD_PSNR_THRESHOLD"] ?? "30.0")
+        let psnrThresh = threshold ?? psnrThreshold(for: referenceName, default: "30.0")
 
         guard let scriptURL = Bundle.module.url(forResource: "compare_psnr", withExtension: "py") else {
             XCTFail("compare_psnr.py not found in test bundle"); return

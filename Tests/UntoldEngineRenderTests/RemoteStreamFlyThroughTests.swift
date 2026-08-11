@@ -157,6 +157,7 @@ final class RemoteStreamFlyThroughTests: BaseRenderSetup {
 
     func testRemoteStreamFlythrough_psnr() async throws {
         let sceneRoot = try await loadRemoteScene()
+        await hydrateFlythroughRoute(sceneRoot: sceneRoot)
 
         for (index, waypoint) in waypoints.enumerated() {
             let name = keyframeNames[index]
@@ -171,10 +172,19 @@ final class RemoteStreamFlyThroughTests: BaseRenderSetup {
             // Refresh the visible-entity list (new tile geometry may have appeared)
             setVisibleEntities()
 
-            // Render a few frames to let the GPU pipeline warm up at this position
-            for _ in 0 ..< 5 {
+            // Render more frames than a "warm-up" strictly needs: driveStreamingUntilReady
+            // only certifies that tiles finished *parsing*, not that BatchingSystem/
+            // ProgressiveAssetLoader have finished integrating them into a drawable state.
+            // Each draw() ticks that integration forward, so extra frames here buy real
+            // settle time for freshly-parsed geometry under CI's slower/contended runner.
+            for _ in 0 ..< 15 {
                 renderer.draw(in: renderer.metalView)
             }
+            // The command-buffer semaphore only bounds how many frames can be in flight —
+            // it does not guarantee the last one has finished. Without this wait, the PSNR
+            // capture below can race the GPU and read a not-yet-settled composite, especially
+            // under CI's virtualized-GPU contention (observed: a ~1dB miss on waypoint 1).
+            await renderInfo.lastCommandBuffer?.completed()
 
             // Capture the deferred-lighting composite and PSNR-compare
             guard let compositeTexture = renderInfo.deferredRenderPassDescriptor
@@ -196,6 +206,27 @@ final class RemoteStreamFlyThroughTests: BaseRenderSetup {
     // MARK: - Shared helpers
 
     // -------------------------------------------------------------------------
+
+    /// Performs a non-asserting pass through the camera route before image capture.
+    /// CI starts with a cold remote asset cache and a slower paravirtual Metal device;
+    /// without this pre-pass, later waypoints can capture while their route-adjacent
+    /// tiles are still downloading or registering.
+    private func hydrateFlythroughRoute(sceneRoot: EntityID) async {
+        for (index, waypoint) in waypoints.enumerated() {
+            snapCamera(to: waypoint)
+            _ = await driveStreamingUntilReady(sceneRoot: sceneRoot)
+            setVisibleEntities()
+            for _ in 0 ..< 10 {
+                renderer.draw(in: renderer.metalView)
+            }
+
+            if index + 1 < waypoints.count {
+                await animateCameraPath(from: waypoint, to: waypoints[index + 1], sceneRoot: sceneRoot)
+            }
+        }
+
+        stopCameraPath()
+    }
 
     /// Resolves the manifest URL, loads the remote tiled scene, and returns the
     /// root entity.  Skips the test if no real URL is configured.
@@ -235,12 +266,22 @@ final class RemoteStreamFlyThroughTests: BaseRenderSetup {
     /// tiles that started loading have finished parsing, then returns.
     /// Returns true if the condition was met within the timeout, false otherwise.
     @discardableResult
-    private func driveStreamingUntilReady(sceneRoot: EntityID, timeout: TimeInterval = 30.0) async -> Bool {
+    private func driveStreamingUntilReady(sceneRoot: EntityID, timeout: TimeInterval = 60.0) async -> Bool {
         let camera = findGameCamera()
+        var stableReadySamples = 0
         return await waitUntil(timeout: timeout) {
             let camPos = getCameraPosition(entityId: camera)
             GeometryStreamingSystem.shared.update(cameraPosition: camPos, deltaTime: 0.016)
-            return self.tilesAreReady(sceneRoot: sceneRoot)
+            if self.tilesAreReady(sceneRoot: sceneRoot) {
+                stableReadySamples += 1
+            } else {
+                stableReadySamples = 0
+            }
+            // 40 samples * 25ms poll interval = ~1s of continuous stability. The previous
+            // 8-sample (~200ms) debounce was long enough to call the state "ready" while
+            // freshly-parsed tiles were still being integrated into a drawable state under
+            // CI's slower/contended runner, producing an incomplete-mesh capture.
+            return stableReadySamples >= 40
         }
     }
 
@@ -266,7 +307,20 @@ final class RemoteStreamFlyThroughTests: BaseRenderSetup {
             guard tilePassesFrustumGate(entityId: $0, frustum: tileFrustum) else { return false }
             return tileDistance(entityId: $0, cameraPosition: cameraPosition) <= tile.effectivePrefetchRadius + 1.0
         }
-        return hasParsed && !hasUnreadyRelevantTile
+
+        let streamingStats = GeometryStreamingSystem.shared.getStats()
+        let noQueuedStreamingWork = streamingStats.activeLoads == 0 &&
+            streamingStats.loadingCount == 0 &&
+            streamingStats.pendingLoadBacklog == 0
+        let noGlobalAssetLoads = !AssetLoadingGate.shared.isLoadingAny
+        // TextureStreamingSystem upgrades/downgrades run independently of geometry
+        // streaming and never register with AssetLoadingGate, so without this check
+        // a tile can be considered "ready" while its texture upgrade is still
+        // in-flight — the composite is then captured showing a fallback/lower-res
+        // texture, producing an intermittent PSNR miss unrelated to geometry residency.
+        let noTextureStreamingWork = TextureStreamingSystem.shared.getStats().activeOps == 0
+
+        return hasParsed && !hasUnreadyRelevantTile && noQueuedStreamingWork && noGlobalAssetLoads && noTextureStreamingWork
     }
 
     private func tilePassesFloorGate(tile: TileComponent, cameraPosition: simd_float3) -> Bool {
