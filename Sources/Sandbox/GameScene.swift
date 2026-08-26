@@ -35,18 +35,6 @@
                  setSceneReady(success)
              }
              */
-            /*
-             let sceneRoot = createEntity()
-             setEntityStreamScene(
-                   entityId: sceneRoot,
-                   url: URL(fileURLWithPath: "/path/to/local/json")
-               ) { success in
-                   if success {
-                       loadSceneAuthored(url: URL(fileURLWithPath: "/path/to/local/json"))
-                   }
-                   setSceneReady(success)
-               }
-             */
 
             // Uncomment to render a streamed scene
         }
@@ -57,6 +45,7 @@
             InputSystem.shared.registerKeyboardEvents()
             InputSystem.shared.registerMouseEvents()
             bypassPostProcessing = false
+            setSpatialDebug(.lodLevels(false))
         }
 
         private func setupDefaultSceneObjects() {

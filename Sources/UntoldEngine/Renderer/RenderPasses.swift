@@ -559,6 +559,22 @@ public enum RenderPasses {
         runtimeState.lock.unlock()
     }
 
+    /// Returns the current shadow entity candidate cache, rebuilding first if dirty.
+    /// Internal — exposed for testing via @testable import. Lets tests pin the exact
+    /// staleness bug this cache has had before: a non-streaming load that skips
+    /// invalidateShadowEntityCache() is silently absent from shadow candidates.
+    static func shadowEntityCandidatesForTesting() -> [EntityID] {
+        runtimeState.lock.lock()
+        let dirty = runtimeState.shadowCacheDirty
+        runtimeState.lock.unlock()
+        if dirty {
+            rebuildShadowEntityCache()
+        }
+        runtimeState.lock.lock()
+        defer { runtimeState.lock.unlock() }
+        return runtimeState.shadowEntityCandidates
+    }
+
     private static func shadowCasterEntityIds(for cascadeIdx: Int) -> [EntityID] {
         ensureShadowCacheConfigured()
         guard let frustum = shadowFrustum(for: cascadeIdx) else { return [] }
@@ -4319,6 +4335,9 @@ public enum RenderPasses {
             _ = commandBuffer
             return
         #else
+            EngineProfiler.shared.beginScope(.gaussianDraw)
+            defer { EngineProfiler.shared.endScope(.gaussianDraw) }
+
             let profileStart = gaussianProfilingStartTime()
             var profileTotals = GaussianProfileTotals()
             var activeSplatTotal = 0
@@ -4495,8 +4514,13 @@ public enum RenderPasses {
                 }
 
                 // bind data here
+                // Same frame-slot indexing as executeGaussianFrustumCulling/executeGaussianDepth/
+                // executeRadixSort — renderInfo.currentInFlightFrameSlot is set once per frame
+                // and stays constant across both eyes, so this correctly reads back whichever
+                // slot this frame's cull/sort pipeline wrote into.
+                let gaussianFrameSlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianSortedIndices.count - 1)
                 renderEncoder.setVertexBuffer(
-                    gaussianComponent.gaussianSortedIndices,
+                    gaussianComponent.gaussianSortedIndices[gaussianFrameSlot],
                     offset: 0,
                     index: Int(gaussianTBDRRenderIndicesIndex.rawValue)
                 )
@@ -4507,30 +4531,26 @@ public enum RenderPasses {
                 )
                 renderEncoder.setVertexBytes(&renderInfo.viewPort, length: MemoryLayout<simd_float2>.stride, index: Int(gaussianTBDRRenderViewPortIndex.rawValue))
 
-                var shMetadata = gaussianComponent.sphericalHarmonicsMetadata ?? GaussianSHMetadata(
-                    degree: 0,
-                    coefficientsPerChannel: 0,
-                    higherOrderCoefficientsPerSplat: 0,
-                    _pad0: 0
-                )
+                // Conic/radius/color are precomputed once per splat per frame by
+                // executeGaussianPreprocess (see GaussianSystem.swift) instead of being
+                // recomputed here 4x per splat (once per instanced quad vertex).
                 renderEncoder.setVertexBuffer(
-                    gaussianComponent.sphericalHarmonicsData ?? gaussianComponent.encodedSplatData,
+                    gaussianComponent.gaussianPrecomputedData[gaussianFrameSlot],
                     offset: 0,
-                    index: Int(gaussianTBDRRenderSHIndex.rawValue)
+                    index: Int(gaussianTBDRRenderPrecomputedIndex.rawValue)
                 )
+
+                var gaussianLODDebugColor = simd_float4(0, 0, 0, 0)
+                if SpatialDebugVisualization.shared.colorRenderablesByLOD,
+                   let gaussianLOD = scene.get(component: GaussianLODComponent.self, for: entityId)
+                {
+                    let color = lodDebugColor(for: gaussianLOD.currentLOD)
+                    gaussianLODDebugColor = simd_float4(color.x, color.y, color.z, 1.0)
+                }
                 renderEncoder.setVertexBytes(
-                    &shMetadata,
-                    length: MemoryLayout<GaussianSHMetadata>.stride,
-                    index: Int(gaussianTBDRRenderSHMetadataIndex.rawValue)
-                )
-                var localCameraPosition = gaussianLocalCameraPosition(
-                    cameraWorldPosition: effectiveCameraPosition,
-                    modelMatrix: modelMatrix
-                )
-                renderEncoder.setVertexBytes(
-                    &localCameraPosition,
-                    length: MemoryLayout<simd_float3>.stride,
-                    index: Int(gaussianTBDRRenderLocalCameraIndex.rawValue)
+                    &gaussianLODDebugColor,
+                    length: MemoryLayout<simd_float4>.stride,
+                    index: Int(gaussianTBDRRenderDebugColorIndex.rawValue)
                 )
 
                 renderEncoder.drawPrimitivesTracked(type: .triangleStrip,

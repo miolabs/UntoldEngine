@@ -148,10 +148,10 @@ final class GaussianStreamingTest: BaseRenderSetup {
         XCTAssertEqual(component.assetKind, .mesh, "❌ Default assetKind should be .mesh so existing mesh streaming call sites are unaffected")
     }
 
-    // MARK: - setEntityGaussianStreamable / findTileEntity
+    // MARK: - setEntityGaussianStreaming / findTileEntity
 
     /// End-to-end check of the consolidated API: given a positioned entity and a tile
-    /// whose bounds contain that position, `setEntityGaussianStreamable` should parent it
+    /// whose bounds contain that position, `setEntityGaussianStreaming` should parent it
     /// under that tile, register it with the octree, and configure it as a real gaussian
     /// streaming candidate — equivalent to `makeUnloadedGaussianEntity`'s manual assembly,
     /// but via the one public call callers are meant to use.
@@ -168,13 +168,14 @@ final class GaussianStreamingTest: BaseRenderSetup {
         let entity = createEntity()
         translateTo(entityId: entity, position: .zero)
 
-        setEntityGaussianStreamable(
+        setEntityGaussianStreaming(
             entityId: entity,
-            filename: "test_gaussians",
-            withExtension: "ply",
-            streamingRadius: 10.0,
-            unloadRadius: 20.0,
-            boundingBoxHalfExtent: simd_float3(1, 1, 1)
+            source: .single(filename: "test_gaussians", withExtension: "ply"),
+            options: GaussianStreamingOptions(
+                streamingRadius: 10.0,
+                unloadRadius: 20.0,
+                boundingBoxHalfExtent: simd_float3(1, 1, 1)
+            )
         )
 
         XCTAssertEqual(
@@ -201,21 +202,164 @@ final class GaussianStreamingTest: BaseRenderSetup {
 
     /// If no tile contains the entity's position, the entity should be left as a plain,
     /// non-streaming entity rather than crashing or silently half-configuring it.
-    func testSetEntityGaussianStreamable_noContainingTileLeavesEntityNonStreaming() {
+    func testSetEntityGaussianStreaming_noContainingTileLeavesEntityNonStreaming() {
         let entity = createEntity()
         translateTo(entityId: entity, position: simd_float3(1000, 1000, 1000)) // no tile out here
 
-        setEntityGaussianStreamable(
+        setEntityGaussianStreaming(
             entityId: entity,
-            filename: "test_gaussians",
-            withExtension: "ply",
-            boundingBoxHalfExtent: simd_float3(1, 1, 1)
+            source: .single(filename: "test_gaussians", withExtension: "ply"),
+            options: GaussianStreamingOptions(
+                boundingBoxHalfExtent: simd_float3(1, 1, 1)
+            )
         )
 
         XCTAssertNil(
             scene.get(component: StreamingComponent.self, for: entity),
             "❌ Entity should not get a StreamingComponent when no containing tile is found"
         )
+    }
+
+    /// Creates a tile at the origin with bounds large enough to contain any entity position
+    /// this file's streaming-registration tests use, and registers it in the octree.
+    @discardableResult
+    private func makeContainingTileAtOrigin() -> EntityID {
+        let tileRoot = createEntity()
+        if let tileComp = scene.assign(to: tileRoot, component: TileComponent.self) {
+            tileComp.state = .parsed
+        }
+        if let tileLocal = scene.get(component: LocalTransformComponent.self, for: tileRoot) {
+            tileLocal.boundingBox = (min: simd_float3(-10, -10, -10), max: simd_float3(10, 10, 10))
+        }
+        OctreeSystem.shared.registerEntity(tileRoot)
+        return tileRoot
+    }
+
+    // MARK: - Auto-resolved bounding box (baked .untoldgs header)
+
+    /// `.untoldgs` sources have a real box baked into their v2 header (see
+    /// `UntoldGSFormat.readHeader`) -- `setEntityGaussianStreamable` should read it
+    /// synchronously at registration time when no explicit override is supplied, rather than
+    /// leaving the entity with a degenerate placeholder box.
+    func testSetEntityGaussianStreamable_autoResolvesBoundingBoxFromBakedUntoldgsHeader() throws {
+        makeContainingTileAtOrigin()
+
+        let plyURL = try XCTUnwrap(LoadingSystem.shared.resourceURL(forResource: "test_gaussians", withExtension: "ply", subResource: nil))
+        let asset = try PLYReader.readGaussianAsset(from: plyURL)
+        let trueBox = computeGaussianSplatBoundingBox(asset.splats)
+
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GaussianStreamingTest-\(UUID().uuidString)")
+            .appendingPathExtension("untoldgs")
+        _ = try bakeGaussianSplatProgressiveTiers(plyURL: plyURL, outputBaseURL: output, lodFractions: [1.0])
+
+        let entity = createEntity()
+        translateTo(entityId: entity, position: .zero)
+
+        // Deliberately omit boundingBoxHalfExtent.
+        setEntityGaussianStreamable(
+            entityId: entity,
+            filename: output.deletingPathExtension().path,
+            withExtension: "untoldgs"
+        )
+
+        let boundingBox = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)?.boundingBox)
+        XCTAssertEqual(boundingBox.min, trueBox.min)
+        XCTAssertEqual(boundingBox.max, trueBox.max)
+        XCTAssertNotNil(scene.get(component: StreamingComponent.self, for: entity), "❌ Entity should still register for streaming once the box resolves from the baked header")
+    }
+
+    /// A raw `.ply` source has no baked header to fall back to, so omitting
+    /// `boundingBoxHalfExtent` there should still leave the entity non-streaming (with a
+    /// warning), not register a degenerate placeholder box.
+    func testSetEntityGaussianStreamable_rawPLYWithoutOverrideLeavesEntityNonStreaming() {
+        makeContainingTileAtOrigin()
+
+        let entity = createEntity()
+        translateTo(entityId: entity, position: .zero)
+
+        // Deliberately omit boundingBoxHalfExtent for a raw .ply source.
+        setEntityGaussianStreamable(
+            entityId: entity,
+            filename: "test_gaussians",
+            withExtension: "ply"
+        )
+
+        XCTAssertNil(
+            scene.get(component: StreamingComponent.self, for: entity),
+            "❌ Entity should not get a StreamingComponent when no override is given and the source has no baked box"
+        )
+    }
+
+    /// Same auto-resolve behavior as above, for the progressive-tier streaming entry point --
+    /// the box should come from the coarsest tier's baked header and be marked explicit so it's
+    /// never overwritten by the (now effectively redundant) async-load fallback.
+    func testSetEntityGaussianProgressiveStreamable_autoResolvesBoundingBoxFromBakedHeader() throws {
+        makeContainingTileAtOrigin()
+
+        let plyURL = try XCTUnwrap(LoadingSystem.shared.resourceURL(forResource: "test_gaussians", withExtension: "ply", subResource: nil))
+        let asset = try PLYReader.readGaussianAsset(from: plyURL)
+        let trueBox = computeGaussianSplatBoundingBox(asset.splats)
+
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GaussianStreamingTest-\(UUID().uuidString)")
+            .appendingPathExtension("untoldgs")
+        _ = try bakeGaussianSplatProgressiveTiers(plyURL: plyURL, outputBaseURL: output, levelCount: 3)
+
+        let entity = createEntity()
+        translateTo(entityId: entity, position: .zero)
+
+        // Deliberately omit boundingBoxHalfExtent.
+        setEntityGaussianProgressiveStreamable(
+            entityId: entity,
+            baseFilename: output.deletingPathExtension().path,
+            levelCount: 3,
+            maxDistances: [20, 50, .greatestFiniteMagnitude]
+        )
+
+        let boundingBox = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)?.boundingBox)
+        XCTAssertEqual(boundingBox.min, trueBox.min)
+        XCTAssertEqual(boundingBox.max, trueBox.max)
+        XCTAssertNotNil(scene.get(component: StreamingComponent.self, for: entity))
+        XCTAssertEqual(scene.get(component: GaussianLODComponent.self, for: entity)?.hasExplicitBoundingBox, true)
+    }
+
+    /// A pre-v2 (48-byte, no baked box) `.untoldgs` tier can't have its header read as a box,
+    /// so with no override supplied, registration should fail cleanly -- no `StreamingComponent`,
+    /// and no half-configured `GaussianLODComponent` left behind for `GaussianLODSystem` to keep
+    /// processing every frame on an entity that never actually streams.
+    func testSetEntityGaussianProgressiveStreamable_unreadableHeaderLeavesNoLeakedComponent() throws {
+        makeContainingTileAtOrigin()
+
+        var bytes: [UInt8] = []
+        bytes += [0x55, 0x54, 0x47, 0x53] // magic "UTGS"
+        bytes += [1, 0, 0, 0] // version = 1 (pre-box format)
+        bytes += [UInt8](repeating: 0, count: 8) // splatCount = 0
+        bytes += [0, 0, 0, 0] // shDegree
+        bytes += [0, 0, 0, 0] // shCoefficientsPerChannel
+        bytes += [0, 0, 0, 0] // shHigherOrderCoefficientsPerSplat
+        bytes += [0, 0, 0, 0] // meanSquaredSplatExtent
+        bytes += [UInt8](repeating: 0, count: 8) // encodedByteCount = 0
+        bytes += [UInt8](repeating: 0, count: 8) // shByteCount = 0
+
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GaussianStreamingTest-v1header-\(UUID().uuidString)")
+            .appendingPathExtension("untoldgs")
+        try Data(bytes).write(to: output)
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        let entity = createEntity()
+        translateTo(entityId: entity, position: .zero)
+
+        setEntityGaussianProgressiveStreamable(
+            entityId: entity,
+            baseFilename: output.deletingPathExtension().path,
+            levelCount: 1,
+            maxDistances: [.greatestFiniteMagnitude]
+        )
+
+        XCTAssertNil(scene.get(component: StreamingComponent.self, for: entity), "❌ Should not register for streaming")
+        XCTAssertNil(scene.get(component: GaussianLODComponent.self, for: entity), "❌ Should not leave a half-configured GaussianLODComponent behind")
     }
 
     /// `findTileEntity` should return the tile whose bounds contain the query point, and

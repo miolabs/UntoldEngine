@@ -48,6 +48,8 @@ func initGuassianComputePipelines() {
 
     createComputePipeline(into: &gaussianFrustumCullPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianFrustumCull", pipelineName: "Gaussian Frustum Cull")
 
+    createComputePipeline(into: &gaussianPreprocessPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianPreprocess", pipelineName: "Gaussian Preprocess")
+
     createComputePipeline(into: &gaussianDepthPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianDepthKeys", pipelineName: "Gaussian Depth")
 
     createComputePipeline(into: &radixClearHistogramPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianRadixClearHistogram", pipelineName: "Radix Clear")
@@ -104,9 +106,20 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             handleError(.noWorldTransformComponent, entityId)
             continue
         }
+        guard !gaussianComponent.gaussianVisibleIndices.isEmpty,
+              !gaussianComponent.gaussianVisibleCount.isEmpty
+        else {
+            handleError(.bufferAllocationFailed, "Gaussian culling buffers")
+            continue
+        }
+        // Cull/depth-key/radix-sort write these buffers fresh every frame; slot per
+        // in-flight frame (mirrors spaceUniform's indexing) so an overlapping newer frame
+        // can't clobber data an older in-flight frame's draw is still reading — see the
+        // comment on GaussianComponent's declaration.
+        let frameSlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianVisibleIndices.count - 1)
         guard let encodedSplatData = gaussianComponent.encodedSplatData,
-              let visibleIndices = gaussianComponent.gaussianVisibleIndices,
-              let visibleCount = gaussianComponent.gaussianVisibleCount
+              let visibleIndices = gaussianComponent.gaussianVisibleIndices[frameSlot],
+              let visibleCount = gaussianComponent.gaussianVisibleCount[frameSlot]
         else {
             handleError(.bufferAllocationFailed, "Gaussian culling buffers")
             continue
@@ -142,6 +155,17 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         var totalSplats = UInt32(gaussianComponent.splatCount)
         var clipGuardBand: Float = 0.25
 
+        // Coarse per-splat HZB occlusion pre-cull, fused into this same dispatch — see
+        // the comment in gaussianFrustumCull (BitonicSort.metal). Reuses the exact same
+        // temporal HZB pyramid mesh occlusion culling builds each frame
+        // (buildHZBDepthPyramid); hzbIsValid guarantees hzbDepthPyramid is non-nil when
+        // true, so the fallback texture below is only ever actually read when the flag
+        // (and therefore the shader's own occlusion branch) is off.
+        let hzbValid = renderInfo.hzbIsValid && textureResources.hzbDepthPyramid != nil
+        var hzbValidFlag: UInt32 = hzbValid ? 1 : 0
+        var hzbReverseZFlag: UInt32 = renderInfo.reverseZEnabled ? 1 : 0
+        var hzbOcclusionBias: Float = 0.02
+
         computeEncoder.setComputePipelineState(cullPipelineState)
         computeEncoder.setBuffer(encodedSplatData, offset: 0, index: Int(gaussianEncodedSplatIndex.rawValue))
         computeEncoder.setBytes(&gaussianUniform, length: MemoryLayout<Uniforms>.stride, index: Int(gaussianUniformIndex.rawValue))
@@ -149,6 +173,13 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         computeEncoder.setBuffer(visibleIndices, offset: 0, index: Int(gaussianVisibleIndicesIndex.rawValue))
         computeEncoder.setBuffer(visibleCount, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
         computeEncoder.setBytes(&clipGuardBand, length: MemoryLayout<Float>.stride, index: Int(gaussianIndicesIndex.rawValue))
+        computeEncoder.setBytes(&hzbReverseZFlag, length: MemoryLayout<UInt32>.stride, index: Int(gaussianCullHZBReverseZIndex.rawValue))
+        computeEncoder.setBytes(&hzbOcclusionBias, length: MemoryLayout<Float>.stride, index: Int(gaussianCullHZBOcclusionBiasIndex.rawValue))
+        computeEncoder.setBytes(&hzbValidFlag, length: MemoryLayout<UInt32>.stride, index: Int(gaussianCullHZBValidIndex.rawValue))
+        computeEncoder.setTexture(
+            textureResources.hzbDepthPyramid ?? textureResources.depthMap,
+            index: Int(gaussianCullHZBDepthPyramidTextureIndex.rawValue)
+        )
 
         let tew = cullPipelineState.threadExecutionWidth
         let maxT = cullPipelineState.maxTotalThreadsPerThreadgroup
@@ -199,6 +230,134 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     )
 }
 
+/// Computes conic/radius/color once per visible splat per frame — previously the draw
+/// vertex shader recomputed all three redundantly on each of its 4 instanced quad vertices
+/// per splat (see gaussianPreprocess in Gaussians.metal). Must run after
+/// executeGaussianFrustumCulling (consumes its visible-index output) and before the Gaussian
+/// draw pass (which reads gaussianComponent.gaussianPrecomputedData).
+public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
+    let profileStart = gaussianProfilingStartTime()
+    var profileTotals = GaussianProfileTotals()
+    var activeSplatTotal = 0
+
+    guard gaussianPreprocessPipeline.success else {
+        handleError(.pipelineStateNulled, gaussianPreprocessPipeline.name!); return
+    }
+    guard let camera = CameraSystem.shared.activeCamera,
+          let cameraComponent = scene.get(component: CameraComponent.self, for: camera)
+    else {
+        handleError(.noActiveCamera)
+        return
+    }
+    guard let preprocessPipelineState = gaussianPreprocessPipeline.pipelineState else {
+        handleError(.pipelineStateNulled, "Gaussian preprocess pipeline state is nil")
+        return
+    }
+
+    let transformId = getComponentId(for: WorldTransformComponent.self)
+    let gaussianId = getComponentId(for: GaussianComponent.self)
+    let entities = queryEntitiesWithComponentIds([transformId, gaussianId], in: scene)
+    guard !entities.isEmpty else { return }
+
+    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+    computeEncoder.label = "Gaussian Preprocess"
+    computeEncoder.setComputePipelineState(preprocessPipelineState)
+
+    for entityId in entities {
+        guard let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) else {
+            handleError(.noGaussianComponent, entityId)
+            continue
+        }
+        profileTotals.include(component: gaussianComponent)
+
+        // Same latent-by-one-frame dispatch-sizing convention as executeGaussianDepth: this
+        // is a CPU-side upper bound for how many threadgroups to launch, not the source of
+        // truth — the kernel itself re-checks against the current frame's visibleCount.
+        let activeCount = activeGaussianSortCount(gaussianComponent)
+        guard activeCount > 0 else { continue }
+        activeSplatTotal += activeCount
+
+        guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else {
+            handleError(.noWorldTransformComponent, entityId)
+            continue
+        }
+        // Same frame-slot indexing as executeGaussianFrustumCulling — must match, since this
+        // reads that same frame's cull output and writes this same frame's precompute output.
+        let frameSlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianVisibleIndices.count - 1)
+        guard let encodedSplatData = gaussianComponent.encodedSplatData,
+              let visibleIndices = gaussianComponent.gaussianVisibleIndices[frameSlot],
+              let visibleCount = gaussianComponent.gaussianVisibleCount[frameSlot],
+              let precomputedData = gaussianComponent.gaussianPrecomputedData[frameSlot]
+        else {
+            handleError(.bufferAllocationFailed, "Gaussian preprocess buffers")
+            continue
+        }
+
+        let modelMatrix = simd_mul(worldTransformComponent.space, .identity)
+
+        // Same effectiveViewMatrix/effectiveCameraPosition requirement as the cull/depth
+        // passes — see the comment on executeGaussianFrustumCulling.
+        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
+        let modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
+        let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+
+        var gaussianUniform = Uniforms()
+        gaussianUniform.modelViewMatrix = modelViewMatrix
+        gaussianUniform.viewMatrix = viewMatrix
+        gaussianUniform.modelMatrix = modelMatrix
+        gaussianUniform.cameraPosition = effectiveCameraPosition
+        gaussianUniform.projectionMatrix = renderInfo.perspectiveSpace
+
+        var localNumGaussians = UInt32(activeCount)
+        var viewport = renderInfo.viewPort
+        var shMetadata = gaussianComponent.sphericalHarmonicsMetadata ?? GaussianSHMetadata(
+            degree: 0,
+            coefficientsPerChannel: 0,
+            higherOrderCoefficientsPerSplat: 0,
+            _pad0: 0
+        )
+        var localCameraPosition = gaussianLocalCameraPosition(
+            cameraWorldPosition: effectiveCameraPosition,
+            modelMatrix: modelMatrix
+        )
+
+        computeEncoder.setBuffer(encodedSplatData, offset: 0, index: Int(gaussianPreprocessSplatIndex.rawValue))
+        computeEncoder.setBytes(&gaussianUniform, length: MemoryLayout<Uniforms>.stride, index: Int(gaussianPreprocessUniformIndex.rawValue))
+        computeEncoder.setBytes(&localNumGaussians, length: MemoryLayout<UInt32>.stride, index: Int(gaussianPreprocessNumOfSplatsIndex.rawValue))
+        computeEncoder.setBuffer(visibleIndices, offset: 0, index: Int(gaussianPreprocessVisibleIndicesIndex.rawValue))
+        computeEncoder.setBuffer(visibleCount, offset: 0, index: Int(gaussianPreprocessVisibleCountIndex.rawValue))
+        computeEncoder.setBytes(&viewport, length: MemoryLayout<simd_float2>.stride, index: Int(gaussianPreprocessViewportIndex.rawValue))
+        computeEncoder.setBuffer(
+            gaussianComponent.sphericalHarmonicsData ?? encodedSplatData,
+            offset: 0,
+            index: Int(gaussianPreprocessSHIndex.rawValue)
+        )
+        computeEncoder.setBytes(&shMetadata, length: MemoryLayout<GaussianSHMetadata>.stride, index: Int(gaussianPreprocessSHMetadataIndex.rawValue))
+        computeEncoder.setBytes(&localCameraPosition, length: MemoryLayout<simd_float3>.stride, index: Int(gaussianPreprocessLocalCameraIndex.rawValue))
+        computeEncoder.setBuffer(precomputedData, offset: 0, index: Int(gaussianPreprocessOutputIndex.rawValue))
+
+        let tew = preprocessPipelineState.threadExecutionWidth
+        let maxT = preprocessPipelineState.maxTotalThreadsPerThreadgroup
+        var block = min(256, maxT)
+        block = max((block / tew) * tew, tew)
+        let numThreadgroups = (activeCount + block - 1) / block
+        computeEncoder.dispatchThreadgroups(
+            MTLSizeMake(numThreadgroups, 1, 1),
+            threadsPerThreadgroup: MTLSizeMake(block, 1, 1)
+        )
+        profileTotals.dispatchCount += 1
+    }
+
+    computeEncoder.endEncoding()
+
+    logGaussianProfile(
+        stage: "Preprocess",
+        startTime: profileStart,
+        totals: profileTotals,
+        extra: "activeSplats=\(activeSplatTotal)"
+    )
+}
+
 public func executeGaussianDepth(_ commandBuffer: MTLCommandBuffer) {
     let profileStart = gaussianProfilingStartTime()
     var profileTotals = GaussianProfileTotals()
@@ -245,9 +404,12 @@ public func executeGaussianDepth(_ commandBuffer: MTLCommandBuffer) {
             continue
         }
 
-        computeEncoder.setBuffer(gaussianComponent.gaussianSortedIndices, offset: 0, index: Int(gaussianIndicesIndex.rawValue))
-        computeEncoder.setBuffer(gaussianComponent.gaussianVisibleIndices, offset: 0, index: Int(gaussianVisibleIndicesIndex.rawValue))
-        computeEncoder.setBuffer(gaussianComponent.gaussianVisibleCount, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
+        // Same frame-slot indexing as executeGaussianFrustumCulling — must match, since
+        // these are the same frame's cull output being consumed here.
+        let frameSlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianSortedIndices.count - 1)
+        computeEncoder.setBuffer(gaussianComponent.gaussianSortedIndices[frameSlot], offset: 0, index: Int(gaussianIndicesIndex.rawValue))
+        computeEncoder.setBuffer(gaussianComponent.gaussianVisibleIndices[frameSlot], offset: 0, index: Int(gaussianVisibleIndicesIndex.rawValue))
+        computeEncoder.setBuffer(gaussianComponent.gaussianVisibleCount[frameSlot], offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
         computeEncoder.setBuffer(
             gaussianComponent.encodedSplatData,
             offset: 0,
@@ -392,7 +554,10 @@ public func executeRadixSort(_ commandBuffer: MTLCommandBuffer) {
 
     for entityId in entities {
         guard let gc = scene.get(component: GaussianComponent.self, for: entityId) else { continue }
-        guard let sortedIndices = gc.gaussianSortedIndices else { continue }
+        // Same frame-slot indexing as executeGaussianFrustumCulling/executeGaussianDepth —
+        // sorting in place on this frame's own cull/depth-key output.
+        let frameSlot = min(renderInfo.currentInFlightFrameSlot, gc.gaussianSortedIndices.count - 1)
+        guard let sortedIndices = gc.gaussianSortedIndices[frameSlot] else { continue }
 
         let n = activeGaussianSortCount(gc)
         guard n >= 2 else { continue }

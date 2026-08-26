@@ -706,7 +706,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         wt.space = matrix_identity_float4x4
 
         guard let keyBuf = makeBuffer(inputKeys) else { XCTFail("Buffer allocation failed"); return }
-        gc.gaussianSortedIndices = keyBuf
+        gc.gaussianSortedIndices = Array(repeating: keyBuf, count: maxInFlightCommandBuffers)
         gc.splatCount = UInt(n)
         gc.visibleSplatCountForRendering = UInt(n)
 
@@ -762,7 +762,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         wt.space = matrix_identity_float4x4
 
         guard let keyBuf = makeBuffer(inputKeys) else { XCTFail("Buffer allocation failed"); return }
-        gc.gaussianSortedIndices = keyBuf
+        gc.gaussianSortedIndices = Array(repeating: keyBuf, count: maxInFlightCommandBuffers)
         gc.splatCount = UInt(n)
         gc.visibleSplatCountForRendering = UInt(n)
 
@@ -814,7 +814,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         else { XCTFail("Setup failed"); return }
 
         wt1.space = matrix_identity_float4x4
-        gc1.gaussianSortedIndices = buf1
+        gc1.gaussianSortedIndices = Array(repeating: buf1, count: maxInFlightCommandBuffers)
         gc1.splatCount = UInt(n)
         gc1.visibleSplatCountForRendering = UInt(n)
 
@@ -861,13 +861,9 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         let splats = positions.map { pos in
             EncodedGaussianSplat(
                 position: pos,
-                opacity: 1.0,
-                color: simd_float3(1, 0, 0),
-                _pad0: 0.0,
-                covA: simd_float3(1, 0, 0),
-                _pad1: 0.0,
-                covB: simd_float3(1, 0, 1),
-                _pad2: 0.0
+                covA: simd_half3(1, 0, 0),
+                covB: simd_half3(1, 0, 1),
+                colorAndOpacity: simd_half4(1, 0, 0, 1)
             )
         }
 
@@ -909,9 +905,9 @@ final class DeviceRadixSortTest: BaseRenderSetup {
 
         visibleCountBuf.contents().storeBytes(of: UInt32(numSplats), as: UInt32.self)
         gc.encodedSplatData = splatBuf
-        gc.gaussianSortedIndices = keyBuf
-        gc.gaussianVisibleIndices = visibleIndexBuf
-        gc.gaussianVisibleCount = visibleCountBuf
+        gc.gaussianSortedIndices = Array(repeating: keyBuf, count: maxInFlightCommandBuffers)
+        gc.gaussianVisibleIndices = Array(repeating: visibleIndexBuf, count: maxInFlightCommandBuffers)
+        gc.gaussianVisibleCount = Array(repeating: visibleCountBuf, count: maxInFlightCommandBuffers)
         gc.splatCount = UInt(numSplats)
         gc.visibleSplatCountForRendering = UInt(numSplats)
         gc.spaceUniform = (0 ..< 2).compactMap { _ in
@@ -979,7 +975,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         else { XCTFail("Setup failed"); return }
 
         wt.space = matrix_identity_float4x4
-        gc.gaussianSortedIndices = keyBuf
+        gc.gaussianSortedIndices = Array(repeating: keyBuf, count: maxInFlightCommandBuffers)
         gc.splatCount = UInt(n)
         gc.visibleSplatCountForRendering = UInt(n)
 

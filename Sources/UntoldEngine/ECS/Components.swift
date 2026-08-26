@@ -97,9 +97,19 @@ public class GaussianComponent: Component {
     var encodedSplatData: MTLBuffer?
     var sphericalHarmonicsData: MTLBuffer?
     var sphericalHarmonicsMetadata: GaussianSHMetadata?
-    var gaussianSortedIndices: MTLBuffer?
-    var gaussianVisibleIndices: MTLBuffer?
-    var gaussianVisibleCount: MTLBuffer?
+    // Written every frame by the cull/depth-key/radix-sort/preprocess passes and read the
+    // same frame by the draw pass. With up to maxInFlightCommandBuffers frames overlapping
+    // on the GPU, a single shared buffer here lets a newer frame's CPU-side writes clobber
+    // data an older in-flight frame's draw is still reading — visible as splat flicker.
+    // Slotted per in-flight frame (indexed by renderInfo.currentInFlightFrameSlot), same
+    // pattern as spaceUniform below, to keep each frame's data isolated.
+    var gaussianSortedIndices: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
+    var gaussianVisibleIndices: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
+    var gaussianVisibleCount: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
+    /// Per-splat conic/radius/color, written once per frame by executeGaussianPreprocess
+    /// and read by the draw vertex shader — see GaussianPrecomputedSplat. Same frame-slot
+    /// race as the buffers above, so it gets the same treatment.
+    var gaussianPrecomputedData: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
     var visibleSplatCountForRendering: UInt = 0
     public var spaceUniform: [MTLBuffer?] = Array(repeating: nil, count: totalPerMeshUniformBuffers())
     var splatCount: UInt = 0
@@ -406,6 +416,23 @@ public enum LODResidencyState {
     case loading // Mesh is being loaded
 }
 
+/// Shared by `LODLevel` and `GaussianLODLevel` so `isLODLevelResident`/`findFallbackLODLevel`
+/// (`LODSystem.swift`) can implement residency/fallback selection once for both mesh and
+/// Gaussian LOD instead of each component re-declaring the same algorithm.
+protocol LODResidencyLevel {
+    var residencyState: LODResidencyState { get }
+    /// Whether this level actually has a usable payload — `residencyState` alone isn't
+    /// trusted, mirroring the double-check both components already made before this was shared.
+    var isPopulated: Bool { get }
+}
+
+/// Shared by `LODLevel` and `GaussianLODLevel` so `selectLODIndex` (`LODSystem.swift`) can pick
+/// a distance-based tier once for both mesh and Gaussian LOD instead of each system
+/// re-declaring the same threshold/hysteresis algorithm.
+protocol LODDistanceLevel {
+    var maxDistance: Float { get }
+}
+
 public struct LODLevel {
     public var mesh: [Mesh] // Meshes for this lod
     public var maxDistance: Float // Switch to next LOD beyond this
@@ -424,6 +451,14 @@ public struct LODLevel {
         residencyState = mesh.isEmpty ? .notResident : .resident
     }
 }
+
+extension LODLevel: LODResidencyLevel {
+    var isPopulated: Bool {
+        !mesh.isEmpty
+    }
+}
+
+extension LODLevel: LODDistanceLevel {}
 
 public class LODComponent: Component {
     public var lodLevels: [LODLevel] = [] // Sorted by distance (LOD0 first)
@@ -445,26 +480,106 @@ public class LODComponent: Component {
 
     /// Check if the desired LOD level has a resident mesh
     public func isLODResident(_ lodIndex: Int) -> Bool {
-        guard lodIndex >= 0, lodIndex < lodLevels.count else { return false }
-        let level = lodLevels[lodIndex]
-        return level.residencyState == .resident && !level.mesh.isEmpty
+        isLODLevelResident(lodLevels, lodIndex)
     }
 
     /// Find the best available fallback LOD (coarser than desired)
     public func findFallbackLOD(from desiredIndex: Int) -> Int? {
-        // Try coarser LODs first (higher index = lower detail)
-        for i in (desiredIndex + 1) ..< lodLevels.count {
-            if isLODResident(i) {
-                return i
-            }
+        findFallbackLODLevel(lodLevels, from: desiredIndex)
+    }
+}
+
+// MARK: - Progressive Gaussian LOD Component
+
+/// One pre-baked quality tier for a progressive Gaussian splat asset.
+/// LOD0 is expected to be the full-resolution tier; later indices are progressively coarser.
+public struct GaussianLODLevel {
+    public var buffers: GaussianComponent?
+    public var maxDistance: Float
+    public var url: URL?
+    public var residencyState: LODResidencyState = .unknown
+    var loadTask: Task<Void, Never>?
+    /// Bake-time mean of this tier's kept splats' squared major-axis extent — see
+    /// `estimatedGaussianOverdraw`. Baked into the `.untoldgs` file itself
+    /// (`UntoldGSFormat`/`bakeGaussianSplatProgressiveTiers`) and populated automatically by
+    /// `loadGaussianLODLevel` once this tier's file is actually read. `nil` only before that —
+    /// i.e. this tier hasn't loaded yet — in which case `clampGaussianLODForOverdraw` falls
+    /// back to distance-only LOD selection for it.
+    public var meanSquaredSplatExtent: Float?
+
+    public init(maxDistance: Float, url: URL? = nil) {
+        self.maxDistance = maxDistance
+        self.url = url
+    }
+}
+
+extension GaussianLODLevel: LODResidencyLevel {
+    var isPopulated: Bool {
+        buffers != nil
+    }
+}
+
+extension GaussianLODLevel: LODDistanceLevel {}
+
+/// Runtime state for a progressively streamed Gaussian splat prop.
+/// The renderer still consumes a normal `GaussianComponent`; this component owns the
+/// per-tier residency and `GaussianLODSystem` copies the selected tier onto the live
+/// `GaussianComponent`.
+public class GaussianLODComponent: Component {
+    public var lodLevels: [GaussianLODLevel] = []
+    public var currentLOD: Int = -1
+    public var desiredLOD: Int = 0
+    public var forcedLOD: Int?
+    public var isUsingFallback: Bool = false
+
+    /// The LOD index pure distance+hysteresis selection last landed on, before the
+    /// overdraw-aware clamp is applied — see `GaussianLODSystem.selectDesiredLOD`. Kept
+    /// separate from `desiredLOD` (the final, possibly overdraw-forced-coarser target used for
+    /// residency/streaming/`applyLOD`) so an overdraw-forced tier doesn't retroactively bias
+    /// the hysteresis anchor `selectLODIndex` uses next frame — otherwise a frame where overdraw
+    /// forces LOD 3 would make LOD 3 "the tier we're logically at" for the *next* frame's
+    /// distance-only hysteresis math too, even though distance alone would have picked LOD 1.
+    var distanceSelectedLOD: Int = 0
+
+    /// Distance to camera the last time this entity's LOD was fully re-evaluated — see
+    /// `GaussianLODSystem.update`'s per-entity fast path, which forces a refresh when this
+    /// entity (not just the camera) has moved enough to plausibly cross a LOD threshold,
+    /// independent of the camera-movement/frame-interval throttle. `nil` forces an evaluation
+    /// the first time this entity is seen.
+    var lastEvaluatedDistance: Float?
+
+    /// `true` when the caller explicitly supplied a `boundingBoxHalfExtent` (always the case
+    /// for the streaming path, optional for the non-streaming path). When `false`,
+    /// `loadGaussianLODLevel` auto-populates `LocalTransformComponent.boundingBox` from the
+    /// first (coarsest) tier's real splat data once it loads, instead of leaving the entity on
+    /// its default placeholder box forever.
+    var hasExplicitBoundingBox: Bool = false
+
+    /// Last state GaussianLODSystem's diagnostic log reported for this entity — used only to
+    /// dedup consecutive identical log lines (log on change, not every evaluation).
+    var lastLoggedDesiredLOD: Int = -2
+    var lastLoggedActualLOD: Int = -2
+
+    public required init() {}
+
+    public func isLODResident(_ lodIndex: Int) -> Bool {
+        isLODLevelResident(lodLevels, lodIndex)
+    }
+
+    public func findFallbackLOD(from desiredIndex: Int) -> Int? {
+        findFallbackLODLevel(lodLevels, from: desiredIndex)
+    }
+
+    /// Cancels in-flight loads and drops residency for every tier. Does not touch
+    /// currentLOD/desiredLOD — callers decide those based on whether this is a
+    /// stream-out (reset to coarsest) or full teardown (component removed right after).
+    func releaseAllLevelResources() {
+        for index in lodLevels.indices {
+            lodLevels[index].loadTask?.cancel()
+            lodLevels[index].loadTask = nil
+            lodLevels[index].buffers = nil
+            lodLevels[index].residencyState = .notResident
         }
-        // Then try finer LODs (lower index = higher detail)
-        for i in (0 ..< desiredIndex).reversed() {
-            if isLODResident(i) {
-                return i
-            }
-        }
-        return nil
     }
 }
 

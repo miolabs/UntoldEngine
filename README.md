@@ -47,9 +47,7 @@ Untold Engine is built for developers and teams who:
 Creator & Lead Developer:  
 https://www.haroldserrano.com
 
-[![untoldengine-image](/docs/images/engine-highlight-5.png)](https://vimeo.com/1176995991?fl=ip&fe=ec)
-
-Click to Play
+![archviz-demo](docs/images/gifs/archviz-demo.gif)
 
 ---
 
@@ -69,18 +67,16 @@ workflow, product experience, and customer-specific behavior.
 
 ## Watch It in Action — Apple Vision Pro Demos
 
-<table>
-  <tr>
-    <td><a href="https://vimeo.com/1186637984?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1186637984.jpg" width="280"></a></td>
-    <td><a href="https://vimeo.com/1186592834?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1186592834.jpg" width="280"></a></td>
-    <td><a href="https://vimeo.com/1176823067?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1176823067.jpg" width="280"></a></td>
-  </tr>
-  <tr>
-    <td><a href="https://vimeo.com/1176823994?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1176823994.jpg" width="280"></a></td>
-    <td><a href="https://vimeo.com/1176995991?fl=ip&fe=ec"><img src="https://vumbnail.com/1176995991.jpg" width="280"></a></td>
-    <td></td>
-  </tr>
-</table>
+| Demo | Description |
+| --- | --- |
+| [CoolSaber](https://github.com/untoldengine/UntoldArcade/tree/main/CoolSaber) | PSVR2-driven lightsaber duels, blades clashing over SharePlay |
+| [CoolWater](https://github.com/untoldengine/UntoldArcade/tree/main/CoolWater) | Real-time animated water with reflection, refraction, and ripples |
+| [CoolCloth](https://github.com/untoldengine/UntoldArcade/tree/main/CoolCloth) | GPU cloth simulation (XPBD) you can punch a ball through |
+| [Archviz Viewer](https://untoldengine.github.io/UntoldEngine/LearningPaths/ArchvizToVisionPro/) | Blender-authored architectural scene walked through in mixed reality |
+| [Bedroom Digital Twin](https://untoldengine.github.io/UntoldEngine/LearningPaths/BedroomDigitalTwin/) | Tap-to-inspect digital twin bedroom with live mock status data |
+| [City Streaming](https://untoldengine.github.io/UntoldEngine/LearningPaths/CityStreamingOnVisionPro/) | City-scale scene streamed in tile by tile with LOD/HLOD |
+
+Full source for every demo above lives in the [UntoldArcade](https://github.com/untoldengine/UntoldArcade) repo.
 
 ## Requirements
 
@@ -88,6 +84,8 @@ workflow, product experience, and customer-specific behavior.
 - Swift 6 / Xcode 26 or newer
 - Apple Silicon Mac
 - Supported platforms: macOS, iOS, and visionOS
+
+![coolsaber-demo](docs/images/gifs/coolsaber-demo.gif)
 
 ## Try the Engine Right Now
 
@@ -104,7 +102,7 @@ Clone the repository and launch the Starter Demo:
 ```bash
 git clone https://github.com/untoldengine/UntoldEngine.git
 cd UntoldEngine
-git checkout v0.15.0
+git checkout v0.17.0
 swift run StarterDemo
 ```
 
@@ -124,14 +122,26 @@ The demos live under `Sources/Demos`. They are runnable when working inside the
 engine repository, but are not exposed as products to apps that add Untold
 Engine as a package dependency.
 
-![untoldengine-image-2](/docs/images/engine-highlight-6.png)
-
 ---
 
 ## Getting Started
 
-To create your own XR, 3D, or spatial visualization app using Untold Engine, see
-[Getting Started](https://untoldengine.github.io/UntoldEngine/API/GettingStarted/).
+To create your own XR, 3D, or spatial visualization app using Untold Engine,
+start with the documentation path that matches where you are:
+
+- **Build a complete Vision Pro app:** follow the
+  [Archviz To Vision Pro learning path](https://untoldengine.github.io/UntoldEngine/LearningPaths/ArchvizToVisionPro/)
+  to take a Blender archviz model into a standalone visionOS project.
+- **Learn the engine API through focused demos:** use the
+  [Tutorials](https://untoldengine.github.io/UntoldEngine/Tutorials/)
+  to understand Starter Demo, lighting, rendering quality, exporter workflows,
+  scene channels, light portals, XR input, and performance diagnostics.
+- **Create your own project from scratch:** see
+  [Getting Started](https://untoldengine.github.io/UntoldEngine/API/GettingStarted/)
+  and [Create A New Xcode Project](https://untoldengine.github.io/UntoldEngine/Tutorials/CreateXcodeProjectTutorial/).
+
+If your team is evaluating Untold Engine and needs an engine capability that is
+not currently available, see [Commercial Use, Sponsored Features, and Support](COMMERCIAL.md).
 
 ## Core Direction
 
@@ -144,8 +154,6 @@ Untold Engine is built around three focused goals:
 - **Metal-First Architecture** — The rendering layer stays close to Metal to maintain performance, shader control, and pipeline flexibility without abstraction layers getting in the way.
 
 ---
-
-![untoldengine-image-2](/docs/images/engine-highlight-7.png)
 
 ## Example Use Cases
 
@@ -306,6 +314,9 @@ modifications, sponsored engine features, priority support, or custom terms.
   under commercial terms.
 - **Priority support / retainers** — get focused help with engine integration,
   rendering issues, performance, and production use.
+
+If your team needs an engine feature that is not currently available, contact 
+[Harold Serrano](https://www.haroldserrano.com/contact) to discuss sponsored feature development, private engine work, commercial licensing, or ongoing support. 
 
 See [COMMERCIAL.md](COMMERCIAL.md) for commercial licensing details.
 

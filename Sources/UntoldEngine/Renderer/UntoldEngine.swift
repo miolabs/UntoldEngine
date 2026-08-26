@@ -197,7 +197,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             BatchingSystem.shared.applyRuntimeBatchingTuning(.macOSBalanced)
         #endif
 
-        Logger.log(message: "Untold Engine Starting. Version 0.15.0")
+        Logger.log(message: "Untold Engine Starting. Version 0.17.0")
     }
 
     public func initSizeableResources() {
@@ -594,6 +594,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
 
         // 3. LOD selection (decides which representation is active, checks residency)
         LODSystem.shared.update(deltaTime: fixedStep)
+        GaussianLODSystem.shared.update(deltaTime: fixedStep)
 
         // 4. Flush events (residency and LOD change events are processed)
         SystemEventBus.shared.flushEvents()

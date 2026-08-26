@@ -1,4 +1,44 @@
 # Changelog
+## v0.17.0 - 2026-08-24
+### 🐞 Fixes
+- [Patch] Fixed tile-streamer texture exporter (42c3fbf…)
+- [Patch] Added lod debug for splats (0f57d0a…)
+- [Patch] Implemented spatial bucketing for progressive Gaussian tier generation (b9f6373…)
+- [Patch] Implemented new API for gaussian system (820424c…)
+- [Patch] Progressive Gaussian loading is now tile-independent (fd9b2b8…)
+- [Patch] Fix Gaussian LOD memory leak, stale-task race, and code-review findings (cee64e1…)
+### 📚 Docs
+- [Docs] Add tutorials for demos (cb0c6c0…)
+- [Docs] Add more tutorials (a43537b…)
+- [Docs] Add even more tutorials (d9158e3…)
+- [Docs] added architecture docs (cfb9122…)
+- [Docs] fix image url (09dd132…)
+- [Docs] Added additional tutorials (e5e3b37…)
+- [Docs] Updated url paths to demos (fca1fbd…)
+- [Docs] Updated readme with gifs (85c6a1d…)
+### 🚀 Features
+- [Feature] Deliver physics backend events to subscribers and USC scripts (75917cf…)
+- [Feature] Progressive loading for splats (f4d3148…)
+- [Feature] Overdraw-aware Gaussian LOD selection (dc2ca60…)
+## v0.16.0 - 2026-08-12
+### 🐞 Fixes
+- [Patch] fixed gaussian not rendering (74d821b…)
+- [Patch] Reduce Gaussian splat fragment-shading overdraw (ed716ab…)
+- [Patch] Cull negligible-opacity Gaussian splats at load time (6ca0713…)
+- [Patch] Address review: clamp non-repeating channels, test pitch/roll (7d54789…)
+- [Patch] Precompute Gaussian splat conic/color; cap blends per pixel (40fa5e3…)
+- [Patch] Added triple buffer to gaussian system (9ce1713…)
+- [Patch] HZB occlusion culling for Gaussian splats (0763066…)
+- [Patch] Fixed standard export blender-addon (e5087e7…)
+- [Patch] Updated blender-add on (a495546…)
+### 📚 Docs
+- [Docs] Updated getting started (78111d1…)
+### 🚀 Features
+- [Feature] Version-gate emissive trust so existing .untold assets don't need re-export (f7fe446…)
+- [Feature] Add UntoldViewOptions for runtime view settings in SwiftUI (1720ba4…)
+- [Feature] Add root motion extraction and application (dc21a5a…)
+### 🧰 Maintenance
+- [Refactor] Share per-mesh vertex-stream binding across render passes (a5b9844…)
 ## v0.15.0 - 2026-08-06
 ### 🐞 Fixes
 - [Patch] Added material fidelity report to the exporter (a36166f…)
