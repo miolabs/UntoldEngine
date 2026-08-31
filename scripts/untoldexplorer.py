@@ -45,7 +45,10 @@ MAGIC = b"UNTOLD\x00\x00"
 # Bumped from 1 to 2 when the exporter started multiplying emissive_factor by
 # Emission Strength (see extract_material). Readers use this to know whether
 # a file's emissiveFactor is trustworthy or a leftover Blender default.
-FORMAT_VERSION = 2
+# Bumped to 4 when the material record grew height-map fields (heightTextureIndex,
+# heightScale, heightMidlevel) and height-remap fields (heightRemapMin, heightRemapMax) —
+# see extract_material's Displacement/Bump detection and write_material_record.
+FORMAT_VERSION = 4
 FILE_ALIGNMENT = 16
 INVALID_INDEX = 0xFFFFFFFF
 HEADER_SIZE = 204
@@ -104,12 +107,14 @@ TEXTURE_FORMAT_RGBA16_FLOAT = 8
 TEXTURE_FLAG_SRGB = 1 << 0
 TEXTURE_FLAG_NORMAL_MAP = 1 << 1
 TEXTURE_FLAG_LUT = 1 << 2
+TEXTURE_FLAG_HEIGHT = 1 << 3
 TEXTURE_FLAG_EMISSIVE = 1 << 6
 TEXTURE_FLAG_OCCLUSION = 1 << 7
 TEXTURE_CHANNEL_R = 0
 TEXTURE_CHANNEL_G = 1
 TEXTURE_CHANNEL_B = 2
 TEXTURE_CHANNEL_A = 3
+UNTOLD_EXPORT_TEMP_OBJECT_PROP = "_untold_export_temp_object"
 
 ProgressCallback = Callable[[str, int, int, str], None]
 
@@ -508,6 +513,11 @@ class MaterialRecord:
     roughness_texture_index: int = INVALID_INDEX
     emissive_texture_index: int = INVALID_INDEX
     occlusion_texture_index: int = INVALID_INDEX
+    height_texture_index: int = INVALID_INDEX
+    height_scale: float = 0.05
+    height_midlevel: float = 0.5
+    height_remap_min: float = 0.0
+    height_remap_max: float = 1.0
     roughness_texture_channel: int = TEXTURE_CHANNEL_R
     metallic_texture_channel: int = TEXTURE_CHANNEL_R
 
@@ -639,6 +649,26 @@ class ExportedMaterial:
     roughness_texture: Optional[ExportedTexture] = None
     emissive_texture: Optional[ExportedTexture] = None
     occlusion_texture: Optional[ExportedTexture] = None
+    height_texture: Optional[ExportedTexture] = None
+    # Blender's Displacement node Scale is a world-space displacement distance (typically
+    # a fraction of a meter), while the engine's heightScale is a UV-normalized ray-march
+    # depth fraction — these are not the same unit and there is no exact conversion without
+    # knowing the mesh's texel density. This value is carried through as a reasonable
+    # starting point, not a precise conversion; expect to retune heightScale after import.
+    height_scale: float = 0.05
+    # Always the neutral default (0.5 = no additional shift) for Displacement-sourced height —
+    # Blender's Midlevel is NOT copied here. The engine's POM is unidirectional (cannot bulge
+    # outward past the true polygon surface the way Blender's signed displacement-around-
+    # Midlevel can), so heightMidlevel is just an additive shift, not a true zero-reference;
+    # copying Blender's Midlevel into it would not reproduce "neutral gray = no visible depth".
+    # Blender's Midlevel is used to derive height_remap_max instead — see extract_material's
+    # Displacement-node detection block.
+    height_midlevel: float = 0.5
+    # Derived from Blender's Displacement Midlevel when present (clamped to (0, 1]): raw values
+    # at/above this clip to "no depth", values below get contrast-stretched into the full depth
+    # range. Identity (0.0, 1.0) when no Midlevel is available (e.g. Bump-sourced height).
+    height_remap_min: float = 0.0
+    height_remap_max: float = 1.0
     roughness_texture_channel: int = TEXTURE_CHANNEL_R
     metallic_texture_channel: int = TEXTURE_CHANNEL_R
 
@@ -800,6 +830,19 @@ class HDRStagingContext:
     def __init__(self) -> None:
         self.staged_by_key = {}
         self.used_names = set()
+
+
+def clean_generated_sidecar_dirs(output_path: Path) -> None:
+    """Remove sidecar directories fully owned by a single-asset export.
+
+    Re-exporting into an existing asset folder must not leave stale staged
+    textures, baked .utex files, color LUTs, or HDR environments from earlier
+    runs. The .untold file itself is overwritten separately.
+    """
+    for dirname in ("Textures", "HDR"):
+        sidecar_dir = output_path.parent / dirname
+        if sidecar_dir.is_dir():
+            shutil.rmtree(sidecar_dir)
 
 
 def aabb_from_points(points: Iterable[tuple[float, float, float]]) -> AABB:
@@ -1156,6 +1199,11 @@ def write_material_record(writer: BinaryWriter, material: MaterialRecord) -> Non
     writer.write_u32(material.roughness_texture_index)
     writer.write_u32(material.emissive_texture_index)
     writer.write_u32(material.occlusion_texture_index)
+    writer.write_u32(material.height_texture_index)
+    writer.write_f32(material.height_scale)
+    writer.write_f32(material.height_midlevel)
+    writer.write_f32(material.height_remap_min)
+    writer.write_f32(material.height_remap_max)
     writer.write_u32(pack_material_texture_channels(material.roughness_texture_channel, material.metallic_texture_channel))
     writer.write_u32(0)
 
@@ -2097,6 +2145,12 @@ _GRAPH_FAITHFUL_NODE_IDS = {
     "ShaderNodeGroup",
     "NodeGroupInput",
     "NodeGroupOutput",
+    # extract_material reads these directly (Displacement -> height texture/Scale/Midlevel,
+    # or Bump -> height texture/Distance as a fallback) — see the height/displacement
+    # detection block. Their own Height/Scale/Midlevel/Distance inputs are still walked and
+    # classified individually below; only the node type itself is exempted here.
+    "ShaderNodeDisplacement",
+    "ShaderNodeBump",
 }
 
 # Traced through by _resolve_texture_from_socket, but their math is dropped.
@@ -2778,6 +2832,58 @@ def _mesh_uv_fingerprint(mesh_data: object) -> str:
     return hashlib.sha1(",".join(parts).encode("utf-8")).hexdigest()
 
 
+# Tolerance for treating a UV bounding box as "within the unit square" — small
+# enough to still catch real tiled unwraps (which typically overshoot by whole
+# units), generous enough to absorb float roundoff from unwrap/pack operators.
+_UV_UNIT_SQUARE_TOLERANCE = 1.0e-3
+
+
+def _mesh_active_uv_bbox(mesh_data: object) -> Optional[tuple[float, float, float, float]]:
+    """Bounding box (min_x, max_x, min_y, max_y) of a mesh's active UV layer.
+
+    Returns None when the mesh has no UV layer or the layer is empty.
+    """
+    uv_layers = getattr(mesh_data, "uv_layers", None)
+    if not uv_layers:
+        return None
+    layer = uv_layers.active or uv_layers[0]
+    data = layer.data
+    n = len(data)
+    if n == 0:
+        return None
+    if _HAS_NUMPY:
+        flat = np.empty(n * 2, dtype=np.float32)
+        data.foreach_get("uv", flat)
+        coords = flat.reshape(-1, 2)
+        return (
+            float(coords[:, 0].min()), float(coords[:, 0].max()),
+            float(coords[:, 1].min()), float(coords[:, 1].max()),
+        )
+    xs = [data[i].uv[0] for i in range(n)]
+    ys = [data[i].uv[1] for i in range(n)]
+    return (min(xs), max(xs), min(ys), max(ys))
+
+
+def _uv_bbox_exceeds_unit_square(bbox: tuple[float, float, float, float], tolerance: float = _UV_UNIT_SQUARE_TOLERANCE) -> bool:
+    """True when a UV bounding box extends outside [0,1]x[0,1].
+
+    Image baking always writes into a [0,1]x[0,1] target regardless of how the
+    mesh's UVs are laid out — unlike live shading, it does not wrap coordinates
+    outside that range. Meshes tiled via oversized UVs (a common technique:
+    scaling the UV unwrap itself up in real-world units and relying on the
+    texture sampler's Repeat/Wrap mode, instead of a Mapping node) look correct
+    in Blender but bake mostly/entirely black, since only the sliver of the
+    mesh whose UVs happen to fall inside the unit square is captured.
+    """
+    min_x, max_x, min_y, max_y = bbox
+    return (
+        min_x < -tolerance
+        or min_y < -tolerance
+        or max_x > 1.0 + tolerance
+        or max_y > 1.0 + tolerance
+    )
+
+
 def _object_transform_fingerprint(mesh_object: object) -> str:
     """Cheap fingerprint of world transform, since Object-coordinate-driven
     procedural nodes (Texture Coordinate 'Object', Object Info) bake
@@ -3038,6 +3144,18 @@ def bake_divergent_materials(
         if len(getattr(mesh_object.data, "uv_layers", [])) == 0:
             print(f"    Skipping '{mesh_object.name}': no UV map", flush=True)
             continue
+        uv_bbox = _mesh_active_uv_bbox(mesh_object.data)
+        if uv_bbox is not None and _uv_bbox_exceeds_unit_square(uv_bbox):
+            min_x, max_x, min_y, max_y = uv_bbox
+            print(
+                f"    Skipping '{mesh_object.name}': UV layout extends outside the [0,1] unit square "
+                f"(x=[{min_x:.3f}, {max_x:.3f}] y=[{min_y:.3f}, {max_y:.3f}]) — likely a tiled unwrap "
+                f"relying on texture-sampler wraparound. Baking only captures the portion inside "
+                f"[0,1] and would leave most of the surface black; falling back to a direct texture "
+                f"reference for '{material.name}' on this mesh instead.",
+                flush=True,
+            )
+            continue
         candidates.append((mesh_object, material, plan))
     if not candidates:
         return {}
@@ -3168,6 +3286,100 @@ def _png_ihdr(path: Path) -> tuple[int, int] | None:
             return bit_depth, color_type
     except Exception:
         return None
+
+
+def _tiff_bits_per_sample_and_channels(path: Path) -> tuple[int, int] | None:
+    """Return (bitsPerSample, samplesPerPixel) read directly from TIFF IFD tags 258/277,
+    or None on failure. Dependency-free (no Pillow) since this runs inside Blender's own
+    Python, which may not have Pillow installed.
+    """
+    _TAG_BITS_PER_SAMPLE = 258
+    _TAG_SAMPLES_PER_PIXEL = 277
+    _TYPE_SHORT = 3
+    _TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8}  # BYTE, ASCII, SHORT, LONG, RATIONAL
+    try:
+        with open(path, "rb") as f:
+            byte_order = f.read(2)
+            if byte_order == b"II":
+                endian = "<"
+            elif byte_order == b"MM":
+                endian = ">"
+            else:
+                return None
+            magic, first_ifd_offset = struct.unpack(endian + "HI", f.read(6))
+            if magic != 42:
+                return None
+            f.seek(first_ifd_offset)
+            (entry_count,) = struct.unpack(endian + "H", f.read(2))
+            bits_per_sample: int | None = None
+            samples_per_pixel: int | None = None
+            for _ in range(entry_count):
+                tag, field_type, count = struct.unpack(endian + "HHI", f.read(8))
+                value_bytes = f.read(4)
+                if tag == _TAG_SAMPLES_PER_PIXEL and field_type == _TYPE_SHORT:
+                    samples_per_pixel = struct.unpack(endian + "H", value_bytes[:2])[0]
+                elif tag == _TAG_BITS_PER_SAMPLE and field_type == _TYPE_SHORT:
+                    type_size = _TYPE_SIZES.get(field_type, 4)
+                    if type_size * count <= 4:
+                        # Value fits inline in the entry itself (single-channel case).
+                        bits_per_sample = struct.unpack(endian + "H", value_bytes[:2])[0]
+                    else:
+                        # Value is an offset to an array (multi-channel case) — every
+                        # channel in a real texture shares one bit depth, so the first
+                        # entry is sufficient.
+                        (offset,) = struct.unpack(endian + "I", value_bytes)
+                        cur = f.tell()
+                        f.seek(offset)
+                        bits_per_sample = struct.unpack(endian + "H", f.read(2))[0]
+                        f.seek(cur)
+            if bits_per_sample is None or samples_per_pixel is None:
+                return None
+            return bits_per_sample, samples_per_pixel
+    except Exception:
+        return None
+
+
+def _source_bit_depth_and_channels(image: object) -> tuple[int, int] | None:
+    """Best-effort read of the TRUE on-disk bit depth and channel count for an image's
+    source file, bypassing Blender's post-load image.depth/image.channels — which, as of
+    the Blender version this was diagnosed against, unreliably reports 32/4 ("already
+    8-bit RGBA") for genuinely 16-bit-per-channel sources, both grayscale TIFF and
+    grayscale PNG. That silently defeats the needs_conversion safety net below: a 16-bit
+    sRGB color texture can keep its 16-bit depth on disk, and Metal has no sRGB 16-bit
+    pixel format, so MTKTextureLoader silently treats it as linear (washed-out/too-bright
+    at runtime) instead of the intended 8-bit downconvert catching it at export time.
+
+    Returns None when there's no inspectable file-backed source (packed/generated images,
+    or a format other than PNG/TIFF) — callers should fall back to Blender's own
+    image.depth/image.channels in that case, same as before this function existed.
+    """
+    filepath = getattr(image, "filepath_raw", "") or getattr(image, "filepath", "")
+    if not filepath:
+        return None
+    try:
+        if bpy is not None:
+            # Resolves blend-file-relative "//" paths; only meaningful inside Blender.
+            source_path = Path(bpy.path.abspath(filepath, library=getattr(image, "library", None)))
+        else:
+            source_path = Path(filepath)
+    except Exception:
+        return None
+    if not source_path.is_file():
+        return None
+
+    suffix = source_path.suffix.lower()
+    if suffix == ".png":
+        info = _png_ihdr(source_path)
+        if info is None:
+            return None
+        bit_depth, color_type = info
+        channels = {0: 1, 2: 3, 3: 3, 4: 2, 6: 4}.get(color_type)
+        if channels is None:
+            return None
+        return bit_depth, channels
+    if suffix in (".tif", ".tiff"):
+        return _tiff_bits_per_sample_and_channels(source_path)
+    return None
 
 
 def _set_scene_color_management_raw(scene: object) -> tuple[object, ...]:
@@ -3650,7 +3862,7 @@ _UNSUPPORTED_TEXTURE_SUFFIXES = {".exr", ".hdr", ".cin", ".dpx"}
 _HDR_IMAGE_SUFFIXES = {".exr", ".hdr"}
 
 
-def write_blender_image_to_path(image_name: str, destination_path: Path) -> None:
+def write_blender_image_to_path(image_name: str, destination_path: Path, *, preserve_precision: bool = False) -> None:
     blender_required()
     image = bpy.data.images.get(image_name)
     if image is None:
@@ -3676,6 +3888,11 @@ def write_blender_image_to_path(image_name: str, destination_path: Path) -> None
 
     original_filepath_raw = getattr(image, "filepath_raw", "")
     original_file_format = getattr(image, "file_format", "PNG")
+    # Must read the source file's own header before filepath_raw is overwritten to the
+    # destination path below — image.filepath/.filepath_raw both then point at the (not
+    # yet written) output PNG, not the original source, and the header would resolve to
+    # the wrong file or nothing at all.
+    source_info = _source_bit_depth_and_channels(image)
     try:
         image.filepath_raw = str(destination_path)
         if destination_path.suffix:
@@ -3713,10 +3930,23 @@ def write_blender_image_to_path(image_name: str, destination_path: Path) -> None
         # RGB/RGBA 16-bit images.
         # Fix: downconvert any 16-bit or grayscale image to 8-bit RGB(A) via
         # save_render so the file on disk is a standard format Metal handles correctly.
-        image_depth = getattr(image, "depth", 0)
-        image_channels = getattr(image, "channels", 4)
+        #
+        # image.depth/image.channels are Blender's OWN post-load metadata, and in
+        # current Blender versions they unreliably report 32/4 ("already 8-bit RGBA")
+        # for genuinely 16-bit-per-channel PNG/TIFF sources — both grayscale and color
+        # — which silently defeats the needs_conversion check below. Read the true
+        # values from the source file's own header when one is available, and only
+        # fall back to Blender's metadata for formats/sources that can't be inspected
+        # directly (JPEG, packed images, generated images, etc.). Captured above, before
+        # filepath_raw was overwritten to point at the destination instead of the source.
+        if source_info is not None:
+            bits_per_sample, image_channels = source_info
+            image_depth = bits_per_sample * image_channels
+        else:
+            image_depth = getattr(image, "depth", 0)
+            image_channels = getattr(image, "channels", 4)
         # Convert when: 16-bit RGB/RGBA (depth > 32), OR any grayscale image
-        # (channels < 3, any bit depth).  In Blender, depth = bits-per-pixel:
+        # (channels < 3, any bit depth).  depth = bits-per-pixel:
         #   8-bit grayscale  → depth=8,  channels=1  (missed by depth>32)
         #   16-bit grayscale → depth=16, channels=1
         #   16-bit RGB/RGBA  → depth=48/64
@@ -3731,7 +3961,15 @@ def write_blender_image_to_path(image_name: str, destination_path: Path) -> None
                     f"by the engine texture pipeline (only 8-bit PNG/JPEG/TGA/etc. "
                     f"are supported). Skipping texture."
                 )
-            print(f"  Converting image '{image_name}' (depth={image_depth}, channels={image_channels}) to 8-bit RGB for Metal compatibility", flush=True)
+            # Height/displacement is the one channel that wants to keep its precision
+            # instead of being flattened to 8-bit: POM ray-marches this data, and 8-bit
+            # quantization becomes visible stair-stepping at grazing angles once amplified
+            # by the parallax offset math (see HeightMapParallaxOcclusionMapping.md §2.2).
+            # The sRGB-16-bit Metal gap that forces 8-bit for color textures doesn't apply
+            # here — height is always linear/non-color data. PNG supports 16-bit grayscale
+            # natively, so only skip the downconvert when there's real precision to keep.
+            target_depth = "16" if (preserve_precision and image_channels < 3 and image_depth >= 16) else "8"
+            print(f"  Converting image '{image_name}' (depth={image_depth}, channels={image_channels}) to {target_depth}-bit RGB for Metal compatibility", flush=True)
             scene = bpy.context.scene
             img_settings = scene.render.image_settings
             saved = (img_settings.file_format, img_settings.color_depth, img_settings.color_mode)
@@ -3768,7 +4006,7 @@ def write_blender_image_to_path(image_name: str, destination_path: Path) -> None
                     pass  # fall back to whatever _set_scene_color_management_raw set
             try:
                 img_settings.file_format = out_format
-                img_settings.color_depth = "8"
+                img_settings.color_depth = target_depth
                 img_settings.color_mode = "RGBA" if image_channels == 4 else "RGB"
                 image.save_render(str(destination_path), scene=scene)
             finally:
@@ -3913,10 +4151,21 @@ def unique_hdr_destination_name(source_name: str, context: HDRStagingContext) ->
     return unique_asset_destination_name(source_name, context.used_names, "environment")
 
 
-def stage_texture_for_output(texture: ExportedTexture, output_path: Path, context: TextureStagingContext) -> Optional[ExportedTexture]:
+def stage_texture_for_output(
+    texture: ExportedTexture,
+    output_path: Path,
+    context: TextureStagingContext,
+    *,
+    preserve_precision: bool = False,
+) -> Optional[ExportedTexture]:
     """Stage a texture for output.  Returns None if the texture format is not
     supported by the engine pipeline (e.g. EXR, HDR) — callers should treat
     None as "no texture" for that material slot.
+
+    preserve_precision: keep 16-bit depth for a genuinely-16-bit grayscale source
+    instead of the usual 8-bit downconvert (see write_blender_image_to_path). Only
+    the height/displacement slot sets this — texbake.py's height path is the only
+    consumer built to preserve and use that extra precision.
     """
     source_path = texture.source_path
     texture_dir = output_path.parent / "Textures"
@@ -3971,17 +4220,17 @@ def stage_texture_for_output(texture: ExportedTexture, output_path: Path, contex
         if source_path is not None and source_path.is_file():
             if source_path != destination_path:
                 if texture.source_image_name:
-                    write_blender_image_to_path(texture.source_image_name, destination_path)
+                    write_blender_image_to_path(texture.source_image_name, destination_path, preserve_precision=preserve_precision)
                 elif bpy is not None:
                     tmp_image = bpy.data.images.load(str(source_path))
                     try:
-                        write_blender_image_to_path(tmp_image.name, destination_path)
+                        write_blender_image_to_path(tmp_image.name, destination_path, preserve_precision=preserve_precision)
                     finally:
                         bpy.data.images.remove(tmp_image)
                 else:
                     shutil.copy2(source_path, destination_path)
         elif texture.source_image_name:
-            write_blender_image_to_path(texture.source_image_name, destination_path)
+            write_blender_image_to_path(texture.source_image_name, destination_path, preserve_precision=preserve_precision)
         else:
             missing_path = str(source_path) if source_path is not None else "<none>"
             raise RuntimeError(f"Texture source does not exist and no Blender image fallback is available: {missing_path}")
@@ -4184,6 +4433,7 @@ def stage_material_for_output(material: ExportedMaterial, output_path: Path, con
         roughness_texture=stage_texture_for_output(material.roughness_texture, output_path, context) if material.roughness_texture is not None else None,
         emissive_texture=stage_texture_for_output(material.emissive_texture, output_path, context) if material.emissive_texture is not None else None,
         occlusion_texture=stage_texture_for_output(material.occlusion_texture, output_path, context) if material.occlusion_texture is not None else None,
+        height_texture=stage_texture_for_output(material.height_texture, output_path, context, preserve_precision=True) if material.height_texture is not None else None,
     )
 
 
@@ -4364,6 +4614,62 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
             strength_input = source.inputs.get("Strength")
             normal_scale = float(strength_input.default_value) if strength_input is not None else 1.0
 
+    # Height/displacement detection: prefer the Material Output's Displacement input (the
+    # standard ArchViz/Poliigon authoring pattern — an Image Texture feeding a Displacement
+    # node's Height socket), falling back to a Bump node feeding the Principled BSDF's Normal
+    # input directly (common in materials authored without a separate Displacement setup).
+    # See docs/proposals/HeightMapParallaxOcclusionMapping.md for the domain rationale.
+    height_texture: Optional[ExportedTexture] = None
+    height_scale = 0.05
+    height_midlevel = 0.5
+    height_remap_min = 0.0
+    height_remap_max = 1.0
+
+    material_output = _material_output_node(material.node_tree) if getattr(material, "node_tree", None) is not None else None
+    displacement_input = material_output.inputs.get("Displacement") if material_output is not None else None
+    if displacement_input is not None and displacement_input.is_linked:
+        displacement_source = displacement_input.links[0].from_node
+        if displacement_source.bl_idname == "ShaderNodeDisplacement":
+            height_input = displacement_source.inputs.get("Height")
+            height_texture = resolve_texture_from_socket(height_input, asset_path) if height_input is not None else None
+            if height_texture is not None:
+                # Blender's Displacement Scale is a world-space distance, not the engine's
+                # UV-normalized heightScale — carried through as a starting point only (see
+                # ExportedMaterial.height_scale docstring), not a precise unit conversion.
+                scale_input = displacement_source.inputs.get("Scale")
+                midlevel_input = displacement_source.inputs.get("Midlevel")
+                if scale_input is not None and not scale_input.is_linked:
+                    height_scale = float(scale_input.default_value)
+                if midlevel_input is not None and not midlevel_input.is_linked:
+                    # The engine's POM is unidirectional (ray-marches INTO the surface from an
+                    # apparent flat top; it cannot bulge outward past the true polygon surface
+                    # the way Blender's signed displacement-around-Midlevel can). Copying
+                    # Blender's Midlevel straight into heightMidlevel does NOT reproduce
+                    # "neutral gray = no visible depth" — heightMidlevel is just an additive
+                    # shift, not a zero-reference (see HeightMapParallaxOcclusionMapping.md).
+                    # Instead, use it as the remap ceiling: raw values at/above Midlevel clip to
+                    # "no depth" (the closest unidirectional approximation of "flush or bulging
+                    # outward"), and values below it get contrast-stretched into the full depth
+                    # range. heightMidlevel itself stays at its neutral default so it remains
+                    # available as a separate, manual runtime tuning shift. Clamped to (0, 1]
+                    # since raw texture samples are always in that range — an out-of-range
+                    # authored Midlevel (e.g. an artist overshooting a slider) would otherwise
+                    # make the remap divide by a value that never matches any real sample.
+                    blender_midlevel = float(midlevel_input.default_value)
+                    height_remap_max = min(max(blender_midlevel, 0.01), 1.0)
+
+    if height_texture is None and normal_input is not None and normal_input.is_linked:
+        normal_source = normal_input.links[0].from_node
+        if normal_source.bl_idname == "ShaderNodeBump":
+            height_input = normal_source.inputs.get("Height")
+            height_texture = resolve_texture_from_socket(height_input, asset_path) if height_input is not None else None
+            if height_texture is not None:
+                distance_input = normal_source.inputs.get("Distance")
+                if distance_input is not None and not distance_input.is_linked:
+                    height_scale = float(distance_input.default_value)
+                # Bump has no Midlevel-equivalent input; height_midlevel/height_remap_max stay
+                # at their neutral defaults.
+
     baked = _baked_material_textures.get(mesh_object.name)
     if baked is not None:
         # Baked images already contain every node-graph contribution, including
@@ -4400,6 +4706,11 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
         roughness_texture=roughness_texture,
         emissive_texture=emissive_texture,
         occlusion_texture=occlusion_texture,
+        height_texture=height_texture,
+        height_scale=height_scale,
+        height_midlevel=height_midlevel,
+        height_remap_min=height_remap_min,
+        height_remap_max=height_remap_max,
         roughness_texture_channel=roughness_texture.channel if roughness_texture is not None else TEXTURE_CHANNEL_R,
         metallic_texture_channel=metallic_texture.channel if metallic_texture is not None else TEXTURE_CHANNEL_R,
     )
@@ -4921,11 +5232,34 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
                         p.material_index = 0
                 new_obj = bpy.data.objects.new(f"{obj.name}_mat{mat_idx}", new_mesh)
                 new_obj.matrix_world = obj.matrix_world.copy()
+                new_obj[UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
                 bpy.context.scene.collection.objects.link(new_obj)
                 result.append(new_obj)
             finally:
                 bm.free()
     return result
+
+
+def cleanup_temporary_export_objects(objects: Iterable[object]) -> None:
+    """Remove temporary Blender objects created for one export pass."""
+    if bpy is None:
+        return
+    for obj in list(objects):
+        try:
+            if not obj.get(UNTOLD_EXPORT_TEMP_OBJECT_PROP):
+                continue
+        except ReferenceError:
+            continue
+        mesh = getattr(obj, "data", None)
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except ReferenceError:
+            pass
+        if mesh is not None and getattr(mesh, "users", 0) == 0:
+            try:
+                bpy.data.meshes.remove(mesh)
+            except ReferenceError:
+                pass
 
 
 def extract_nodes(
@@ -4947,17 +5281,20 @@ def extract_nodes(
     if progress_callback is not None:
         progress_callback("Select objects", 0, 1, f"{len(imported_objects)} imported object(s)")
     export_objects = prepare_export_objects_from_blender_objects(imported_objects, mesh_name)
-    return extract_nodes_from_objects(
-        export_objects,
-        asset_path,
-        convert_orientation=convert_orientation,
-        source_orientation=source_orientation,
-        validate=validate,
-        bake_materials=bake_materials,
-        bake_resolution=bake_resolution,
-        bake_cache=bake_cache,
-        progress_callback=progress_callback,
-    )
+    try:
+        return extract_nodes_from_objects(
+            export_objects,
+            asset_path,
+            convert_orientation=convert_orientation,
+            source_orientation=source_orientation,
+            validate=validate,
+            bake_materials=bake_materials,
+            bake_resolution=bake_resolution,
+            bake_cache=bake_cache,
+            progress_callback=progress_callback,
+        )
+    finally:
+        cleanup_temporary_export_objects(export_objects)
 
 
 def extract_scene_payload_from_current_scene(
@@ -5229,6 +5566,7 @@ def build_untold_file(
         roughness_texture_index = add_texture(material.roughness_texture)
         emissive_texture_index = add_texture(material.emissive_texture, TEXTURE_FLAG_EMISSIVE | TEXTURE_FLAG_SRGB)
         occlusion_texture_index = add_texture(material.occlusion_texture, TEXTURE_FLAG_OCCLUSION)
+        height_texture_index = add_texture(material.height_texture, TEXTURE_FLAG_HEIGHT)
 
         key = (
             material.name,
@@ -5245,6 +5583,11 @@ def build_untold_file(
             roughness_texture_index,
             emissive_texture_index,
             occlusion_texture_index,
+            height_texture_index,
+            material.height_scale,
+            material.height_midlevel,
+            material.height_remap_min,
+            material.height_remap_max,
             material.roughness_texture_channel,
             material.metallic_texture_channel,
         )
@@ -5271,6 +5614,11 @@ def build_untold_file(
                 roughness_texture_index=roughness_texture_index,
                 emissive_texture_index=emissive_texture_index,
                 occlusion_texture_index=occlusion_texture_index,
+                height_texture_index=height_texture_index,
+                height_scale=material.height_scale,
+                height_midlevel=material.height_midlevel,
+                height_remap_min=material.height_remap_min,
+                height_remap_max=material.height_remap_max,
                 roughness_texture_channel=material.roughness_texture_channel,
                 metallic_texture_channel=material.metallic_texture_channel,
             )
@@ -5904,6 +6252,7 @@ def export_objects_to_untold(
     bake_cache: bool = True,
     bake_color_management: bool = False,
     color_lut_size: int = 32,
+    clean_sidecars: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> dict[str, object]:
     exported_lights, exported_cameras = extract_scene_payload_from_objects(
@@ -5912,18 +6261,23 @@ def export_objects_to_untold(
         source_orientation=source_orientation,
         include_scene_payload=True,
     )
-    exported_nodes = extract_nodes_from_objects(
-        export_objects,
-        source_asset_path,
-        convert_orientation=convert_orientation,
-        source_orientation=source_orientation,
-        validate=validate,
-        bake_materials=bake_materials,
-        bake_resolution=bake_resolution,
-        bake_cache=bake_cache,
-        progress_callback=progress_callback,
-    )
+    try:
+        exported_nodes = extract_nodes_from_objects(
+            export_objects,
+            source_asset_path,
+            convert_orientation=convert_orientation,
+            source_orientation=source_orientation,
+            validate=validate,
+            bake_materials=bake_materials,
+            bake_resolution=bake_resolution,
+            bake_cache=bake_cache,
+            progress_callback=progress_callback,
+        )
+    finally:
+        cleanup_temporary_export_objects(export_objects)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if clean_sidecars:
+        clean_generated_sidecar_dirs(output_path)
 
     color_management_bake: Optional[ColorManagementBake] = None
     if bake_color_management:
@@ -6104,6 +6458,7 @@ def main(argv: list[str]) -> int:
             convert_orientation=args.convert_orientation,
             source_orientation=args.source_orientation,
         )
+        clean_generated_sidecar_dirs(output_path)
         print(f"Staging {len(exported_nodes)} node(s) ...", flush=True)
         exported_nodes = stage_nodes_for_output(exported_nodes, output_path)
         staged_hdr_assets = stage_hdr_assets_for_output(output_path.parent, input_path)

@@ -55,61 +55,66 @@ final class RendererTests: BaseRenderSetup {
 
     /* Uncomment to generate reference images*/
     /**
-     func testGenerateReferenceImages() {
-         // Ensure renderer and metalview are properly initialized
-         XCTAssertNotNil(renderer, "Renderer should be initialized")
-         XCTAssertNotNil(renderer.metalView, "MetalView should be initialized")
-         // Manually trigger the draw call
-         renderer.draw(in: renderer.metalView)
+      func testGenerateReferenceImages() {
+          // Ensure renderer and metalview are properly initialized
+          XCTAssertNotNil(renderer, "Renderer should be initialized")
+          XCTAssertNotNil(renderer.metalView, "MetalView should be initialized")
+          // Manually trigger the draw call
+          renderer.draw(in: renderer.metalView)
 
-         let expectation = XCTestExpectation(description: "Render graph execution delay")
+          let expectation = XCTestExpectation(description: "Render graph execution delay")
 
-         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-             // generate different render targets
+          DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+              // generate different render targets
 
-             self.testGenerateRenderTarget(
-                 targetName: "IrradianceIBL",
-                 texture: textureResources.irradianceMap!
-             )
+              self.testGenerateRenderTarget(
+                  targetName: "IrradianceIBL",
+                  texture: textureResources.irradianceMap!
+              )
 
-             self.testGenerateRenderTarget(
-                 targetName: "SpecularIBL",
-                 texture: textureResources.specularMap!
-             )
+              self.testGenerateRenderTarget(
+                  targetName: "SpecularIBL",
+                  texture: textureResources.specularMap!
+              )
 
-             self.testGenerateRenderTarget(
-                 targetName: "BRDFIBL",
-                 texture: textureResources.iblBRDFMap!
-             )
+              self.testGenerateRenderTarget(
+                  targetName: "BRDFIBL",
+                  texture: textureResources.iblBRDFMap!
+              )
 
-             self.testGenerateRenderTarget(
-                 targetName: "DepthTarget",
-                 texture: renderInfo.offscreenRenderPassDescriptor.depthAttachment.texture!,
-                 isDepthTexture: true
-             )
+              self.testGenerateRenderTarget(
+                  targetName: "DepthTarget",
+                  texture: renderInfo.offscreenRenderPassDescriptor.depthAttachment.texture!,
+                  isDepthTexture: true
+              )
 
-             self.testGenerateRenderTarget(
-                 targetName: "LightPassColor",
-                 texture: renderInfo.deferredRenderPassDescriptor.colorAttachments[0].texture!
-             )
+              self.testGenerateRenderTarget(
+                  targetName: "LightPassColor",
+                  texture: renderInfo.deferredRenderPassDescriptor.colorAttachments[0].texture!
+              )
 
-             self.testGenerateRenderTarget(
-                 targetName: "TransparencyTarget",
-                 texture: renderInfo.deferredRenderPassDescriptor.colorAttachments[0].texture!
-             )
+              self.testGenerateRenderTarget(
+                  targetName: "TransparencyTarget",
+                  texture: renderInfo.deferredRenderPassDescriptor.colorAttachments[0].texture!
+              )
 
-             self.testGenerateRenderTarget(
-                 targetName: "CompositeColorTarget",
-                 texture: renderInfo.renderPassDescriptor.colorAttachments[0].texture!
-             )
+              self.testGenerateRenderTarget(
+                  targetName: "DisplacementMap",
+                  texture: renderInfo.deferredRenderPassDescriptor.colorAttachments[0].texture!
+              )
 
-             expectation.fulfill()
-         }
+              self.testGenerateRenderTarget(
+                  targetName: "CompositeColorTarget",
+                  texture: renderInfo.renderPassDescriptor.colorAttachments[0].texture!
+              )
 
-         // Wait for the execution
-         wait(for: [expectation], timeout: TimeInterval(timeoutFactor))
-     }
-      */
+              expectation.fulfill()
+          }
+
+          // Wait for the execution
+          wait(for: [expectation], timeout: TimeInterval(timeoutFactor))
+      }
+     */
     func testColorTarget() {
         XCTAssertNotNil(renderer, "Renderer should be initialized")
         XCTAssertNotNil(renderer.metalView, "MetalView should be initialized")
@@ -317,6 +322,25 @@ final class RendererTests: BaseRenderSetup {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             self.psnrTest(
                 targetName: "TransparencyTarget",
+                texture: renderInfo.deferredRenderPassDescriptor.colorAttachments[Int(colorTarget.rawValue)].texture!
+            )
+            expectation.fulfill()
+        }
+
+        wait(for: [expectation], timeout: TimeInterval(timeoutFactor))
+    }
+
+    func testDisplacementMap() {
+        XCTAssertNotNil(renderer, "Renderer should be initialized")
+        XCTAssertNotNil(renderer.metalView, "MetalView should be initialized")
+
+        renderer.draw(in: renderer.metalView)
+
+        let expectation = XCTestExpectation(description: "DisplacementMap test")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            self.psnrTest(
+                targetName: "DisplacementMap",
                 texture: renderInfo.deferredRenderPassDescriptor.colorAttachments[Int(colorTarget.rawValue)].texture!
             )
             expectation.fulfill()

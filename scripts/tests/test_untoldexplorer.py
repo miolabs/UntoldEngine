@@ -143,6 +143,57 @@ class UntoldExplorerTests(unittest.TestCase):
         self.assertTrue(key.startswith("path:"))
         self.assertIn("forest.exr", key)
 
+    def test_clean_generated_sidecar_dirs_removes_stale_export_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "asset" / "asset.untold"
+            textures_dir = output_path.parent / "Textures"
+            hdr_dir = output_path.parent / "HDR"
+            textures_dir.mkdir(parents=True)
+            hdr_dir.mkdir()
+            (textures_dir / "old.png").write_bytes(b"stale texture")
+            (hdr_dir / "old.exr").write_bytes(b"stale hdr")
+            output_path.write_bytes(b"previous export")
+
+            u.clean_generated_sidecar_dirs(output_path)
+
+            self.assertFalse(textures_dir.exists())
+            self.assertFalse(hdr_dir.exists())
+            self.assertTrue(output_path.exists())
+
+    def test_cleanup_temporary_export_objects_removes_tagged_split_meshes(self) -> None:
+        class FakeBpyCollection:
+            def __init__(self) -> None:
+                self.removed = []
+
+            def remove(self, item, do_unlink=False) -> None:
+                self.removed.append((item, do_unlink))
+
+        class FakeBpy:
+            def __init__(self) -> None:
+                self.data = FakeData(objects=FakeBpyCollection(), meshes=FakeBpyCollection())
+
+        class FakeTempObject(dict):
+            def __init__(self, name: str, data=None, tagged: bool = False) -> None:
+                super().__init__()
+                self.name = name
+                self.data = data
+                if tagged:
+                    self[u.UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
+
+        previous_bpy = u.bpy
+        fake_bpy = FakeBpy()
+        mesh = FakeData(users=0)
+        temp_obj = FakeTempObject("Wall_mat0", mesh, tagged=True)
+        real_obj = FakeTempObject("Wall", FakeData(users=0), tagged=False)
+        try:
+            u.bpy = fake_bpy
+            u.cleanup_temporary_export_objects([real_obj, temp_obj])
+        finally:
+            u.bpy = previous_bpy
+
+        self.assertEqual(fake_bpy.data.objects.removed, [(temp_obj, True)])
+        self.assertEqual(fake_bpy.data.meshes.removed, [(mesh, False)])
+
     def test_normalize_and_pack_helpers_use_fallbacks_and_clamping(self) -> None:
         self.assertEqual(u.normalize3((0.0, 0.0, 0.0), (1.0, 2.0, 3.0)), (1.0, 2.0, 3.0))
         self.assertEqual(u.pack_snorm10(2.0), 511)
@@ -666,7 +717,8 @@ class UntoldExplorerTests(unittest.TestCase):
         u.write_entity_record(we, entity)
         self.assertEqual(we.count, 136)
 
-        # Material record: 88 bytes (per assetFormat.md schema)
+        # Material record: 108 bytes (per assetFormat.md schema — grew from 88 to 108
+        # bytes at FORMAT_VERSION 3/4 with the height-map and height-remap fields).
         wm = u.BinaryWriter()
         mat = u.MaterialRecord(
             name_offset=0, flags=0,
@@ -680,12 +732,15 @@ class UntoldExplorerTests(unittest.TestCase):
             roughness_texture_index=u.INVALID_INDEX,
             emissive_texture_index=u.INVALID_INDEX,
             occlusion_texture_index=u.INVALID_INDEX,
+            height_texture_index=u.INVALID_INDEX,
+            height_scale=0.05, height_midlevel=0.5,
+            height_remap_min=0.0, height_remap_max=1.0,
             roughness_texture_channel=u.TEXTURE_CHANNEL_G,
             metallic_texture_channel=u.TEXTURE_CHANNEL_B,
         )
         u.write_material_record(wm, mat)
-        self.assertEqual(wm.count, 88)
-        self.assertEqual(struct.unpack_from("<I", wm.data, 80)[0], 0b1001)
+        self.assertEqual(wm.count, 108)
+        self.assertEqual(struct.unpack_from("<I", wm.data, 100)[0], 0b1001)
 
         # Texture record: 8×u32 = 32 bytes
         wt = u.BinaryWriter()
@@ -923,6 +978,149 @@ class MaterialGraphAnalysisTests(unittest.TestCase):
         self.assertEqual(exported.metallic_factor, 1.0)
         self.assertIs(exported.normal_texture, baked.normal)
         self.assertEqual(exported.normal_scale, 1.0)
+
+    def test_extract_material_reads_height_from_displacement_node(self) -> None:
+        """The standard ArchViz/Poliigon authoring pattern: an Image Texture feeds a
+        Displacement node's Height socket, which feeds Material Output's Displacement
+        input. Scale becomes heightScale directly. Midlevel does NOT get copied into
+        heightMidlevel (which stays at its neutral default) — the engine's POM is
+        unidirectional and heightMidlevel is just an additive shift, not a true
+        zero-reference, so copying Blender's Midlevel there would not reproduce "neutral
+        gray = no visible depth". Instead Midlevel becomes the height_remap_max ceiling:
+        raw values at/above it clip to "no depth", values below get contrast-stretched
+        into the full depth range."""
+        height_tex = _make_image_node("height_map")
+        height_input = FakeSocket("Height")
+        height_input.link_from(height_tex, "Color")
+        scale_socket = FakeSocket("Scale")
+        scale_socket.default_value = 0.02
+        midlevel_socket = FakeSocket("Midlevel")
+        midlevel_socket.default_value = 0.7
+        displacement_node = FakeNode(
+            "ShaderNodeDisplacement",
+            inputs={"Height": height_input, "Scale": scale_socket, "Midlevel": midlevel_socket},
+        )
+        displacement_node.name = "Displacement"
+
+        principled, output = _make_principled_output(None)
+        principled.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        displacement_socket = FakeSocket("Displacement")
+        displacement_socket.link_from(displacement_node, "Displacement")
+        output.inputs["Displacement"] = displacement_socket
+
+        material = _make_material("disp_mat", [output, principled, displacement_node, height_tex])
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertIsNotNone(exported.height_texture)
+        self.assertEqual(exported.height_texture.name, "height_map.png")
+        self.assertAlmostEqual(exported.height_scale, 0.02)
+        self.assertAlmostEqual(exported.height_midlevel, 0.5, msg="heightMidlevel stays neutral, Blender's Midlevel is not copied here")
+        self.assertAlmostEqual(exported.height_remap_min, 0.0)
+        self.assertAlmostEqual(exported.height_remap_max, 0.7, msg="Blender's Midlevel becomes the remap ceiling")
+
+        # The Displacement node's own type is not flagged as bakeable — it's now
+        # faithfully handled (extracted as height) — but its Height chain is still
+        # walked and would be individually classified if unsupported.
+        analysis = u.analyze_material(material)
+        self.assertEqual(analysis.classification, u.MATERIAL_GRAPH_SUPPORTED)
+
+    def _make_displacement_material(self, *, midlevel: float, name: str = "disp_mat") -> FakeData:
+        height_tex = _make_image_node("height_map")
+        height_input = FakeSocket("Height")
+        height_input.link_from(height_tex, "Color")
+        scale_socket = FakeSocket("Scale")
+        scale_socket.default_value = 0.02
+        midlevel_socket = FakeSocket("Midlevel")
+        midlevel_socket.default_value = midlevel
+        displacement_node = FakeNode(
+            "ShaderNodeDisplacement",
+            inputs={"Height": height_input, "Scale": scale_socket, "Midlevel": midlevel_socket},
+        )
+        displacement_node.name = "Displacement"
+
+        principled, output = _make_principled_output(None)
+        principled.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        displacement_socket = FakeSocket("Displacement")
+        displacement_socket.link_from(displacement_node, "Displacement")
+        output.inputs["Displacement"] = displacement_socket
+
+        return _make_material(name, [output, principled, displacement_node, height_tex])
+
+    def test_extract_material_clamps_out_of_range_midlevel_to_remap_ceiling(self) -> None:
+        """Regression: a real Poliigon .blend was found with Midlevel authored as 7.4
+        (an artist overshooting a slider, not a valid [0,1] height reference). Raw texture
+        samples are always in [0,1], so an unclamped remap ceiling of 7.4 would make
+        virtually every real sample divide down toward "maximum depth" — a badly broken
+        result, not a validation error, so it must be clamped rather than trusted as-is."""
+        material = self._make_displacement_material(midlevel=7.4, name="overshoot_mat")
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertAlmostEqual(exported.height_remap_max, 1.0)
+
+    def test_extract_material_clamps_near_zero_midlevel_to_remap_floor(self) -> None:
+        material = self._make_displacement_material(midlevel=0.0, name="zero_mat")
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertAlmostEqual(exported.height_remap_max, 0.01)
+
+    def test_extract_material_falls_back_to_bump_height_when_no_displacement(self) -> None:
+        """Materials authored without a separate Displacement setup sometimes feed a
+        Bump node's Height socket into the Principled BSDF's Normal input directly."""
+        height_tex = _make_image_node("bump_height")
+        height_input = FakeSocket("Height")
+        height_input.link_from(height_tex, "Color")
+        distance_socket = FakeSocket("Distance")
+        distance_socket.default_value = 0.03
+        bump_node = FakeNode("ShaderNodeBump", inputs={"Height": height_input, "Distance": distance_socket})
+        bump_node.name = "Bump"
+
+        normal_socket = FakeSocket("Normal")
+        normal_socket.link_from(bump_node, "Normal")
+        base_color_socket = FakeSocket("Base Color")
+        base_color_socket.default_value = (1.0, 1.0, 1.0, 1.0)
+        principled = FakeNode("ShaderNodeBsdfPrincipled", inputs={"Base Color": base_color_socket, "Normal": normal_socket})
+        principled.name = "Principled BSDF"
+        surface = FakeSocket("Surface")
+        surface.link_from(principled, "BSDF")
+        output = FakeNode("ShaderNodeOutputMaterial", inputs={"Surface": surface})
+        output.name = "Material Output"
+
+        material = _make_material("bump_mat", [output, principled, bump_node, height_tex])
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertIsNotNone(exported.height_texture)
+        self.assertEqual(exported.height_texture.name, "bump_height.png")
+        self.assertAlmostEqual(exported.height_scale, 0.03)
+        # Bump has no Midlevel-equivalent input; height_midlevel/height_remap_max stay at
+        # their neutral defaults.
+        self.assertAlmostEqual(exported.height_midlevel, 0.5)
+        self.assertAlmostEqual(exported.height_remap_min, 0.0)
+        self.assertAlmostEqual(exported.height_remap_max, 1.0)
+
+    def test_extract_material_without_displacement_or_bump_has_no_height(self) -> None:
+        tex = _make_image_node("original")
+        principled, output = _make_principled_output(tex)
+        material = _make_material("plain_mat", [output, principled, tex])
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertIsNone(exported.height_texture)
+        self.assertEqual(exported.height_scale, 0.05)
+        self.assertEqual(exported.height_midlevel, 0.5)
 
     def test_bake_plan_marks_only_divergent_channels(self) -> None:
         # Mix on base color, math node on roughness, clean normal/emissive.
@@ -1311,6 +1509,188 @@ class MaterialGraphAnalysisTests(unittest.TestCase):
         mesh = FakeSceneObject("Floor", "MESH", FakeData(materials=[material], uv_layers=[]))
         lines = u.material_fidelity_report_lines([mesh])
         self.assertEqual(lines, ["Material fidelity report: 1 supported, 0 bakeable, 0 unbakeable"])
+
+
+def _build_minimal_png(bit_depth: int, color_type: int) -> bytes:
+    """A syntactically valid PNG containing only a magic + IHDR chunk. _png_ihdr only
+    reads the first 26 bytes, so the rest of a real PNG (IDAT/IEND, valid CRCs) is
+    unnecessary."""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\x0d"  # chunk length (unused by the reader)
+        + b"IHDR"
+        + b"\x00\x00\x00\x01\x00\x00\x00\x01"  # width=1, height=1 (unused)
+        + bytes([bit_depth, color_type])
+        + b"\x00\x00\x00\x00\x00"  # compression, filter, interlace + padding (unused)
+    )
+
+
+def _build_minimal_tiff(bits_per_sample: list[int], *, big_endian: bool = False) -> bytes:
+    """A minimal little/big-endian TIFF with BitsPerSample(258) and SamplesPerPixel(277)
+    tags, matching exactly what _tiff_bits_per_sample_and_channels reads. No image data —
+    the reader only walks the first IFD's tag table."""
+    endian = ">" if big_endian else "<"
+    samples_per_pixel = len(bits_per_sample)
+    entries: list[tuple[int, bytes]] = []
+    extra_data = b""
+
+    if samples_per_pixel == 1:
+        entries.append((258, struct.pack(endian + "HHI", 258, 3, 1) + struct.pack(endian + "HH", bits_per_sample[0], 0)))
+    else:
+        ifd_entry_count = 2
+        bits_offset = 8 + 2 + ifd_entry_count * 12 + 4
+        entries.append((258, struct.pack(endian + "HHI", 258, 3, samples_per_pixel) + struct.pack(endian + "I", bits_offset)))
+        extra_data = b"".join(struct.pack(endian + "H", v) for v in bits_per_sample)
+
+    entries.append((277, struct.pack(endian + "HHI", 277, 3, 1) + struct.pack(endian + "HH", samples_per_pixel, 0)))
+    entries.sort(key=lambda e: e[0])
+
+    header = (b"MM" if big_endian else b"II") + struct.pack(endian + "HI", 42, 8)
+    ifd_body = struct.pack(endian + "H", len(entries)) + b"".join(e[1] for e in entries) + struct.pack(endian + "I", 0)
+    return header + ifd_body + extra_data
+
+
+class TextureBitDepthDetectionTests(unittest.TestCase):
+    """Regression coverage for the needs_conversion detection bug: Blender's own
+    image.depth/image.channels report 32/4 ("already 8-bit RGBA") for genuinely
+    16-bit-per-channel PNG/TIFF sources, silently defeating the safety net that
+    downconverts 16-bit/grayscale textures to avoid the Metal sRGB-16-bit and
+    grayscale-loads-as-red bugs. _source_bit_depth_and_channels reads the true values
+    from the source file's own header instead of trusting Blender's post-load metadata."""
+
+    def test_tiff_single_channel_16bit_inline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            self.assertEqual(u._tiff_bits_per_sample_and_channels(path), (16, 1))
+
+    def test_tiff_multi_channel_8bit_via_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "color.tiff"
+            path.write_bytes(_build_minimal_tiff([8, 8, 8]))
+            self.assertEqual(u._tiff_bits_per_sample_and_channels(path), (8, 3))
+
+    def test_tiff_big_endian(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height_be.tiff"
+            path.write_bytes(_build_minimal_tiff([16], big_endian=True))
+            self.assertEqual(u._tiff_bits_per_sample_and_channels(path), (16, 1))
+
+    def test_tiff_invalid_file_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "not_a_tiff.tiff"
+            path.write_bytes(b"not a tiff file")
+            self.assertIsNone(u._tiff_bits_per_sample_and_channels(path))
+
+    def test_png_ihdr_16bit_grayscale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.png"
+            path.write_bytes(_build_minimal_png(bit_depth=16, color_type=0))
+            self.assertEqual(u._png_ihdr(path), (16, 0))
+            self.assertEqual(u._png_bit_depth(path), 16)
+
+    def test_png_ihdr_8bit_rgb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "color.png"
+            path.write_bytes(_build_minimal_png(bit_depth=8, color_type=2))
+            self.assertEqual(u._png_ihdr(path), (8, 2))
+
+    def test_png_ihdr_invalid_file_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "not_a_png.png"
+            path.write_bytes(b"not a png file")
+            self.assertIsNone(u._png_ihdr(path))
+
+    def test_source_bit_depth_dispatches_to_tiff_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = None  # exercise the no-bpy fallback path (Path(filepath) directly)
+                self.assertEqual(u._source_bit_depth_and_channels(image), (16, 1))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_dispatches_to_png_reader_with_channel_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.png"
+            path.write_bytes(_build_minimal_png(bit_depth=16, color_type=0))  # grayscale
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = None
+                self.assertEqual(u._source_bit_depth_and_channels(image), (16, 1))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_uses_bpy_path_abspath_when_available(self) -> None:
+        """Inside real Blender, filepath_raw can be a blend-relative '//' path that only
+        bpy.path.abspath knows how to resolve — this must be preferred over treating the
+        raw string as a plain OS path when bpy is available."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            image = FakeData(filepath_raw="//not/a/real/relative/path.tiff", filepath="", library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = FakeData(path=FakeData(abspath=lambda p, library=None: str(path)))
+                self.assertEqual(u._source_bit_depth_and_channels(image), (16, 1))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_returns_none_for_unsupported_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "photo.jpg"
+            path.write_bytes(b"not actually decoded, suffix-only dispatch")
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = None
+                self.assertIsNone(u._source_bit_depth_and_channels(image))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_returns_none_when_no_filepath(self) -> None:
+        image = FakeData(filepath_raw="", filepath="", library=None)
+        original_bpy = u.bpy
+        try:
+            u.bpy = None
+            self.assertIsNone(u._source_bit_depth_and_channels(image))
+        finally:
+            u.bpy = original_bpy
+
+    def test_source_bit_depth_returns_none_when_file_missing(self) -> None:
+        image = FakeData(filepath_raw="/nonexistent/path/height.tiff", filepath="", library=None)
+        original_bpy = u.bpy
+        try:
+            u.bpy = None
+            self.assertIsNone(u._source_bit_depth_and_channels(image))
+        finally:
+            u.bpy = original_bpy
+
+    def test_needs_conversion_now_fires_for_real_world_16bit_grayscale_tiff(self) -> None:
+        """The actual regression: a genuinely 16-bit single-channel source (e.g. a
+        Poliigon displacement map) must compute depth=16, channels=1 -> needs_conversion
+        True, even though Blender's own image.depth/channels report 32/4 for this exact
+        case (confirmed against real Blender 5.1 + a real Poliigon TIFF asset)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "displacement.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None,
+                              depth=32, channels=4)  # Blender's (misleading) post-load metadata
+            original_bpy = u.bpy
+            try:
+                u.bpy = None
+                source_info = u._source_bit_depth_and_channels(image)
+                self.assertEqual(source_info, (16, 1))
+                bits_per_sample, image_channels = source_info
+                image_depth = bits_per_sample * image_channels
+                needs_conversion = image_depth > 32 or image_channels < 3
+                self.assertTrue(needs_conversion, "16-bit grayscale source must trigger the 8-bit safety downconvert")
+            finally:
+                u.bpy = original_bpy
 
 
 if __name__ == "__main__":

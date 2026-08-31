@@ -1,0 +1,802 @@
+{
+  "depthOfField" : {
+    "focusRange" : 0.1933618,
+    "maxBlur" : 0.0012119081,
+    "enabled" : true,
+    "focusDistance" : 1
+  },
+  "colorGrading" : {
+    "exposure" : -0.2,
+    "enabled" : true,
+    "temperature" : 44.536102,
+    "contrast" : 1.15,
+    "saturation" : 0.9,
+    "tint" : -5.5075684,
+    "brightness" : -0.05
+  },
+  "entities" : [
+    {
+      "hasRenderingComponent" : true,
+      "assetURL" : "file:\/\/\/primitive\/Sphere",
+      "uuid" : "393039BD-F37F-4354-8DB0-7B2956A8CB51",
+      "materialData" : {
+        "roughnessWrapMode" : 1,
+        "roughnessURL" : "file:\/\/\/Users\/haroldserrano\/Downloads\/UntoldXRTest\/Sources\/UntoldXRTest\/GameData\/Materials\/MetalCorrodedHeavy001\/MetalCorrodedHeavy001_ROUGHNESS_2K_METALNESS.jpg",
+        "opacity" : 1,
+        "emissiveValue" : [
+          0,
+          0,
+          0
+        ],
+        "heightURL" : "file:\/\/\/Users\/haroldserrano\/Downloads\/UntoldXRTest\/Sources\/UntoldXRTest\/GameData\/Materials\/Bricks066_4K-JPG\/Bricks066_4K-JPG_Displacement.jpg",
+        "heightRemapMax" : 1,
+        "normalURL" : "file:\/\/\/Users\/haroldserrano\/Downloads\/UntoldXRTest\/Sources\/UntoldXRTest\/GameData\/Materials\/MetalCorrodedHeavy001\/MetalCorrodedHeavy001_NRM_2K_METALNESS.jpg",
+        "stScale" : 1,
+        "baseColorURL" : "file:\/\/\/Users\/haroldserrano\/Downloads\/UntoldXRTest\/Sources\/UntoldXRTest\/GameData\/Materials\/MetalCorrodedHeavy001\/MetalCorrodedHeavy001_COL_2K_METALNESS.jpg",
+        "baseColorWrapMode" : 1,
+        "alphaMode" : 0,
+        "baseColorValue" : [
+          1,
+          1,
+          1,
+          1
+        ],
+        "metallicURL" : "file:\/\/\/Users\/haroldserrano\/Downloads\/UntoldXRTest\/Sources\/UntoldXRTest\/GameData\/Materials\/MetalCorrodedHeavy001\/MetalCorrodedHeavy001_METALNESS_2K_METALNESS.jpg",
+        "normalWrapMode" : 1,
+        "heightScale" : 0.05,
+        "metallicValue" : 1,
+        "heightMidlevel" : 0.5,
+        "heightEnabled" : true,
+        "heightRemapMin" : 0,
+        "alphaCutoff" : 0.5,
+        "roughnessValue" : 1,
+        "metallicWrapMode" : 1,
+        "heightWrapMode" : 1
+      },
+      "hasKineticComponent" : false,
+      "customComponents" : {
+
+      },
+      "name" : "Sphere-8589934593",
+      "scale" : [
+        5,
+        5,
+        5
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "asset" : {
+        "path" : "\/primitive\/Sphere",
+        "displayName" : "Sphere",
+        "kind" : "procedural"
+      },
+      "castsShadow" : true,
+      "assetName" : "Sphere",
+      "animations" : [
+
+      ],
+      "rotation" : [
+        0,
+        0,
+        0,
+        1
+      ],
+      "hasAnimationComponent" : false,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "hasRenderingComponent" : true,
+      "assetURL" : "file:\/\/\/primitive\/default_cube",
+      "uuid" : "1E2C04DE-4515-4DF4-8881-044590E26ED0",
+      "materialData" : {
+        "roughnessWrapMode" : 1,
+        "opacity" : 1,
+        "emissiveValue" : [
+          0,
+          0,
+          0
+        ],
+        "heightRemapMax" : 1,
+        "baseColorWrapMode" : 1,
+        "stScale" : 1,
+        "normalWrapMode" : 1,
+        "heightRemapMin" : 0,
+        "alphaMode" : 0,
+        "baseColorValue" : [
+          1,
+          1,
+          1,
+          1
+        ],
+        "heightMidlevel" : 0.5,
+        "heightScale" : 0.05,
+        "metallicValue" : 0,
+        "heightEnabled" : true,
+        "alphaCutoff" : 0.5,
+        "roughnessValue" : 0.9,
+        "metallicWrapMode" : 1,
+        "heightWrapMode" : 1
+      },
+      "hasKineticComponent" : false,
+      "hasDirLightComponent" : true,
+      "customComponents" : {
+
+      },
+      "name" : "Directional Light",
+      "scale" : [
+        1,
+        1,
+        1
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "asset" : {
+        "path" : "\/primitive\/default_cube",
+        "displayName" : "default_cube",
+        "kind" : "procedural"
+      },
+      "castsShadow" : true,
+      "assetName" : "default_cube",
+      "animations" : [
+
+      ],
+      "lightData" : {
+        "radius" : 1,
+        "color" : [
+          1,
+          1,
+          1
+        ],
+        "coneAngle" : 30,
+        "falloff" : 0.5,
+        "right" : [
+          1,
+          0,
+          0
+        ],
+        "twoSided" : false,
+        "up" : [
+          0,
+          1,
+          0
+        ],
+        "intensity" : 5,
+        "bounds" : [
+          1,
+          1
+        ],
+        "castsShadow" : true,
+        "forward" : [
+          0,
+          0,
+          -1
+        ],
+        "usesRadiometricUnits" : false
+      },
+      "rotation" : [
+        -0.31243286,
+        0.6343387,
+        0.31243268,
+        0.634339
+      ],
+      "hasAnimationComponent" : false,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        0,
+        1.7585897,
+        0
+      ]
+    },
+    {
+      "hasRenderingComponent" : false,
+      "cameraData" : {
+        "target" : [
+          0,
+          0,
+          -2
+        ],
+        "up" : [
+          0,
+          1,
+          0
+        ],
+        "eye" : [
+          0,
+          1,
+          4
+        ]
+      },
+      "assetURL" : "file:\/\/\/",
+      "uuid" : "B0DF2382-4D25-4706-8AE2-4CA4362A0493",
+      "hasKineticComponent" : false,
+      "hasCameraComponent" : true,
+      "name" : "Game Camera",
+      "scale" : [
+        1,
+        1,
+        1
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "customComponents" : {
+
+      },
+      "assetName" : "",
+      "animations" : [
+
+      ],
+      "rotation" : [
+        0.082480535,
+        -0,
+        -0,
+        0.9965927
+      ],
+      "hasAnimationComponent" : false,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        0,
+        1,
+        4
+      ]
+    },
+    {
+      "hasRenderingComponent" : true,
+      "assetURL" : "file:\/\/\/primitive\/default_cube",
+      "uuid" : "0F6F830A-A3B5-4E3A-947B-48808B568346",
+      "materialData" : {
+        "roughnessWrapMode" : 1,
+        "opacity" : 1,
+        "emissiveValue" : [
+          1,
+          1,
+          1
+        ],
+        "heightRemapMax" : 1,
+        "baseColorWrapMode" : 1,
+        "stScale" : 1,
+        "normalWrapMode" : 1,
+        "heightRemapMin" : 0,
+        "alphaMode" : 0,
+        "baseColorValue" : [
+          1,
+          1,
+          1,
+          1
+        ],
+        "heightMidlevel" : 0.5,
+        "heightScale" : 0.05,
+        "metallicValue" : 0,
+        "heightEnabled" : true,
+        "alphaCutoff" : 0.5,
+        "roughnessValue" : 0.9,
+        "metallicWrapMode" : 1,
+        "heightWrapMode" : 1
+      },
+      "hasKineticComponent" : false,
+      "customComponents" : {
+
+      },
+      "name" : "Entity_12",
+      "scale" : [
+        1,
+        1,
+        1
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "asset" : {
+        "path" : "\/primitive\/default_cube",
+        "displayName" : "default_cube",
+        "kind" : "procedural"
+      },
+      "castsShadow" : true,
+      "assetName" : "default_cube",
+      "animations" : [
+
+      ],
+      "lightData" : {
+        "range" : 0,
+        "falloff" : 0.5,
+        "intensity" : 10,
+        "color" : [
+          1,
+          1,
+          1
+        ],
+        "coneAngle" : 15,
+        "right" : [
+          1,
+          0,
+          0
+        ],
+        "bounds" : [
+          1,
+          1
+        ],
+        "up" : [
+          0,
+          1,
+          0
+        ],
+        "twoSided" : false,
+        "forward" : [
+          0,
+          0,
+          -1
+        ],
+        "castsShadow" : false,
+        "usesRadiometricUnits" : false,
+        "radius" : 1
+      },
+      "rotation" : [
+        -0.34599066,
+        0.43647692,
+        0.18660319,
+        0.8092945
+      ],
+      "hasAnimationComponent" : false,
+      "hasSpotLightComponent" : true,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        1.0505034,
+        0.74240667,
+        1.187109
+      ]
+    },
+    {
+      "hasRenderingComponent" : true,
+      "assetURL" : "file:\/\/\/primitive\/Cube",
+      "uuid" : "4001EF1D-538F-4F9B-9093-27E9DF292D4C",
+      "materialData" : {
+        "roughnessWrapMode" : 1,
+        "opacity" : 1,
+        "emissiveValue" : [
+          0,
+          0,
+          0
+        ],
+        "heightRemapMax" : 1,
+        "baseColorWrapMode" : 1,
+        "stScale" : 1,
+        "normalWrapMode" : 1,
+        "heightRemapMin" : 0,
+        "alphaMode" : 0,
+        "baseColorValue" : [
+          1,
+          1,
+          1,
+          1
+        ],
+        "heightMidlevel" : 0.5,
+        "heightScale" : 0.05,
+        "metallicValue" : 0,
+        "heightEnabled" : true,
+        "alphaCutoff" : 0.5,
+        "roughnessValue" : 0.9,
+        "metallicWrapMode" : 1,
+        "heightWrapMode" : 1
+      },
+      "hasKineticComponent" : false,
+      "customComponents" : {
+
+      },
+      "name" : "Cube-51539607557",
+      "scale" : [
+        1,
+        1,
+        1
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "asset" : {
+        "path" : "\/primitive\/Cube",
+        "displayName" : "Cube",
+        "kind" : "procedural"
+      },
+      "castsShadow" : true,
+      "assetName" : "Cube",
+      "animations" : [
+
+      ],
+      "rotation" : [
+        0,
+        0,
+        0,
+        1
+      ],
+      "hasAnimationComponent" : false,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        0,
+        0.7419706,
+        0.97658753
+      ]
+    },
+    {
+      "hasRenderingComponent" : true,
+      "assetURL" : "file:\/\/\/primitive\/default_cube",
+      "uuid" : "988CB404-9A0A-4699-A3E3-433DB5A0C89A",
+      "materialData" : {
+        "roughnessWrapMode" : 1,
+        "opacity" : 1,
+        "emissiveValue" : [
+          1,
+          1,
+          1
+        ],
+        "heightRemapMax" : 1,
+        "baseColorWrapMode" : 1,
+        "stScale" : 1,
+        "normalWrapMode" : 1,
+        "heightRemapMin" : 0,
+        "alphaMode" : 0,
+        "baseColorValue" : [
+          1,
+          1,
+          1,
+          1
+        ],
+        "heightMidlevel" : 0.5,
+        "heightScale" : 0.05,
+        "metallicValue" : 0,
+        "heightEnabled" : true,
+        "alphaCutoff" : 0.5,
+        "roughnessValue" : 0.9,
+        "metallicWrapMode" : 1,
+        "heightWrapMode" : 1
+      },
+      "hasKineticComponent" : false,
+      "customComponents" : {
+
+      },
+      "name" : "Entity_39",
+      "scale" : [
+        1,
+        1,
+        1
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "asset" : {
+        "path" : "\/primitive\/default_cube",
+        "displayName" : "default_cube",
+        "kind" : "procedural"
+      },
+      "castsShadow" : true,
+      "assetName" : "default_cube",
+      "animations" : [
+
+      ],
+      "hasAreaLightComponent" : true,
+      "lightData" : {
+        "range" : 0,
+        "falloff" : 0.5,
+        "intensity" : 10,
+        "color" : [
+          1,
+          1,
+          1
+        ],
+        "coneAngle" : 30,
+        "right" : [
+          0.99984825,
+          0,
+          -0.017421832
+        ],
+        "bounds" : [
+          0.5,
+          0.5
+        ],
+        "up" : [
+          0.008094259,
+          0.88551843,
+          0.4645338
+        ],
+        "twoSided" : false,
+        "forward" : [
+          0.015427353,
+          -0.46460432,
+          0.8853841
+        ],
+        "castsShadow" : false,
+        "usesRadiometricUnits" : false,
+        "radius" : 1
+      },
+      "rotation" : [
+        0.23924142,
+        0.008458254,
+        -0.0020841702,
+        0.97092104
+      ],
+      "hasAnimationComponent" : false,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        0,
+        -0.5330231,
+        1.0356375
+      ]
+    },
+    {
+      "hasRenderingComponent" : true,
+      "assetURL" : "file:\/\/\/primitive\/default_cube",
+      "uuid" : "486ECB03-FA8A-4671-A022-74D8E23CCE6F",
+      "materialData" : {
+        "roughnessWrapMode" : 1,
+        "opacity" : 1,
+        "emissiveValue" : [
+          0,
+          0,
+          0
+        ],
+        "heightRemapMax" : 1,
+        "baseColorWrapMode" : 1,
+        "stScale" : 1,
+        "normalWrapMode" : 1,
+        "heightRemapMin" : 0,
+        "alphaMode" : 0,
+        "baseColorValue" : [
+          1,
+          1,
+          1,
+          1
+        ],
+        "heightMidlevel" : 0.5,
+        "heightScale" : 0.05,
+        "metallicValue" : 0,
+        "heightEnabled" : true,
+        "alphaCutoff" : 0.5,
+        "roughnessValue" : 0.9,
+        "metallicWrapMode" : 1,
+        "heightWrapMode" : 1
+      },
+      "hasKineticComponent" : false,
+      "customComponents" : {
+
+      },
+      "name" : "Entity_29",
+      "scale" : [
+        1,
+        1,
+        1
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "asset" : {
+        "path" : "\/primitive\/default_cube",
+        "displayName" : "default_cube",
+        "kind" : "procedural"
+      },
+      "castsShadow" : true,
+      "assetName" : "default_cube",
+      "animations" : [
+
+      ],
+      "hasPointLightComponent" : true,
+      "lightData" : {
+        "range" : 0,
+        "falloff" : 0.5,
+        "intensity" : 10,
+        "color" : [
+          1,
+          1,
+          1
+        ],
+        "coneAngle" : 30,
+        "right" : [
+          1,
+          0,
+          0
+        ],
+        "bounds" : [
+          1,
+          1
+        ],
+        "up" : [
+          0,
+          1,
+          0
+        ],
+        "twoSided" : false,
+        "forward" : [
+          0,
+          0,
+          -1
+        ],
+        "castsShadow" : false,
+        "usesRadiometricUnits" : false,
+        "radius" : 1
+      },
+      "rotation" : [
+        -0.7071067,
+        0,
+        0,
+        0.7071068
+      ],
+      "hasAnimationComponent" : false,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        -1.5321543,
+        -0.93593675,
+        0.56710863
+      ]
+    },
+    {
+      "hasRenderingComponent" : true,
+      "assetURL" : "file:\/\/\/primitive\/Cube",
+      "uuid" : "E550403F-3E1D-460B-AFE9-2456666D9A12",
+      "materialData" : {
+        "roughnessWrapMode" : 1,
+        "opacity" : 1,
+        "emissiveValue" : [
+          0,
+          0,
+          0
+        ],
+        "heightRemapMax" : 1,
+        "baseColorWrapMode" : 1,
+        "stScale" : 1,
+        "normalWrapMode" : 1,
+        "heightRemapMin" : 0,
+        "alphaMode" : 0,
+        "baseColorValue" : [
+          1,
+          1,
+          1,
+          1
+        ],
+        "heightMidlevel" : 0.5,
+        "heightScale" : 0.05,
+        "metallicValue" : 0,
+        "heightEnabled" : true,
+        "alphaCutoff" : 0.5,
+        "roughnessValue" : 0.9,
+        "metallicWrapMode" : 1,
+        "heightWrapMode" : 1
+      },
+      "hasKineticComponent" : false,
+      "customComponents" : {
+
+      },
+      "name" : "Cube-107374182405",
+      "scale" : [
+        10,
+        10,
+        10
+      ],
+      "axisOfRotations" : [
+        0,
+        0,
+        0
+      ],
+      "asset" : {
+        "path" : "\/primitive\/Cube",
+        "displayName" : "Cube",
+        "kind" : "procedural"
+      },
+      "castsShadow" : true,
+      "assetName" : "Cube",
+      "animations" : [
+
+      ],
+      "rotation" : [
+        0,
+        0,
+        0,
+        1
+      ],
+      "hasAnimationComponent" : false,
+      "mass" : 0,
+      "hasLocalTransformComponent" : true,
+      "position" : [
+        -4.1108685,
+        0,
+        -35.049004
+      ]
+    }
+  ],
+  "bloom" : {
+    "intensity" : 0,
+    "enabled" : false,
+    "threshold" : 0.5
+  },
+  "toneMapping" : {
+    "exposure" : 1,
+    "toneMapOperator" : 0,
+    "gamma" : 1
+  },
+  "chromaticAberration" : {
+    "center" : [
+      0.5,
+      0.5
+    ],
+    "enabled" : false,
+    "intensity" : 0
+  },
+  "antiAliasing" : {
+    "smaa" : {
+      "edgeThreshold" : 0.1
+    },
+    "fxaa" : {
+      "edgeThreshold" : 0.125,
+      "subpixelQuality" : 0.75,
+      "edgeThresholdMin" : 0.0625
+    },
+    "mode" : "fxaa"
+  },
+  "environment" : {
+    "hdr" : "",
+    "renderEnvironment" : true,
+    "ambientIntensity" : 0.4,
+    "applyIBL" : true
+  },
+  "ssao" : {
+    "bias" : 0.02,
+    "radius" : 0.5,
+    "enabled" : true,
+    "intensity" : 0.5
+  },
+  "colorCorrection" : {
+    "lift" : [
+      0,
+      0,
+      0
+    ],
+    "gamma" : [
+      1,
+      1,
+      1
+    ],
+    "gain" : [
+      1,
+      1,
+      1
+    ],
+    "enabled" : false,
+    "tint" : 0,
+    "temperature" : 0
+  },
+  "schemaVersion" : 2,
+  "vignette" : {
+    "center" : [
+      0.5,
+      0.5
+    ],
+    "softness" : 0.1501407,
+    "radius" : 0.45014572,
+    "enabled" : true,
+    "intensity" : 1
+  }
+}

@@ -86,6 +86,10 @@ That's the whole integration — no `changeAnimation` calls, no states.
 - `searchInterval` trades responsiveness for cost; 0.1 s is a good
   default. Databases of a few thousand frames need no acceleration
   structure.
+- Hierarchical assets (loaded via `setEntityMeshAsync`) keep their
+  `AnimationComponent` on a skinned child, but heading, world position,
+  and root-motion deltas all anchor to the entity you called the APIs on
+  — the same handle your game steers.
 - Combine with **foot IK** for terrain and **animation policy**
   (`.forceOff`) as a distance LOD lever — freeze far characters and stop
   calling `setMotionMatchingGoal` for them.

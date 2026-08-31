@@ -116,6 +116,7 @@ typedef enum{
     modelPassFragmentHasNormalTextureIndex,
     modelPassFragmentMaterialParameterIndex,
     modelPassFragmentSTScaleIndex,
+    modelPassFragmentPOMQualityIndex,
 }ModelPassFragmentBufferIndices;
 
 
@@ -163,12 +164,14 @@ typedef enum{
     modelPassRoughnessTextureIndex,
     modelPassMetallicTextureIndex,
     modelPassNormalTextureIndex,
+    modelPassHeightTextureIndex,
 }ModelPassTextureIndices;
 
 typedef enum{
     modelPassBaseSamplerIndex,
     modelPassNormalSamplerIndex,
-    modelPassMaterialSamplerIndex
+    modelPassMaterialSamplerIndex,
+    modelPassHeightSamplerIndex
 }ModelPassSamplerIndices;
 
 typedef enum{
@@ -319,7 +322,7 @@ typedef enum RenderTargets{
 
 typedef struct{
     simd_float4 baseColor;
-    simd_int4 hasTexture; //x=hasbasecolor,y=hasroughmap, z=hasmetalmap
+    simd_int4 hasTexture; //x=hasbasecolor,y=hasroughmap, z=hasmetalmap, w=hasheightmap
     simd_int4 textureChannels; //x=roughness channel, y=metallic channel; 0=r,1=g,2=b,3=a
     simd_float4 edgeTint;
     simd_float3 emmissive;
@@ -339,7 +342,31 @@ typedef struct{
     int alphaMode; // 0=opaque, 1=mask, 2=blend
     simd_float4 lodDither; // x=threshold, y=mode: 0 off, 1 keep below, 2 keep at/above
     bool interactWithLight;
+    // Parallax Occlusion Mapping. heightScale is the total ray-march depth in UV-normalized
+    // units — named after Blender's Displacement node "Scale" input, but NOT unit-equivalent:
+    // Blender's Scale is a world-space distance, this is a UV-space fraction. A raw Scale
+    // value carried through from Blender needs retuning, not a straight copy (see the
+    // exporter's ExportedMaterial.height_scale docstring). heightMidlevel matches its
+    // "Midlevel" input.
+    float heightScale;
+    float heightMidlevel;
+    // Contrast-stretch applied to the raw height sample before heightMidlevel: many real-world
+    // displacement maps only use a narrow slice of [0,1], leaving POM almost no local
+    // contrast to work with unless that slice is remapped back out first. Identity is (0,1).
+    float heightRemapMin;
+    float heightRemapMax;
 }MaterialParametersUniform;
+
+// Runtime-tunable Parallax Occlusion Mapping cost controls (global, not per-material — see
+// POMQualitySettings in Globals.swift). minSteps/maxSteps bound the adaptive ray-march step
+// count; maxDistance/fadeStartDistance fade POM out entirely beyond a configurable distance,
+// gating the ray march itself for distant fragments rather than just fading the visual result.
+typedef struct{
+    float minSteps;
+    float maxSteps;
+    float maxDistance;
+    float fadeStartDistance;
+}POMQualityUniform;
 
 typedef struct{
     float ambientIntensity;
