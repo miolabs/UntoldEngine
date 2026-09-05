@@ -76,6 +76,13 @@ struct RootMotionState {
             blendWeight = 0
             return
         }
+        // A negligible outgoing velocity needs no crossfade — arming one
+        // would only sustain residual drift when searches re-jump between
+        // near-idle frames.
+        guard simd_length(lastWorldVelocity) > 0.05 || abs(lastYawRate) > 0.1 else {
+            blendWeight = 0
+            return
+        }
         blendWeight = 1
         blendHalflife = halflife
         frozenVelocity = lastWorldVelocity
