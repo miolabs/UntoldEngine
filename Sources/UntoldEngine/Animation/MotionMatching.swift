@@ -370,6 +370,7 @@ func motionMatchingJump(
     )
     animationComponent.currentAnimation = clip
     animationComponent.currentTime = frame.time
+    animationComponent.rootMotion.beginVelocityBlend(halflife: halflife)
     animationComponent.rootMotion.resetHistory()
 }
 
