@@ -43,6 +43,15 @@ public struct MotionMatchingDescriptor {
     /// velocity — lower is more responsive, higher is smoother.
     public var predictionHalflife: Float
 
+    /// Fastest heading change the predicted trajectory may request, in
+    /// radians per second. The query is built as a turn-rate-limited arc
+    /// toward the goal: heading rotates at most this fast and commanded
+    /// speed scales with the cosine of the remaining heading error, so an
+    /// off-heading goal asks for "turn (in place), then accelerate" — a
+    /// trajectory the database's turn and circular clips actually contain
+    /// — instead of full-speed travel in a direction no clip can do.
+    public var maxTurnRate: Float
+
     /// Minimum time playback runs before another jump may fire. The search
     /// still runs every `searchInterval`, but without this floor a frame
     /// that systematically beats the incumbent (for example the velocity
@@ -61,6 +70,7 @@ public struct MotionMatchingDescriptor {
         searchInterval: Float = 0.1,
         transitionHalflife: Float = 0.1,
         predictionHalflife: Float = 0.25,
+        maxTurnRate: Float = 2.0,
         minPlayTime: Float = 0.3,
         weights: MotionMatchingWeights = MotionMatchingWeights()
     ) {
@@ -71,9 +81,30 @@ public struct MotionMatchingDescriptor {
         self.searchInterval = searchInterval
         self.transitionHalflife = transitionHalflife
         self.predictionHalflife = predictionHalflife
+        self.maxTurnRate = maxTurnRate
         self.minPlayTime = minPlayTime
         self.weights = weights
     }
+}
+
+/// Signed heading error (radians, wrapped) from the character's forward to
+/// the goal: the desired facing when one is set, else the desired velocity
+/// direction. Zero when the goal gives no direction.
+func motionMatchingGoalYawDelta(
+    state: MotionMatchingState,
+    inverseEntityYaw: simd_quatf
+) -> Float {
+    if let facing = state.desiredFacing,
+       simd_length_squared(simd_float3(facing.x, 0, facing.z)) > 1e-8
+    {
+        let facingCS = inverseEntityYaw.act(simd_float3(facing.x, 0, facing.z))
+        return atan2(facingCS.x, facingCS.z)
+    }
+    let velocityCS = inverseEntityYaw.act(state.desiredVelocity)
+    if simd_length_squared(simd_float3(velocityCS.x, 0, velocityCS.z)) > 1e-6 {
+        return atan2(velocityCS.x, velocityCS.z)
+    }
+    return 0
 }
 
 /// Per-entity motion matching state.
@@ -157,12 +188,24 @@ func updateMotionMatching(
     ).yaw
     let inverseEntityYaw = simd_quatf(angle: -entityYaw, axis: simd_float3(0, 1, 0))
 
-    // Advance the simulated velocity toward the goal (first-order lag).
+    // Advance the simulated velocity toward what the goal asks for ALONG
+    // THE CURRENT HEADING: full desired speed when aligned, scaled down by
+    // the cosine of the heading error, zero when the goal is behind — the
+    // heading change itself is expressed by the arc trajectory below and
+    // realized by the clips' root yaw. Lagging toward the raw goal vector
+    // would drive the query sideways or backward at full speed, a
+    // trajectory no clip contains, and the search would degenerate.
     let desiredVelocityCS = inverseEntityYaw.act(animationComponent.motionMatching.desiredVelocity)
+    let goalYawDelta = motionMatchingGoalYawDelta(
+        state: animationComponent.motionMatching,
+        inverseEntityYaw: inverseEntityYaw
+    )
+    let desiredSpeed = simd_length(simd_float3(desiredVelocityCS.x, 0, desiredVelocityCS.z))
+    let alignedSpeed = desiredSpeed * max(0, cos(goalYawDelta))
     let lambda = 0.693_147_18 / max(descriptor.predictionHalflife, 1e-3)
     let approach = 1 - exp(-lambda * deltaTime)
     animationComponent.motionMatching.simulatedVelocity +=
-        (desiredVelocityCS - animationComponent.motionMatching.simulatedVelocity) * approach
+        (simd_float3(0, 0, alignedSpeed) - animationComponent.motionMatching.simulatedVelocity) * approach
 
     animationComponent.motionMatching.searchClock += deltaTime
     animationComponent.motionMatching.historyElapsed += deltaTime
@@ -302,31 +345,40 @@ private func buildMotionMatchingQuery(
         query.append(value.z)
     }
 
-    // Predicted trajectory: integrate the first-order lag of the simulated
-    // velocity toward the desired velocity, in character space. Facing
-    // approaches the desired facing with the same time constant.
-    let velocity = animationComponent.motionMatching.simulatedVelocity
+    // Predicted trajectory: a turn-rate-limited arc toward the goal.
+    // Heading rotates at most `maxTurnRate` toward the goal direction, and
+    // speed lags toward the desired speed scaled by the cosine of the
+    // remaining heading error — so a goal behind the character predicts
+    // "rotate roughly in place, then accelerate out of the turn", which is
+    // exactly the trajectory shape of turn and circular clips.
     let desiredVelocityCS = inverseEntityYaw.act(animationComponent.motionMatching.desiredVelocity)
+    let desiredSpeed = simd_length(simd_float3(desiredVelocityCS.x, 0, desiredVelocityCS.z))
+    let goalYawDelta = motionMatchingGoalYawDelta(
+        state: animationComponent.motionMatching,
+        inverseEntityYaw: inverseEntityYaw
+    )
     let lambda = 0.693_147_18 / max(descriptor.predictionHalflife, 1e-3)
+    let turnRate = max(descriptor.maxTurnRate, 1e-3)
 
-    var desiredYawDelta: Float = 0
-    if let facing = animationComponent.motionMatching.desiredFacing,
-       simd_length_squared(simd_float3(facing.x, 0, facing.z)) > 1e-8
-    {
-        let facingCS = inverseEntityYaw.act(simd_float3(facing.x, 0, facing.z))
-        desiredYawDelta = atan2(facingCS.x, facingCS.z)
-    } else if simd_length_squared(simd_float3(desiredVelocityCS.x, 0, desiredVelocityCS.z)) > 1e-6 {
-        desiredYawDelta = atan2(desiredVelocityCS.x, desiredVelocityCS.z)
-    }
-
+    var arcYaw: Float = 0
+    var arcPosition = simd_float3.zero
+    var arcSpeed = max(0, animationComponent.motionMatching.simulatedVelocity.z)
+    var arcTime: Float = 0
+    let integrationStep: Float = 1.0 / 30.0
     for horizon in MotionFeatureLayout.trajectoryHorizons {
-        let decay = (1 - exp(-lambda * horizon)) / lambda
-        let position = desiredVelocityCS * horizon + (velocity - desiredVelocityCS) * decay
-        query.append(position.x)
-        query.append(position.z)
-        let yawAtHorizon = desiredYawDelta * (1 - exp(-lambda * horizon))
-        query.append(sin(yawAtHorizon))
-        query.append(cos(yawAtHorizon))
+        while arcTime < horizon - 1e-6 {
+            let step = min(integrationStep, horizon - arcTime)
+            let remaining = goalYawDelta - arcYaw
+            arcYaw += max(-turnRate * step, min(turnRate * step, remaining))
+            let desiredNow = desiredSpeed * max(0, cos(goalYawDelta - arcYaw))
+            arcSpeed += (desiredNow - arcSpeed) * (1 - exp(-lambda * step))
+            arcPosition += simd_float3(sin(arcYaw), 0, cos(arcYaw)) * (arcSpeed * step)
+            arcTime += step
+        }
+        query.append(arcPosition.x)
+        query.append(arcPosition.z)
+        query.append(sin(arcYaw))
+        query.append(cos(arcYaw))
     }
 
     return query

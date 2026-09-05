@@ -88,6 +88,28 @@ final class AnimationMotionMatchingTests: XCTestCase {
         return AnimationClip(runtimeClip: RuntimeAnimationClip(name: name, duration: 2.0, channels: [rootChannel]))
     }
 
+    /// Turn-in-place clip: the root yaws +90° about +Y over the 2 s loop
+    /// with no travel.
+    private func makeTurnClip() -> AnimationClip {
+        func yawKey(_ angle: Float) -> SIMD4<Float> {
+            let q = simd_quatf(angle: angle, axis: simd_float3(0, 1, 0))
+            return SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real)
+        }
+        let rootChannel = RuntimeAnimationChannel(
+            jointPath: "root",
+            translations: [
+                .init(time: 0.0, value: simd_float3(0, 0.9, 0)),
+                .init(time: 2.0, value: simd_float3(0, 0.9, 0)),
+            ],
+            rotations: [
+                .init(time: 0.0, value: yawKey(0)),
+                .init(time: 1.0, value: yawKey(.pi / 4)),
+                .init(time: 2.0, value: yawKey(.pi / 2)),
+            ]
+        )
+        return AnimationClip(runtimeClip: RuntimeAnimationClip(name: "turn", duration: 2.0, channels: [rootChannel]))
+    }
+
     private var animationComponent: AnimationComponent {
         scene.get(component: AnimationComponent.self, for: entityId)!
     }
@@ -243,6 +265,25 @@ final class AnimationMotionMatchingTests: XCTestCase {
             previousTime = current
             time += deltaTime
         }
+    }
+
+    /// A goal behind the character must be met by turning: the predicted
+    /// trajectory is a turn-rate-limited arc with speed scaled by the
+    /// cosine of the heading error, so the turn clip's "rotate in place"
+    /// trajectory wins — not the walk driven backward, which no clip
+    /// contains and which used to make the search degenerate.
+    func testGoalBehindSelectsTurnNotBackwardTravel() {
+        animationComponent.animationClips["turn"] = makeTurnClip()
+        setMotionMatchingEnabled(entityId: entityId, enabled: true)
+
+        run(seconds: 1.0, goal: simd_float3(0, 0, -1))
+
+        XCTAssertEqual(animationComponent.currentAnimation?.name, "turn",
+                       "A goal behind the character must select the turn clip")
+        XCTAssertGreaterThan(getLocalPosition(entityId: entityId).z, -0.1,
+                             "The character must not be driven backward toward the goal")
+        let (yaw, _) = yawTwist(getRotationQuaternion(entityId: entityId))
+        XCTAssertGreaterThan(abs(yaw), 0.2, "The turn clip's root yaw must be rotating the character toward the goal")
     }
 
     func testDisabledByDefault() {
