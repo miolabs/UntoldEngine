@@ -19,7 +19,7 @@ Clone the repository and launch the demo:
 ```bash
 git clone https://github.com/untoldengine/UntoldEngine.git
 cd UntoldEngine
-git checkout v0.18.0
+git checkout v0.18.1
 swift run ShowcaseDemo
 ```
 
@@ -238,6 +238,20 @@ architecture.
 
 > **Legacy overloads** — `loadTiledScene(manifest:)` and `loadTiledScene(url:)` remain
 > available for backwards compatibility. They create an internal root entity automatically.
+
+## Loading a `.untoldscene`
+
+To load a scene authored with the Untold Editor, use `loadUntoldScene(named:)`:
+
+```swift
+loadUntoldScene(named: "myscene") { success in
+    setSceneReady(success)
+}
+```
+
+`loadUntoldScene` looks for `myscene.untoldscene` under your project's `Scenes/`
+asset folder; the `.untoldscene` extension is optional and can be omitted, as
+shown above.
 
 ## Using Your Own Assets
 

@@ -74,43 +74,37 @@ updateTextureSampler(entityId: entity, textureType: .baseColor, wrapMode: .repea
 
 Material changes automatically notify static batching when needed.
 
-## Bake Complex Blender Materials
+## Complex Blender Materials
 
-If a Blender material uses node graphs the runtime cannot evaluate directly,
-export with material baking. The exporter flattens complex material behavior into
-textures the engine can load.
+The exporter only reads a fixed set of material inputs (base color,
+roughness, metallic, normal, emissive). If a Blender material uses node
+graphs the runtime cannot evaluate directly — procedural nodes, `Mix`,
+`Math`, or other complex graph behavior — bake it to flat textures with a
+third-party tool before export so the imported result matches Blender. The
+Blender addon's `Untold Materials` panel (`Scan Materials`) tells you which
+materials diverge and why; see [Using The Blender
+Plugin](../API/UsingBlenderAddon.md#material-fidelity).
 
-CLI example:
-
-```bash
-untoldengine export \
-  --input GameData/Models/office/office.usdz \
-  --output GameData/Models/office/office.untold \
-  --bake-materials
-```
-
-Use this when Blender and the engine disagree because the source material uses
-procedural nodes, Mix, Math, or other complex graph behavior.
-
-## Bake Color Management
+## Color Grading
 
 Blender's View Transform, Look, Exposure, and Gamma are scene-wide display
-settings. They are not part of a normal mesh import.
-
-Export a color LUT with:
+settings, not part of a normal mesh import. The engine approximates them
+with a native tonemap operator (`setPostFX(.tonemapOperator(_))`, ACES
+Filmic by default, AgX also available) and composes an optional
+externally-authored `.cube` creative grade on top:
 
 ```bash
 untoldengine export \
   --input GameData/Models/office/office.usdz \
   --output GameData/Models/office/office.untold \
-  --bake-color-management
+  --color-grade-lut GameData/LUTs/warm_grade.cube
 ```
 
 Then load scene-authored data:
 
 ```swift
 loadSceneAuthored(filename: "office", withExtension: "untold") { success in
-    // Scene-authored lights/cameras and the baked color LUT are registered.
+    // Scene-authored lights/cameras and the .cube grade are registered.
 }
 ```
 
@@ -122,12 +116,15 @@ loadSceneAuthored(url: manifestURL) { success in
 }
 ```
 
-Toggle the baked LUT for comparison:
+Toggle the grade for comparison:
 
 ```swift
-setPostFX(.colorLUT(.enabled(false)))
-setPostFX(.colorLUT(.enabled(true)))
+setPostFX(.colorGradeLUT(.enabled(false)))
+setPostFX(.colorGradeLUT(.enabled(true)))
 ```
+
+See [Using Color Management](../API/UsingColorManagement.md) for the full
+picture, including the standalone `setColorGradeLUT` API.
 
 ## Texture Optimization
 
@@ -147,14 +144,15 @@ When a material does not look right:
 
 1. Confirm the `.untold` asset loads successfully.
 2. Check base color, roughness, metallic, normal, and opacity.
-3. If Blender node graphs are involved, try `--bake-materials`.
-4. If the whole image tone differs from Blender, try `--bake-color-management`.
+3. If Blender node graphs are involved, scan materials in the Blender addon
+   and bake divergent ones with a third-party tool before re-exporting.
+4. If the whole image tone differs from Blender, try switching the tonemap
+   operator (`.aces`/`.agx`) or applying a `--color-grade-lut`.
 5. If runtime memory or package size is high, apply texture baking/optimization.
 
 ## Related Documentation
 
 - [Materials](../API/UsingMaterials.md)
-- [Bake Materials](../API/UsingBakeMaterials.md)
 - [Color Management](../API/UsingColorManagement.md)
 - [Post Effects](../API/UsingPostFX.md)
 - [Optimizations](../API/Optimizations.md)

@@ -75,6 +75,10 @@ public enum RenderExtensionProperty: Sendable {
 public enum RenderingEnvironmentProperty: Sendable {
     case ibl(Bool)
     case visible(Bool)
+    /// Selects the procedural atmospheric sky (true, the default) vs. the debug/editor grid
+    /// (false) as the background when IBL (`.visible`) is off. Has no effect in XR full
+    /// immersion (always IBL) or XR passthrough (no background pass).
+    case sky(Bool)
     case lightingMode(RuntimeEnvironmentLightingMode)
     case realWorldLightingContribution(Float)
     /// Scales the intensity of image-based lighting contributed by the environment.
@@ -150,6 +154,8 @@ private func applyRenderingEnvironmentProperty(_ property: RenderingEnvironmentP
         applyIBL = value
     case let .visible(value):
         renderEnvironment = value
+    case let .sky(value):
+        renderSkyBackground = value
     case let .lightingMode(value):
         RuntimeEnvironmentLightingStore.shared.mode = value
     case let .realWorldLightingContribution(value):
@@ -249,6 +255,8 @@ public enum PostFXProperty: Sendable {
     case preset(PostFXPreset)
     case colorGrading(ColorGradingProperty)
     case colorLUT(ColorLUTProperty)
+    case colorGradeLUT(ColorGradeLUTProperty)
+    case tonemapOperator(TonemapOperator)
     case colorCorrection(ColorCorrectionProperty)
     case bloomThreshold(BloomThresholdProperty)
     case bloomComposite(BloomCompositeProperty)
@@ -272,6 +280,14 @@ public enum ColorGradingProperty: Sendable {
 /// Blender scene, see ColorLUTParams) — this only lets a developer toggle it
 /// off to compare against the default ACES tonemap, not author new LUT data.
 public enum ColorLUTProperty: Sendable {
+    case enabled(Bool)
+}
+
+/// An externally-authored standard .cube LUT (see ColorGradeLUTParams),
+/// applied as a post-tonemap creative grade -- composes with either the
+/// native tonemap or the whole-transform bake above. Also asset-derived;
+/// this only lets a developer toggle it off, not author new LUT data.
+public enum ColorGradeLUTProperty: Sendable {
     case enabled(Bool)
 }
 
@@ -330,6 +346,10 @@ public func setPostFX(_ property: PostFXProperty) {
         applyColorGradingProperty(property)
     case let .colorLUT(property):
         applyColorLUTProperty(property)
+    case let .colorGradeLUT(property):
+        applyColorGradeLUTProperty(property)
+    case let .tonemapOperator(op):
+        TonemapParams.shared.operator = op
     case let .colorCorrection(property):
         applyColorCorrectionProperty(property)
     case let .bloomThreshold(property):
@@ -586,6 +606,13 @@ private func applyColorLUTProperty(_ property: ColorLUTProperty) {
     switch property {
     case let .enabled(value):
         ColorLUTParams.shared.setEnabled(value)
+    }
+}
+
+private func applyColorGradeLUTProperty(_ property: ColorGradeLUTProperty) {
+    switch property {
+    case let .enabled(value):
+        ColorGradeLUTParams.shared.setEnabled(value)
     }
 }
 

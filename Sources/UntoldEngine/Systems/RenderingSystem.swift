@@ -223,6 +223,7 @@ private typealias CompiledRenderGraphResult = (
 
 let gameModeReservedPassIDs: Set<String> = [
     "environment",
+    "sky",
     "grid",
     "shadow",
     "batchedShadow",
@@ -265,6 +266,7 @@ let gameModeReservedPassIDs: Set<String> = [
 
 enum BasePassMode {
     case environment
+    case sky
     case grid
     case ar
     case none
@@ -281,6 +283,13 @@ func addSceneBackgroundPass(
         )
         graph[environmentPass.id] = environmentPass
         return environmentPass.id
+    case .sky:
+        // Sky pass with the reference grid overlaid on top of its ground fill.
+        let skyPass = RenderPass(
+            id: "sky", dependencies: [], execute: RenderPasses.skyGridExecution
+        )
+        graph[skyPass.id] = skyPass
+        return skyPass.id
     case .grid:
         let gridPass = RenderPass(
             id: "grid", dependencies: [], execute: RenderPasses.gridExecution
@@ -304,8 +313,9 @@ private func buildGameModeGraphWithCompilation() throws -> CompiledRenderGraphRe
     let mode: BasePassMode
     switch renderInfo.immersionStyle {
     case .none:
-        // macOS/iOS path: use environment or grid
-        mode = renderEnvironment ? .environment : .grid
+        // macOS/iOS path: environment (IBL) takes precedence when enabled, otherwise the
+        // procedural sky is the default background, falling back to the grid if requested.
+        mode = renderEnvironment ? .environment : (renderSkyBackground ? .sky : .grid)
     case .mixed:
         // XR passthrough: no base pass needed
         mode = .none
@@ -315,7 +325,7 @@ private func buildGameModeGraphWithCompilation() throws -> CompiledRenderGraphRe
     case .ar:
         mode = .ar
     @unknown default:
-        mode = renderEnvironment ? .environment : .grid
+        mode = renderEnvironment ? .environment : (renderSkyBackground ? .sky : .grid)
     }
 
     let frameStartID = builder.resolveStage(.frameStart, after: nil)
@@ -816,6 +826,37 @@ func colorGradingCustomization(encoder: MTLRenderCommandEncoder) {
         &colorLUTSize,
         length: MemoryLayout<Int32>.stride,
         index: Int(colorLUTSizeIndex.rawValue)
+    )
+
+    let colorGradeLUT = ColorGradeLUTParams.shared.snapshot()
+    encoder.setFragmentTexture(colorGradeLUT.lutTexture, index: Int(colorGradeLUTTextureIndex.rawValue))
+
+    var colorGradeLUTEnabled = colorGradeLUT.enabled && colorGradeLUT.lutTexture != nil
+    encoder.setFragmentBytes(
+        &colorGradeLUTEnabled,
+        length: MemoryLayout<Bool>.stride,
+        index: Int(colorGradeLUTEnabledIndex.rawValue)
+    )
+
+    var colorGradeLUTDomainMin = colorGradeLUT.domainMin
+    encoder.setFragmentBytes(
+        &colorGradeLUTDomainMin,
+        length: MemoryLayout<simd_float3>.stride,
+        index: Int(colorGradeLUTDomainMinIndex.rawValue)
+    )
+
+    var colorGradeLUTDomainMax = colorGradeLUT.domainMax
+    encoder.setFragmentBytes(
+        &colorGradeLUTDomainMax,
+        length: MemoryLayout<simd_float3>.stride,
+        index: Int(colorGradeLUTDomainMaxIndex.rawValue)
+    )
+
+    var tonemapOperator = TonemapParams.shared.operator.shaderValue
+    encoder.setFragmentBytes(
+        &tonemapOperator,
+        length: MemoryLayout<Int32>.stride,
+        index: Int(tonemapOperatorSelectIndex.rawValue)
     )
 }
 

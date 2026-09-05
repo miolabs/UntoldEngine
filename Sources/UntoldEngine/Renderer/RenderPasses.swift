@@ -937,7 +937,9 @@ public enum RenderPasses {
         materialParameters.hasTexture.x = 0
     }
 
-    public static let gridExecution: RenderPassExecution = { commandBuffer in
+    /// loadAction controls whether this draw clears the target (grid used as the sole background)
+    /// or loads over whatever a prior pass already wrote (grid overlaid on top of the sky pass).
+    private static func encodeGridPass(_ commandBuffer: MTLCommandBuffer, loadAction: MTLLoadAction) {
         guard let gridPipeline = PipelineManager.shared.renderPipelinesByType[.grid] else {
             handleError(.pipelineStateNulled, "gridPipeline is nil")
             return
@@ -983,7 +985,7 @@ public enum RenderPasses {
         }
         encoderDescriptor.colorAttachments[0].clearColor = mtkBackgroundColor
         encoderDescriptor.colorAttachments[0].storeAction = MTLStoreAction.store
-        encoderDescriptor.colorAttachments[0].loadAction = MTLLoadAction.clear
+        encoderDescriptor.colorAttachments[0].loadAction = loadAction
 
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
         else {
@@ -1022,6 +1024,103 @@ public enum RenderPasses {
         renderEncoder.drawPrimitivesTracked(type: MTLPrimitiveType.triangle, vertexStart: 0, vertexCount: 6)
 
         renderEncoder.updateFence(renderInfo.fence, after: .fragment)
+    }
+
+    public static let gridExecution: RenderPassExecution = { commandBuffer in
+        encodeGridPass(commandBuffer, loadAction: .clear)
+    }
+
+    public static let skyExecution: RenderPassExecution = { commandBuffer in
+        guard let skyPipeline = PipelineManager.shared.renderPipelinesByType[.sky] else {
+            handleError(.pipelineStateNulled, "skyPipeline is nil")
+            return
+        }
+
+        if skyPipeline.success == false {
+            handleError(.pipelineStateNulled, skyPipeline.name!)
+            return
+        }
+
+        guard let camera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: camera) else {
+            handleError(.noActiveCamera)
+            return
+        }
+
+        // update uniforms
+        var skyUniforms = SkyUniforms()
+
+        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
+        skyUniforms.invViewMatrix = viewMatrix.inverse
+        skyUniforms.invProjectionMatrix = renderInfo.perspectiveSpace.inverse
+        skyUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+
+        let sunParameters = getDirectionalLightParameters()
+        skyUniforms.sunDirection = sunParameters.direction
+        skyUniforms.sunColor = sunParameters.color
+        skyUniforms.sunIntensity = sunParameters.intensity
+
+        if let skyUniformBuffer = bufferResources.skyUniforms {
+            skyUniformBuffer.contents().copyMemory(
+                from: &skyUniforms, byteCount: MemoryLayout<SkyUniforms>.stride
+            )
+        } else {
+            handleError(.bufferAllocationFailed, bufferResources.skyUniforms!.label!)
+            return
+        }
+
+        // create the encoder
+
+        guard let encoderDescriptor = renderInfo.environmentRenderPassDescriptor else {
+            handleError(.renderPassCreationFailed, "Environment render pass descriptor not initialized")
+            return
+        }
+        encoderDescriptor.colorAttachments[0].clearColor = mtkBackgroundColor
+        encoderDescriptor.colorAttachments[0].storeAction = MTLStoreAction.store
+        encoderDescriptor.colorAttachments[0].loadAction = MTLLoadAction.clear
+
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        else {
+            handleError(.renderPassCreationFailed, "Sky Pass")
+            return
+        }
+
+        defer {
+            // Make sure no matter what we end the encoding at the end of the function
+            renderEncoder.popDebugGroup()
+            renderEncoder.endEncoding()
+        }
+
+        renderEncoder.label = "Sky Pass"
+
+        renderEncoder.pushDebugGroup("Sky Pass")
+
+        renderEncoder.setRenderPipelineState(skyPipeline.pipelineState!)
+        renderEncoder.setDepthStencilState(skyPipeline.depthState)
+
+        // send the uniforms
+        renderEncoder.setVertexBuffer(
+            bufferResources.skyVertexBuffer, offset: 0, index: Int(skyPassPositionIndex.rawValue)
+        )
+
+        renderEncoder.setVertexBuffer(
+            bufferResources.skyUniforms, offset: 0, index: Int(skyPassUniformIndex.rawValue)
+        )
+
+        renderEncoder.setFragmentBuffer(
+            bufferResources.skyUniforms, offset: 0, index: Int(skyPassUniformIndex.rawValue)
+        )
+
+        renderEncoder.drawPrimitivesTracked(type: MTLPrimitiveType.triangle, vertexStart: 0, vertexCount: 6)
+
+        renderEncoder.updateFence(renderInfo.fence, after: .fragment)
+    }
+
+    /// Sky pass followed by the grid overlaid on top (loaded, not cleared), so the reference grid
+    /// reads over the sky's flat ground fill the same way Unity's Scene view overlays its grid on
+    /// top of the sky/horizon background.
+    public static let skyGridExecution: RenderPassExecution = { commandBuffer in
+        skyExecution(commandBuffer)
+        encodeGridPass(commandBuffer, loadAction: .load)
     }
 
     public static let executeEnvironmentPass: RenderPassExecution = { commandBuffer in
@@ -1775,11 +1874,15 @@ public enum RenderPasses {
                         )
 
                         // set normal
-                        // set normal
                         var hasNormal: Bool = (material.normal.texture != nil)
                         renderEncoder.setFragmentBytes(
                             &hasNormal, length: MemoryLayout<Bool>.stride,
                             index: Int(modelPassFragmentHasNormalTextureIndex.rawValue)
+                        )
+                        var normalIsPackedXY = material.normalIsPackedXY
+                        renderEncoder.setFragmentBytes(
+                            &normalIsPackedXY, length: MemoryLayout<Bool>.stride,
+                            index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue)
                         )
 
                         var materialParameters = MaterialParametersUniform()
@@ -2010,6 +2113,8 @@ public enum RenderPasses {
 
             var hasNormal: Bool = (material.normal.texture != nil)
             renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
+            var normalIsPackedXY = material.normalIsPackedXY
+            renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
             // Logger.log(message: "  🎨 Material baseColor: \(material.baseColorValue)")
             var materialParameters = MaterialParametersUniform()
             materialParameters.specular = material.specular
@@ -2195,6 +2300,8 @@ public enum RenderPasses {
 
                         var hasNormal = (material.normal.texture != nil)
                         renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
+                        var normalIsPackedXY = material.normalIsPackedXY
+                        renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
 
                         var materialParameters = MaterialParametersUniform()
                         materialParameters.specular = material.specular
@@ -2292,6 +2399,8 @@ public enum RenderPasses {
 
                     var hasNormal = (material.normal.texture != nil)
                     renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
+                    var normalIsPackedXY = material.normalIsPackedXY
+                    renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
 
                     var materialParameters = MaterialParametersUniform()
                     materialParameters.specular = material.specular
@@ -3620,6 +3729,12 @@ public enum RenderPasses {
                         &hasNormal,
                         length: MemoryLayout<Bool>.stride,
                         index: Int(transparencyPassFragmentHasNormalTextureIndex.rawValue)
+                    )
+                    var normalIsPackedXY = material.normalIsPackedXY
+                    renderEncoder.setFragmentBytes(
+                        &normalIsPackedXY,
+                        length: MemoryLayout<Bool>.stride,
+                        index: Int(transparencyPassFragmentNormalIsPackedXYIndex.rawValue)
                     )
 
                     var materialParameters = MaterialParametersUniform()

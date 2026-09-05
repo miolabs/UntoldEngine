@@ -6,7 +6,6 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from bpy_extras.io_utils import ExportHelper
 
 from . import bridge
-from . import color_management
 from . import material_fidelity
 from . import object_metadata
 from . import viewport_overlay
@@ -139,48 +138,16 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
         default="thorough",
     )
 
-    bake_materials: BoolProperty(
-        name="Bake Materials",
+    color_grade_lut: StringProperty(
+        name="Color Grade LUT",
         description=(
-            "Bake materials the engine cannot evaluate (Mix, Math, procedural textures, ...) "
-            "into flat textures via Cycles so the export matches Blender. See the material "
-            "fidelity report printed to the console during export"
+            "Path to an externally-authored standard .cube 3D LUT to stage and apply as a "
+            "post-tonemap creative grade. Nothing is rendered from Blender -- the .cube is "
+            "copied as-is and loaded directly by the engine, so any LUT from any grading tool "
+            "works"
         ),
-        default=False,
-    )
-
-    bake_resolution: IntProperty(
-        name="Bake Resolution",
-        description="Square resolution for baked material textures. Override per material via a "
-                    "material['untold_bake_resolution'] custom property",
-        default=1024,
-        min=1,
-        soft_max=4096,
-    )
-
-    bake_cache: BoolProperty(
-        name="Use Bake Cache",
-        description="Skip re-baking materials unchanged since the last export. Disable to force "
-                    "every divergent material to be re-baked",
-        default=True,
-    )
-
-    bake_color_management: BoolProperty(
-        name="Bake Color Management",
-        description=(
-            "Bake the scene's active View Transform/Look/Exposure/Gamma into a color-grading "
-            "RGBA16Float LUT targeting canonical sRGB output so Untold can closely reproduce "
-            "Blender's color management, including Filmic/AgX highlight compression"
-        ),
-        default=False,
-    )
-
-    color_lut_size: IntProperty(
-        name="Color LUT Size",
-        description="Grid size (N) for the NxNxN color-grading LUT",
-        default=32,
-        min=4,
-        soft_max=64,
+        default="",
+        subtype="FILE_PATH",
     )
 
     validate: BoolProperty(
@@ -232,11 +199,7 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
                 source_orientation=self.source_orientation,
                 validate=self.validate,
                 compress_geometry=self.compress_geometry,
-                bake_materials=self.bake_materials,
-                bake_resolution=self.bake_resolution,
-                bake_cache=self.bake_cache,
-                bake_color_management=self.bake_color_management,
-                color_lut_size=self.color_lut_size,
+                color_grade_lut_path=self.color_grade_lut or None,
                 bake_textures=self.bake_textures,
                 texture_quality=self.texture_quality,
                 keep_texture_temp=self.keep_texture_temp,
@@ -256,8 +219,6 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
         )
         if compression_summary["detail"]:
             message += f" | Geometry: {compression_summary['detail']}"
-        if result.get("baked_material_count"):
-            message += f" | Materials: baked {result['baked_material_count']}"
         if result.get("hdr_asset_count"):
             message += f" | HDR: staged {result['hdr_asset_count']}"
         if result.get("texture_bake_status") == "baked":
@@ -508,49 +469,15 @@ class UNTOLD_OT_export_tiled_scene(bpy.types.Operator):
         default=False,
     )
 
-    bake_materials: BoolProperty(
-        name="Bake Materials",
+    color_grade_lut: StringProperty(
+        name="Color Grade LUT",
         description=(
-            "Bake materials the engine cannot evaluate (Mix, Math, procedural textures, ...) "
-            "into flat textures via Cycles so the export matches Blender. Applies to full-detail "
-            "tile and shared-bucket payloads only — HLOD/LOD tiles are decimated stand-ins and "
-            "are not separately baked"
+            "Path to an externally-authored standard .cube 3D LUT to stage once for the whole "
+            "scene and reference from the manifest's colorGradeLUT key, applied as a post-tonemap "
+            "creative grade"
         ),
-        default=False,
-    )
-
-    bake_resolution: IntProperty(
-        name="Bake Resolution",
-        description="Square resolution for baked material textures. Override per material via a "
-                    "material['untold_bake_resolution'] custom property",
-        default=1024,
-        min=1,
-        soft_max=4096,
-    )
-
-    bake_cache: BoolProperty(
-        name="Use Bake Cache",
-        description="Skip re-baking materials unchanged since the last export. Disable to force "
-                    "every divergent material to be re-baked",
-        default=True,
-    )
-
-    bake_color_management: BoolProperty(
-        name="Bake Color Management",
-        description=(
-            "Bake the scene's active View Transform/Look/Exposure/Gamma into a scene-wide "
-            "RGBA16Float LUT referenced from the manifest's colorLUT key, targeting "
-            "canonical sRGB output"
-        ),
-        default=False,
-    )
-
-    color_lut_size: IntProperty(
-        name="Color LUT Size",
-        description="Grid size (N) for the NxNxN color-grading LUT",
-        default=32,
-        min=4,
-        soft_max=64,
+        default="",
+        subtype="FILE_PATH",
     )
 
     dry_run: BoolProperty(
@@ -645,11 +572,7 @@ class UNTOLD_OT_export_tiled_scene(bpy.types.Operator):
                 generate_hlod=self.generate_hlod,
                 generate_lod=self.generate_lod,
                 compress_geometry=self.compress_geometry,
-                bake_materials=self.bake_materials,
-                bake_resolution=self.bake_resolution,
-                bake_cache=self.bake_cache,
-                bake_color_management=self.bake_color_management,
-                color_lut_size=self.color_lut_size,
+                color_grade_lut_path=self.color_grade_lut or None,
                 dry_run=self.dry_run,
                 write_manifest_in_dry_run=self.write_manifest_in_dry_run,
                 progress_callback=progress,
@@ -692,11 +615,9 @@ def register() -> None:
     object_metadata.register()
     viewport_overlay.register()
     material_fidelity.register()
-    color_management.register()
 
 
 def unregister() -> None:
-    color_management.unregister()
     material_fidelity.unregister()
     viewport_overlay.unregister()
     object_metadata.unregister()

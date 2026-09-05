@@ -102,7 +102,7 @@ Clone the repository and launch the Starter Demo:
 ```bash
 git clone https://github.com/untoldengine/UntoldEngine.git
 cd UntoldEngine
-git checkout v0.18.0
+git checkout v0.18.1
 swift run StarterDemo
 ```
 
@@ -216,7 +216,6 @@ Untold Engine is well-suited for:
 - [Profiler](docs/API/UsingProfiler.md)
 - [Spatial Debugger](docs/API/SpatialDebugger.md)
 - [Asset Exporter](docs/API/UsingTheExporter.md)
-- [Bake Materials](docs/API/UsingBakeMaterials.md)
 - [Color Management](docs/API/UsingColorManagement.md)
 - [Optimizations](docs/API/Optimizations.md)
 

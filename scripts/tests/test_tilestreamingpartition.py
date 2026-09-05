@@ -38,6 +38,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import tilestreamingpartition as t  # noqa: E402
+import untoldexplorer as u  # noqa: E402
 
 
 class FakeObject(dict):
@@ -664,68 +665,39 @@ class TileStreamingPartitionTests(unittest.TestCase):
         self.assertEqual(args.floor_count, 3)
         self.assertAlmostEqual(args.floor_band_height, 4.5)
 
-    def test_parse_args_bake_materials_and_resolution(self) -> None:
-        args = t.parse_args([
-            "script.py",
-            "--bake-materials",
-            "--bake-resolution", "2048",
-        ])
-        self.assertTrue(args.bake_materials)
-        self.assertEqual(args.bake_resolution, 2048)
+    def test_parse_args_color_grade_lut(self) -> None:
+        args = t.parse_args(["script.py", "--color-grade-lut", "/tmp/grade.cube"])
+        self.assertEqual(args.color_grade_lut, "/tmp/grade.cube")
 
-    def test_parse_args_bake_materials_defaults_off(self) -> None:
+    def test_parse_args_color_grade_lut_defaults_none(self) -> None:
         args = t.parse_args(["script.py"])
-        self.assertFalse(args.bake_materials)
-        self.assertIsNone(args.bake_resolution)
+        self.assertIsNone(args.color_grade_lut)
 
-    def test_apply_cli_overrides_sets_bake_materials_globals(self) -> None:
-        previous = (t.BAKE_MATERIALS, t.BAKE_RESOLUTION)
+    def test_apply_cli_overrides_sets_color_grade_lut_path(self) -> None:
+        previous = t.COLOR_GRADE_LUT_PATH
         try:
-            args = t.parse_args(["script.py", "--bake-materials", "--bake-resolution", "2048"])
+            args = t.parse_args(["script.py", "--color-grade-lut", "/tmp/grade.cube"])
             t.apply_cli_overrides(args)
-            self.assertTrue(t.BAKE_MATERIALS)
-            self.assertEqual(t.BAKE_RESOLUTION, 2048)
+            self.assertEqual(t.COLOR_GRADE_LUT_PATH, "/tmp/grade.cube")
         finally:
-            t.BAKE_MATERIALS, t.BAKE_RESOLUTION = previous
+            t.COLOR_GRADE_LUT_PATH = previous
 
-    def test_config_snapshot_and_bundle_round_trips_bake_settings(self) -> None:
-        """Regression guard: BAKE_MATERIALS/BAKE_RESOLUTION/BAKE_CACHE must survive
-        the snapshot -> worker-subprocess-restore round trip, or --bake-materials
-        would silently do nothing whenever --parallel-workers spawns workers
-        (the default for multi-tile scenes) despite working for --parallel-workers 1."""
-        previous = (t.BAKE_MATERIALS, t.BAKE_RESOLUTION, t.BAKE_CACHE)
-        try:
-            t.BAKE_MATERIALS = True
-            t.BAKE_RESOLUTION = 2048
-            t.BAKE_CACHE = False
-            snapshot = t._config_snapshot()
-            self.assertEqual(snapshot["BAKE_MATERIALS"], True)
-            self.assertEqual(snapshot["BAKE_RESOLUTION"], 2048)
-            self.assertEqual(snapshot["BAKE_CACHE"], False)
+    def test_manifest_color_grade_lut_payload_none_when_not_staged(self) -> None:
+        self.assertIsNone(t._manifest_color_grade_lut_payload(None))
 
-            t.BAKE_MATERIALS = False
-            t.BAKE_RESOLUTION = 1024
-            t.BAKE_CACHE = True
-            t._apply_bundle_config(snapshot)
-            self.assertTrue(t.BAKE_MATERIALS)
-            self.assertEqual(t.BAKE_RESOLUTION, 2048)
-            self.assertFalse(t.BAKE_CACHE)
-        finally:
-            t.BAKE_MATERIALS, t.BAKE_RESOLUTION, t.BAKE_CACHE = previous
-
-    def test_parse_args_no_bake_cache(self) -> None:
-        args = t.parse_args(["script.py", "--bake-materials", "--no-bake-cache"])
-        self.assertTrue(args.bake_materials)
-        self.assertTrue(args.no_bake_cache)
-
-    def test_apply_cli_overrides_disables_bake_cache(self) -> None:
-        previous = t.BAKE_CACHE
-        try:
-            args = t.parse_args(["script.py", "--no-bake-cache"])
-            t.apply_cli_overrides(args)
-            self.assertFalse(t.BAKE_CACHE)
-        finally:
-            t.BAKE_CACHE = previous
+    def test_manifest_color_grade_lut_payload_shape(self) -> None:
+        staged = u.ColorGradeLUT(
+            uri="Textures/gradelut_abc123.cube",
+            lut_size=33,
+            domain_min=(0.0, 0.0, 0.0),
+            domain_max=(1.0, 1.0, 1.0),
+            source_path=Path("/tmp/out/Textures/gradelut_abc123.cube"),
+        )
+        payload = t._manifest_color_grade_lut_payload(staged)
+        self.assertEqual(payload["lutUri"], "Textures/gradelut_abc123.cube")
+        self.assertEqual(payload["lutSize"], 33)
+        self.assertEqual(payload["domainMin"], [0.0, 0.0, 0.0])
+        self.assertEqual(payload["domainMax"], [1.0, 1.0, 1.0])
 
     # ------------------------------------------------------------------
     # UV layer normalization before cross-object merge

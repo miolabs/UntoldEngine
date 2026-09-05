@@ -88,6 +88,7 @@ CHUNK_TYPES = {
     "light_table": 19,
     "camera_table": 20,
     "color_management_table": 21,
+    "color_grade_lut_table": 22,
 }
 
 VERTEX_LAYOUT_PBR_STATIC_V1 = 1
@@ -485,15 +486,19 @@ class CameraRecord:
 
 
 @dataclass(frozen=True)
-class ColorManagementRecord:
-    lut_texture_index: int
-    view_transform_name_offset: int
-    look_name_offset: int
-    exposure: float
-    gamma: float
-    shaper_min_stops: float
-    shaper_max_stops: float
+class ColorGradeLUTRecord:
+    """An externally-authored .cube LUT, applied as a post-tonemap creative grade.
+
+    References a plain .cube file staged next to the export -- no Blender
+    render/bake, no custom domain. The engine loads the .cube directly (see
+    CubeLUTLoader) rather than through the native .utex texture pipeline, so
+    there is no texture_index here.
+    """
+
+    lut_uri_offset: int
     lut_size: int
+    domain_min: tuple[float, float, float]
+    domain_max: tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -1266,15 +1271,13 @@ def write_camera_record(writer: BinaryWriter, camera: CameraRecord) -> None:
     writer.write_matrix4x4_column_major(camera.local_transform_rows)
 
 
-def write_color_management_record(writer: BinaryWriter, record: ColorManagementRecord) -> None:
-    writer.write_u32(record.lut_texture_index)
-    writer.write_u32(record.view_transform_name_offset)
-    writer.write_u32(record.look_name_offset)
-    writer.write_f32(record.exposure)
-    writer.write_f32(record.gamma)
-    writer.write_f32(record.shaper_min_stops)
-    writer.write_f32(record.shaper_max_stops)
+def write_color_grade_lut_record(writer: BinaryWriter, record: ColorGradeLUTRecord) -> None:
+    writer.write_u32(record.lut_uri_offset)
     writer.write_u32(record.lut_size)
+    for value in record.domain_min:
+        writer.write_f32(value)
+    for value in record.domain_max:
+        writer.write_f32(value)
 
 
 def write_skeleton_record(writer: BinaryWriter, skeleton: SkeletonRecord) -> None:
@@ -1381,7 +1384,6 @@ def validation_path_for_output(output_path: Path) -> Path:
 def build_validation_payload(
     asset_name: str,
     validation_meshes: list[ValidationMesh],
-    color_management_bake: Optional["ColorManagementBake"] = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "format": "untold-validation",
@@ -1409,18 +1411,6 @@ def build_validation_payload(
             for mesh in validation_meshes
         ],
     }
-    if color_management_bake is not None:
-        payload["color_management"] = {
-            "view_transform": color_management_bake.view_transform,
-            "look": color_management_bake.look,
-            "exposure": color_management_bake.exposure,
-            "gamma": color_management_bake.gamma,
-            "display_device": color_management_bake.display_device,
-            "lut_size": color_management_bake.lut_size,
-            "shaper_min_stops": color_management_bake.shaper_min_stops,
-            "shaper_max_stops": color_management_bake.shaper_max_stops,
-            "lut_uri": color_management_bake.lut_texture.uri,
-        }
     return payload
 
 
@@ -1428,10 +1418,9 @@ def write_validation_file(
     output_path: Path,
     asset_name: str,
     validation_meshes: list[ValidationMesh],
-    color_management_bake: Optional["ColorManagementBake"] = None,
 ) -> Path:
     validation_path = validation_path_for_output(output_path)
-    payload = build_validation_payload(asset_name, validation_meshes, color_management_bake)
+    payload = build_validation_payload(asset_name, validation_meshes)
     validation_path.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
     return validation_path
 
@@ -1938,6 +1927,10 @@ def _blender_light_casts_shadow(light_data: object) -> bool:
 
 
 def _blender_light_engine_intensity(light_data: object) -> float:
+    # For SUN lights, Blender's `energy` is already irradiance in W/m² (the
+    # "Strength" field), not radiant power in watts like other light types.
+    # No unit conversion is needed here for either case; do not "fix" this
+    # into a watts-style conversion for SUN lights.
     power = max(float(getattr(light_data, "energy", 1.0)), 0.0)
     exposure = _blender_light_source_exposure(light_data)
     return power * math.pow(2.0, exposure)
@@ -2119,7 +2112,7 @@ def _resolve_texture_from_socket(input_socket: object, asset_path: Path, visited
     return None
 
 
-# --- Material graph fidelity analysis (see docs/API/UsingBlenderAddon.md#material-node-baking) ---
+# --- Material graph fidelity analysis (see docs/API/UsingBlenderAddon.md#material-fidelity) ---
 #
 # Classifies each material by how faithfully the exporter can represent its node
 # graph, so exports can report exactly which materials will diverge from Blender:
@@ -2480,781 +2473,9 @@ def material_fidelity_report_lines(mesh_objects: Iterable[object]) -> list[str]:
         lines.append(f"  [{analysis.classification}] {analysis.material_name} — {details}")
     lines.extend(report.uv_warnings)
     if counts[MATERIAL_GRAPH_BAKEABLE] or counts[MATERIAL_GRAPH_UNBAKEABLE]:
-        lines.append("  Materials listed above will render differently in the engine than in Blender.")
-        lines.append("  See docs/API/UsingBlenderAddon.md#material-node-baking for details.")
+        lines.append("  Materials listed above will render differently in the engine than in Blender")
+        lines.append("  unless baked to flat textures with a third-party tool or fixed in the graph.")
     return lines
-
-
-# --- Milestones 2/3: export-time material baking (opt-in via --bake-materials) ---
-#
-# For materials with divergent node graphs, Blender itself evaluates them:
-# color/scalar channels are rewired into a temporary Emission shader and baked
-# with type=EMIT (exact, lighting-free, and correct for metallic materials,
-# whose Diffuse-pass albedo bakes black); the normal channel uses a
-# tangent-space NORMAL bake with the original graph intact.  Roughness and
-# metallic are packed into one ORM-style image (G=roughness, B=metallic).
-# Divergence is decided per channel, so a material with a Mix on base color
-# only bakes base color.  Baked textures are registered by material name;
-# extract_material substitutes them for the traced textures.
-
-@dataclass
-class BakedMaterialTextures:
-    base_color: Optional[ExportedTexture] = None
-    orm: Optional[ExportedTexture] = None  # G=roughness, B=metallic
-    normal: Optional[ExportedTexture] = None
-    emissive: Optional[ExportedTexture] = None
-
-    def channel_labels(self) -> list[str]:
-        labels = []
-        if self.base_color is not None:
-            labels.append("base color")
-        if self.orm is not None:
-            labels.append("roughness+metallic")
-        if self.normal is not None:
-            labels.append("normal")
-        if self.emissive is not None:
-            labels.append("emissive")
-        return labels
-
-
-MAX_BAKE_RESOLUTION = 8192
-
-
-def validate_bake_resolution(resolution: int) -> int:
-    """Validate a --bake-resolution value, clamping instead of failing at the high end.
-
-    Raises RuntimeError for non-positive values (Blender's bpy.data.images.new()
-    rejects these with a much less clear error).  Values above MAX_BAKE_RESOLUTION
-    are clamped with a warning rather than rejected, since an oversized bake is
-    slow, not unsafe.
-    """
-    if resolution <= 0:
-        raise RuntimeError(f"--bake-resolution must be a positive integer, got {resolution}")
-    if resolution > MAX_BAKE_RESOLUTION:
-        print(
-            f"Warning: --bake-resolution {resolution} is very high; clamping to {MAX_BAKE_RESOLUTION}.",
-            flush=True,
-        )
-        return MAX_BAKE_RESOLUTION
-    return resolution
-
-
-_baked_material_textures: dict[str, BakedMaterialTextures] = {}
-
-# Owns the tempfile.mkdtemp() directory created by bake_divergent_materials(), if any.
-# The directory holds the baked PNGs and must survive until stage_nodes_for_output()
-# has copied them into the final Textures/ output folder — call
-# cleanup_material_bake_temp_dir() once staging (or the whole export) is complete.
-_material_bake_temp_dir: Optional[Path] = None
-
-
-def _set_material_bake_temp_dir(directory: Path) -> None:
-    global _material_bake_temp_dir
-    _material_bake_temp_dir = directory
-
-
-def cleanup_material_bake_temp_dir() -> None:
-    """Remove the temp directory created by the most recent bake_divergent_materials()
-    call, if any.  Safe to call even when no bake happened."""
-    global _material_bake_temp_dir
-    if _material_bake_temp_dir is not None and _material_bake_temp_dir.is_dir():
-        shutil.rmtree(_material_bake_temp_dir, ignore_errors=True)
-    _material_bake_temp_dir = None
-
-
-_BAKE_CHANNEL_SOCKETS = {
-    "base_color": ("Base Color",),
-    "orm": ("Roughness", "Metallic"),
-    "normal": ("Normal",),
-    "emissive": ("Emission Color", "Emission"),
-}
-
-
-def _safe_bake_stem(name: str) -> str:
-    stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name)
-    return stem or "material"
-
-
-def _findings_from_socket(socket: object, stop_node_ids: Optional[set[int]] = None) -> list[MaterialGraphFinding]:
-    findings: list[MaterialGraphFinding] = []
-    if socket is None or not getattr(socket, "is_linked", False):
-        return findings
-    visited: set[int] = set()
-    classified: set[tuple[int, str]] = set()
-    for link in getattr(socket, "links", []):
-        source_socket_name = getattr(getattr(link, "from_socket", None), "name", "") or ""
-        _walk_material_graph(link.from_node, source_socket_name, findings, visited, classified, stop_node_ids)
-    return findings
-
-
-def _max_upstream_image_dimension(socket: object) -> int:
-    """Largest width/height among ShaderNodeTexImage nodes feeding socket.
-
-    Walks through Mix/Group/etc. nodes the same way bake-need detection does
-    (reuses _walk_material_graph), so it finds a material's own source
-    textures regardless of how many nodes sit between them and the
-    Principled BSDF input.  Used to auto-size a material's bake resolution
-    instead of applying a flat default that can be far below (and blur) a
-    material built from a high-resolution photo texture, or unnecessarily
-    above one built from a small tiling texture.
-    """
-    if socket is None or not getattr(socket, "is_linked", False):
-        return 0
-    findings: list[MaterialGraphFinding] = []
-    visited: set[int] = set()
-    classified: set[tuple[int, str]] = set()
-    image_sizes: list[int] = []
-    for link in getattr(socket, "links", []):
-        source_socket_name = getattr(getattr(link, "from_socket", None), "name", "") or ""
-        _walk_material_graph(link.from_node, source_socket_name, findings, visited, classified, None, image_sizes)
-    return max(image_sizes, default=0)
-
-
-def _next_power_of_two(value: int) -> int:
-    if value <= 1:
-        return 1
-    return 1 << (value - 1).bit_length()
-
-
-def material_bake_plan(material: object) -> dict[str, bool]:
-    """Decide per channel whether export-time baking is needed and possible.
-
-    Returns {} when nothing should be baked.  The channel bake recipes
-    (_wire_emission_base_color etc.) only read individual Principled BSDF
-    inputs — they have no way to reproduce a shader combined above the
-    Principled (Mix Shader, Add Shader, another BSDF blended in).  So any
-    divergence found between the Material Output and the Principled BSDF
-    makes the *entire material* unbakeable with the current implementation,
-    not just "every channel": baking individual channels from the Principled
-    alone would silently discard the shader-level blending and produce a
-    confidently wrong texture.  Only divergence found on a single Principled
-    input (Base Color, Roughness, etc.) is baked, and only for that channel.
-    Channels with view-dependent (unbakeable) findings are skipped with a
-    warning.
-    """
-    tree = getattr(material, "node_tree", None)
-    if tree is None:
-        return {}
-    principled = _principled_bsdf_node(tree)
-    output_node = _material_output_node(tree)
-    if principled is None or output_node is None:
-        return {}
-    if _node_tree_is_animated(tree):
-        print(f"    Skipping '{material.name}': animated node values cannot be baked", flush=True)
-        return {}
-
-    global_findings = _findings_from_socket(output_node.inputs.get("Surface"), stop_node_ids={_graph_node_key(principled)})
-    if global_findings:
-        if any(finding.category == MATERIAL_GRAPH_UNBAKEABLE for finding in global_findings):
-            print(f"    Skipping '{material.name}': view-dependent nodes above the Principled BSDF cannot be baked", flush=True)
-        else:
-            print(
-                f"    Skipping '{material.name}': shader-level mixing above the Principled BSDF "
-                f"(e.g. Mix Shader / Add Shader) is not supported by the baker — per-channel "
-                f"emission rewiring cannot reproduce shader blending",
-                flush=True,
-            )
-        return {}
-
-    plan: dict[str, bool] = {}
-    for channel, socket_names in _BAKE_CHANNEL_SOCKETS.items():
-        channel_findings: list[MaterialGraphFinding] = []
-        for socket_name in socket_names:
-            socket = principled.inputs.get(socket_name)
-            channel_findings.extend(_findings_from_socket(socket))
-        if any(finding.category == MATERIAL_GRAPH_UNBAKEABLE for finding in channel_findings):
-            print(f"    Skipping '{material.name}' {channel} channel: view-dependent nodes cannot be baked", flush=True)
-            plan[channel] = False
-            continue
-        plan[channel] = bool(channel_findings)
-    if not any(plan.values()):
-        return {}
-    return plan
-
-
-def _wire_emission_base_color(tree: object, principled: object, emission: object) -> list[object]:
-    base_color_input = principled.inputs.get("Base Color")
-    if base_color_input is not None and base_color_input.is_linked:
-        tree.links.new(base_color_input.links[0].from_socket, emission.inputs["Color"])
-    elif base_color_input is not None:
-        emission.inputs["Color"].default_value = vector4(base_color_input.default_value)
-    return []
-
-
-def _wire_emission_orm(tree: object, principled: object, emission: object) -> list[object]:
-    combine = tree.nodes.new("ShaderNodeCombineColor")
-    combine.inputs["Red"].default_value = 1.0
-    for socket_name, combine_input in (("Roughness", "Green"), ("Metallic", "Blue")):
-        socket = principled.inputs.get(socket_name)
-        if socket is not None and socket.is_linked:
-            tree.links.new(socket.links[0].from_socket, combine.inputs[combine_input])
-        elif socket is not None:
-            combine.inputs[combine_input].default_value = float(socket.default_value)
-    tree.links.new(combine.outputs["Color"], emission.inputs["Color"])
-    return [combine]
-
-
-def _wire_emission_emissive(tree: object, principled: object, emission: object) -> list[object]:
-    emissive_input = principled.inputs.get("Emission Color") or principled.inputs.get("Emission")
-    if emissive_input is not None and emissive_input.is_linked:
-        tree.links.new(emissive_input.links[0].from_socket, emission.inputs["Color"])
-    elif emissive_input is not None:
-        emission.inputs["Color"].default_value = vector4(emissive_input.default_value)
-    return []
-
-
-_BAKE_CHANNEL_RECIPES = {
-    # channel: (file suffix, bake type, emission wiring, image colorspace)
-    "base_color": ("basecolor", "EMIT", _wire_emission_base_color, None),
-    "orm": ("orm", "EMIT", _wire_emission_orm, "Non-Color"),
-    "normal": ("normal", "NORMAL", None, "Non-Color"),
-    "emissive": ("emissive", "EMIT", _wire_emission_emissive, None),
-}
-
-
-def _bake_output_filename(mesh_object: object, channel: str) -> str:
-    file_suffix = _BAKE_CHANNEL_RECIPES[channel][0]
-    return f"{_safe_bake_stem(mesh_object.name)}_{file_suffix}.png"
-
-
-def _resolution_for_material(material: object, default_resolution: int, plan: Optional[dict[str, bool]] = None) -> int:
-    """Pick the bake resolution for one material.
-
-    An explicit material["untold_bake_resolution"] custom property always
-    wins (set via Blender's generic Custom Properties panel, or
-    material["untold_bake_resolution"] = 2048 in Python) — this remains the
-    manual escape hatch for cases the auto-detection below gets wrong.
-
-    Otherwise the resolution is auto-detected from the material's own source
-    textures: the largest ShaderNodeTexImage feeding any channel `plan` says
-    needs baking sets the floor (rounded up to a power of two), so a
-    material built from e.g. a 4096x4096 photo texture doesn't get flattened
-    to a flat --bake-resolution default and come out visibly blurrier in the
-    engine than the same material looks in Blender. Never goes *below*
-    default_resolution, so materials with only small/no source textures keep
-    today's behavior. Falls back to default_resolution outright when no
-    plan is given or no source texture is found upstream (e.g. a
-    procedural/solid-color material).
-    """
-    override = material.get("untold_bake_resolution", None) if hasattr(material, "get") else None
-    if override is not None:
-        try:
-            return validate_bake_resolution(int(override))
-        except (TypeError, ValueError, RuntimeError) as exc:
-            print(
-                f"    Warning: invalid untold_bake_resolution on '{material.name}': {override!r} ({exc}); "
-                f"using auto-detected/default resolution",
-                flush=True,
-            )
-
-    if not plan:
-        return default_resolution
-    tree = getattr(material, "node_tree", None)
-    principled = _principled_bsdf_node(tree) if tree is not None else None
-    if principled is None:
-        return default_resolution
-
-    largest_source = 0
-    for channel, needed in plan.items():
-        if not needed:
-            continue
-        for socket_name in _BAKE_CHANNEL_SOCKETS.get(channel, ()):
-            largest_source = max(largest_source, _max_upstream_image_dimension(principled.inputs.get(socket_name)))
-    if largest_source <= 0:
-        return default_resolution
-    return validate_bake_resolution(max(default_resolution, _next_power_of_two(largest_source)))
-
-
-def _material_node_tree_fingerprint(material: object) -> str:
-    """Deterministic hash of everything in a material's node tree that could
-    affect a bake result: node types, unlinked socket default values, and
-    link topology.  Hashes the whole tree rather than just the subgraph
-    feeding one channel — simpler, and safe to over-invalidate (an unrelated
-    node edit forces one unnecessary re-bake) rather than risk
-    under-invalidating (silently serving a stale bake).
-    """
-    def format_default_value(default: object) -> object:
-        try:
-            return tuple(round(float(component), 6) for component in default)
-        except TypeError:
-            try:
-                return round(float(default), 6)
-            except (TypeError, ValueError):
-                return str(default)
-
-    tree = getattr(material, "node_tree", None)
-    if tree is None:
-        return "no-node-tree"
-    lines: list[str] = []
-    for node in tree.nodes:
-        lines.append(f"NODE|{node.name}|{node.bl_idname}|mute={getattr(node, 'mute', False)}")
-        inputs = getattr(node, "inputs", None)
-        for socket in (inputs.values() if inputs is not None else []):
-            if getattr(socket, "is_linked", False):
-                continue
-            default = getattr(socket, "default_value", None)
-            if default is None:
-                continue
-            lines.append(f"INPUT|{node.name}|{socket.name}|{format_default_value(default)}")
-        # Constant-value nodes (RGB, Value) store their configured value on
-        # the OUTPUT socket, not an input — must be hashed too, or editing a
-        # ShaderNodeRGB's color leaves the fingerprint (and cache key)
-        # unchanged, silently serving a stale bake.
-        outputs = getattr(node, "outputs", None)
-        for index, socket in enumerate(outputs.values() if outputs is not None else []):
-            default = getattr(socket, "default_value", None)
-            if default is None:
-                continue
-            lines.append(f"OUTPUT|{node.name}|{index}:{socket.name}|{format_default_value(default)}")
-    for link in getattr(tree, "links", []):
-        lines.append(f"LINK|{link.from_node.name}.{link.from_socket.name}|{link.to_node.name}.{link.to_socket.name}")
-    lines.sort()  # Blender's node/link iteration order is not guaranteed stable.
-    return hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
-
-
-def _mesh_uv_fingerprint(mesh_data: object) -> str:
-    """Cheap content hash of the mesh's active UV layer.  Invalidates the
-    bake cache when a mesh is re-unwrapped without renaming the object."""
-    uv_layers = getattr(mesh_data, "uv_layers", None)
-    if not uv_layers:
-        return "no-uv"
-    layer = uv_layers.active or uv_layers[0]
-    data = layer.data
-    n = len(data)
-    if n == 0:
-        return "empty-uv"
-    if _HAS_NUMPY:
-        flat = np.empty(n * 2, dtype=np.float32)
-        data.foreach_get("uv", flat)
-        return hashlib.sha1(flat.tobytes()).hexdigest()
-    step = max(1, n // 256)
-    parts = [f"{data[i].uv[0]:.6f},{data[i].uv[1]:.6f}" for i in range(0, n, step)]
-    return hashlib.sha1(",".join(parts).encode("utf-8")).hexdigest()
-
-
-# Tolerance for treating a UV bounding box as "within the unit square" — small
-# enough to still catch real tiled unwraps (which typically overshoot by whole
-# units), generous enough to absorb float roundoff from unwrap/pack operators.
-_UV_UNIT_SQUARE_TOLERANCE = 1.0e-3
-
-
-def _mesh_active_uv_bbox(mesh_data: object) -> Optional[tuple[float, float, float, float]]:
-    """Bounding box (min_x, max_x, min_y, max_y) of a mesh's active UV layer.
-
-    Returns None when the mesh has no UV layer or the layer is empty.
-    """
-    uv_layers = getattr(mesh_data, "uv_layers", None)
-    if not uv_layers:
-        return None
-    layer = uv_layers.active or uv_layers[0]
-    data = layer.data
-    n = len(data)
-    if n == 0:
-        return None
-    if _HAS_NUMPY:
-        flat = np.empty(n * 2, dtype=np.float32)
-        data.foreach_get("uv", flat)
-        coords = flat.reshape(-1, 2)
-        return (
-            float(coords[:, 0].min()), float(coords[:, 0].max()),
-            float(coords[:, 1].min()), float(coords[:, 1].max()),
-        )
-    xs = [data[i].uv[0] for i in range(n)]
-    ys = [data[i].uv[1] for i in range(n)]
-    return (min(xs), max(xs), min(ys), max(ys))
-
-
-def _uv_bbox_exceeds_unit_square(bbox: tuple[float, float, float, float], tolerance: float = _UV_UNIT_SQUARE_TOLERANCE) -> bool:
-    """True when a UV bounding box extends outside [0,1]x[0,1].
-
-    Image baking always writes into a [0,1]x[0,1] target regardless of how the
-    mesh's UVs are laid out — unlike live shading, it does not wrap coordinates
-    outside that range. Meshes tiled via oversized UVs (a common technique:
-    scaling the UV unwrap itself up in real-world units and relying on the
-    texture sampler's Repeat/Wrap mode, instead of a Mapping node) look correct
-    in Blender but bake mostly/entirely black, since only the sliver of the
-    mesh whose UVs happen to fall inside the unit square is captured.
-    """
-    min_x, max_x, min_y, max_y = bbox
-    return (
-        min_x < -tolerance
-        or min_y < -tolerance
-        or max_x > 1.0 + tolerance
-        or max_y > 1.0 + tolerance
-    )
-
-
-def _object_transform_fingerprint(mesh_object: object) -> str:
-    """Cheap fingerprint of world transform, since Object-coordinate-driven
-    procedural nodes (Texture Coordinate 'Object', Object Info) bake
-    differently depending on it."""
-    matrix = mesh_object.matrix_world
-    values = (round(matrix[r][c], 6) for r in range(4) for c in range(4))
-    return ",".join(str(v) for v in values)
-
-
-def _material_bake_cache_key(mesh_object: object, material: object, channel: str, resolution: int) -> str:
-    parts = [
-        _material_node_tree_fingerprint(material),
-        _mesh_uv_fingerprint(getattr(mesh_object, "data", None)),
-        _object_transform_fingerprint(mesh_object),
-        f"resolution={resolution}",
-        f"channel={channel}",
-    ]
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
-
-
-def _material_bake_cache_dir(asset_path: Path) -> Path:
-    return asset_path.parent / f".untold_bake_cache_{_safe_bake_stem(asset_path.stem)}"
-
-
-class MaterialBakeCache:
-    """Persistent, content-addressed cache of baked material textures, so
-    re-exporting an unchanged scene skips Cycles bakes entirely.
-
-    Stored alongside the source asset rather than the export output: one
-    source asset commonly exports to many different tile/output locations
-    (tile-streaming, repeated single-asset exports to different folders)
-    that should all share the same cache.  Cache entries are content-keyed
-    (see _material_bake_cache_key), so cache growth is bounded by the number
-    of distinct (mesh, material, channel, resolution) combinations ever
-    baked from this source asset — stale entries are never automatically
-    pruned; delete the cache directory to reset it.
-    """
-
-    def __init__(self, cache_dir: Path) -> None:
-        self.cache_dir = cache_dir
-        self.manifest_path = cache_dir / "manifest.json"
-        self.hits = 0
-        self.misses = 0
-        self._manifest: dict[str, str] = {}
-        if self.manifest_path.is_file():
-            try:
-                self._manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                self._manifest = {}
-
-    def get(self, cache_key: str) -> Optional[Path]:
-        filename = self._manifest.get(cache_key)
-        if filename is None:
-            return None
-        cached_path = self.cache_dir / filename
-        if not cached_path.is_file():
-            return None
-        self.hits += 1
-        return cached_path
-
-    def put(self, cache_key: str, source_file: Path) -> Path:
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        cached_path = self.cache_dir / f"{cache_key}.png"
-        shutil.copy2(source_file, cached_path)
-        self._manifest[cache_key] = cached_path.name
-        self.misses += 1
-        return cached_path
-
-    def save_manifest(self) -> None:
-        if not self._manifest:
-            return
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.manifest_path.write_text(json.dumps(self._manifest, indent=2, sort_keys=True), encoding="utf-8")
-
-
-def _bake_material_channel(
-    material: object,
-    mesh_object: object,
-    resolution: int,
-    bake_dir: Path,
-    channel: str,
-) -> Optional[ExportedTexture]:
-    """Bake one channel of one material, using only mesh_object's own UVs, into a PNG.
-
-    Baking is scoped to a single mesh instance rather than shared across every
-    object that uses the material: sharing one texture across multiple
-    objects risks one object's bake silently overwriting another's at
-    overlapping UV coordinates, or the two instances legitimately differing
-    where procedural/object-space nodes evaluate per-object.  The node tree
-    is restored exactly, including on failure, so the bake is safe inside a
-    live Blender session.
-    """
-    import bpy as _bpy
-
-    file_suffix, bake_type, wire_emission, colorspace = _BAKE_CHANNEL_RECIPES[channel]
-    tree = material.node_tree
-    principled = next((node for node in tree.nodes if node.bl_idname == "ShaderNodeBsdfPrincipled"), None)
-    output_node = _material_output_node(tree)
-    surface_socket = output_node.inputs.get("Surface") if output_node is not None else None
-    if principled is None or surface_socket is None:
-        return None
-
-    view_layer = _bpy.context.view_layer
-    original_surface_source = surface_socket.links[0].from_socket if surface_socket.is_linked else None
-    previous_active_node = tree.nodes.active
-
-    image = _bpy.data.images.new(f"{mesh_object.name}_{file_suffix}_bake", width=resolution, height=resolution)
-    if colorspace is not None:
-        image.colorspace_settings.name = colorspace
-    bake_target = tree.nodes.new("ShaderNodeTexImage")
-    bake_target.image = image
-    tree.nodes.active = bake_target
-    temp_nodes: list[object] = [bake_target]
-
-    if wire_emission is not None:
-        emission = tree.nodes.new("ShaderNodeEmission")
-        temp_nodes.append(emission)
-        temp_nodes.extend(wire_emission(tree, principled, emission))
-        tree.links.new(emission.outputs["Emission"], surface_socket)
-
-    previous_uv_index = mesh_object.data.uv_layers.active_index
-    try:
-        # Clear selection across every object, not just this view layer's:
-        # bake() validates all currently-selected objects are in the active
-        # view layer, and stale selection left over from a different scene
-        # (e.g. a previous tile's now-removed temp scene, processed earlier
-        # in the same sequential run) makes it fail with "Object 'X' is not
-        # in view layer" even though X was never selected in this call.
-        for obj in _bpy.data.objects:
-            try:
-                obj.select_set(False)
-            except RuntimeError:
-                pass
-        mesh_object.select_set(True)
-        mesh_object.data.uv_layers.active_index = 0
-        view_layer.objects.active = mesh_object
-
-        bake_kwargs = {"margin": 16, "use_clear": True, "use_selected_to_active": False}
-        if bake_type == "NORMAL":
-            bake_kwargs["normal_space"] = "TANGENT"
-        _bpy.ops.object.bake(type=bake_type, **bake_kwargs)
-
-        output_file = bake_dir / _bake_output_filename(mesh_object, channel)
-        image.filepath_raw = str(output_file)
-        image.file_format = "PNG"
-        image.save()
-        return ExportedTexture(
-            name=output_file.name,
-            uri=output_file.name,
-            width=resolution,
-            height=resolution,
-            mip_count=1,
-            source_path=output_file,
-        )
-    finally:
-        try:
-            mesh_object.data.uv_layers.active_index = previous_uv_index
-        except Exception:
-            pass
-        for temp_node in temp_nodes:
-            tree.nodes.remove(temp_node)
-        tree.nodes.active = previous_active_node
-        if original_surface_source is not None:
-            tree.links.new(original_surface_source, surface_socket)
-        _bpy.data.images.remove(image)
-
-
-def _sanitize_cmyk_source_images() -> None:
-    """Convert any CMYK-encoded source image on disk to an RGB copy and
-    repoint the matching Blender image datablock at it.
-
-    Cycles loads baked source textures directly via OpenImageIO, bypassing
-    Blender's own image loader. OpenImageIO's JPEG CMYK->RGB conversion has
-    a native stack-corruption bug in Blender 5.1 (crashes with
-    SIGBUS/EXC_BAD_ACCESS inside JpgInput::read_native_scanlines while
-    baking — confirmed via macOS crash reports against a real asset pack).
-    Converting the source file to plain RGB before Cycles ever touches it
-    avoids the crash. Some asset packs (e.g. ones with Adobe-exported
-    signage textures) ship exactly one such file, but it can be reused
-    across many objects, so a single bad image can crash every worker.
-    """
-    import bpy as _bpy
-    try:
-        from PIL import Image as _PILImage
-    except ImportError:
-        return
-
-    safe_dir: Optional[Path] = None
-    for image in _bpy.data.images:
-        filepath = bpy.path.abspath(image.filepath) if image.filepath else ""
-        if not filepath or not os.path.isfile(filepath):
-            continue
-        try:
-            with _PILImage.open(filepath) as source_image:
-                if source_image.mode != "CMYK":
-                    continue
-                rgb_image = source_image.convert("RGB")
-        except Exception:
-            continue
-        if safe_dir is None:
-            safe_dir = Path(tempfile.mkdtemp(prefix="untold_cmyk_sanitized_"))
-        safe_path = safe_dir / f"{Path(filepath).stem}_rgb.jpg"
-        rgb_image.save(safe_path, quality=95)
-        print(f"    Converted CMYK source image to RGB: {Path(filepath).name} -> {safe_path.name}", flush=True)
-        image.filepath = str(safe_path)
-        image.reload()
-
-
-def bake_divergent_materials(
-    mesh_objects: Iterable[object],
-    *,
-    resolution: int = 1024,
-    samples: int = 1,
-    asset_path: Optional[Path] = None,
-    use_cache: bool = True,
-) -> dict[str, BakedMaterialTextures]:
-    """Bake every divergent channel for every (mesh, material) pair.
-
-    Returns baked textures keyed by mesh object name — baking is scoped per
-    mesh instance, not shared across every object using a material, so two
-    objects that happen to share a material (e.g. many chairs using the same
-    "Wood" material) each get their own texture rather than risking one
-    object's bake overwriting another's at overlapping UV coordinates.
-    material_bake_plan() is only computed once per distinct material and
-    reused across its instances, since the plan only depends on the node
-    graph.  resolution is the fallback default; each material's actual bake
-    resolution is auto-detected from its own source textures (see
-    _resolution_for_material()) unless overridden via a
-    material["untold_bake_resolution"] custom property.  When asset_path is
-    given and use_cache is True, each (mesh, material, channel, resolution)
-    combination is looked up in a persistent, content-addressed cache next
-    to the source asset (see MaterialBakeCache) and only baked on a miss —
-    re-exporting an unchanged scene skips every bake.  Render engine, sample
-    count, selection, and active object are restored afterwards so repeated
-    or in-session (add-on) exports see no scene changes.
-    """
-    blender_required()
-    import bpy as _bpy
-
-    _sanitize_cmyk_source_images()
-
-    plans_by_material_name: dict[str, dict[str, bool]] = {}
-    candidates: list[tuple[object, object, dict[str, bool]]] = []  # (mesh_object, material, plan)
-    for mesh_object in mesh_objects:
-        material_slots = getattr(getattr(mesh_object, "data", None), "materials", None) or []
-        material = material_slots[0] if material_slots and material_slots[0] is not None else None
-        if material is None:
-            continue
-        if material.name not in plans_by_material_name:
-            try:
-                plans_by_material_name[material.name] = material_bake_plan(material)
-            except Exception as exc:
-                print(f"    Warning: bake planning failed for '{material.name}': {exc}", flush=True)
-                plans_by_material_name[material.name] = {}
-        plan = plans_by_material_name[material.name]
-        if not plan:
-            continue
-        if len(getattr(mesh_object.data, "uv_layers", [])) == 0:
-            print(f"    Skipping '{mesh_object.name}': no UV map", flush=True)
-            continue
-        uv_bbox = _mesh_active_uv_bbox(mesh_object.data)
-        if uv_bbox is not None and _uv_bbox_exceeds_unit_square(uv_bbox):
-            min_x, max_x, min_y, max_y = uv_bbox
-            print(
-                f"    Skipping '{mesh_object.name}': UV layout extends outside the [0,1] unit square "
-                f"(x=[{min_x:.3f}, {max_x:.3f}] y=[{min_y:.3f}, {max_y:.3f}]) — likely a tiled unwrap "
-                f"relying on texture-sampler wraparound. Baking only captures the portion inside "
-                f"[0,1] and would leave most of the surface black; falling back to a direct texture "
-                f"reference for '{material.name}' on this mesh instead.",
-                flush=True,
-            )
-            continue
-        candidates.append((mesh_object, material, plan))
-    if not candidates:
-        return {}
-
-    cache = MaterialBakeCache(_material_bake_cache_dir(asset_path)) if (use_cache and asset_path is not None) else None
-
-    bake_dir = Path(tempfile.mkdtemp(prefix="untold_material_bake_"))
-    _set_material_bake_temp_dir(bake_dir)
-    scene = _bpy.context.scene
-    view_layer = _bpy.context.view_layer
-    previous_engine = scene.render.engine
-    previous_samples = scene.cycles.samples if hasattr(scene, "cycles") else None
-    previous_threads_mode = scene.render.threads_mode
-    previous_threads = scene.render.threads
-    previous_selection = [obj for obj in view_layer.objects if obj.select_get()]
-    previous_active = view_layer.objects.active
-
-    baked: dict[str, BakedMaterialTextures] = {}
-    try:
-        scene.render.engine = "CYCLES"
-        if hasattr(scene, "cycles"):
-            scene.cycles.samples = samples
-        # Force single-threaded baking. Cycles' TBB image-loading pool has hit
-        # a real Blender/OpenImageIO crash (SIGBUS/EXC_BAD_ACCESS in
-        # JpgInput::read_native_scanlines, stack-guard-region corruption
-        # across worker threads) on some source JPEG textures in large asset
-        # packs. Serializing image loads avoids the inter-thread stack
-        # adjacency that triggers it, at the cost of slower baking.
-        scene.render.threads_mode = 'FIXED'
-        scene.render.threads = 1
-        for mesh_object, material, plan in candidates:
-            channels = BakedMaterialTextures()
-            material_resolution = _resolution_for_material(material, resolution, plan)
-            for channel, needed in plan.items():
-                if not needed:
-                    continue
-                cache_key = (
-                    _material_bake_cache_key(mesh_object, material, channel, material_resolution)
-                    if cache is not None
-                    else None
-                )
-                cached_path = cache.get(cache_key) if cache is not None and cache_key is not None else None
-                if cached_path is not None:
-                    print(
-                        f"    Using cached {channel}: '{mesh_object.name}' (material '{material.name}')",
-                        flush=True,
-                    )
-                    output_file = bake_dir / _bake_output_filename(mesh_object, channel)
-                    shutil.copy2(cached_path, output_file)
-                    texture = ExportedTexture(
-                        name=output_file.name,
-                        uri=output_file.name,
-                        width=material_resolution,
-                        height=material_resolution,
-                        mip_count=1,
-                        source_path=output_file,
-                    )
-                else:
-                    print(
-                        f"    Baking {channel}: '{mesh_object.name}' (material '{material.name}') "
-                        f"({material_resolution}x{material_resolution})",
-                        flush=True,
-                    )
-                    try:
-                        texture = _bake_material_channel(material, mesh_object, material_resolution, bake_dir, channel)
-                    except Exception as exc:
-                        print(f"    Warning: {channel} bake failed for '{mesh_object.name}': {exc}", flush=True)
-                        continue
-                    if texture is not None and cache is not None and cache_key is not None:
-                        cache.put(cache_key, texture.source_path)
-                if texture is not None:
-                    setattr(channels, channel, texture)
-            if channels.channel_labels():
-                baked[mesh_object.name] = channels
-        if cache is not None:
-            print(f"    Bake cache: {cache.hits} hit(s), {cache.misses} miss(es)", flush=True)
-    finally:
-        scene.render.engine = previous_engine
-        if previous_samples is not None and hasattr(scene, "cycles"):
-            scene.cycles.samples = previous_samples
-        scene.render.threads_mode = previous_threads_mode
-        scene.render.threads = previous_threads
-        for obj in view_layer.objects:
-            try:
-                obj.select_set(False)
-            except RuntimeError:
-                pass
-        for obj in previous_selection:
-            try:
-                obj.select_set(True)
-            except RuntimeError:
-                pass
-        try:
-            view_layer.objects.active = previous_active
-        except Exception:
-            pass
-        if cache is not None:
-            cache.save_manifest()
-    return baked
 
 
 def _png_bit_depth(path: Path) -> int:
@@ -3503,352 +2724,104 @@ def _strip_png_color_profile_chunks(path: Path) -> None:
 
 
 # ──────────────────────────────────────────────
-# Color-grading LUT bake
+# Color-grade LUT import (.cube)
 #
-# Captures the scene's active View Transform/Look/Exposure/Gamma by baking a
-# known identity color grid through Blender's own color management
-# (image.save_render) rather than reimplementing Filmic/AgX curve math. This
-# reproduces whatever Blender actually does, including HDR highlight
-# compression, for any current or future view transform or custom Look.
+# Stages an externally-authored standard .cube file as-is -- no bake, no
+# shaper encoding, no .utex conversion. It's meant to be applied as a
+# creative grade *on top of*
+# whichever tonemap operator the engine runs, in ordinary 0-1 display-referred
+# space, so any .cube produced by any grading tool works, not just ones this
+# exporter produces. The engine parses and uploads the .cube directly (see
+# CubeLUTLoader.swift) rather than going through the native texture pipeline.
 # ──────────────────────────────────────────────
 
-MAX_COLOR_LUT_SIZE = 64
-MIN_COLOR_LUT_SIZE = 4
-
-# Log2 "shaper" domain, anchored on 18% middle gray, that the identity grid is
-# built in. Blender's own curves already saturate to white by ~4 stops over
-# 1.0 (see the feasibility spike), so -10..+6 stops is a generous starting
-# range covering both deep shadow and bright HDR highlight detail. The Metal
-# sampler uses this exact encode/decode contract.
-_LUT_SHAPER_MIDDLE_GRAY = 0.18
-_LUT_SHAPER_MIN_STOPS = -10.0
-_LUT_SHAPER_MAX_STOPS = 6.0
-
-
-def validate_lut_size(lut_size: int) -> int:
-    """Validate a --color-lut-size value, clamping instead of failing at either end."""
-    if lut_size < MIN_COLOR_LUT_SIZE:
-        raise RuntimeError(f"--color-lut-size must be >= {MIN_COLOR_LUT_SIZE}, got {lut_size}")
-    if lut_size > MAX_COLOR_LUT_SIZE:
-        print(
-            f"Warning: --color-lut-size {lut_size} is very high; clamping to {MAX_COLOR_LUT_SIZE}.",
-            flush=True,
-        )
-        return MAX_COLOR_LUT_SIZE
-    return lut_size
-
-
-def _lut_shaper_decode(t: float) -> float:
-    """Map a normalized [0, 1] shaper-space value to a scene-linear color value."""
-    stops = _LUT_SHAPER_MIN_STOPS + t * (_LUT_SHAPER_MAX_STOPS - _LUT_SHAPER_MIN_STOPS)
-    return _LUT_SHAPER_MIDDLE_GRAY * (2.0 ** stops)
-
-
-def build_identity_lut_grid_pixels(lut_size: int) -> list[float]:
-    """RGBA float pixel buffer (Blender's flat .pixels layout) for a
-    lut_size-cubed identity LUT grid, unwrapped as a 2D strip: width =
-    lut_size * lut_size (blue axis tiled horizontally), height = lut_size.
-
-    Blender's `.pixels` buffer is bottom-up, but `image.save_render()` flips
-    vertically when writing a top-down PNG. Rows are written here in reverse
-    (green index g placed at buffer row `lut_size - 1 - g`) so that after that
-    flip, PNG/texture row g still holds green index g — the convention the
-    runtime LUT sampler assumes.
-    """
-    width = lut_size * lut_size
-    step = 1.0 / (lut_size - 1) if lut_size > 1 else 0.0
-    linear_steps = [_lut_shaper_decode(i * step) for i in range(lut_size)]
-
-    pixels = [0.0] * (width * lut_size * 4)
-    for g in range(lut_size):
-        green = linear_steps[g]
-        row_offset = (lut_size - 1 - g) * width * 4
-        for b in range(lut_size):
-            blue = linear_steps[b]
-            tile_offset = row_offset + b * lut_size * 4
-            for r in range(lut_size):
-                idx = tile_offset + r * 4
-                pixels[idx + 0] = linear_steps[r]
-                pixels[idx + 1] = green
-                pixels[idx + 2] = blue
-                pixels[idx + 3] = 1.0
-    return pixels
+_CUBE_LUT_MIN_SIZE = 2
+_CUBE_LUT_MAX_SIZE = 129  # generous upper bound; common grading tools cap at 33 or 65
+_CUBE_LUT_HEADER_MAX_LINES = 32
 
 
 @dataclass(frozen=True)
-class ColorManagementBake:
-    lut_texture: "ExportedTexture"
-    view_transform: str
-    look: str
-    exposure: float
-    gamma: float
+class ColorGradeLUT:
+    """A staged, externally-authored .cube LUT (see stage_color_grade_lut_for_output)."""
+
+    uri: str
     lut_size: int
-    display_device: str = "sRGB"
-    shaper_min_stops: float = _LUT_SHAPER_MIN_STOPS
-    shaper_max_stops: float = _LUT_SHAPER_MAX_STOPS
+    domain_min: tuple[float, float, float]
+    domain_max: tuple[float, float, float]
+    source_path: Path
 
 
-_UTEX_MAGIC = b"UTEX\x00\x00\x00\x00"
-_UTEX_VERSION = 1
-_UTEX_HEADER_SIZE = 64
-_UTEX_MIP_ENTRY_SIZE = 16
-_UTEX_RGBA16_FLOAT_PIXEL_FORMAT = 115
-_UTEX_HEADER_FMT = "<8sIIIIIIBBxxII5I"
-_UTEX_MIP_ENTRY_FMT = "<IIII"
-
-
-def build_rgba16f_utex_bytes(
-    pixels: list[float],
-    width: int,
-    height: int,
-    *,
-    source_rows_bottom_up: bool = True,
-) -> bytes:
-    """Build a one-mip RGBA16Float .utex payload.
-
-    Blender image buffers are bottom-up while Metal uploads texture rows
-    top-down. Reverse the rows by default so the LUT's green axis has the same
-    orientation in Blender, the native container, and the Metal sampler.
+def _parse_cube_lut_header(path: Path) -> tuple[int, tuple[float, float, float], tuple[float, float, float]]:
+    """Read just enough of a .cube file to validate it and recover LUT_3D_SIZE
+    and DOMAIN_MIN/DOMAIN_MAX, without loading the (potentially large) data body.
     """
-    expected_values = width * height * 4
-    if width <= 0 or height <= 0 or len(pixels) != expected_values:
-        raise ValueError(
-            f"Expected {expected_values} RGBA values for {width}x{height}, got {len(pixels)}"
+    lut_size: Optional[int] = None
+    domain_min = (0.0, 0.0, 0.0)
+    domain_max = (1.0, 1.0, 1.0)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _ in range(_CUBE_LUT_HEADER_MAX_LINES):
+                line = handle.readline()
+                if not line:
+                    break
+                stripped = line.split("#", 1)[0].strip()
+                if not stripped:
+                    continue
+                parts = stripped.split()
+                keyword = parts[0].upper()
+                if keyword == "LUT_3D_SIZE" and len(parts) >= 2:
+                    lut_size = int(parts[1])
+                elif keyword == "DOMAIN_MIN" and len(parts) >= 4:
+                    domain_min = (float(parts[1]), float(parts[2]), float(parts[3]))
+                elif keyword == "DOMAIN_MAX" and len(parts) >= 4:
+                    domain_max = (float(parts[1]), float(parts[2]), float(parts[3]))
+                elif keyword == "LUT_1D_SIZE":
+                    raise RuntimeError(f"'{path.name}' is a 1D .cube LUT; only 3D LUTs (LUT_3D_SIZE) are supported")
+                elif keyword[0].isdigit() or keyword[0] in "+-.":
+                    # Reached the first data row without finding LUT_3D_SIZE.
+                    break
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not read '{path}' as a .cube LUT: {exc}") from exc
+
+    if lut_size is None:
+        raise RuntimeError(f"'{path.name}' has no LUT_3D_SIZE header; not a valid 3D .cube LUT")
+    if not (_CUBE_LUT_MIN_SIZE <= lut_size <= _CUBE_LUT_MAX_SIZE):
+        raise RuntimeError(
+            f"'{path.name}' has an unsupported LUT_3D_SIZE {lut_size} "
+            f"(expected {_CUBE_LUT_MIN_SIZE}-{_CUBE_LUT_MAX_SIZE})"
         )
-
-    payload = bytearray(expected_values * 2)
-    output_index = 0
-    row_indices = range(height - 1, -1, -1) if source_rows_bottom_up else range(height)
-    for source_y in row_indices:
-        row_start = source_y * width * 4
-        for value in pixels[row_start : row_start + width * 4]:
-            struct.pack_into("<e", payload, output_index, float(value))
-            output_index += 2
-
-    payload_offset = _UTEX_HEADER_SIZE + _UTEX_MIP_ENTRY_SIZE
-    header = struct.pack(
-        _UTEX_HEADER_FMT,
-        _UTEX_MAGIC,
-        _UTEX_VERSION,
-        1,  # NativeTexFlags.hasAlpha
-        width,
-        height,
-        1,
-        _UTEX_RGBA16_FLOAT_PIXEL_FORMAT,
-        1,
-        1,
-        payload_offset,
-        len(payload),
-        0, 0, 0, 0, 0,
-    )
-    mip = struct.pack(_UTEX_MIP_ENTRY_FMT, 0, len(payload), width, height)
-    return header + mip + bytes(payload)
+    return lut_size, domain_min, domain_max
 
 
-def color_lut_filename(utex_bytes: bytes) -> str:
-    """Return a stable, collision-safe filename derived from LUT contents."""
-    digest = hashlib.sha256(utex_bytes).hexdigest()[:16]
-    return f"gradelut_{digest}.utex"
+def stage_color_grade_lut_for_output(lut_path: Path, output_dir: Path) -> ColorGradeLUT:
+    """Validate and stage an externally-authored .cube LUT next to the export.
 
-
-def decode_rgba16f_utex_bytes(data: bytes) -> tuple[int, int, list[float]]:
-    """Decode the RGBA16Float subset of .utex used by color LUT validation."""
-    if len(data) < _UTEX_HEADER_SIZE + _UTEX_MIP_ENTRY_SIZE:
-        raise ValueError("Truncated .utex data")
-    header = struct.unpack_from(_UTEX_HEADER_FMT, data, 0)
-    if header[0] != _UTEX_MAGIC or header[1] != _UTEX_VERSION:
-        raise ValueError("Invalid .utex header")
-    width, height, mip_count, pixel_format = header[3], header[4], header[5], header[6]
-    payload_offset, payload_size = header[9], header[10]
-    if mip_count != 1 or pixel_format != _UTEX_RGBA16_FLOAT_PIXEL_FORMAT:
-        raise ValueError("Expected a one-mip RGBA16Float .utex")
-    expected_size = width * height * 8
-    if payload_size != expected_size or payload_offset + payload_size > len(data):
-        raise ValueError("Invalid RGBA16Float .utex payload size")
-    values = [
-        item[0]
-        for item in struct.iter_unpack(
-            "<e",
-            data[payload_offset : payload_offset + payload_size],
-        )
-    ]
-    return width, height, values
-
-
-def sample_color_lut_pixels(
-    pixels: list[float],
-    lut_size: int,
-    color: tuple[float, float, float],
-) -> tuple[float, float, float]:
-    """CPU reference for LookShader.metal's trilinear LUT sampling."""
-    width = lut_size * lut_size
-    if len(pixels) != width * lut_size * 4:
-        raise ValueError("LUT pixel count does not match lut_size")
-
-    coords: list[float] = []
-    for channel in color:
-        stops = math.log2(max(channel, 1.0e-6) / _LUT_SHAPER_MIDDLE_GRAY)
-        t = max(0.0, min(1.0, (stops - _LUT_SHAPER_MIN_STOPS) / (_LUT_SHAPER_MAX_STOPS - _LUT_SHAPER_MIN_STOPS)))
-        coords.append(t * (lut_size - 1))
-
-    low = [math.floor(value) for value in coords]
-    high = [min(value + 1, lut_size - 1) for value in low]
-    frac = [coords[index] - low[index] for index in range(3)]
-
-    def texel(r: int, g: int, b: int) -> tuple[float, float, float]:
-        offset = (g * width + b * lut_size + r) * 4
-        return tuple(pixels[offset + channel] for channel in range(3))
-
-    result = [0.0, 0.0, 0.0]
-    for bz, blue_index in enumerate((low[2], high[2])):
-        wb = (1.0 - frac[2]) if bz == 0 else frac[2]
-        for gy, green_index in enumerate((low[1], high[1])):
-            wg = (1.0 - frac[1]) if gy == 0 else frac[1]
-            for rx, red_index in enumerate((low[0], high[0])):
-                wr = (1.0 - frac[0]) if rx == 0 else frac[0]
-                sample = texel(red_index, green_index, blue_index)
-                weight = wr * wg * wb
-                for channel in range(3):
-                    result[channel] += sample[channel] * weight
-    return result[0], result[1], result[2]
-
-
-def bake_color_management_lut(lut_size: int, textures_dir: Path) -> ColorManagementBake:
-    """Bake Blender's active view transform into an RGBA16Float LUT.
-
-    The runtime's look pass (fragmentLookShader) writes to a linear
-    intermediate texture and applies exactly one gamma encode later, in
-    fragmentOutputTransformShader — the same contract ACESFilmicToneMapping's
-    output already follows. A LUT baked straight through save_render() would
-    violate that: save_render() bakes the View Transform AND the scene's
-    display-device sRGB gamma together, so the shipped texture would already
-    be gamma-encoded, and the engine's existing gamma step would then apply a
-    second time on top — washing out the image (lifted blacks, crushed
-    contrast). To keep the single-gamma-encode contract, this bakes through
-    the real display transform (to capture the View Transform's tonemap curve
-    correctly) and then decodes the result back to linear before writing the
-    file actually shipped as the LUT texture.
+    Nothing is rendered or derived here -- the artist's .cube is copied as-is
+    (content-addressed so identical LUTs reused across exports don't pile up
+    under Textures/), and the engine parses/uploads it directly at load time.
     """
-    blender_required()
-    import bpy as _bpy
+    lut_path = lut_path.expanduser().resolve()
+    if not lut_path.is_file():
+        raise RuntimeError(f"--color-grade-lut path does not exist: {lut_path}")
+    if lut_path.suffix.lower() != ".cube":
+        raise RuntimeError(f"--color-grade-lut expects a .cube file, got: {lut_path}")
 
-    scene = _bpy.context.scene
-    view_settings = scene.view_settings
-    view_transform = str(getattr(view_settings, "view_transform", "Standard"))
-    look = str(getattr(view_settings, "look", "None"))
-    exposure = float(getattr(view_settings, "exposure", 0.0))
-    gamma = float(getattr(view_settings, "gamma", 1.0))
+    lut_size, domain_min, domain_max = _parse_cube_lut_header(lut_path)
 
-    lut_size = validate_lut_size(lut_size)
-    width = lut_size * lut_size
-    height = lut_size
+    data = lut_path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    textures_dir = output_dir / "Textures"
     textures_dir.mkdir(parents=True, exist_ok=True)
+    destination_path = textures_dir / f"gradelut_{digest}.cube"
+    if not destination_path.is_file():
+        destination_path.write_bytes(data)
 
-    # Step 1: bake the identity grid through the scene's real, active color
-    # management into a canonical sRGB display target. The engine output
-    # transform is also sRGB, so the exported result does not depend on the
-    # display device selected in the author's Blender UI.
-    with tempfile.NamedTemporaryFile(
-        prefix=".gradelut_display_encoded_",
-        suffix=".png",
-        dir=textures_dir,
-        delete=False,
-    ) as intermediate_file:
-        intermediate_path = Path(intermediate_file.name)
-    bake_image = _bpy.data.images.new(
-        "untold_lut_bake", width=width, height=height, float_buffer=True, alpha=True
-    )
-    display_settings = scene.display_settings
-    saved_display_device = str(getattr(display_settings, "display_device", "sRGB"))
-    saved_dither = float(getattr(scene.render, "dither_intensity", 0.0))
-    try:
-        try:
-            display_settings.display_device = "sRGB"
-        except Exception as error:
-            raise RuntimeError(
-                "The active Blender OCIO configuration has no sRGB display device; "
-                "Untold's canonical output target is sRGB."
-            ) from error
-        if hasattr(scene.render, "dither_intensity"):
-            scene.render.dither_intensity = 0.0
-
-        bake_image.pixels = build_identity_lut_grid_pixels(lut_size)
-        img_settings = scene.render.image_settings
-        saved_settings = (
-            img_settings.file_format,
-            img_settings.color_depth,
-            img_settings.color_mode,
-            getattr(img_settings, "color_management", None),
-        )
-        img_settings.file_format = "PNG"
-        img_settings.color_depth = "16"
-        img_settings.color_mode = "RGBA"
-        if hasattr(img_settings, "color_management"):
-            img_settings.color_management = "FOLLOW_SCENE"
-        try:
-            bake_image.filepath_raw = str(intermediate_path)
-            bake_image.file_format = "PNG"
-            # Uses the scene's real, active view_settings — this is the whole
-            # point of the bake, so no neutralization here.
-            bake_image.save_render(str(intermediate_path), scene=scene)
-        finally:
-            img_settings.file_format, img_settings.color_depth, img_settings.color_mode = saved_settings[:3]
-            if saved_settings[3] is not None:
-                img_settings.color_management = saved_settings[3]
-    except Exception:
-        try:
-            intermediate_path.unlink()
-        except OSError:
-            pass
-        raise
-    finally:
-        _bpy.data.images.remove(bake_image)
-        if hasattr(scene.render, "dither_intensity"):
-            scene.render.dither_intensity = saved_dither
-        display_settings.display_device = saved_display_device
-
-    # Step 2: reload the display-encoded PNG. Blender decodes any image whose
-    # colorspace is "sRGB" back to linear float pixels when populating
-    # .pixels — recovering the tonemapped-but-linear value the engine needs,
-    # using Blender's own color pipeline rather than hand-rolled OETF math.
-    try:
-        reloaded = _bpy.data.images.load(str(intermediate_path))
-        try:
-            reloaded.colorspace_settings.name = "sRGB"
-            linear_pixels = list(reloaded.pixels)
-        finally:
-            _bpy.data.images.remove(reloaded)
-    finally:
-        try:
-            intermediate_path.unlink()
-        except OSError:
-            pass
-
-    # Step 3: preserve the decoded linear values as half floats. This avoids
-    # both 8-bit shadow quantization and ASTC approximation in the color
-    # transform. Content-addressing prevents different scenes exported into
-    # the same directory from overwriting each other's LUT.
-    utex_bytes = build_rgba16f_utex_bytes(linear_pixels, width, height)
-    output_path = textures_dir / color_lut_filename(utex_bytes)
-    output_path.write_bytes(utex_bytes)
-
-    lut_texture = ExportedTexture(
-        name="ColorGradeLUT",
-        uri=str(Path("Textures") / output_path.name),
-        width=width,
-        height=height,
-        mip_count=1,
-        source_path=output_path,
-        texture_format=TEXTURE_FORMAT_RGBA16_FLOAT,
-    )
-    return ColorManagementBake(
-        lut_texture=lut_texture,
-        view_transform=view_transform,
-        look=look,
-        exposure=exposure,
-        gamma=gamma,
+    return ColorGradeLUT(
+        uri=str(Path("Textures") / destination_path.name),
         lut_size=lut_size,
-        display_device="sRGB",
+        domain_min=domain_min,
+        domain_max=domain_max,
+        source_path=destination_path,
     )
 
 
@@ -3961,14 +2934,17 @@ def write_blender_image_to_path(image_name: str, destination_path: Path, *, pres
                     f"by the engine texture pipeline (only 8-bit PNG/JPEG/TGA/etc. "
                     f"are supported). Skipping texture."
                 )
-            # Height/displacement is the one channel that wants to keep its precision
-            # instead of being flattened to 8-bit: POM ray-marches this data, and 8-bit
-            # quantization becomes visible stair-stepping at grazing angles once amplified
+            # Height/displacement and normal maps are the channels that want to keep their
+            # precision instead of being flattened to 8-bit: POM ray-marches height data, and
+            # 8-bit quantization becomes visible stair-stepping at grazing angles once amplified
             # by the parallax offset math (see HeightMapParallaxOcclusionMapping.md §2.2).
-            # The sRGB-16-bit Metal gap that forces 8-bit for color textures doesn't apply
-            # here — height is always linear/non-color data. PNG supports 16-bit grayscale
-            # natively, so only skip the downconvert when there's real precision to keep.
-            target_depth = "16" if (preserve_precision and image_channels < 3 and image_depth >= 16) else "8"
+            # Normal maps encode fine per-texel surface detail (fabric weave, wrinkles, ...);
+            # quantizing that to 8-bit before ASTC compression even runs compounds into visible
+            # noise once lit. The sRGB-16-bit Metal gap that forces 8-bit for color textures
+            # doesn't apply to either — both are always linear/non-color data. PNG supports
+            # 16-bit grayscale and RGB natively, so only skip the downconvert when there's real
+            # precision to keep.
+            target_depth = "16" if (preserve_precision and image_depth >= 16) else "8"
             print(f"  Converting image '{image_name}' (depth={image_depth}, channels={image_channels}) to {target_depth}-bit RGB for Metal compatibility", flush=True)
             scene = bpy.context.scene
             img_settings = scene.render.image_settings
@@ -4162,10 +3138,10 @@ def stage_texture_for_output(
     supported by the engine pipeline (e.g. EXR, HDR) — callers should treat
     None as "no texture" for that material slot.
 
-    preserve_precision: keep 16-bit depth for a genuinely-16-bit grayscale source
-    instead of the usual 8-bit downconvert (see write_blender_image_to_path). Only
-    the height/displacement slot sets this — texbake.py's height path is the only
-    consumer built to preserve and use that extra precision.
+    preserve_precision: keep 16-bit depth for a genuinely-16-bit source instead of
+    the usual 8-bit downconvert (see write_blender_image_to_path). Set by the
+    height/displacement and normal slots — texbake.py's height and normal paths are
+    the consumers built to preserve and use that extra precision.
     """
     source_path = texture.source_path
     texture_dir = output_path.parent / "Textures"
@@ -4428,7 +3404,7 @@ def stage_material_for_output(material: ExportedMaterial, output_path: Path, con
     return replace(
         material,
         base_color_texture=stage_texture_for_output(material.base_color_texture, output_path, context) if material.base_color_texture is not None else None,
-        normal_texture=stage_texture_for_output(material.normal_texture, output_path, context) if material.normal_texture is not None else None,
+        normal_texture=stage_texture_for_output(material.normal_texture, output_path, context, preserve_precision=True) if material.normal_texture is not None else None,
         metallic_texture=stage_texture_for_output(material.metallic_texture, output_path, context) if material.metallic_texture is not None else None,
         roughness_texture=stage_texture_for_output(material.roughness_texture, output_path, context) if material.roughness_texture is not None else None,
         emissive_texture=stage_texture_for_output(material.emissive_texture, output_path, context) if material.emissive_texture is not None else None,
@@ -4669,25 +3645,6 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
                     height_scale = float(distance_input.default_value)
                 # Bump has no Midlevel-equivalent input; height_midlevel/height_remap_max stay
                 # at their neutral defaults.
-
-    baked = _baked_material_textures.get(mesh_object.name)
-    if baked is not None:
-        # Baked images already contain every node-graph contribution, including
-        # solid factors, so the factors must be neutral to avoid double-applying.
-        if baked.base_color is not None:
-            base_color_texture = baked.base_color
-            base_color = (1.0, 1.0, 1.0, 1.0)
-        if baked.orm is not None:
-            roughness_texture = replace(baked.orm, channel=TEXTURE_CHANNEL_G)
-            metallic_texture = replace(baked.orm, channel=TEXTURE_CHANNEL_B)
-            roughness = 1.0
-            metallic = 1.0
-        if baked.normal is not None:
-            normal_texture = baked.normal
-            normal_scale = 1.0
-        if baked.emissive is not None:
-            emissive_texture = baked.emissive
-            emissive = (1.0, 1.0, 1.0)
 
     occlusion_texture = _detect_occlusion_texture(material, asset_path)
 
@@ -5268,9 +4225,6 @@ def extract_nodes(
     convert_orientation: bool = False,
     source_orientation: str = "blender-native",
     validate: bool = False,
-    bake_materials: bool = False,
-    bake_resolution: int = 1024,
-    bake_cache: bool = True,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> list[ExportedNode]:
     blender_required()
@@ -5288,9 +4242,6 @@ def extract_nodes(
             convert_orientation=convert_orientation,
             source_orientation=source_orientation,
             validate=validate,
-            bake_materials=bake_materials,
-            bake_resolution=bake_resolution,
-            bake_cache=bake_cache,
             progress_callback=progress_callback,
         )
     finally:
@@ -5319,9 +4270,6 @@ def extract_nodes_from_objects(
     convert_orientation: bool = False,
     source_orientation: str = "blender-native",
     validate: bool = False,
-    bake_materials: bool = False,
-    bake_resolution: int = 1024,
-    bake_cache: bool = True,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> list[ExportedNode]:
     blender_required()
@@ -5333,21 +4281,6 @@ def extract_nodes_from_objects(
     depsgraph = _bpy.context.evaluated_depsgraph_get()
 
     mesh_objects = [obj for obj in export_objects if getattr(obj, "type", None) == "MESH"]
-
-    _baked_material_textures.clear()
-    if bake_materials:
-        print("  Baking node-graph materials ...", flush=True)
-        if progress_callback is not None:
-            progress_callback("Bake materials", 0, 1, "divergent channels")
-        _baked_material_textures.update(
-            bake_divergent_materials(
-                mesh_objects,
-                resolution=bake_resolution,
-                asset_path=asset_path,
-                use_cache=bake_cache,
-            )
-        )
-        depsgraph = _bpy.context.evaluated_depsgraph_get()
 
     total = len(mesh_objects)
     print(f"  Processing {total} mesh(es) ...", flush=True)
@@ -5376,16 +4309,6 @@ def extract_nodes_from_objects(
 
     for report_line in material_fidelity_report_lines(mesh_objects):
         print(f"  {report_line}", flush=True)
-    if _baked_material_textures:
-        material_name_by_object_name = {
-            obj.name: obj.data.materials[0].name
-            for obj in mesh_objects
-            if getattr(obj.data, "materials", None) and obj.data.materials[0] is not None
-        }
-        for baked_name in sorted(_baked_material_textures):
-            channel_summary = ", ".join(_baked_material_textures[baked_name].channel_labels())
-            material_name = material_name_by_object_name.get(baked_name, "?")
-            print(f"  Baked '{baked_name}' (material '{material_name}'): {channel_summary}", flush=True)
 
     descendant_world_corners_by_name: dict[str, list[tuple[float, float, float]]] = {}
 
@@ -5460,20 +4383,45 @@ def extract_nodes_from_objects(
     return normalize_export_nodes(nodes)
 
 
+def _blender_python_packages_dir() -> Path:
+    """Directory `untoldengine bootstrap` installs Blender-context Python packages
+    into (see BlenderPythonPackageDependency in BootstrapCommand.swift).
+
+    This script runs inside Blender's own bundled Python interpreter, which has its
+    own separate site-packages from the system `python3`. Worse, `untoldengine
+    export` launches Blender with `--factory-startup`, which excludes user
+    site-packages from `sys.path` entirely — so even `pip install --user` run
+    against Blender's own bundled python3 is invisible here. Blender's embedded
+    interpreter also ignores the `PYTHONPATH` environment variable, so bootstrap
+    can't inject it that way either. `pip install --target` into this fixed
+    directory, added to sys.path explicitly below, is the only path that works.
+    """
+    home_root = os.environ.get("UNTOLDENGINE_HOME")
+    base = Path(home_root).expanduser() if home_root else Path.home() / ".untoldengine"
+    return base / "tools" / "blender-python-packages"
+
+
 def _compress_geometry_chunks(vertex_raw: bytes, index_raw: bytes) -> tuple[bytes, bytes]:
     """Compress vertex and index byte arrays with LZ4 raw block format.
 
     Uses lz4.block (not lz4.frame) to produce raw LZ4 block data compatible
     with Apple's COMPRESSION_LZ4_RAW algorithm on the runtime side.
-    Install the dependency with: pip install lz4
+    Install the dependency with: untoldengine bootstrap
     """
     try:
         import lz4.block as lz4_block  # type: ignore[import]
     except ImportError:
-        raise RuntimeError(
-            "The 'lz4' package is required for geometry compression. "
-            "Install it with: pip install lz4"
-        )
+        vendor_dir = _blender_python_packages_dir()
+        if vendor_dir.is_dir() and str(vendor_dir) not in sys.path:
+            sys.path.insert(0, str(vendor_dir))
+        try:
+            import lz4.block as lz4_block  # type: ignore[import]
+        except ImportError:
+            raise RuntimeError(
+                "The 'lz4' package is required for geometry compression, and wasn't "
+                "found in Blender's bundled Python or in "
+                f"{vendor_dir}. Run: untoldengine bootstrap"
+            )
     vertex_compressed: bytes = lz4_block.compress(vertex_raw, store_size=False)
     index_compressed: bytes = lz4_block.compress(index_raw, store_size=False)
     return vertex_compressed, index_compressed
@@ -5495,7 +4443,7 @@ def build_untold_file(
     exported_lights: Optional[list[ExportedLight]] = None,
     exported_cameras: Optional[list[ExportedCamera]] = None,
     compress_geometry: bool = False,
-    color_management_bake: Optional[ColorManagementBake] = None,
+    color_grade_lut: Optional[ColorGradeLUT] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> bytes:
     if not exported_nodes:
@@ -5511,7 +4459,7 @@ def build_untold_file(
     entities: list[EntityRecord] = []
     light_records: list[LightRecord] = []
     camera_records: list[CameraRecord] = []
-    color_management_records: list[ColorManagementRecord] = []
+    color_grade_lut_records: list[ColorGradeLUTRecord] = []
     meshes: list[MeshRecord] = []
     skeletons: list[SkeletonRecord] = []
     skeleton_joints: list[SkeletonJointRecord] = []
@@ -5739,6 +4687,10 @@ def build_untold_file(
     for exported_light in exported_lights:
         entity_id = next_scene_payload_entity_id
         next_scene_payload_entity_id += 1
+        # Set unconditionally for every light type, including SUN/directional:
+        # `intensity` above is always a physical quantity (watts for
+        # point/spot/area, W/m² irradiance for SUN), never the old arbitrary
+        # engine units.
         light_flags = LIGHT_FLAG_RADIOMETRIC
         if exported_light.casts_shadow:
             light_flags |= LIGHT_FLAG_CASTS_SHADOW
@@ -5789,18 +4741,13 @@ def build_untold_file(
             )
         )
 
-    if color_management_bake is not None:
-        lut_texture_index = add_texture(color_management_bake.lut_texture, TEXTURE_FLAG_LUT)
-        color_management_records.append(
-            ColorManagementRecord(
-                lut_texture_index=lut_texture_index,
-                view_transform_name_offset=string_table.add(color_management_bake.view_transform),
-                look_name_offset=string_table.add(color_management_bake.look),
-                exposure=color_management_bake.exposure,
-                gamma=color_management_bake.gamma,
-                shaper_min_stops=color_management_bake.shaper_min_stops,
-                shaper_max_stops=color_management_bake.shaper_max_stops,
-                lut_size=color_management_bake.lut_size,
+    if color_grade_lut is not None:
+        color_grade_lut_records.append(
+            ColorGradeLUTRecord(
+                lut_uri_offset=string_table.add(color_grade_lut.uri),
+                lut_size=color_grade_lut.lut_size,
+                domain_min=color_grade_lut.domain_min,
+                domain_max=color_grade_lut.domain_max,
             )
         )
 
@@ -5832,10 +4779,10 @@ def build_untold_file(
         write_camera_record(camera_writer, camera_record)
     camera_chunk = camera_writer.data
 
-    color_management_writer = BinaryWriter()
-    for color_management_record in color_management_records:
-        write_color_management_record(color_management_writer, color_management_record)
-    color_management_chunk = color_management_writer.data
+    color_grade_lut_writer = BinaryWriter()
+    for color_grade_lut_record in color_grade_lut_records:
+        write_color_grade_lut_record(color_grade_lut_writer, color_grade_lut_record)
+    color_grade_lut_chunk = color_grade_lut_writer.data
 
     skeleton_writer = BinaryWriter()
     for skeleton in skeletons:
@@ -5920,13 +4867,13 @@ def build_untold_file(
         (CHUNK_TYPES["joint_index_data"], joint_index_raw, len(joint_index_raw), 0, COMPRESSION_NONE),
         (CHUNK_TYPES["joint_weight_data"], joint_weight_raw, len(joint_weight_raw), 0, COMPRESSION_NONE),
     ]
-    if color_management_records:
+    if color_grade_lut_records:
         chunk_payloads.append(
             (
-                CHUNK_TYPES["color_management_table"],
-                color_management_chunk,
-                len(color_management_chunk),
-                len(color_management_records),
+                CHUNK_TYPES["color_grade_lut_table"],
+                color_grade_lut_chunk,
+                len(color_grade_lut_chunk),
+                len(color_grade_lut_records),
                 COMPRESSION_NONE,
             )
         )
@@ -6247,11 +5194,7 @@ def export_objects_to_untold(
     source_orientation: str = "blender-native",
     validate: bool = False,
     compress_geometry: bool = False,
-    bake_materials: bool = False,
-    bake_resolution: int = 1024,
-    bake_cache: bool = True,
-    bake_color_management: bool = False,
-    color_lut_size: int = 32,
+    color_grade_lut_path: Optional[Path] = None,
     clean_sidecars: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> dict[str, object]:
@@ -6268,9 +5211,6 @@ def export_objects_to_untold(
             convert_orientation=convert_orientation,
             source_orientation=source_orientation,
             validate=validate,
-            bake_materials=bake_materials,
-            bake_resolution=bake_resolution,
-            bake_cache=bake_cache,
             progress_callback=progress_callback,
         )
     finally:
@@ -6279,17 +5219,13 @@ def export_objects_to_untold(
     if clean_sidecars:
         clean_generated_sidecar_dirs(output_path)
 
-    color_management_bake: Optional[ColorManagementBake] = None
-    if bake_color_management:
+    color_grade_lut: Optional[ColorGradeLUT] = None
+    if color_grade_lut_path is not None:
         if progress_callback is not None:
-            progress_callback("Bake color management", 0, 1, "LUT")
-        color_management_bake = bake_color_management_lut(
-            validate_lut_size(color_lut_size),
-            output_path.parent / "Textures",
-        )
+            progress_callback("Stage color grade LUT", 0, 1, color_grade_lut_path.name)
+        color_grade_lut = stage_color_grade_lut_for_output(color_grade_lut_path, output_path.parent)
 
     exported_nodes = stage_nodes_for_output(exported_nodes, output_path, progress_callback=progress_callback)
-    cleanup_material_bake_temp_dir()
     untold_bytes = build_untold_file(
         exported_nodes,
         output_path,
@@ -6297,7 +5233,7 @@ def export_objects_to_untold(
         exported_lights=exported_lights,
         exported_cameras=exported_cameras,
         compress_geometry=compress_geometry,
-        color_management_bake=color_management_bake,
+        color_grade_lut=color_grade_lut,
         progress_callback=progress_callback,
     )
     if progress_callback is not None:
@@ -6316,7 +5252,6 @@ def export_objects_to_untold(
             output_path,
             output_path.stem,
             [exported_mesh.validation_mesh for exported_mesh in exported_meshes],
-            color_management_bake,
         )
 
     return {
@@ -6329,8 +5264,7 @@ def export_objects_to_untold(
         "camera_count": len(exported_cameras),
         "vertex_count": sum(exported_mesh.vertex_count for exported_mesh in exported_meshes),
         "index_count": sum(exported_mesh.index_count for exported_mesh in exported_meshes),
-        "baked_material_count": len(_baked_material_textures),
-        "color_management_baked": color_management_bake is not None,
+        "color_grade_lut_staged": color_grade_lut is not None,
     }
 
 
@@ -6369,38 +5303,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Export animation-only clip data keyed by the source armature joint paths instead of exporting mesh/model data.",
     )
     parser.add_argument(
-        "--bake-materials",
-        action="store_true",
-        help="Bake node-graph materials the engine cannot evaluate (Mix, Math, procedural textures, ...) into flat textures via Cycles so the exported result matches Blender. Bakes base color, roughness+metallic (packed), normal, and emissive — only the channels that actually diverge.",
-    )
-    parser.add_argument(
-        "--bake-resolution",
-        type=int,
-        default=1024,
-        help=f"Fallback square resolution for baked material textures when a material's own source "
-             f"textures can't be auto-detected (default: 1024, max: {MAX_BAKE_RESOLUTION}). Each "
-             f"material's bake resolution is normally auto-detected from the largest source texture "
-             f"feeding it, rounded up to a power of two, and never goes below this default. Override "
-             f"explicitly via a material['untold_bake_resolution'] custom property.",
-    )
-    parser.add_argument(
-        "--no-bake-cache",
-        action="store_true",
-        help="Disable the persistent bake cache (stored next to the source asset as "
-             ".untold_bake_cache_<name>/) and force every divergent material to be re-baked.",
-    )
-    parser.add_argument(
-        "--bake-color-management",
-        action="store_true",
-        help="Bake the scene's active View Transform/Look/Exposure/Gamma into a color-grading "
-             "RGBA16Float LUT so Untold can closely reproduce Blender's sRGB display transform, "
-             "including Filmic/AgX highlight compression.",
-    )
-    parser.add_argument(
-        "--color-lut-size",
-        type=int,
-        default=32,
-        help=f"Grid size (N) for the NxNxN color-grading LUT (default: 32, max: {MAX_COLOR_LUT_SIZE}).",
+        "--color-grade-lut",
+        default=None,
+        help="Path to an externally-authored standard .cube 3D LUT to stage alongside the export "
+             "and apply as a post-tonemap creative grade. Nothing is rendered or derived from "
+             "Blender -- the .cube is copied as-is and loaded directly by the engine, so any LUT "
+             "from any grading tool works.",
     )
     return parser.parse_args(argv)
 
@@ -6414,8 +5322,6 @@ def main(argv: list[str]) -> int:
         raise RuntimeError(f"Unsupported source asset type: {input_path.suffix}")
     if not input_path.is_file():
         raise RuntimeError(f"Input asset does not exist: {input_path}")
-    args.bake_resolution = validate_bake_resolution(args.bake_resolution)
-    args.color_lut_size = validate_lut_size(args.color_lut_size)
 
     print(f"{'Opening' if input_path.suffix.lower() == '.blend' else 'Importing'} {input_path.name} ...", flush=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6444,9 +5350,6 @@ def main(argv: list[str]) -> int:
             convert_orientation=args.convert_orientation,
             source_orientation=args.source_orientation,
             validate=args.validate,
-            bake_materials=args.bake_materials,
-            bake_resolution=args.bake_resolution,
-            bake_cache=not args.no_bake_cache,
             progress_callback=lambda stage, done, total, detail: progress.stage(
                 stage,
                 f"{done}/{total} {detail}" if total > 1 else detail,
@@ -6462,16 +5365,12 @@ def main(argv: list[str]) -> int:
         print(f"Staging {len(exported_nodes)} node(s) ...", flush=True)
         exported_nodes = stage_nodes_for_output(exported_nodes, output_path)
         staged_hdr_assets = stage_hdr_assets_for_output(output_path.parent, input_path)
-        cleanup_material_bake_temp_dir()
         progress.advance("Stage nodes", output_path.name)
 
-        color_management_bake: Optional[ColorManagementBake] = None
-        if args.bake_color_management:
-            print("Baking color management LUT ...", flush=True)
-            color_management_bake = bake_color_management_lut(
-                args.color_lut_size,
-                output_path.parent / "Textures",
-            )
+        color_grade_lut: Optional[ColorGradeLUT] = None
+        if args.color_grade_lut:
+            print(f"Staging color grade LUT {args.color_grade_lut} ...", flush=True)
+            color_grade_lut = stage_color_grade_lut_for_output(Path(args.color_grade_lut), output_path.parent)
 
         print("Building .untold file ...", flush=True)
         untold_bytes = build_untold_file(
@@ -6481,7 +5380,7 @@ def main(argv: list[str]) -> int:
             exported_lights=exported_lights,
             exported_cameras=exported_cameras,
             compress_geometry=args.compress_geometry,
-            color_management_bake=color_management_bake,
+            color_grade_lut=color_grade_lut,
             progress_callback=lambda stage, done, total, detail: progress.stage(
                 stage,
                 f"{done}/{total} {detail}" if total > 1 else detail,
@@ -6496,10 +5395,12 @@ def main(argv: list[str]) -> int:
         print(f"Lights: {len(exported_lights)}, Cameras: {len(exported_cameras)}")
         if staged_hdr_assets:
             print(f"HDR environments: {len(staged_hdr_assets)}")
+        if color_grade_lut is not None:
+            print(f"Color grade LUT: {color_grade_lut.uri}")
         print(f"Vertices: {sum(exported_mesh.vertex_count for exported_mesh in exported_meshes)}, indices: {sum(exported_mesh.index_count for exported_mesh in exported_meshes)}")
         if args.validate:
             # This sidecar is only for validation/debugging in engine-side tests.
-            validation_path = write_validation_file(output_path, output_path.stem, [exported_mesh.validation_mesh for exported_mesh in exported_meshes], color_management_bake)
+            validation_path = write_validation_file(output_path, output_path.stem, [exported_mesh.validation_mesh for exported_mesh in exported_meshes])
             print(f"Wrote {validation_path}")
         progress.advance("Complete", output_path.name)
     return 0

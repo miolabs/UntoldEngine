@@ -129,16 +129,11 @@ untoldengine export \
 `--optimize` compresses geometry and, when textures are present, bakes and
 patches textures to `.utex`.
 
-Use `--bake-materials` when Blender materials use node graphs the runtime cannot
-evaluate directly:
-
-```bash
-untoldengine export \
-  --input /path/to/lamp.blend \
-  --output ~/Projects/MyGame/Sources/MyGame/GameData/Models/lamp/lamp.untold \
-  --convert-orientation \
-  --bake-materials
-```
+The exporter only reads a fixed set of material inputs (base color,
+roughness, metallic, normal, emissive). If a Blender material uses node
+graphs the runtime cannot evaluate directly (`Mix`, `Math`, procedural
+textures, ...), bake it to flat textures with a third-party tool before
+export so the imported result matches what you see in Blender.
 
 ## Export Animation Clips
 
@@ -165,26 +160,29 @@ used by `changeAnimation(...)`.
 
 ## Export Color Management
 
-If the scene should match Blender's View Transform, Look, Exposure, and Gamma,
-export a baked color LUT:
+To apply a creative color grade on top of the engine's native tonemap
+operator, stage an externally-authored `.cube` LUT with the export:
 
 ```bash
 untoldengine export \
   --input /path/to/office.blend \
   --output ~/Projects/MyGame/Sources/MyGame/GameData/Models/office/office.untold \
   --convert-orientation \
-  --bake-color-management
+  --color-grade-lut GameData/LUTs/warm_grade.cube
 ```
 
 Load scene-authored data after the mesh:
 
 ```swift
 loadSceneAuthored(filename: "office", withExtension: "untold") { success in
-    // Baked color management and authored scene data are registered.
+    // The .cube grade and authored scene data are registered.
 }
 ```
 
-`setEntityMeshAsync(...)` does not load the baked LUT by itself.
+`setEntityMeshAsync(...)` does not load the `.cube` grade by itself. See
+[Using Color Management](../API/UsingColorManagement.md) for the full
+picture, including the tonemap operator and the standalone
+`setColorGradeLUT` API.
 
 ## Export A Streamed Scene
 
@@ -271,7 +269,7 @@ untoldengine export-tiles \
 | --- | --- |
 | Asset does not load | Confirm the `.untold` file is under `Sources/<ProjectName>/GameData/Models/<name>/`. |
 | Animation does not play | Confirm the clip was exported with `--animation` and registered with `setEntityAnimations(...)`. |
-| Blender look does not match | Export with `--bake-color-management` and call `loadSceneAuthored(...)`. |
+| Blender look does not match | Try `setPostFX(.tonemapOperator(.agx))`, or export with `--color-grade-lut` and call `loadSceneAuthored(...)`. |
 | Tiled scene does not stream | Confirm the manifest is under `GameData/StreamModels/<SceneName>/` and tile paths are relative to it. |
 | Optimized export fails | Run `untoldengine bootstrap`, then rerun the export. |
 

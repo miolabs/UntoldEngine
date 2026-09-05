@@ -27,7 +27,7 @@ struct ExportTilesCommand: ParsableCommand {
 
         Example:
           untoldengine export-tiles --input scene.usdz --output-dir tile_exports \\
-            --tile-size-x 25 --tile-size-z 25 --optimize --bake-materials
+            --tile-size-x 25 --tile-size-z 25 --optimize
           untoldengine export-tiles --input scene.blend --output-dir tile_exports \\
             --tile-size-x 25 --tile-size-z 25
         """
@@ -126,20 +126,8 @@ struct ExportTilesCommand: ParsableCommand {
     @Flag(name: .long, help: "Compress geometry and bake/patch textures after export (implies --compress-geometry)")
     var optimize = false
 
-    @Flag(name: .customLong("bake-materials"), help: "Bake node-graph materials the engine can't evaluate (Mix, Math, procedural textures, ...) into flat textures so the export matches Blender")
-    var bakeMaterials = false
-
-    @Option(name: .customLong("bake-resolution"), help: "Square resolution for baked material textures (max: \(ExportCommand.maxBakeResolution)). Override per material via a material['untold_bake_resolution'] custom property")
-    var bakeResolution: Int = 1024
-
-    @Flag(name: .customLong("no-bake-cache"), help: "Disable the persistent bake cache and force every divergent material to be re-baked, even if unchanged since the last export")
-    var noBakeCache = false
-
-    @Flag(name: .customLong("bake-color-management"), help: "Bake the scene's active View Transform/Look/Exposure/Gamma into a scene-wide color-grading LUT referenced from the manifest's colorLUT key")
-    var bakeColorManagement = false
-
-    @Option(name: .customLong("color-lut-size"), help: "Grid size (N) for the NxNxN color-grading LUT")
-    var colorLutSize: Int = 32
+    @Option(name: .customLong("color-grade-lut"), help: "Path to an externally-authored standard .cube 3D LUT to stage once for the whole scene and reference from the manifest's colorGradeLUT key, applied as a post-tonemap creative grade")
+    var colorGradeLUT: String?
 
     func run() throws {
         let outputDirURL = resolvePath(outputDir).standardizedFileURL
@@ -151,14 +139,6 @@ struct ExportTilesCommand: ParsableCommand {
                 throw ExportTilesError.inputNotFound(resolved.path)
             }
             inputURL = resolved
-        }
-
-        guard bakeResolution > 0 else {
-            throw ExportTilesError.invalidBakeResolution(bakeResolution)
-        }
-        let clampedBakeResolution = min(bakeResolution, ExportCommand.maxBakeResolution)
-        if clampedBakeResolution != bakeResolution {
-            printInfo("--bake-resolution \(bakeResolution) is very high; clamping to \(clampedBakeResolution).")
         }
 
         let blenderURL = try resolveBlenderExecutable(override: blender)
@@ -205,14 +185,12 @@ struct ExportTilesCommand: ParsableCommand {
         if writeManifestInDryRun { partitionerArguments.append("--write-manifest-in-dry-run") }
 
         if compressGeometry || optimize { partitionerArguments.append("--compress-geometry") }
-        if bakeMaterials {
-            partitionerArguments.append("--bake-materials")
-            partitionerArguments += ["--bake-resolution", String(clampedBakeResolution)]
-            if noBakeCache { partitionerArguments.append("--no-bake-cache") }
-        }
-        if bakeColorManagement {
-            partitionerArguments.append("--bake-color-management")
-            partitionerArguments += ["--color-lut-size", String(colorLutSize)]
+        if let colorGradeLUT {
+            let lutURL = resolvePath(colorGradeLUT).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: lutURL.path) else {
+                throw ExportTilesError.colorGradeLUTNotFound(lutURL.path)
+            }
+            partitionerArguments += ["--color-grade-lut", lutURL.path]
         }
 
         printInfo("Using Blender: \(blenderURL.path)")
@@ -289,7 +267,7 @@ enum ExportTilesError: LocalizedError {
     case partitionerNotInstalled(String)
     case exportFailed(Int32)
     case optimizeFailed(Int32)
-    case invalidBakeResolution(Int)
+    case colorGradeLUTNotFound(String)
 
     var errorDescription: String? {
         switch self {
@@ -301,8 +279,8 @@ enum ExportTilesError: LocalizedError {
             return "Blender tile partitioner failed with exit status \(status)"
         case let .optimizeFailed(status):
             return "Texture optimization (texbake) failed with exit status \(status)"
-        case let .invalidBakeResolution(value):
-            return "--bake-resolution must be a positive integer, got \(value)"
+        case let .colorGradeLUTNotFound(path):
+            return "--color-grade-lut path does not exist: \(path)"
         }
     }
 }

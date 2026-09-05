@@ -286,6 +286,7 @@ public func destroyAllEntities(completion: (() -> Void)? = nil) {
     enforceRegistrationMainActor()
     SceneAuthoredSourceStore.shared.clear()
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     enqueuePendingDestroyCompletion(completion)
 
     let toDestroy = scene.getAllEntities()
@@ -1139,6 +1140,100 @@ private func loadColorLUTTexture(_ reference: RuntimeTextureReference?) -> MTLTe
     }
 }
 
+/// Loads an externally-authored .cube grade LUT and applies it as global
+/// rendering state, composing with (not replacing) whichever tonemap ran.
+/// Same transactional clear-then-publish contract as replaceColorManagement.
+private func replaceColorGradeLUT(_ colorGradeLUT: RuntimeColorGradeLUT?) {
+    ColorGradeLUTParams.shared.clear()
+
+    guard let colorGradeLUT, let url = colorGradeLUT.lutURL else {
+        return
+    }
+
+    guard (2 ... 129).contains(colorGradeLUT.lutSize),
+          colorGradeLUT.domainMax.x > colorGradeLUT.domainMin.x,
+          colorGradeLUT.domainMax.y > colorGradeLUT.domainMin.y,
+          colorGradeLUT.domainMax.z > colorGradeLUT.domainMin.z
+    else {
+        Logger.log(
+            message: "[UntoldColorGradeLUT] Invalid LUT parameters; skipping the creative grade",
+            category: LogCategory.textureLoading.rawValue
+        )
+        return
+    }
+
+    loadAndInstallColorGradeLUT(from: url, expectedLUTSize: colorGradeLUT.lutSize)
+}
+
+/// Parses a .cube at `url` and installs it into ColorGradeLUTParams, using the
+/// parsed file's own domainMin/domainMax (not a separately-cached copy, so an
+/// artist hand-editing the .cube in place can't drift out of sync with a stale
+/// manifest/record). `expectedLUTSize` is an optional consistency check against
+/// a manifest/record's declared size -- pass nil when loading directly from a
+/// bare URL with no prior expectations (see setColorGradeLUT).
+private func loadAndInstallColorGradeLUT(
+    from url: URL,
+    expectedLUTSize: Int?,
+    sourceFilename: String? = nil,
+    sourceExtension: String? = nil
+) {
+    do {
+        let (texture, lut) = try CubeLUTLoader.loadTexture(device: renderInfo.device, from: url)
+        if let expectedLUTSize, lut.size != expectedLUTSize {
+            Logger.log(
+                message: "[UntoldColorGradeLUT] .cube LUT_3D_SIZE \(lut.size) does not match expected \(expectedLUTSize); skipping the creative grade",
+                category: LogCategory.textureLoading.rawValue
+            )
+            return
+        }
+        ColorGradeLUTParams.shared.replace(
+            texture: texture,
+            domainMin: lut.domainMin,
+            domainMax: lut.domainMax,
+            sourceFilename: sourceFilename,
+            sourceExtension: sourceExtension
+        )
+    } catch {
+        Logger.log(
+            message: "[UntoldColorGradeLUT] Failed to load '\(url.lastPathComponent)': \(error); skipping the creative grade",
+            category: LogCategory.textureLoading.rawValue
+        )
+    }
+}
+
+/// Loads a standalone .cube color-grade LUT and applies it immediately, fully
+/// independent of any scene/manifest -- unlike the colorGradeLUT reference
+/// installed by loadSceneAuthored, this can point at any .cube file (hand
+/// authored, from a grading tool, downloaded, or shipped with the app) and
+/// takes effect without re-exporting or reloading the scene.
+///
+/// `filename` is resolved the same way every other asset name is (see
+/// LoadingSystem.getResourceURL): a bare name searches the standard
+/// structured folders (a new "LUT" folder alongside Models/Textures/etc.),
+/// while an absolute path is used directly.
+public func setColorGradeLUT(filename: String, withExtension: String = "cube") {
+    guard let url = LoadingSystem.shared.resourceURL(
+        forResource: filename,
+        withExtension: withExtension,
+        subResource: nil
+    ) else {
+        ColorGradeLUTParams.shared.clear()
+        Logger.log(
+            message: "[UntoldColorGradeLUT] '\(filename).\(withExtension)' not found; skipping the creative grade",
+            category: LogCategory.textureLoading.rawValue
+        )
+        return
+    }
+
+    ColorGradeLUTParams.shared.clear()
+    loadAndInstallColorGradeLUT(
+        from: url,
+        expectedLUTSize: nil,
+        sourceFilename: filename,
+        sourceExtension: withExtension
+    )
+}
+
 private func registerUntoldLight(_ light: RuntimeLightSource) {
     let lightEntityId = createEntity()
 
@@ -1429,8 +1524,7 @@ public func setEntityMeshAsync(
     }
 }
 
-/// Loads scene-authored lights/cameras and replaces the active scene color
-/// management from a `.untold` asset, separate from any mesh load.
+/// Loads scene-authored lights/cameras from a `.untold` asset, separate from any mesh load.
 ///
 /// Call this alongside `setEntityMeshAsync` when you want to bring scene-authored
 /// lights and cameras from an exported asset into the current scene without coupling
@@ -1440,18 +1534,7 @@ public func loadSceneAuthored(
     withExtension ext: String,
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
-    loadSceneAuthored(filename: filename, withExtension: ext, registerEntities: true, completion: completion)
-}
-
-private func loadSceneAuthored(
-    filename: String,
-    withExtension ext: String,
-    registerEntities: Bool,
-    completion: (@Sendable (Bool) -> Void)? = nil
-) {
     Task {
-        ColorLUTParams.shared.clear()
-        SceneAuthoredSourceStore.shared.clear()
         guard let url = LoadingSystem.shared.resourceURL(
             forResource: filename, withExtension: ext, subResource: nil
         ) else {
@@ -1466,29 +1549,19 @@ private func loadSceneAuthored(
             return
         }
 
-        let sourceReference = sceneAssetReference(
-            kind: .model,
-            url: url,
-            displayName: url.deletingPathExtension().lastPathComponent
-        )
         guard let runtimeAsset = loadUntoldRuntimeAsset(url: url) else {
             completion?(false)
             return
         }
 
-        replaceColorManagement(runtimeAsset.colorManagement)
-        SceneAuthoredSourceStore.shared.source = sourceReference
-        if registerEntities {
-            withWorldMutationGate {
-                registerUntoldScenePayload(from: runtimeAsset)
-            }
+        withWorldMutationGate {
+            registerUntoldScenePayload(from: runtimeAsset)
         }
         completion?(true)
     }
 }
 
-/// Loads scene-authored lights/cameras and replaces the active scene color
-/// management from a `.json` tile manifest, separate from tile residency.
+/// Loads scene-authored lights/cameras from a `.json` tile manifest, separate from tile residency.
 ///
 /// Call this alongside `setEntityStreamScene` when the manifest contains
 /// `scene_lights` / `scene_cameras` you want imported into the current scene.
@@ -1496,17 +1569,7 @@ public func loadSceneAuthored(
     url manifestURL: URL,
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
-    loadSceneAuthored(url: manifestURL, registerEntities: true, completion: completion)
-}
-
-private func loadSceneAuthored(
-    url manifestURL: URL,
-    registerEntities: Bool,
-    completion: (@Sendable (Bool) -> Void)? = nil
-) {
     Task {
-        ColorLUTParams.shared.clear()
-        SceneAuthoredSourceStore.shared.clear()
         do {
             let localURL: URL
             if manifestURL.scheme?.lowercased() == "https" {
@@ -1525,61 +1588,14 @@ private func loadSceneAuthored(
                 return
             }
 
-            let sourceReference = sceneAssetReference(
-                kind: .streamModel,
-                url: manifestURL,
-                displayName: manifestURL.deletingPathExtension().lastPathComponent
-            )
-            let colorManagement = try await manifestColorManagement(
-                tileManifest.colorLUT,
-                manifestURL: manifestURL,
-                localManifestURL: localURL
-            )
-            replaceColorManagement(colorManagement)
-            SceneAuthoredSourceStore.shared.source = sourceReference
-            if registerEntities {
-                withWorldMutationGate {
-                    registerManifestScenePayload(tileManifest)
-                }
+            withWorldMutationGate {
+                registerManifestScenePayload(tileManifest)
             }
             completion?(true)
         } catch {
             handleError(.manifestNotFound, error.localizedDescription, manifestURL.lastPathComponent)
             completion?(false)
         }
-    }
-}
-
-func loadSceneAuthoredColorManagement(
-    from source: SceneAssetReference,
-    completion: (@Sendable (Bool) -> Void)? = nil
-) {
-    switch source.kind {
-    case .model:
-        guard let url = resolvedSceneAssetURL(source) else {
-            ColorLUTParams.shared.clear()
-            SceneAuthoredSourceStore.shared.clear()
-            completion?(false)
-            return
-        }
-        loadSceneAuthored(
-            filename: url.path,
-            withExtension: url.pathExtension,
-            registerEntities: false,
-            completion: completion
-        )
-    case .streamModel:
-        guard let url = resolvedSceneAssetURL(source) else {
-            ColorLUTParams.shared.clear()
-            SceneAuthoredSourceStore.shared.clear()
-            completion?(false)
-            return
-        }
-        loadSceneAuthored(url: url, registerEntities: false, completion: completion)
-    case .animation, .procedural:
-        ColorLUTParams.shared.clear()
-        SceneAuthoredSourceStore.shared.clear()
-        completion?(false)
     }
 }
 
@@ -1658,6 +1674,7 @@ public func setEntityMeshDirect(entityId: EntityID, meshes: [Mesh], assetName: S
 /// Called by registerTiledScene before registering new tile stubs.
 private func clearScene() {
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     SceneAuthoredSourceStore.shared.clear()
     for entity in scene.getAllEntities() {
         destroyEntity(entityId: entity)
@@ -1705,6 +1722,10 @@ private struct TileManifest: Decodable {
     let sceneLights: [ManifestLightEntry]?
     let sceneCameras: [ManifestCameraEntry]?
     let colorLUT: ManifestColorManagementEntry?
+    /// An externally-authored .cube grade LUT (see stage_color_grade_lut_for_output
+    /// in scripts/untoldexplorer.py) — separate from colorLUT above, which is a
+    /// proprietary baked-.utex whole-transform bake.
+    let colorGradeLUT: ManifestColorGradeLUTEntry?
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -1717,6 +1738,7 @@ private struct TileManifest: Decodable {
         case sceneLights = "scene_lights"
         case sceneCameras = "scene_cameras"
         case colorLUT
+        case colorGradeLUT
     }
 }
 
@@ -1730,6 +1752,13 @@ private struct ManifestColorManagementEntry: Decodable {
     let gamma: Float
     let shaperMinStops: Float
     let shaperMaxStops: Float
+}
+
+private struct ManifestColorGradeLUTEntry: Decodable {
+    let lutUri: String
+    let lutSize: Int
+    let domainMin: [Float]
+    let domainMax: [Float]
 }
 
 private struct ManifestLightEntry: Decodable {
@@ -2150,6 +2179,58 @@ private func manifestColorManagement(
     )
 }
 
+/// Resolves a manifest `colorGradeLUT` entry into a RuntimeColorGradeLUT,
+/// downloading it first if the manifest is remote. Mirrors
+/// manifestColorManagement's URL resolution, but the target file is a plain
+/// staged .cube (parsed directly by CubeLUTLoader), not a native texture.
+private func manifestColorGradeLUT(
+    _ entry: ManifestColorGradeLUTEntry?,
+    manifestURL: URL,
+    localManifestURL: URL
+) async throws -> RuntimeColorGradeLUT? {
+    guard let entry else { return nil }
+    guard (2 ... 129).contains(entry.lutSize),
+          entry.domainMin.count == 3,
+          entry.domainMax.count == 3,
+          entry.domainMax[0] > entry.domainMin[0],
+          entry.domainMax[1] > entry.domainMin[1],
+          entry.domainMax[2] > entry.domainMin[2]
+    else {
+        throw UntoldValidationError.invalidColorGradeLUTRecord
+    }
+
+    let baseURL = manifestURL.scheme?.lowercased() == "https"
+        ? manifestURL.deletingLastPathComponent()
+        : localManifestURL.deletingLastPathComponent()
+    let resolvedURL: URL
+    if let absolute = URL(string: entry.lutUri), absolute.scheme != nil {
+        resolvedURL = absolute
+    } else if baseURL.isFileURL {
+        resolvedURL = baseURL.appendingPathComponent(entry.lutUri)
+    } else {
+        guard let remoteURL = URL(string: entry.lutUri, relativeTo: baseURL)?.absoluteURL else {
+            throw URLError(.badURL)
+        }
+        resolvedURL = remoteURL
+    }
+
+    let localLUTURL: URL
+    if resolvedURL.scheme?.lowercased() == "https" {
+        localLUTURL = try await RemoteAssetDownloader.shared.localURL(for: resolvedURL)
+    } else if resolvedURL.scheme?.lowercased() == "http" {
+        throw RemoteAssetDownloader.DownloadError.insecureScheme("http")
+    } else {
+        localLUTURL = resolvedURL
+    }
+
+    return RuntimeColorGradeLUT(
+        lutURL: localLUTURL,
+        lutSize: entry.lutSize,
+        domainMin: SIMD3<Float>(entry.domainMin[0], entry.domainMin[1], entry.domainMin[2]),
+        domainMax: SIMD3<Float>(entry.domainMax[0], entry.domainMax[1], entry.domainMax[2])
+    )
+}
+
 // MARK: - setEntityStreamScene / loadTiledScene
 
 /// Attaches a distance-streamed tile scene to `rootEntityId`.
@@ -2203,6 +2284,7 @@ public func setEntityStreamScene(
 
     let completionBox = completion.map { BoolCompletionBox(callback: $0) }
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let colorManagement = try await manifestColorManagement(
@@ -2211,6 +2293,12 @@ public func setEntityStreamScene(
                 localManifestURL: manifestURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: manifestURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             registerTiledScene(
                 rootEntityId: rootEntityId,
                 manifest: tileManifest,
@@ -2263,6 +2351,7 @@ public func loadTiledScene(
 
     let completionBox = completion.map { BoolCompletionBox(callback: $0) }
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let colorManagement = try await manifestColorManagement(
@@ -2271,6 +2360,12 @@ public func loadTiledScene(
                 localManifestURL: manifestURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: manifestURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             let rootEntityId = createEntity()
             setEntityName(entityId: rootEntityId, name: "\(manifest).root")
             registerTiledScene(
@@ -2310,6 +2405,7 @@ public func setEntityStreamScene(
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let localURL: URL
@@ -2340,6 +2436,12 @@ public func setEntityStreamScene(
                 localManifestURL: localURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: localURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             registerTiledScene(
                 rootEntityId: rootEntityId,
                 manifest: tileManifest,
@@ -2372,6 +2474,7 @@ public func loadTiledScene(
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let localURL: URL
@@ -2402,6 +2505,12 @@ public func loadTiledScene(
                 localManifestURL: localURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: localURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             let rootEntityId = createEntity()
             setEntityName(entityId: rootEntityId, name: "\(manifestURL.deletingPathExtension().lastPathComponent).root")
 

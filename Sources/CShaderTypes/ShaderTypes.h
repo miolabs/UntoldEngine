@@ -100,6 +100,27 @@ typedef enum{
 }GridPassBufferIndices;
 
 typedef enum{
+    skyPassPositionIndex,
+    skyPassUniformIndex,
+}SkyPassBufferIndices;
+
+// Uniforms for the procedural atmospheric sky background pass. invViewMatrix/invProjectionMatrix
+// let the vertex shader reconstruct a world-space ray per pixel; sunDirection/sunColor/sunIntensity
+// are sourced from the engine's active directional light so the sun position drives the sky's
+// appearance. Physical scattering constants (Rayleigh/Mie/ozone coefficients, planet/atmosphere
+// radii) live as `constant` values inside SkyShader.metal, not here, so they can later be promoted
+// into LUT precompute passes (Transmittance/Sky-View/Aerial Perspective) without changing this struct.
+typedef struct
+{
+    matrix_float4x4 invViewMatrix;
+    matrix_float4x4 invProjectionMatrix;
+    simd_float3 cameraPosition;
+    simd_float3 sunDirection;
+    simd_float3 sunColor;
+    float sunIntensity;
+} SkyUniforms;
+
+typedef enum{
     modelPassVerticesIndex,
     modelPassNormalIndex,
     modelPassUVIndex,
@@ -117,6 +138,7 @@ typedef enum{
     modelPassFragmentMaterialParameterIndex,
     modelPassFragmentSTScaleIndex,
     modelPassFragmentPOMQualityIndex,
+    modelPassFragmentNormalIsPackedXYIndex,
 }ModelPassFragmentBufferIndices;
 
 
@@ -226,6 +248,31 @@ typedef enum{
     colorLUTShaperMaxStopsIndex,
     colorLUTSizeIndex,
 }ColorLUTPassBufferIndices;
+
+typedef enum {
+    colorGradeLUTTextureIndex = 2,   // texture(0)=sceneTexture, texture(1)=colorLUTTexture (whole-transform bake)
+} LookPassGradeLUTTextureIndices;
+
+typedef enum{
+    // An externally-authored .cube LUT (see CubeLUTLoader.swift), applied as a
+    // post-tonemap creative grade -- independent of, and composable with,
+    // ColorLUTPassBufferIndices above (which replaces the tonemap entirely).
+    colorGradeLUTEnabledIndex = 11,   // starts after ColorLUTPassBufferIndices (7-10)
+    colorGradeLUTDomainMinIndex,
+    colorGradeLUTDomainMaxIndex,
+}ColorGradeLUTPassBufferIndices;
+
+// Selects which native tonemap operator the look pass runs when colorLUTEnabled
+// (the whole-transform bake) is off. Only meaningful in that branch -- the
+// baked LUT and the .cube grade above are unaffected by this selector.
+typedef enum {
+    tonemapOperatorSelectIndex = 14,   // starts after ColorGradeLUTPassBufferIndices (11-13)
+} TonemapSelectBufferIndices;
+
+typedef enum {
+    tonemapOperatorACES = 0,
+    tonemapOperatorAgX = 1,
+} TonemapOperatorID;
 
 typedef enum{
     colorCorrectionPassColorTextureIndex,
@@ -645,6 +692,7 @@ typedef enum{
     transparencyPassFragmentHasNormalTextureIndex,
     transparencyPassFragmentMaterialParameterIndex,
     transparencyPassFragmentSTScaleIndex,
+    transparencyPassFragmentNormalIsPackedXYIndex,
 }TransparencyPassFragmentBufferIndices;
 
 typedef enum{
@@ -661,7 +709,7 @@ typedef enum{
 }TransparencyPassSamplerIndices;
 
 typedef enum {
-    transparencyPassLightOrthoViewMatrixIndex = 4, // starts after TransparencyPassFragmentBufferIndices
+    transparencyPassLightOrthoViewMatrixIndex = 5, // starts after TransparencyPassFragmentBufferIndices
     transparencyPassLightParamsIndex,
     transparencyPassCameraPositionIndex,           // simd_float3 (camera position)
     transparencyPassPointLightsIndex,              // PointLightBlock

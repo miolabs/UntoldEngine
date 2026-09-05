@@ -9,6 +9,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import CShaderTypes
 import Foundation
 import MetalKit
 import simd
@@ -842,6 +843,7 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var gameModeValue: Bool = true
     private var applyIBLValue: Bool = false
     private var renderEnvironmentValue: Bool = false
+    private var renderSkyBackgroundValue: Bool = false
     private var ambientIntensityValue: Float = 0.4
     private var hdrURLValue: String = "teatro_massimo_2k.hdr"
     private var resourceURLValue: URL?
@@ -1208,6 +1210,22 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         set {
             lock.lock()
             renderEnvironmentValue = newValue
+            lock.unlock()
+        }
+    }
+
+    /// Selects the procedural atmospheric sky (true, default) vs. the debug/editor grid (false)
+    /// as the non-XR background when IBL (renderEnvironment) is disabled.
+    var renderSkyBackground: Bool {
+        get {
+            lock.lock()
+            let value = renderSkyBackgroundValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            renderSkyBackgroundValue = newValue
             lock.unlock()
         }
     }
@@ -1594,6 +1612,11 @@ public var renderEnvironment: Bool {
     set { RuntimeGlobalsStore.shared.renderEnvironment = newValue }
 }
 
+public var renderSkyBackground: Bool {
+    get { RuntimeGlobalsStore.shared.renderSkyBackground }
+    set { RuntimeGlobalsStore.shared.renderSkyBackground = newValue }
+}
+
 public var ambientIntensity: Float {
     get { RuntimeGlobalsStore.shared.ambientIntensity }
     set { RuntimeGlobalsStore.shared.ambientIntensity = newValue }
@@ -1917,6 +1940,135 @@ public final class ColorLUTParams: @unchecked Sendable {
         )
         lock.unlock()
         return value
+    }
+}
+
+/// An externally-authored standard .cube 3D LUT (see CubeLUTLoader), applied
+/// as a post-tonemap creative grade. Unlike ColorLUTParams above (which
+/// replaces the tonemap step entirely with a proprietary baked LUT), this
+/// composes with whichever tonemap operator ran and operates in ordinary
+/// [domainMin, domainMax] display-referred space -- no shaper encoding.
+/// Asset-derived, installed/cleared by the scene-authored payload loader.
+struct ColorGradeLUTSnapshot {
+    let enabled: Bool
+    let lutTexture: MTLTexture?
+    let domainMin: SIMD3<Float>
+    let domainMax: SIMD3<Float>
+}
+
+public final class ColorGradeLUTParams: @unchecked Sendable {
+    public static let shared = ColorGradeLUTParams()
+
+    private struct State {
+        var enabled = false
+        var lutTexture: MTLTexture?
+        var domainMin = SIMD3<Float>(0, 0, 0)
+        var domainMax = SIMD3<Float>(1, 1, 1)
+        // Only set when installed via the standalone setColorGradeLUT(filename:)
+        // API (nil for the scene-authored colorGradeLUT path, which is already
+        // restorable via SceneData.sceneAuthoredSource) -- lets the scene
+        // serializer persist and restore a manually-chosen LUT independent of
+        // any scene asset. See SceneSerializer.swift.
+        var sourceFilename: String?
+        var sourceExtension: String?
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+
+    public var enabled: Bool {
+        get { snapshot().enabled }
+        set { setEnabled(newValue) }
+    }
+
+    public func setEnabled(_ enabled: Bool) {
+        lock.lock()
+        state.enabled = enabled && state.lutTexture != nil
+        lock.unlock()
+    }
+
+    func replace(
+        texture: MTLTexture,
+        domainMin: SIMD3<Float>,
+        domainMax: SIMD3<Float>,
+        sourceFilename: String? = nil,
+        sourceExtension: String? = nil
+    ) {
+        lock.lock()
+        state = State(
+            enabled: true,
+            lutTexture: texture,
+            domainMin: domainMin,
+            domainMax: domainMax,
+            sourceFilename: sourceFilename,
+            sourceExtension: sourceExtension
+        )
+        lock.unlock()
+    }
+
+    public func clear() {
+        lock.lock()
+        state = State()
+        lock.unlock()
+    }
+
+    /// The filename/extension last passed to setColorGradeLUT, if the active
+    /// LUT (if any) was installed that way. Used by the scene serializer.
+    public var source: (filename: String, extension: String)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let filename = state.sourceFilename, let ext = state.sourceExtension else { return nil }
+        return (filename, ext)
+    }
+
+    func snapshot() -> ColorGradeLUTSnapshot {
+        lock.lock()
+        let value = ColorGradeLUTSnapshot(
+            enabled: state.enabled,
+            lutTexture: state.lutTexture,
+            domainMin: state.domainMin,
+            domainMax: state.domainMax
+        )
+        lock.unlock()
+        return value
+    }
+}
+
+/// Which native tonemap operator the look pass runs when no whole-transform
+/// bake (ColorLUTParams) is active. Independent of, and composable with,
+/// both ColorLUTParams and ColorGradeLUTParams above.
+public enum TonemapOperator: String, Sendable, Codable, Equatable {
+    case aces
+    case agx
+
+    var shaderValue: Int32 {
+        switch self {
+        case .aces: Int32(tonemapOperatorACES.rawValue)
+        case .agx: Int32(tonemapOperatorAgX.rawValue)
+        }
+    }
+}
+
+public final class TonemapParams: @unchecked Sendable {
+    public static let shared = TonemapParams()
+
+    // ACES Filmic is the engine's default tonemap operator. AgX (Blender's
+    // default View Transform since 4.0) is available via
+    // setPostFX(.tonemapOperator(.agx)) for scenes that want to match it.
+    private let lock = NSLock()
+    private var _operator: TonemapOperator = .aces
+
+    public var `operator`: TonemapOperator {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _operator
+        }
+        set {
+            lock.lock()
+            _operator = newValue
+            lock.unlock()
+        }
     }
 }
 
