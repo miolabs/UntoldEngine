@@ -331,6 +331,19 @@ final class AnimationMotionMatchingTests: XCTestCase {
                        "With a floor larger than the gain the incumbent keeps playing")
     }
 
+    func testPrepareBuildsDatabaseBeforeEnable() {
+        prepareMotionMatching(entityId: entityId)
+        XCTAssertNotNil(animationComponent.motionMatching.database, "Built eagerly")
+        XCTAssertFalse(isMotionMatchingEnabled(entityId: entityId))
+        XCTAssertNil(animationComponent.currentAnimation, "Preparing does not start playback")
+
+        let database = animationComponent.motionMatching.database
+        setMotionMatchingEnabled(entityId: entityId, enabled: true)
+        run(seconds: 0.1, goal: simd_float3(0, 0, 1))
+        XCTAssertNotNil(animationComponent.currentAnimation, "First enabled update searches")
+        XCTAssertTrue(animationComponent.motionMatching.database === database, "Prepared database is kept")
+    }
+
     func testDisabledByDefault() {
         // Descriptor set in setUp, but not enabled: nothing should play.
         run(seconds: 0.5, goal: simd_float3(0, 0, 1))

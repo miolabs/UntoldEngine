@@ -429,7 +429,7 @@ private func buildMotionMatchingQuery(
 
 // MARK: - Database build and jumps
 
-private func buildMotionDatabase(
+func buildMotionDatabase(
     animationComponent: AnimationComponent,
     skeleton: Skeleton,
     descriptor: MotionMatchingDescriptor

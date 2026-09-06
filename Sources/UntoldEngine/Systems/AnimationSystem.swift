@@ -481,6 +481,32 @@ public func setMotionMatching(entityId: EntityID, descriptor: MotionMatchingDesc
     }
 }
 
+/// Builds the motion database now rather than on the first enabled update,
+/// so enabling motion matching later — say, handing a character over from
+/// a scripted idle — does not stall that frame. Needs a descriptor and the
+/// clips already loaded; a no-op once the database exists.
+public func prepareMotionMatching(entityId: EntityID) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (componentEntityId, animationComponent) in animationComponents {
+        guard animationComponent.motionMatching.database == nil,
+              let descriptor = animationComponent.motionMatching.descriptor,
+              let skeletonComponent = scene.get(component: SkeletonComponent.self, for: componentEntityId)
+        else { continue }
+        buildMotionDatabase(
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            descriptor: descriptor
+        )
+        // Search on the first enabled update, as the lazy path does.
+        animationComponent.motionMatching.searchClock = descriptor.searchInterval
+    }
+}
+
 public func setMotionMatchingEnabled(entityId: EntityID, enabled: Bool) {
     let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
     guard animationComponents.isEmpty == false else {
