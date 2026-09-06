@@ -281,7 +281,11 @@ final class MotionDatabase {
     /// vector; returns the best frame index. When `preferredIndex` is
     /// given (the frame playback is currently at), the search is seeded
     /// with its discounted cost, so only meaningfully better frames win.
-    func search(query: [Float], preferredIndex: Int? = nil) -> Int? {
+    /// `minimumGain` is an absolute floor on how much better (in scaled
+    /// feature-space cost) a candidate must be than the incumbent to win:
+    /// the relative switch margin alone lets negligible differences between
+    /// two near-perfect matches trigger a jump.
+    func search(query: [Float], preferredIndex: Int? = nil, minimumGain: Float = 0) -> Int? {
         guard query.count == dimensions, frames.isEmpty == false else { return nil }
 
         var scaledQuery = query
@@ -291,6 +295,7 @@ final class MotionDatabase {
 
         var bestIndex = 0
         var bestCost = Float.greatestFiniteMagnitude
+        var incumbentCost: Float?
         if let preferredIndex, preferredIndex >= 0, preferredIndex < frames.count {
             var cost: Float = 0
             let base = preferredIndex * dimensions
@@ -300,6 +305,7 @@ final class MotionDatabase {
             }
             bestIndex = preferredIndex
             bestCost = cost * Self.switchMargin
+            incumbentCost = cost
         }
         features.withUnsafeBufferPointer { buffer in
             for f in 0 ..< frames.count {
@@ -317,6 +323,11 @@ final class MotionDatabase {
                     bestIndex = f
                 }
             }
+        }
+        if let preferredIndex, let incumbentCost, bestIndex != preferredIndex,
+           incumbentCost - bestCost < minimumGain
+        {
+            return preferredIndex
         }
         return bestIndex
     }

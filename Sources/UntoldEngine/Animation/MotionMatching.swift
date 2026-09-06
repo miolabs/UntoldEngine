@@ -63,6 +63,13 @@ public struct MotionMatchingDescriptor {
     /// default) disables it; a few radians per second is typical.
     public var headingCorrectionRate: Float
 
+    /// Absolute floor on the cost improvement a candidate frame needs over
+    /// the incumbent before a jump fires (scaled feature-space units). The
+    /// relative switch margin is meaningless when both costs are tiny — a
+    /// standing character re-matching the stillest frame of its idle every
+    /// search "restarts" the idle instead of playing it through.
+    public var switchMinimumGain: Float
+
     /// Minimum time playback runs before another jump may fire. The search
     /// still runs every `searchInterval`, but without this floor a frame
     /// that systematically beats the incumbent (for example the velocity
@@ -83,6 +90,7 @@ public struct MotionMatchingDescriptor {
         predictionHalflife: Float = 0.25,
         maxTurnRate: Float = 2.0,
         headingCorrectionRate: Float = 0,
+        switchMinimumGain: Float = 0.05,
         minPlayTime: Float = 0.3,
         weights: MotionMatchingWeights = MotionMatchingWeights()
     ) {
@@ -95,6 +103,7 @@ public struct MotionMatchingDescriptor {
         self.predictionHalflife = predictionHalflife
         self.maxTurnRate = maxTurnRate
         self.headingCorrectionRate = headingCorrectionRate
+        self.switchMinimumGain = switchMinimumGain
         self.minPlayTime = minPlayTime
         self.weights = weights
     }
@@ -279,7 +288,7 @@ func updateMotionMatching(
         database: database,
         descriptor: descriptor,
         inverseEntityYaw: inverseEntityYaw
-    ), let best = database.search(query: query, preferredIndex: preferredIndex) else { return }
+    ), let best = database.search(query: query, preferredIndex: preferredIndex, minimumGain: descriptor.switchMinimumGain) else { return }
 
     let frame = database.frames[best]
     let clip = database.clips[frame.clipIndex]

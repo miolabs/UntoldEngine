@@ -317,6 +317,20 @@ final class AnimationMotionMatchingTests: XCTestCase {
         XCTAssertGreaterThan(withWarp, 0.8, "The warp must rotate the traveling character toward the goal")
     }
 
+    /// A candidate that beats the incumbent by less than the minimum gain
+    /// must not win, however good the relative margin looks.
+    func testSearchIgnoresNegligibleGains() throws {
+        let database = try XCTUnwrap(buildDatabase())
+        XCTAssertGreaterThan(database.frames.count, 32)
+
+        // Query reproducing frame 30 exactly; its neighbour is the incumbent.
+        let query = database.rawFeatures(at: 30)
+        let exact = try XCTUnwrap(database.search(query: query, preferredIndex: 31, minimumGain: 0))
+        XCTAssertNotEqual(exact, 31, "With no floor the exact match wins")
+        XCTAssertEqual(database.search(query: query, preferredIndex: 31, minimumGain: 1e6), 31,
+                       "With a floor larger than the gain the incumbent keeps playing")
+    }
+
     func testDisabledByDefault() {
         // Descriptor set in setUp, but not enabled: nothing should play.
         run(seconds: 0.5, goal: simd_float3(0, 0, 1))
