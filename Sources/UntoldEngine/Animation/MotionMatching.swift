@@ -52,6 +52,17 @@ public struct MotionMatchingDescriptor {
     /// — instead of full-speed travel in a direction no clip can do.
     public var maxTurnRate: Float
 
+    /// Orientation warp: a rate-limited yaw correction (radians per second)
+    /// applied to the anchor while the character travels, closing whatever
+    /// heading error the chosen clips leave. Databases rarely contain a
+    /// curved clip for every speed — a pack may have circular sprints and
+    /// in-place pivots but no curved walk — so without a warp the search
+    /// prefers "walk straight, slightly off-heading" over "stop and pivot",
+    /// and a 20-30° error persists indefinitely. Scaled by travel speed so
+    /// a standing character never rotates without a pivot clip. Zero (the
+    /// default) disables it; a few radians per second is typical.
+    public var headingCorrectionRate: Float
+
     /// Minimum time playback runs before another jump may fire. The search
     /// still runs every `searchInterval`, but without this floor a frame
     /// that systematically beats the incumbent (for example the velocity
@@ -71,6 +82,7 @@ public struct MotionMatchingDescriptor {
         transitionHalflife: Float = 0.1,
         predictionHalflife: Float = 0.25,
         maxTurnRate: Float = 2.0,
+        headingCorrectionRate: Float = 0,
         minPlayTime: Float = 0.3,
         weights: MotionMatchingWeights = MotionMatchingWeights()
     ) {
@@ -82,6 +94,7 @@ public struct MotionMatchingDescriptor {
         self.transitionHalflife = transitionHalflife
         self.predictionHalflife = predictionHalflife
         self.maxTurnRate = maxTurnRate
+        self.headingCorrectionRate = headingCorrectionRate
         self.minPlayTime = minPlayTime
         self.weights = weights
     }
@@ -206,6 +219,27 @@ func updateMotionMatching(
     let approach = 1 - exp(-lambda * deltaTime)
     animationComponent.motionMatching.simulatedVelocity +=
         (simd_float3(0, 0, alignedSpeed) - animationComponent.motionMatching.simulatedVelocity) * approach
+
+    // Orientation warp: close the residual heading error the clips leave,
+    // proportionally to how fast the character is ACTUALLY traveling (the
+    // root motion applied last frame) — the simulated speed collapses for
+    // large errors by design, but a character mid-stride can still bend
+    // its path; a standing one must wait for a pivot clip.
+    if descriptor.headingCorrectionRate > 0, abs(goalYawDelta) > 1e-4, deltaTime > 0 {
+        let travel = animationComponent.rootMotion.isEnabled
+            ? simd_length(animationComponent.rootMotion.lastWorldVelocity)
+            : simd_length(animationComponent.motionMatching.simulatedVelocity)
+        let movementScale = min(1, travel / 0.5)
+        let maxStep = descriptor.headingCorrectionRate * deltaTime * movementScale
+        let step = max(-maxStep, min(maxStep, goalYawDelta))
+        if abs(step) > 1e-6 {
+            let base = simd_length_squared(entityRotation.vector) < 1e-8
+                ? simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+                : entityRotation
+            let corrected = simd_normalize(base * simd_quatf(angle: step, axis: simd_float3(0, 1, 0)))
+            rotateTo(entityId: anchor, rotation: corrected)
+        }
+    }
 
     animationComponent.motionMatching.searchClock += deltaTime
     animationComponent.motionMatching.historyElapsed += deltaTime

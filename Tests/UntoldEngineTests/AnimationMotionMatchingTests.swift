@@ -286,6 +286,37 @@ final class AnimationMotionMatchingTests: XCTestCase {
         XCTAssertGreaterThan(abs(yaw), 0.2, "The turn clip's root yaw must be rotating the character toward the goal")
     }
 
+    /// A database with only straight clips cannot turn the character; the
+    /// heading warp closes the error while traveling, and stays off when
+    /// the rate is zero.
+    func testHeadingWarpClosesErrorStraightClipsCannot() {
+        func yawAfterChase(warpRate: Float) -> Float {
+            setRootMotionEnabled(entityId: entityId, enabled: true)
+            setMotionMatching(entityId: entityId, descriptor: MotionMatchingDescriptor(
+                leftFootPath: "root/foot_l",
+                rightFootPath: "root/foot_r",
+                clipNames: ["walk"],
+                headingCorrectionRate: warpRate
+            ))
+            setMotionMatchingEnabled(entityId: entityId, enabled: true)
+            rotateTo(entityId: entityId, rotation: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1))
+            var time: Float = 0
+            while time < 1.5 {
+                // goal 90° to the right of the initial +Z heading
+                setMotionMatchingGoal(entityId: entityId, desiredVelocity: simd_float3(1, 0, 0), desiredFacing: simd_float3(1, 0, 0))
+                AnimationSystem.shared.update(deltaTime)
+                time += deltaTime
+            }
+            return yawTwist(getRotationQuaternion(entityId: entityId)).yaw
+        }
+
+        let withoutWarp = yawAfterChase(warpRate: 0)
+        XCTAssertLessThan(abs(withoutWarp), 0.1, "Straight clips alone must not turn the character")
+
+        let withWarp = yawAfterChase(warpRate: 2.0)
+        XCTAssertGreaterThan(withWarp, 0.8, "The warp must rotate the traveling character toward the goal")
+    }
+
     func testDisabledByDefault() {
         // Descriptor set in setUp, but not enabled: nothing should play.
         run(seconds: 0.5, goal: simd_float3(0, 0, 1))
