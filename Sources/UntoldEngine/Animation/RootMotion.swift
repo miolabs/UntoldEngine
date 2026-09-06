@@ -35,6 +35,13 @@ struct RootMotionState {
     /// games move the asset root.
     var anchorEntity: EntityID = .invalid
 
+    /// Whether this component applies its deltas to the anchor. Modular
+    /// assets carry one AnimationComponent per skinned part, all sampling
+    /// the same clips against the same anchor; exactly one of them drives
+    /// the transform or the anchor moves at N× clip speed. The others still
+    /// extract and ground their poses so every part stays in sync.
+    var drivesAnchor = true
+
     /// Optional joint-path override; by default the skeleton's first
     /// parentless joint drives root motion.
     var rootJointPath: String?
@@ -223,7 +230,13 @@ func applyRootMotion(
         horizontal = simd_float3(delta.x, 0, delta.z)
     }
 
-    if scene.get(component: LocalTransformComponent.self, for: motionEntity) != nil {
+    // Only the anchor's designated driver applies the deltas (and the velocity
+    // crossfade) to the entity. The other components of a modular asset still
+    // extract and ground their poses but must not move the shared anchor again,
+    // or it travels at N x clip speed (see setRootMotionEnabled).
+    if animationComponent.rootMotion.drivesAnchor,
+       scene.get(component: LocalTransformComponent.self, for: motionEntity) != nil
+    {
         // LocalTransformComponent's default rotation is the zero
         // quaternion (simd_quatf()), which rotates every vector to zero
         // — treat it as identity so deltas survive on never-rotated
