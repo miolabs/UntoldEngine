@@ -20,7 +20,8 @@ import Foundation
 import Metal
 import simd
 
-let maxNumOfGaussians: UInt64 = 1024 * 1024 * 5
+/// Per-entity splat cap for this platform — see GaussianRuntimeLimits.
+let maxNumOfGaussians = UInt64(GaussianRuntimeLimits.maxSplatsPerEntity)
 
 /// The CPU's view of how many splats survived the cull: read back from a *completed* frame
 /// (see the completion handler in `executeGaussianFrustumCulling`), so with
