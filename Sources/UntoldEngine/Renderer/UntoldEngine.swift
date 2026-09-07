@@ -595,9 +595,6 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         // 3. LOD selection (decides which representation is active, checks residency)
         LODSystem.shared.update(deltaTime: fixedStep)
         GaussianLODSystem.shared.update(deltaTime: fixedStep)
-        // The twin swap's cross-fade is a wall-clock duration, so it takes the measured frame
-        // time rather than the fixed step (250 ms is 250 ms at 60 Hz and at 90 Hz).
-        GaussianTwinSystem.shared.update(deltaTime: timeSinceLastUpdate ?? fixedStep)
 
         // 4. Flush events (residency and LOD change events are processed)
         SystemEventBus.shared.flushEvents()

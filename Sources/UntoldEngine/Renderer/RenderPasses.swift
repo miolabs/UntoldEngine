@@ -342,43 +342,36 @@ public enum RenderPasses {
         )
     }
 
-    // MARK: - Mesh twin swap (GaussianTwinComponent)
+    // MARK: - Mesh occluder shells and fades (MeshOccluderComponent, MeshFadeComponent)
 
-    /// A twin that is loading, fading or swapped draws through the per-entity path even while
-    /// its batch group still contains it (the group is rebuilt without it a few frames later),
-    /// like an entity in a LOD or tile fade.
+    /// An entity with an occluder shell or a running fade draws through the per-entity path even
+    /// while its batch group still contains it (the group is rebuilt without it a few frames
+    /// later), like an entity in a LOD or tile fade.
     @inline(__always)
-    private static func isEntityInGaussianTwinTransition(_ entityId: EntityID) -> Bool {
-        guard let twin = scene.get(component: GaussianTwinComponent.self, for: entityId) else { return false }
-        return twin.state != .armed
+    private static func isEntityInMeshOccluderOrFade(_ entityId: EntityID) -> Bool {
+        scene.get(component: MeshOccluderComponent.self, for: entityId) != nil
+            || scene.get(component: MeshFadeComponent.self, for: entityId) != nil
     }
 
-    /// A swapped twin draws no colour: its splat stands in for it. Depth comes from the
-    /// occluder shell (`gaussianTwinShellExecution`); shadows, physics and picking stay on
-    /// because `RenderComponent.isVisible` is untouched.
+    /// A mesh whose occluder shell has taken over draws no colour: depth comes from the shell
+    /// (`meshOccluderShellExecution`); shadows, physics and picking stay on because
+    /// `RenderComponent.isVisible` is untouched.
     @inline(__always)
-    private static func gaussianTwinSkipsColor(_ entityId: EntityID) -> Bool {
-        scene.get(component: GaussianTwinComponent.self, for: entityId)?.state == .swapped
+    private static func meshSkipsColor(_ entityId: EntityID) -> Bool {
+        scene.get(component: MeshOccluderComponent.self, for: entityId)?.drawsColor == false
     }
 
-    /// The twin's cross-fade dither: outgoing (mode 2) while the splat fades in, incoming
-    /// (mode 1) while it fades out. Applied last so it wins over a LOD or tile fade on the
-    /// same entity.
+    /// The app-driven cross-fade dither: outgoing (mode 2) or incoming (mode 1). Applied last so
+    /// it wins over a LOD or tile fade on the same entity.
     @inline(__always)
-    private static func applyGaussianTwinDither(
+    private static func applyMeshFadeDither(
         entityId: EntityID,
         materialParameters: inout MaterialParametersUniform
     ) {
-        guard let twin = scene.get(component: GaussianTwinComponent.self, for: entityId) else { return }
-        let threshold = simd_clamp(twin.fadeProgress, 0.0, 1.0)
-        switch twin.state {
-        case .crossFading:
-            materialParameters.lodDither = simd_float4(threshold, 2.0, 0.0, 0.0)
-        case .reverting:
-            materialParameters.lodDither = simd_float4(threshold, 1.0, 0.0, 0.0)
-        case .armed, .loading, .swapped:
-            break
-        }
+        guard let fade = scene.get(component: MeshFadeComponent.self, for: entityId) else { return }
+        let threshold = simd_clamp(fade.progress, 0.0, 1.0)
+        let mode: Float = fade.direction == .fadeOut ? 2.0 : 1.0
+        materialParameters.lodDither = simd_float4(threshold, mode, 0.0, 0.0)
     }
 
     @inline(__always)
@@ -579,7 +572,12 @@ public enum RenderPasses {
             else { continue }
             // Batch-eligible entities always cast shadows via shadowCasterBatchGroups.
             // Excluding them here prevents O(n_loaded_tiles) individual shadow draw calls.
-            if batchingEnabled, scene.get(component: StaticBatchComponent.self, for: entityId) != nil { continue }
+            // A mesh carrying an occluder shell or fade is out of its batch and casts on its
+            // own (the system that adds or removes those components invalidates this cache).
+            if batchingEnabled,
+               scene.get(component: StaticBatchComponent.self, for: entityId) != nil,
+               !isEntityInMeshOccluderOrFade(entityId)
+            { continue }
             candidates.append(entityId)
         }
 
@@ -654,7 +652,11 @@ public enum RenderPasses {
                 // scale with the scene and eventually overflow the GPU command buffer budget.
                 // During the brief batch-rebuild window their shadow is absent; this is
                 // preferable to the alternative of the app freezing at ~300+ loaded tiles.
-                if scene.get(component: StaticBatchComponent.self, for: entityId) != nil { continue }
+                // The exception is a mesh carrying an occluder shell or fade: it stays out of
+                // its batch for as long as the component is there, so it casts on its own.
+                if scene.get(component: StaticBatchComponent.self, for: entityId) != nil,
+                   !isEntityInMeshOccluderOrFade(entityId)
+                { continue }
                 if BatchingSystem.shared.isBatched(entityId: entityId) { continue }
             }
 
@@ -1808,14 +1810,14 @@ public enum RenderPasses {
                BatchingSystem.shared.isBatched(entityId: entityId),
                !isEntityInActiveLODFade(entityId),
                !isEntityInActiveTileRepresentationFade(entityId),
-               !isEntityInGaussianTwinTransition(entityId)
+               !isEntityInMeshOccluderOrFade(entityId)
             {
                 continue
             }
 
             if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { continue }
             if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
-            if gaussianTwinSkipsColor(entityId) { continue }
+            if meshSkipsColor(entityId) { continue }
 
             guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
                 handleError(.noRenderComponent, entityId)
@@ -1951,7 +1953,7 @@ public enum RenderPasses {
                         applyStreamingTierDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
                         applyLODDither(draw: lodDraw, materialParameters: &materialParameters)
                         applyTileRepresentationDither(entityId: entityId, materialParameters: &materialParameters)
-                        applyGaussianTwinDither(entityId: entityId, materialParameters: &materialParameters)
+                        applyMeshFadeDither(entityId: entityId, materialParameters: &materialParameters)
 
                         renderEncoder.setFragmentBytes(
                             &materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride,
@@ -2296,13 +2298,13 @@ public enum RenderPasses {
                BatchingSystem.shared.isBatched(entityId: entityId),
                !isEntityInActiveLODFade(entityId),
                !isEntityInActiveTileRepresentationFade(entityId),
-               !isEntityInGaussianTwinTransition(entityId)
+               !isEntityInMeshOccluderOrFade(entityId)
             { continue }
             if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { continue }
             if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
             if hasComponent(entityId: entityId, componentType: GizmoComponent.self) { continue }
             if hasComponent(entityId: entityId, componentType: LightComponent.self) { continue }
-            if gaussianTwinSkipsColor(entityId) { continue }
+            if meshSkipsColor(entityId) { continue }
 
             guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else { continue }
             guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else { continue }
@@ -2371,7 +2373,7 @@ public enum RenderPasses {
                         applyStreamingTierDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
                         applyLODDither(draw: lodDraw, materialParameters: &materialParameters)
                         applyTileRepresentationDither(entityId: entityId, materialParameters: &materialParameters)
-                        applyGaussianTwinDither(entityId: entityId, materialParameters: &materialParameters)
+                        applyMeshFadeDither(entityId: entityId, materialParameters: &materialParameters)
 
                         renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
@@ -3665,8 +3667,8 @@ public enum RenderPasses {
             if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
             if hasComponent(entityId: entityId, componentType: GizmoComponent.self) { continue }
             if hasComponent(entityId: entityId, componentType: LightComponent.self) { continue }
-            // A swapped twin's blend submeshes go with its colour (there is no dither path here).
-            if gaussianTwinSkipsColor(entityId) { continue }
+            // Blend submeshes go with the colour (there is no dither path here).
+            if meshSkipsColor(entityId) { continue }
 
             guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
                 continue
@@ -3837,22 +3839,22 @@ public enum RenderPasses {
         renderEncoder.updateFence(renderInfo.fence, after: .fragment)
     }
 
-    /// Depth-only occluder shells of the mesh twins whose splat is shown (`GaussianTwinComponent`
-    /// in `.crossFading`, `.swapped` or `.reverting`). Each mesh is drawn shrunk along its normals
-    /// by the twin's margin (`vertexGaussianTwinShellShader`) into the resolved opaque depth,
-    /// after the colour geometry and before the HZB copy, SSAO and the splat pass's depth
-    /// snapshot: the splat is then hidden only behind the object's own far side, never by the
-    /// surface it sits on. Blend submeshes are left out (their splats show through them), and
-    /// the unshrunk mesh keeps casting shadows through the shadow passes as before.
-    public static let gaussianTwinShellExecution: RenderPassExecution = { commandBuffer in
-        guard !GaussianDebugOptions.shared.disableTwinShell else { return }
+    /// Depth-only occluder shells of the meshes that carry a `MeshOccluderComponent`. Each mesh is
+    /// drawn again with depth only, pushed along its normals away from the camera by the
+    /// component's margin (`vertexMeshOccluderShellShader`), into the resolved opaque depth after
+    /// the colour geometry and before the HZB copy, SSAO and the splat pass's depth snapshot: a
+    /// stand-in shown in the mesh's place (a captured splat twin) is hidden only behind the
+    /// object's far side, never by the surface it sits on. Blend submeshes are left out (their
+    /// stand-in shows through them), and the unshrunk mesh keeps casting shadows as before.
+    public static let meshOccluderShellExecution: RenderPassExecution = { commandBuffer in
+        guard !GaussianDebugOptions.shared.disableOccluderShell else { return }
         guard let depthTexture = textureResources.depthMap else { return }
-        guard let pipeline = PipelineManager.shared.renderPipelinesByType[.gaussianTwinShell] else {
-            handleError(.pipelineStateNulled, "gaussianTwinShellPipeline is nil")
+        guard let pipeline = PipelineManager.shared.renderPipelinesByType[.meshOccluderShell] else {
+            handleError(.pipelineStateNulled, "meshOccluderShellPipeline is nil")
             return
         }
         guard pipeline.success, let pipelineState = pipeline.pipelineState else {
-            handleError(.pipelineStateNulled, pipeline.name ?? "Gaussian Twin Shell Pipeline")
+            handleError(.pipelineStateNulled, pipeline.name ?? "Mesh Occluder Shell Pipeline")
             return
         }
         guard let camera = CameraSystem.shared.activeCamera,
@@ -3864,14 +3866,8 @@ public enum RenderPasses {
 
         let shellEntityIds = visibleEntityIds.filter { entityId in
             guard scene.mask(for: entityId) != nil,
-                  let twin = scene.get(component: GaussianTwinComponent.self, for: entityId)
+                  scene.get(component: MeshOccluderComponent.self, for: entityId) != nil
             else { return false }
-            switch twin.state {
-            case .crossFading, .swapped, .reverting:
-                break
-            case .armed, .loading:
-                return false
-            }
             if shouldHideSceneEntity(entityId: entityId) || shouldRenderSceneEntityAsWireframe(entityId: entityId) {
                 return false
             }
@@ -3895,7 +3891,7 @@ public enum RenderPasses {
         descriptor.depthAttachment.storeAction = .store
 
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
-            handleError(.renderPassCreationFailed, "Gaussian Twin Shell Pass")
+            handleError(.renderPassCreationFailed, "Mesh Occluder Shell Pass")
             return
         }
 
@@ -3905,8 +3901,8 @@ public enum RenderPasses {
             renderEncoder.endEncoding()
         }
 
-        renderEncoder.label = "Gaussian Twin Shell Pass"
-        renderEncoder.pushDebugGroup("Gaussian Twin Shell Pass")
+        renderEncoder.label = "Mesh Occluder Shell Pass"
+        renderEncoder.pushDebugGroup("Mesh Occluder Shell Pass")
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(pipeline.depthState)
         renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
@@ -3914,16 +3910,16 @@ public enum RenderPasses {
         renderEncoder.setTriangleFillMode(.fill)
 
         for entityId in shellEntityIds {
-            guard let twin = scene.get(component: GaussianTwinComponent.self, for: entityId),
+            guard let occluder = scene.get(component: MeshOccluderComponent.self, for: entityId),
                   let renderComponent = scene.get(component: RenderComponent.self, for: entityId),
                   let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId)
             else { continue }
 
-            var shrinkMeters = max(0, twin.options.occluderShrinkMeters)
+            var shrinkMeters = max(0, occluder.shrinkMeters)
             renderEncoder.setVertexBytes(
                 &shrinkMeters,
                 length: MemoryLayout<Float>.stride,
-                index: Int(modelPassGaussianTwinShrinkIndex.rawValue)
+                index: Int(modelPassOccluderShrinkIndex.rawValue)
             )
 
             for mesh in renderComponent.mesh {

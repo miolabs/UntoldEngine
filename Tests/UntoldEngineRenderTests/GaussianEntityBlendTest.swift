@@ -15,7 +15,7 @@ import simd
 import XCTest
 
 /// Per-entity opacity weight and linear colour gain, applied by the preprocess when it compacts
-/// an entity's splats into the shared working set: what the twin swap cross-fades and what
+/// an entity's splats into the shared working set: what a mesh-to-splat cross-fade drives and what
 /// calibrates a capture's exposure to the scene.
 final class GaussianEntityBlendTest: BaseRenderSetup {
     override func tearDown() async throws {

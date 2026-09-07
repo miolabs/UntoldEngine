@@ -1,5 +1,5 @@
 //
-//  GaussianTwinRenderTest.swift
+//  MeshOccluderShellRenderTest.swift
 //  UntoldEngine
 //
 // Copyright (C) Untold Engine Studios
@@ -13,16 +13,16 @@ import simd
 @testable import UntoldEngine
 import XCTest
 
-/// The mesh-to-splat twin swap on screen: the swapped mesh draws no colour but still hides
-/// splats behind its shrunk depth shell, the cross-fade dithers the mesh out, and a `.untold`
-/// scene's `gaussianAsset` record drives the whole loop through `GaussianTwinSystem`.
+/// The pieces a splat stand-in for a mesh is built from: a colour-off mesh still hides splats
+/// behind its shrunk depth shell, the mesh fade dithers the colour out or in, and a `.untold`
+/// scene's `gaussianAsset` record arrives as link data that a URL load turns into a splat
+/// sharing the entity with its mesh.
 @MainActor
-final class GaussianTwinRenderTest: BaseRenderSetup {
+final class MeshOccluderShellRenderTest: BaseRenderSetup {
     private var temporaryFiles: [URL] = []
 
     override func tearDown() async throws {
-        GaussianTwinSystem.shared.splatRenderingAvailableOverride = nil
-        GaussianDebugOptions.shared.disableTwinShell = false
+        GaussianDebugOptions.shared.disableOccluderShell = false
         GaussianDebugOptions.shared.disableHZBOcclusionCull = false
         LoadingSystem.shared.resourceURLFn = getResourceURL
         destroyAllEntities()
@@ -53,16 +53,9 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
         return cameraEntity
     }
 
-    /// Twin settings that keep the live system (ticked by every draw) from moving a state the
-    /// test forced: the fade lasts practically forever, and the swap distance is set per state
-    /// by `forceTwin` so the system agrees with it.
-    private static let pinnedOptions = GaussianTwinOptions(swapDistanceMeters: 1, hysteresisMeters: 0, crossFadeDuration: 1e6)
-
     /// A cube whose near face covers the whole frame (see GaussianRenderingTest's occlusion
-    /// tests), linked to the test splat as its twin. The splat cloud sits at the cube's
-    /// origin, i.e. inside the cube behind its near face. The material is emissive so the lit
-    /// colour does not depend on the test IBL bake (as in EmissiveLightPassTest).
-    private func makeTwinCube(at position: simd_float3, extent: Float = 8.0, options: GaussianTwinOptions = pinnedOptions) throws -> EntityID {
+    /// tests). The material is emissive so the lit colour does not depend on the test IBL bake.
+    private func makeCube(at position: simd_float3, extent: Float = 8.0) -> EntityID {
         let entity = createEntity()
         var meshes = BasicPrimitives.createCube(extent: extent)
         let emissiveMaterial = Material(
@@ -81,7 +74,7 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
         }
         if let renderComponent = scene.assign(to: entity, component: RenderComponent.self) {
             renderComponent.mesh = meshes
-            renderComponent.assetURL = URL(fileURLWithPath: "/dev/null/twin.untold")
+            renderComponent.assetURL = URL(fileURLWithPath: "/dev/null/occluder.untold")
         }
         if let local = scene.get(component: LocalTransformComponent.self, for: entity) {
             local.position = position
@@ -92,34 +85,15 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
             space.columns.3 = simd_float4(position, 1.0)
             world.space = space
         }
-        try setEntityGaussianTwin(entityId: entity, payloadURL: testPLYURL(), options: options)
         setVisibleEntities()
         return entity
     }
 
-    /// Loads the twin's payload synchronously and puts the swap in `state`, the way the system
-    /// would after its fade.
-    private func loadPayloadAndForce(entity: EntityID, state: GaussianTwinState, progress: Float) async throws {
-        let twin = try XCTUnwrap(scene.get(component: GaussianTwinComponent.self, for: entity))
-        if !twin.payloadResident {
-            let url = try XCTUnwrap(twin.payloadURL)
-            let loaded = await loadGaussianTwinPayload(url: url)
-            let result = try XCTUnwrap(loaded)
-            withWorldMutationGate {
-                applyGaussianTwinPayload(result, to: entity, twin: twin)
-            }
-        }
-        forceTwin(entity: entity, state: state, progress: progress)
-    }
-
-    private func forceTwin(entity: EntityID, state: GaussianTwinState, progress: Float) {
-        guard let twin = scene.get(component: GaussianTwinComponent.self, for: entity) else { return }
-        // The camera is 5 m from the cube: a zero swap distance keeps the system wanting the
-        // swap (crossFading/swapped hold), 1 m keeps it not wanting it (reverting/armed hold).
-        twin.options.swapDistanceMeters = (state == .crossFading || state == .swapped) ? 0 : 1
-        twin.state = state
-        twin.fadeProgress = progress
-        scene.get(component: GaussianComponent.self, for: entity)?.opacityScale = gaussianTwinSplatOpacity(state: state, progress: progress)
+    /// Puts the test splat on the cube's entity (its cloud then sits inside the cube).
+    private func loadSplat(onto entity: EntityID, opacityScale: Float) async throws {
+        let url = try testPLYURL()
+        let loaded = await setEntityGaussianAsync(entityId: entity, url: url, opacityScale: opacityScale)
+        XCTAssertTrue(loaded, "The test splat should load onto the mesh entity")
     }
 
     // MARK: - Readback
@@ -145,10 +119,9 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
     private var backgroundLit: [Float16]?
 
     /// Draws one frame and blocks until its command buffer completed, so the shared targets can
-    /// be read back on the spot (no run-loop wait, which an async test could not service). The
-    /// visible list is re-seeded first: the GPU cull of the previous frame is temporal (its HZB
-    /// holds a full-frame cube's own near face), so the tests pin the list to every mesh entity
-    /// the way the single-frame occlusion tests do.
+    /// be read back on the spot. The visible list is re-seeded first: the GPU cull of the
+    /// previous frame is temporal (its HZB holds a full-frame cube's own near face), so the tests
+    /// pin the list to every mesh entity the way the single-frame occlusion tests do.
     private func drawFrameAndWait() {
         setVisibleEntities()
         renderer.draw(in: renderer.metalView)
@@ -190,11 +163,11 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
 
     // MARK: - Tests
 
-    /// Swapped: the mesh draws no colour, yet its shrunk shell still hides the splat cloud that
-    /// sits inside it. Turning the shell off (debug switch) is the control: the cloud shows.
-    /// The splat cull's temporal HZB pre-cull is off so only the depth snapshot the splat pass
-    /// tests against — the shell's depth — decides.
-    func testSwappedTwinDrawsNoColourButItsShellStillOccludes() async throws {
+    /// A colour-off mesh with an occluder shell draws no lit colour, yet the shell still hides
+    /// the splat cloud inside it. Turning the shells off (debug switch) is the control: the cloud
+    /// shows. The splat cull's temporal HZB pre-cull is off so only the depth snapshot the splat
+    /// pass tests against — the shell's depth — decides.
+    func testColourOffMeshDrawsNothingButItsShellStillOccludes() async throws {
         GaussianDebugOptions.shared.disableHZBOcclusionCull = true
         let eye = simd_float3(0, 3, 7)
         let target = simd_float3(0, 0, 0)
@@ -202,152 +175,157 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
         try captureBackground()
 
         let nearPoint = eye + 0.657 * (target - eye)
-        let entity = try makeTwinCube(at: nearPoint)
+        let entity = makeCube(at: nearPoint)
 
-        let armed = try render()
-        XCTAssertGreaterThan(armed.litCoverage, 1000, "Sanity: the armed twin's mesh fills the frame")
-        XCTAssertLessThan(armed.splatMaxAlpha, 0.05, "Nothing is loaded while armed")
+        let plain = try render()
+        XCTAssertGreaterThan(plain.litCoverage, 1000, "Sanity: the mesh fills the frame")
+        XCTAssertLessThan(plain.splatMaxAlpha, 0.05, "No splat yet")
 
-        try await loadPayloadAndForce(entity: entity, state: .swapped, progress: 1)
-        let swapped = try render()
-        XCTAssertLessThan(swapped.litCoverage, armed.litCoverage / 50, "A swapped twin draws no colour (got \(swapped.litCoverage) of \(armed.litCoverage))")
-        XCTAssertLessThan(swapped.splatMaxAlpha, 0.05, "The shell hides the cloud inside the mesh, got \(swapped.splatMaxAlpha)")
+        try await loadSplat(onto: entity, opacityScale: 1)
+        let occluder = try XCTUnwrap(scene.assign(to: entity, component: MeshOccluderComponent.self))
+        occluder.drawsColor = false
+        let shelled = try render()
+        XCTAssertLessThan(shelled.litCoverage, plain.litCoverage / 50, "Colour off: nothing lit (got \(shelled.litCoverage) of \(plain.litCoverage))")
+        XCTAssertLessThan(shelled.splatMaxAlpha, 0.05, "The shell hides the cloud inside the mesh, got \(shelled.splatMaxAlpha)")
 
-        GaussianDebugOptions.shared.disableTwinShell = true
+        GaussianDebugOptions.shared.disableOccluderShell = true
         let noShell = try render()
         XCTAssertGreaterThan(noShell.splatMaxAlpha, 0.05, "Without the shell nothing writes the mesh's depth and the cloud shows")
-        GaussianDebugOptions.shared.disableTwinShell = false
+        GaussianDebugOptions.shared.disableOccluderShell = false
+
+        occluder.drawsColor = true
+        let colourBack = try render()
+        XCTAssertGreaterThan(colourBack.litCoverage, plain.litCoverage * 9 / 10, "Colour on again with the shell still present: the full mesh is back")
     }
 
-    /// Mid cross-fade the mesh is screen-door dithered: about half its pixels are gone.
-    func testCrossFadeDithersHalfTheMeshAtHalfProgress() async throws {
+    /// A quarter of the way, fading out still keeps three quarters of the pixels and fading in
+    /// keeps one quarter: the two directions are complementary halves of the same dither.
+    func testMeshFadeKeepsComplementaryPixelSetsInEachDirection() throws {
         let eye = simd_float3(0, 3, 7)
         let target = simd_float3(0, 0, 0)
         createTestCamera(eye: eye, target: target)
         try captureBackground()
 
         let nearPoint = eye + 0.657 * (target - eye)
-        let entity = try makeTwinCube(at: nearPoint)
-        let armed = try render()
-        XCTAssertGreaterThan(armed.litCoverage, 1000)
+        let entity = makeCube(at: nearPoint)
+        let plain = try render()
+        XCTAssertGreaterThan(plain.litCoverage, 1000)
 
-        try await loadPayloadAndForce(entity: entity, state: .crossFading, progress: 0.5)
-        let fading = try render()
-        let ratio = Float(fading.litCoverage) / Float(armed.litCoverage)
-        XCTAssertEqual(ratio, 0.5, accuracy: 0.12, "Mode-2 dither at threshold 0.5 keeps about half the pixels, kept \(ratio)")
+        let fade = try XCTUnwrap(scene.assign(to: entity, component: MeshFadeComponent.self))
+        fade.direction = .fadeOut
+        fade.progress = 0.25
+        let fadingOut = try render()
+        let outRatio = Float(fadingOut.litCoverage) / Float(plain.litCoverage)
+        XCTAssertEqual(outRatio, 0.75, accuracy: 0.1, "Fading out at 0.25 discards a quarter of the pixels, kept \(outRatio)")
 
-        forceTwin(entity: entity, state: .reverting, progress: 0.5)
-        let reverting = try render()
-        let revertRatio = Float(reverting.litCoverage) / Float(armed.litCoverage)
-        XCTAssertEqual(revertRatio, 0.5, accuracy: 0.12, "Mode-1 dither at threshold 0.5 keeps the other half, kept \(revertRatio)")
+        fade.direction = .fadeIn
+        let fadingIn = try render()
+        let inRatio = Float(fadingIn.litCoverage) / Float(plain.litCoverage)
+        XCTAssertEqual(inRatio, 0.25, accuracy: 0.1, "Fading in at 0.25 keeps a quarter of the pixels, kept \(inRatio)")
+        XCTAssertEqual(outRatio + inRatio, 1.0, accuracy: 0.1, "The two directions are complementary")
 
-        forceTwin(entity: entity, state: .armed, progress: 0)
+        scene.remove(component: MeshFadeComponent.self, from: entity)
         let back = try render()
-        XCTAssertGreaterThan(back.litCoverage, armed.litCoverage * 9 / 10, "Armed again: the full mesh is back")
+        XCTAssertGreaterThan(back.litCoverage, plain.litCoverage * 9 / 10, "Fade removed: the full mesh is back")
     }
 
-    /// Where splats cannot be drawn (the iOS simulator creates no splat pipelines) a twin never
-    /// leaves `armed`, so the mesh keeps its colour instead of turning into a depth-only hole.
-    func testSwapHoldsArmedWhereSplatsCannotBeDrawn() throws {
-        createTestCamera(eye: simd_float3(0, 3, 7), target: .zero)
-        let entity = try makeTwinCube(at: .zero, options: GaussianTwinOptions(swapDistanceMeters: 0))
-        let twin = try XCTUnwrap(scene.get(component: GaussianTwinComponent.self, for: entity))
-
-        GaussianTwinSystem.shared.splatRenderingAvailableOverride = false
-        GaussianTwinSystem.shared.update(deltaTime: 0.016)
-        XCTAssertEqual(twin.state, .armed, "No splat pipelines: the mesh keeps showing")
-        XCTAssertNil(twin.loadTask, "Nothing is loaded either")
-
-        GaussianTwinSystem.shared.splatRenderingAvailableOverride = true
-        GaussianTwinSystem.shared.update(deltaTime: 0.016)
-        XCTAssertEqual(twin.state, .loading, "With the pipelines the same tick starts the swap")
-        twin.loadTask?.cancel()
-    }
-
-    /// A `.untold` scene whose entity carries a `gaussianAsset` record with the `meshTwin` flag
-    /// comes up with the twin linked and its settings seeded; the system then loads, fades,
-    /// swaps, reverts by distance, and the ledger and bounding box account for both.
-    func testUntoldSceneLinksTheTwinAndTheSystemRunsTheSwap() async throws {
-        let fixture = try makeTwinSceneFixture()
+    /// A `.untold` scene whose entity carries a `gaussianAsset` record comes up with the link
+    /// data on the mesh entity; loading that payload by URL puts the splat beside the mesh, with
+    /// the ledger and the bounding box accounting for both, and removing it takes only its share.
+    func testUntoldSceneLinkLoadsASplatBesideTheMesh() async throws {
+        let fixture = try makeLinkedSceneFixture()
         let entity = createEntity()
         setEntityMesh(entityId: entity, filename: fixture.untoldURL.deletingPathExtension().path, withExtension: "untold")
 
-        let twin = try XCTUnwrap(scene.get(component: GaussianTwinComponent.self, for: entity), "The meshTwin record links a twin to the mesh entity")
-        XCTAssertEqual(twin.payloadURL?.standardizedFileURL, fixture.payloadURL.standardizedFileURL, "Payload resolved next to the .untold file")
-        XCTAssertEqual(twin.options.occluderShrinkMeters, 0.03)
-        XCTAssertEqual(twin.options.exposureOffsetEV, 0.5)
-        XCTAssertEqual(twin.options.swapDistanceMeters, 12)
-        XCTAssertEqual(twin.state, .armed)
+        let link = try XCTUnwrap(scene.get(component: GaussianAssetLinkComponent.self, for: entity), "The gaussianAsset record arrives as link data on the mesh entity")
+        XCTAssertEqual(link.payloadURL?.standardizedFileURL, fixture.payloadURL.standardizedFileURL, "Payload resolved next to the .untold file")
+        XCTAssertTrue(link.isMeshTwin)
+        XCTAssertEqual(link.occluderShrinkMeters, 0.03)
+        XCTAssertEqual(link.exposureOffsetEV, 0.5)
+        XCTAssertEqual(link.swapDistanceMeters, 12)
+        XCTAssertEqual(link.lodCount, 1)
+        XCTAssertEqual(link.lodSplatCounts.count, 1)
+        XCTAssertEqual(link.lodSwitchScreenHeights.count, 1)
+        XCTAssertNil(scene.get(component: GaussianComponent.self, for: entity), "Linking loads nothing")
+
         let meshBox = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)).boundingBox
         XCTAssertEqual(meshBox.max.x, 1, accuracy: 1e-5, "Sanity: the fixture mesh box is the unit box")
         let meshBytes = MemoryBudgetManager.shared.getMemorySize(for: entity) ?? 0
         XCTAssertGreaterThan(meshBytes, 0, "The mesh registers its own bytes")
 
-        // Far away: nothing happens.
-        let camera = createTestCamera(eye: simd_float3(0, 0, 40), target: .zero)
-        GaussianTwinSystem.shared.update(deltaTime: 0.016)
-        XCTAssertEqual(twin.state, .armed)
-        XCTAssertNil(scene.get(component: GaussianComponent.self, for: entity))
-
-        // Within the swap distance: the payload loads, then the fade runs to the swap.
-        cameraLookAt(entityId: camera, eye: simd_float3(0, 0, 5), target: .zero, up: simd_float3(0, 1, 0))
-        GaussianTwinSystem.shared.update(deltaTime: 0.016)
-        XCTAssertEqual(twin.state, .loading)
-        let deadline = Date().addingTimeInterval(15)
-        while !twin.payloadResident, !twin.loadFailed, Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        XCTAssertTrue(twin.payloadResident, "The .untoldgs payload should load")
+        let payloadURL = try XCTUnwrap(link.payloadURL)
+        let loaded = await setEntityGaussianAsync(entityId: entity, url: payloadURL, opacityScale: 0)
+        XCTAssertTrue(loaded)
         let gaussian = try XCTUnwrap(scene.get(component: GaussianComponent.self, for: entity))
-        XCTAssertEqual(gaussian.exposureOffsetEV, 0.5, "The record's exposure offset reaches the splat")
-        XCTAssertEqual(gaussian.opacityScale, 0, "Resident but hidden until the fade starts")
+        XCTAssertEqual(gaussian.opacityScale, 0, "Resident but hidden, as requested")
+        XCTAssertGreaterThan(gaussian.estimatedGPUBytes, 0)
 
-        GaussianTwinSystem.shared.update(deltaTime: 0.016)
-        XCTAssertEqual(twin.state, .crossFading)
-        for _ in 0 ..< 4 {
-            GaussianTwinSystem.shared.update(deltaTime: 0.1)
-        }
-        XCTAssertEqual(twin.state, .swapped)
-        XCTAssertEqual(gaussian.opacityScale, 1)
-
-        // The test cloud reaches about ±1.4 in x and y, past the fixture's unit box.
-        let unionBox = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)).boundingBox
-        XCTAssertLessThan(unionBox.min.x, meshBox.min.x, "The mesh box grows to the union with the splat's box")
-        XCTAssertGreaterThan(unionBox.max.x, meshBox.max.x, "The mesh box grows to the union with the splat's box")
-        XCTAssertLessThanOrEqual(simd_reduce_max(unionBox.min - meshBox.min), 0, "It never shrinks")
-        XCTAssertGreaterThanOrEqual(simd_reduce_min(unionBox.max - meshBox.max), 0, "It never shrinks")
+        // The mesh keeps its own box; the splat's box (about ±1.4 in x, past the unit box) is on
+        // the component for whoever needs it.
+        let boxAfter = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)).boundingBox
+        XCTAssertEqual(boxAfter.min, meshBox.min, "The mesh box is untouched by the splat")
+        XCTAssertEqual(boxAfter.max, meshBox.max)
+        let splatBox = try XCTUnwrap(gaussian.localBoundingBox)
+        XCTAssertGreaterThan(splatBox.max.x, meshBox.max.x, "The splat's own box is kept on the component")
         XCTAssertEqual(MemoryBudgetManager.shared.getMemorySize(for: entity) ?? 0, meshBytes, "The mesh entry is untouched by the splat")
-        XCTAssertEqual(MemoryBudgetManager.shared.auxiliaryMeshBytes(for: entity), twin.payloadGPUBytes, "The splat's bytes ride beside it")
-        XCTAssertGreaterThan(twin.payloadGPUBytes, 0)
+        XCTAssertEqual(MemoryBudgetManager.shared.auxiliaryMeshBytes(for: entity), gaussian.estimatedGPUBytes, "The splat's bytes ride beside it")
 
-        // Beyond the swap distance plus hysteresis: the reverse fade ends armed, payload kept.
-        cameraLookAt(entityId: camera, eye: simd_float3(0, 0, 40), target: .zero, up: simd_float3(0, 1, 0))
-        GaussianTwinSystem.shared.update(deltaTime: 0.016)
-        XCTAssertEqual(twin.state, .reverting)
-        for _ in 0 ..< 4 {
-            GaussianTwinSystem.shared.update(deltaTime: 0.1)
-        }
-        XCTAssertEqual(twin.state, .armed)
-        XCTAssertEqual(gaussian.opacityScale, 0)
-        XCTAssertTrue(twin.payloadResident, "A revert keeps the payload so the next swap is instant")
-
-        // Unlinking drops the splat and its bytes; the mesh's stay.
-        removeEntityGaussianTwin(entityId: entity)
+        removeEntityGaussian(entityId: entity)
         XCTAssertNil(scene.get(component: GaussianComponent.self, for: entity))
-        XCTAssertNil(scene.get(component: GaussianTwinComponent.self, for: entity))
         XCTAssertEqual(MemoryBudgetManager.shared.getMemorySize(for: entity) ?? 0, meshBytes)
+        XCTAssertEqual(MemoryBudgetManager.shared.auxiliaryMeshBytes(for: entity), 0)
+    }
+
+    /// The two representations may arrive and leave in either order; the ledger holds the mesh
+    /// entry plus the splat's bytes beside it whenever both are resident, and the survivor's
+    /// bytes alone otherwise.
+    func testLedgerFollowsTheMeshAndSplatInEitherOrder() async throws {
+        // Splat first, on an entity with no mesh: the splat is the entry.
+        let entity = createEntity()
+        let url = try testPLYURL()
+        let loadedAlone = await setEntityGaussianAsync(entityId: entity, url: url, opacityScale: 0)
+        XCTAssertTrue(loadedAlone)
+        let gaussian = try XCTUnwrap(scene.get(component: GaussianComponent.self, for: entity))
+        let splatBytes = gaussian.estimatedGPUBytes
+        XCTAssertGreaterThan(splatBytes, 0)
+        XCTAssertEqual(MemoryBudgetManager.shared.getMemorySize(for: entity), splatBytes, "Alone, the splat is the entry")
+        XCTAssertEqual(MemoryBudgetManager.shared.auxiliaryMeshBytes(for: entity), 0)
+        let splatBox = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)).boundingBox
+
+        // Then the mesh arrives: it takes the entry, the splat's bytes move beside it, and the
+        // entity takes the mesh's box.
+        let meshes = BasicPrimitives.createCube(extent: 1.0)
+        setEntityMeshDirect(entityId: entity, meshes: meshes, assetName: "cube")
+        let meshBytes = MemoryBudgetManager.shared.getMemorySize(for: entity) ?? 0
+        XCTAssertGreaterThan(meshBytes, 0)
+        XCTAssertNotEqual(meshBytes, splatBytes, "The entry is now the mesh's")
+        XCTAssertEqual(MemoryBudgetManager.shared.auxiliaryMeshBytes(for: entity), splatBytes, "The splat rides beside it")
+        let meshBox = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)).boundingBox
+        XCTAssertLessThan(meshBox.max.x, splatBox.max.x, "The entity's box is the mesh's, not the splat's")
+        XCTAssertNotNil(scene.get(component: GaussianComponent.self, for: entity), "The splat survived the mesh registration")
+
+        // The mesh leaves: the splat is the entry again and the box is the splat's.
+        removeEntityMesh(entityId: entity)
+        XCTAssertEqual(MemoryBudgetManager.shared.getMemorySize(for: entity), splatBytes, "The splat's bytes take the entry back")
+        XCTAssertEqual(MemoryBudgetManager.shared.auxiliaryMeshBytes(for: entity), 0)
+        let boxAfter = try XCTUnwrap(scene.get(component: LocalTransformComponent.self, for: entity)).boundingBox
+        XCTAssertEqual(boxAfter.max.x, splatBox.max.x, accuracy: 1e-5)
+
+        // And the splat leaves last: nothing remains in the ledger.
+        removeEntityGaussian(entityId: entity)
+        XCTAssertNil(MemoryBudgetManager.shared.getMemorySize(for: entity))
         XCTAssertEqual(MemoryBudgetManager.shared.auxiliaryMeshBytes(for: entity), 0)
     }
 
     // MARK: - .untold fixture with a gaussianAsset chunk
 
-    private struct TwinSceneFixture {
+    private struct LinkedSceneFixture {
         let untoldURL: URL
         let payloadURL: URL
     }
 
-    private func makeTwinSceneFixture() throws -> TwinSceneFixture {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("GaussianTwinRenderTest-\(UUID().uuidString)")
+    private func makeLinkedSceneFixture() throws -> LinkedSceneFixture {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("MeshOccluderShellRenderTest-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         temporaryFiles.append(directory)
 
@@ -413,7 +391,7 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
             estimatedGPUBytes: UInt64(vertexData.count + indexData.count),
             localBounds: bounds
         )
-        let twinRecord = UntoldGaussianAssetRecordV1(
+        let linkRecord = UntoldGaussianAssetRecordV1(
             entityId: 0,
             payloadPathOffset: strings.offsets[payloadURL.lastPathComponent]!,
             flags: UntoldGaussianAssetFlags.meshTwin,
@@ -441,7 +419,7 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
             (.textureTable, encodeRecords([texture]), 1),
             (.vertexData, vertexData, 0),
             (.indexData, indexData, 0),
-            (.gaussianAssetTable, encodeRecords([twinRecord]), 1),
+            (.gaussianAssetTable, encodeRecords([linkRecord]), 1),
         ]
         header.chunkCount = UInt32(payloads.count)
         let untoldURL = directory.appendingPathComponent("chair.untold")
@@ -449,7 +427,7 @@ final class GaussianTwinRenderTest: BaseRenderSetup {
         try fileData.write(to: untoldURL, options: .atomic)
         let decoded = try UntoldReader().readAsset(from: fileData)
         XCTAssertEqual(decoded.gaussianAssets.count, 1, "Fixture carries one gaussianAsset record")
-        return TwinSceneFixture(untoldURL: untoldURL, payloadURL: payloadURL)
+        return LinkedSceneFixture(untoldURL: untoldURL, payloadURL: payloadURL)
     }
 
     private func encodeRecords(_ records: [some UntoldBinaryEncodable]) -> Data {

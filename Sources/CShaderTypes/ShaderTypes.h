@@ -131,7 +131,7 @@ typedef enum{
     modelPassUniformIndex,
     modelPassJointTransformIndex,
     modelPassHasArmature,
-    modelPassGaussianTwinShrinkIndex,
+    modelPassOccluderShrinkIndex,
 }ModelPassBufferIndices;
 typedef enum{
     modelPassFragmentUniformIndex,

@@ -832,8 +832,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
         // Verify dependencies
         XCTAssertEqual(graph["model"]?.dependencies, ["shadow"], "Model pass should depend on shadow pass")
         XCTAssertEqual(graph["batchedModel"]?.dependencies, ["model"], "Batched model pass should depend on model pass")
-        XCTAssertEqual(graph["gaussianTwinShell"]?.dependencies, ["batchedModel"], "Twin shell pass should follow all opaque colour geometry")
-        XCTAssertEqual(graph["hzbDepthSource"]?.dependencies, ["gaussianTwinShell"], "HZB source pass should copy depth after the twin shells are written")
+        XCTAssertEqual(graph["meshOccluderShell"]?.dependencies, ["batchedModel"], "Occluder shell pass should follow all opaque colour geometry")
+        XCTAssertEqual(graph["hzbDepthSource"]?.dependencies, ["meshOccluderShell"], "HZB source pass should copy depth after the occluder shells are written")
         XCTAssertNil(graph["wireframeOcclusionDepth"], "Wireframe occlusion depth pass should not exist in the graph")
         XCTAssertEqual(graph["ssao"]?.dependencies, ["hzbDepthSource"], "SSAO pass should depend on the stored opaque depth source")
 
@@ -855,8 +855,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
         assertTopologicalConstraints(order: order, constraints: [
             ("shadow", "model"),
             ("model", "batchedModel"),
-            ("batchedModel", "gaussianTwinShell"),
-            ("gaussianTwinShell", "hzbDepthSource"),
+            ("batchedModel", "meshOccluderShell"),
+            ("meshOccluderShell", "hzbDepthSource"),
             ("hzbDepthSource", "ssao"),
             ("ssao", "lightPass"),
         ])
@@ -1012,7 +1012,7 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
             ("environment", "shadow"),
             ("shadow", "model"),
             ("model", "gaussian"),
-            ("gaussianTwinShell", "gaussian"),
+            ("meshOccluderShell", "gaussian"),
             ("model", "lightPass"),
             ("lightPass", "transparency"),
             ("transparency", "wireframe"),
@@ -1321,8 +1321,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
 
         let (graph, _) = try buildGameModeGraph()
 
-        XCTAssertEqual(graph["gaussian"]?.dependencies, ["model", "gaussianTwinShell"],
-                       "Gaussian pass should depend on the model pass and the twin shell to access the depth buffer")
+        XCTAssertEqual(graph["gaussian"]?.dependencies, ["model", "meshOccluderShell"],
+                       "Gaussian pass should depend on the model pass and the occluder shells to access the depth buffer")
     }
 
     func testBuildGameModeGraph_PreCompDependsOnGaussian() throws {
@@ -1364,8 +1364,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
 
             XCTAssertNotNil(graph["gaussian"],
                             "Gaussian pass should exist in \(description) mode")
-            XCTAssertEqual(graph["gaussian"]?.dependencies, ["model", "gaussianTwinShell"],
-                           "Gaussian should depend on model and the twin shell in \(description) mode")
+            XCTAssertEqual(graph["gaussian"]?.dependencies, ["model", "meshOccluderShell"],
+                           "Gaussian should depend on model and the occluder shells in \(description) mode")
         }
     }
 
