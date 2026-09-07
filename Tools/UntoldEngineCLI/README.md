@@ -83,6 +83,24 @@ untoldengine export \
   --compress-geometry
 ```
 
+### `gaussian-link` - Link an entity to a splat payload
+
+Writes, removes or lists the `gaussianAsset` records of a `.untold` asset so an
+entity's mesh gets a cooked `.untoldgs` twin. Every other chunk of the file is
+copied unchanged. The payload path is stored relative to the directory of the
+file that is written (the input with `--in-place`, the `--output` file
+otherwise), which is where the runtime resolves it; keep the payload inside or
+beside that file. A `meshTwin` link on an entity without a mesh (the root of a
+multi-node asset) is written with a warning that lists the mesh-bearing entities.
+
+```bash
+untoldengine gaussian-link --untold Chair/chair.untold --entity 0 \
+  --payload Chair/chair.untoldgs --swap-distance 8 --occluder-shrink 0.02 --in-place
+untoldengine gaussian-link --untold Chair/chair.untold --entity 0 \
+  --remove --output Chair/chair_plain.untold
+untoldengine gaussian-link --untold Chair/chair.untold --list
+```
+
 ### `create` - Create a new project
 
 Creates a new UntoldEngine game project.
