@@ -474,6 +474,10 @@ final class AnimationRootMotionTests: XCTestCase {
         }
     }
 
+    /// A clip switch with a transition must not snap the entity's travel:
+    /// the applied velocity crossfades from the outgoing clip's to the
+    /// incoming clip's with the transition halflife.
+
     // MARK: - Root joint override
 
     func testRootJointPathOverride() {

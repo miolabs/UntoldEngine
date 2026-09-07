@@ -176,6 +176,258 @@ final class AnimationFootIKTests: XCTestCase {
                        "After release the foot must catch up to the animation")
     }
 
+    /// The frame the lock releases must land exactly where the last locked
+    /// frame did: the stored offset is what lines the two up, so the
+    /// catch-up decay may only start on the frame after.
+    func testStanceLockReleaseFrameIsContinuous() {
+        // Raising the ground bends the knee, so every target below is
+        // within reach and the solve lands exactly on it.
+        setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0.1) }
+        setFootIKEnabled(entityId: entityId, enabled: true)
+        setFootIKStanceLocking(entityId: entityId, enabled: true)
+
+        changeAnimation(entityId: entityId, name: "stand", transitionHalflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+        XCTAssertTrue(animationComponent.footIK.lockStates[0].locked, "Sanity: two static frames plant the foot")
+
+        // Drift until the animation pulls the ankle past maxLockDistance.
+        changeAnimation(entityId: entityId, name: "drift", transitionHalflife: 0)
+        var lastLockedX = anklePosition().x
+        var released = false
+        for _ in 0 ..< 60 {
+            AnimationSystem.shared.update(deltaTime)
+            if animationComponent.footIK.lockStates[0].locked == false {
+                released = true
+                break
+            }
+            lastLockedX = anklePosition().x
+        }
+        XCTAssertTrue(released, "Sanity: the drift released the lock")
+
+        // Release frame: the foot has not moved from the last locked frame.
+        let releaseX = anklePosition().x
+        XCTAssertEqual(releaseX, lastLockedX, accuracy: 1e-4,
+                       "The release frame must line up with the last locked frame")
+
+        // Next frame: the decay takes its first step toward the animation.
+        let releaseAnimatedX = animationComponent.currentTime * 0.5
+        AnimationSystem.shared.update(deltaTime)
+        let decay = exp(-0.693_147_18 * deltaTime / animationComponent.footIK.releaseHalflife)
+        let expectedX = animationComponent.currentTime * 0.5 + (releaseX - releaseAnimatedX) * decay
+        XCTAssertEqual(anklePosition().x, expectedX, accuracy: 1e-4,
+                       "The catch-up decay begins on the frame after release")
+    }
+
+    /// A foot that re-locks while the catch-up decay is still running must
+    /// not snap to the animated ankle: the re-lock frame continues the decay
+    /// by one step, and the catch-up then completes while the foot stays
+    /// locked.
+    func testStanceLockRelockMidDecayEasesIn() {
+        setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0.1) }
+        setFootIKEnabled(entityId: entityId, enabled: true)
+        setFootIKStanceLocking(entityId: entityId, enabled: true)
+
+        changeAnimation(entityId: entityId, name: "stand", transitionHalflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+
+        // Drift past maxLockDistance so the lock releases, then a few more
+        // frames so a sizeable offset is still decaying.
+        changeAnimation(entityId: entityId, name: "drift", transitionHalflife: 0)
+        var released = false
+        for _ in 0 ..< 60 {
+            AnimationSystem.shared.update(deltaTime)
+            if animationComponent.footIK.lockStates[0].locked == false {
+                released = true
+                break
+            }
+        }
+        XCTAssertTrue(released, "Sanity: the drift released the lock")
+        for _ in 0 ..< 5 {
+            AnimationSystem.shared.update(deltaTime)
+        }
+        let animatedX = animationComponent.currentTime * 0.5
+        var previousX = anklePosition().x
+        XCTAssertLessThan(previousX, animatedX - 0.05, "Sanity: a sizeable offset is still decaying")
+
+        // Freeze the animation: the ankle stops, so the foot re-locks. Every
+        // frame from here on continues the decay by exactly one step.
+        setAnimationPlaybackSpeed(entityId: entityId, speed: 0)
+        let decay = exp(-0.693_147_18 * deltaTime / animationComponent.footIK.releaseHalflife)
+        for frame in 0 ..< 60 {
+            AnimationSystem.shared.update(deltaTime)
+            XCTAssertTrue(animationComponent.footIK.lockStates[0].locked, "A stationary foot stays locked (frame \(frame))")
+            let expectedX = animatedX + (previousX - animatedX) * decay
+            // Under ~4 mm of lateral offset the two-bone solve skips its aim
+            // rotation, so exact steps are only asserted above that band.
+            if abs(expectedX - animatedX) > 0.01 {
+                XCTAssertEqual(anklePosition().x, expectedX, accuracy: 1e-4,
+                               "Re-locking continues the decay instead of snapping (frame \(frame))")
+            }
+            previousX = anklePosition().x
+        }
+        XCTAssertEqual(previousX, animatedX, accuracy: 5e-3, "The catch-up completes while locked")
+    }
+
+    /// A hard cut that moves a planted foot within the solver's reach must
+    /// ease the foot to the new stance: no pop on the cut frame, a re-plant
+    /// at the new animated ankle, and a catch-up that completes without the
+    /// lock flickering.
+    func testStanceLockCutWithinReachEasesToNewStance() {
+        setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0.1) }
+        setFootIKEnabled(entityId: entityId, enabled: true)
+        setFootIKStanceLocking(entityId: entityId, enabled: true)
+
+        changeAnimation(entityId: entityId, name: "stand", transitionHalflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+
+        // Jump 0.35 m in a single frame: play the drift clip 0.7 s in one
+        // step, then freeze it there.
+        changeAnimation(entityId: entityId, name: "drift", transitionHalflife: 0)
+        setAnimationPlaybackSpeed(entityId: entityId, speed: 0.7 / deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+        setAnimationPlaybackSpeed(entityId: entityId, speed: 0)
+        let cutX = animationComponent.currentTime * 0.5
+        XCTAssertEqual(cutX, 0.35, accuracy: 1e-4, "Sanity: the cut moved the ankle 0.35 m")
+        XCTAssertEqual(anklePosition().x, 0, accuracy: 1e-4, "The cut frame keeps the foot where it was planted")
+
+        let decay = exp(-0.693_147_18 * deltaTime / animationComponent.footIK.releaseHalflife)
+        var previousX = anklePosition().x
+        for frame in 0 ..< 60 {
+            AnimationSystem.shared.update(deltaTime)
+            XCTAssertTrue(animationComponent.footIK.lockStates[0].locked, "The foot re-plants and stays locked (frame \(frame))")
+            let expectedX = cutX + (previousX - cutX) * decay
+            // Under ~4 mm of lateral offset the two-bone solve skips its aim
+            // rotation, so exact steps are only asserted above that band.
+            if abs(expectedX - cutX) > 0.01 {
+                XCTAssertEqual(anklePosition().x, expectedX, accuracy: 1e-4,
+                               "The catch-up runs one decay step per frame (frame \(frame))")
+            }
+            previousX = anklePosition().x
+        }
+        XCTAssertEqual(previousX, cutX, accuracy: 5e-3, "The foot settles on the new stance")
+    }
+
+    /// A cut larger than maxAdjustment cannot be absorbed: the solve skips
+    /// the cut frame and the foot shows the animated pose. It must then
+    /// re-plant right there, not pop back toward the old anchor a few
+    /// frames later once the leftover catch-up shrinks under the bound.
+    func testStanceLockCutBeyondMaxAdjustmentReplantsWithoutPoppingBack() {
+        setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0) }
+        animationComponent.footIK.maxAdjustment = 0.3
+        setFootIKEnabled(entityId: entityId, enabled: true)
+        setFootIKStanceLocking(entityId: entityId, enabled: true)
+
+        changeAnimation(entityId: entityId, name: "stand", transitionHalflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+
+        changeAnimation(entityId: entityId, name: "drift", transitionHalflife: 0)
+        setAnimationPlaybackSpeed(entityId: entityId, speed: 0.7 / deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+        setAnimationPlaybackSpeed(entityId: entityId, speed: 0)
+        let cutX = animationComponent.currentTime * 0.5
+        XCTAssertEqual(anklePosition().x, cutX, accuracy: 1e-4, "A cut beyond maxAdjustment shows the animated foot")
+
+        for frame in 0 ..< 10 {
+            AnimationSystem.shared.update(deltaTime)
+            XCTAssertTrue(animationComponent.footIK.lockStates[0].locked, "The foot re-plants on the new stance (frame \(frame))")
+            XCTAssertEqual(anklePosition().x, cutX, accuracy: 1e-4,
+                           "The foot must not pop back toward the old anchor (frame \(frame))")
+        }
+    }
+
+    /// A release while a catch-up is still in flight must fold the pinned
+    /// offset into it, so the release frame continues the decay by one step
+    /// rather than dropping the leftover and popping.
+    func testStanceLockReleaseMidCatchUpStaysContinuous() {
+        setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0.1) }
+        setFootIKEnabled(entityId: entityId, enabled: true)
+        setFootIKStanceLocking(entityId: entityId, enabled: true)
+
+        changeAnimation(entityId: entityId, name: "stand", transitionHalflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+
+        // Drift to a distance release, decay a little, then freeze so the
+        // foot re-locks with a catch-up still in flight.
+        changeAnimation(entityId: entityId, name: "drift", transitionHalflife: 0)
+        var released = false
+        for _ in 0 ..< 60 {
+            AnimationSystem.shared.update(deltaTime)
+            if animationComponent.footIK.lockStates[0].locked == false {
+                released = true
+                break
+            }
+        }
+        XCTAssertTrue(released, "Sanity: the drift released the lock")
+        for _ in 0 ..< 5 {
+            AnimationSystem.shared.update(deltaTime)
+        }
+        setAnimationPlaybackSpeed(entityId: entityId, speed: 0)
+        for _ in 0 ..< 3 {
+            AnimationSystem.shared.update(deltaTime)
+        }
+        XCTAssertTrue(animationComponent.footIK.lockStates[0].locked, "Sanity: the foot re-locked mid-catch-up")
+        let lockedAnimatedX = animationComponent.currentTime * 0.5
+        let lastLockedX = anklePosition().x
+        XCTAssertLessThan(lastLockedX, lockedAnimatedX - 0.03, "Sanity: a catch-up is still in flight")
+
+        // Swing the foot away at 2 m/s: the release frame must continue the
+        // decay from the last locked frame, leftover included.
+        setAnimationPlaybackSpeed(entityId: entityId, speed: 4)
+        AnimationSystem.shared.update(deltaTime)
+        XCTAssertFalse(animationComponent.footIK.lockStates[0].locked, "Sanity: a fast foot releases")
+        let decay = exp(-0.693_147_18 * deltaTime / animationComponent.footIK.releaseHalflife)
+        let expectedX = lockedAnimatedX + (lastLockedX - lockedAnimatedX) * decay
+        XCTAssertEqual(anklePosition().x, expectedX, accuracy: 1e-4,
+                       "A release mid-catch-up must not drop the leftover offset")
+    }
+
+    /// A probe miss while a catch-up is in flight shows the raw foot for
+    /// that frame; the catch-up must be dropped so the foot does not pop
+    /// back toward the old anchor once the probe recovers.
+    func testStanceLockProbeMissMidCatchUpDropsTheCatchUp() {
+        setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0.1) }
+        setFootIKEnabled(entityId: entityId, enabled: true)
+        setFootIKStanceLocking(entityId: entityId, enabled: true)
+
+        changeAnimation(entityId: entityId, name: "stand", transitionHalflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+
+        changeAnimation(entityId: entityId, name: "drift", transitionHalflife: 0)
+        var released = false
+        for _ in 0 ..< 60 {
+            AnimationSystem.shared.update(deltaTime)
+            if animationComponent.footIK.lockStates[0].locked == false {
+                released = true
+                break
+            }
+        }
+        XCTAssertTrue(released, "Sanity: the drift released the lock")
+        AnimationSystem.shared.update(deltaTime)
+        AnimationSystem.shared.update(deltaTime)
+        XCTAssertGreaterThan(simd_length(animationComponent.footIK.lockStates[0].releaseOffset), 0.1,
+                             "Sanity: a catch-up is in flight")
+
+        // One frame without ground: the foot shows the raw animated pose.
+        setFootIKGroundQuery(entityId: entityId) { _ in nil }
+        AnimationSystem.shared.update(deltaTime)
+        XCTAssertEqual(anklePosition().x, animationComponent.currentTime * 0.5, accuracy: 1e-4,
+                       "Sanity: with no ground the foot follows the animation")
+        XCTAssertEqual(simd_length(animationComponent.footIK.lockStates[0].releaseOffset), 0, accuracy: 1e-6,
+                       "A probe miss drops the catch-up")
+
+        // Probe back: no pop back toward the old anchor.
+        setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0.1) }
+        AnimationSystem.shared.update(deltaTime)
+        XCTAssertEqual(anklePosition().x, animationComponent.currentTime * 0.5, accuracy: 1e-4,
+                       "After the probe recovers the foot follows the animation")
+    }
+
     func testStanceLockIgnoresFastFeet() {
         setFootIKGroundQuery(entityId: entityId) { _ in FootIKGroundSample(height: 0) }
         setFootIKEnabled(entityId: entityId, enabled: true)

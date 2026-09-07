@@ -214,10 +214,12 @@ func applyRootMotion(
 
     // Extracted travel this frame; zero on the re-baseline frame right
     // after a clip switch (the crossfade below still carries the frozen
-    // outgoing velocity through that frame).
+    // outgoing velocity through that frame). Only the driving component
+    // extracts and applies; the others just ground their poses.
+    let drivesAnchor = animationComponent.rootMotion.drivesAnchor
     var horizontal = simd_float3.zero
     var yawDelta: Float = 0
-    if animationComponent.rootMotion.hasPreviousSample {
+    if animationComponent.rootMotion.hasPreviousSample, drivesAnchor {
         var delta = translation - animationComponent.rootMotion.previousTranslation
         if translationTime < animationComponent.rootMotion.previousTranslationTime {
             delta += compiledClip.rootTranslationPerLoop
@@ -230,13 +232,7 @@ func applyRootMotion(
         horizontal = simd_float3(delta.x, 0, delta.z)
     }
 
-    // Only the anchor's designated driver applies the deltas (and the velocity
-    // crossfade) to the entity. The other components of a modular asset still
-    // extract and ground their poses but must not move the shared anchor again,
-    // or it travels at N x clip speed (see setRootMotionEnabled).
-    if animationComponent.rootMotion.drivesAnchor,
-       scene.get(component: LocalTransformComponent.self, for: motionEntity) != nil
-    {
+    if drivesAnchor, scene.get(component: LocalTransformComponent.self, for: motionEntity) != nil {
         // LocalTransformComponent's default rotation is the zero
         // quaternion (simd_quatf()), which rotates every vector to zero
         // — treat it as identity so deltas survive on never-rotated
