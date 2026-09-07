@@ -209,7 +209,7 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         computeEncoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
         profileTotals.dispatchCount += 1
 
-        // A hidden entity (a resident twin whose mesh is showing) keeps a zero visible set:
+        // A hidden entity (opacityScale 0: resident but not shown) keeps a zero visible set:
         // the finalize below derives empty indirect arguments from the reset count, so the
         // preprocess and draw skip it without walking its splats.
         if gaussianComponent.opacityScale <= 0 {

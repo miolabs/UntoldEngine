@@ -99,7 +99,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         guard decoded.header.fileType != .animation else { return [] }
         let entitiesByID = Dictionary(uniqueKeysWithValues: decoded.entities.map { ($0.entityId, $0) })
         let runtimeSkeletonsByEntity = try makeRuntimeSkeletonsByEntity(decoded: decoded)
-        let gaussianTwinsByEntity = try makeRuntimeGaussianTwinsByEntity(decoded: decoded, baseURL: baseURL)
+        let gaussianAssetsByEntity = try makeRuntimeGaussianAssetsByEntity(decoded: decoded, baseURL: baseURL)
         var worldTransformsByID: [UInt32: simd_float4x4] = [:]
         var visiting: Set<UInt32> = []
 
@@ -139,40 +139,45 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 jointIndexChunkData: jointIndexChunkData,
                 jointWeightChunkData: jointWeightChunkData,
                 runtimeSkeletonsByEntity: runtimeSkeletonsByEntity,
-                gaussianTwinsByEntity: gaussianTwinsByEntity
+                gaussianAssetsByEntity: gaussianAssetsByEntity
             )
         }
     }
 
-    /// The `gaussianAsset` records flagged as mesh twins, keyed by the entity they attach to.
-    /// The payload path is resolved next to the `.untold` file (or as the flattened bundle
-    /// basename, like textures); a missing file is not an error here — the swap reports it
-    /// when it first tries to load.
-    private func makeRuntimeGaussianTwinsByEntity(
+    /// The `gaussianAsset` records keyed by the entity they attach to. The payload path is
+    /// resolved next to the `.untold` file (or as the flattened bundle basename, like textures);
+    /// a missing file is not an error here — whoever loads the payload reports it.
+    private func makeRuntimeGaussianAssetsByEntity(
         decoded: UntoldDecodedAsset,
         baseURL: URL
-    ) throws -> [UInt32: RuntimeGaussianTwinSource] {
-        var twins: [UInt32: RuntimeGaussianTwinSource] = [:]
-        for record in decoded.gaussianAssets where record.flags & UntoldGaussianAssetFlags.meshTwin != 0 {
-            guard twins[record.entityId] == nil else {
-                Logger.logWarning(message: "[NativeFormatLoader] Entity \(record.entityId) has more than one meshTwin gaussianAsset record; keeping the first")
+    ) throws -> [UInt32: RuntimeGaussianAssetLink] {
+        var links: [UInt32: RuntimeGaussianAssetLink] = [:]
+        for record in decoded.gaussianAssets {
+            guard links[record.entityId] == nil else {
+                Logger.logWarning(message: "[NativeFormatLoader] Entity \(record.entityId) has more than one gaussianAsset record; keeping the first")
                 continue
             }
             guard let path = try decoded.string(at: record.payloadPathOffset),
                   let payloadURL = resolvedURL(from: path, baseURL: baseURL)
             else { continue }
-            if let entity = decoded.entities.first(where: { $0.entityId == record.entityId }), entity.meshRecordCount == 0 {
-                Logger.logWarning(message: "[NativeFormatLoader] meshTwin gaussianAsset record on entity \(record.entityId), which has no mesh to swap from; ignored")
-                continue
+            if record.flags & UntoldGaussianAssetFlags.meshTwin != 0,
+               let entity = decoded.entities.first(where: { $0.entityId == record.entityId }),
+               entity.meshRecordCount == 0
+            {
+                Logger.logWarning(message: "[NativeFormatLoader] meshTwin gaussianAsset record on entity \(record.entityId), which has no mesh to swap from")
             }
-            twins[record.entityId] = RuntimeGaussianTwinSource(
+            links[record.entityId] = RuntimeGaussianAssetLink(
                 payloadURL: payloadURL,
+                flags: record.flags,
+                lodCount: Int(record.lodCount),
+                lodSplatCounts: Array(record.lodSplatCounts.prefix(Int(record.lodCount))),
+                lodSwitchScreenHeights: Array(record.lodSwitchScreenHeights.prefix(Int(record.lodCount))),
                 occluderShrinkMeters: record.occluderShrinkMeters,
                 exposureOffsetEV: record.exposureOffsetEV,
                 swapDistanceMeters: record.swapDistanceMeters
             )
         }
-        return twins
+        return links
     }
 
     private func makeRuntimeLights(decoded: UntoldDecodedAsset) throws -> [RuntimeLightSource] {
@@ -307,7 +312,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
         runtimeSkeletonsByEntity: [UInt32: RuntimeSkeleton],
-        gaussianTwinsByEntity: [UInt32: RuntimeGaussianTwinSource] = [:]
+        gaussianAssetsByEntity: [UInt32: RuntimeGaussianAssetLink] = [:]
     ) throws -> RuntimeAssetNode {
         let nodeName = try decoded.string(at: entity.nameOffset) ?? "entity_\(entity.entityId)"
         let meshStart = Int(entity.firstMeshRecordIndex)
@@ -342,7 +347,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             worldBounds: entity.worldBounds,
             skeleton: runtimeSkeletonsByEntity[entity.entityId],
             primitives: primitives,
-            gaussianTwin: primitives.isEmpty ? nil : gaussianTwinsByEntity[entity.entityId]
+            gaussianAsset: gaussianAssetsByEntity[entity.entityId]
         )
     }
 

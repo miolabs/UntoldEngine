@@ -333,8 +333,8 @@ public class MemoryBudgetManager: @unchecked Sendable {
         registerMesh(entityId: entityId, meshSizeBytes: meshSize, textureSizeBytes: textureSize)
     }
 
-    /// Bytes an entity keeps resident alongside its mesh — a captured splat twin's payload
-    /// (`GaussianTwinComponent`) — tracked apart from the mesh entry, so mesh streaming, which
+    /// Bytes an entity keeps resident alongside its mesh — a splat on a mesh entity
+    /// (`GaussianComponent` next to a `RenderComponent`) — tracked apart from the mesh entry, so mesh streaming, which
     /// registers and unregisters that entry whole, neither drops nor double-counts them. They
     /// count toward the geometry total and budget checks, not toward `getMemorySize` (what
     /// evicting the mesh would free). Zero removes the record.

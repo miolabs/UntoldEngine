@@ -108,8 +108,8 @@ public class GaussianComponent: Component {
     var splatCount: UInt = 0
 
     /// Multiplier on every splat's opacity this frame: 1 draws the asset as captured, 0 hides
-    /// it without unloading (nothing is compacted into the frame), values between cross-fade.
-    /// The twin swap drives it; apps may set it directly.
+    /// it without unloading (nothing is compacted into the frame; its cull is skipped), values
+    /// between cross-fade. An application system that swaps a mesh for its splat drives it.
     public var opacityScale: Float = 1
     /// Exposure the capture was recorded at, from the `.untoldgs` header (0 for `.ply`), and
     /// its white balance as an RGB multiplier (1 for none). Baked by the cook, read on load.
@@ -121,7 +121,7 @@ public class GaussianComponent: Component {
     /// In XR, multiply the colour by the real-world lighting estimate's tint
     /// (`RuntimeEnvironmentLightingStore`, while its mode is `.realWorldEstimate` and the
     /// latest estimate is valid), so a capture made under neutral light takes on the colour of
-    /// the room it is shown in. Off by default; the twin swap turns it on from its options.
+    /// the room it is shown in. Off by default.
     public var useRealWorldTint = false
 
     /// The linear gain the preprocess applies to this asset's colour: the capture white balance
@@ -134,85 +134,89 @@ public class GaussianComponent: Component {
         captureWhiteBalance * pow(2, exposureOffsetEV - captureExposureEV)
     }
 
+    /// GPU bytes of the resident splat and its local-space box, set by every load path
+    /// (single file, progressive tier, streamed). On an entity that also draws a mesh the splat
+    /// is the secondary representation: its bytes ride beside the mesh's `MemoryBudgetManager`
+    /// entry and the entity keeps the mesh's bounding box; this box is the splat's own.
+    public internal(set) var estimatedGPUBytes = 0
+    public internal(set) var localBoundingBox: (min: simd_float3, max: simd_float3)?
+
     public required init() {}
 }
 
-/// Where a mesh entity with a captured splat twin (`GaussianTwinComponent`) stands in the swap.
-public enum GaussianTwinState: Int, Sendable, Equatable {
-    /// The mesh is drawn as usual; the splat is not shown (it may or may not be resident).
-    case armed
-    /// The splat payload is being read; nothing changes on screen until it is resident.
-    case loading
-    /// The mesh colour dithers out while the splat's opacity ramps in, over `crossFadeDuration`.
-    case crossFading
-    /// The splat is shown. The mesh keeps writing depth (as a shrunk shell), shadows and physics.
-    case swapped
-    /// The reverse fade: the mesh dithers back in while the splat ramps out.
-    case reverting
+/// Draws the mesh as a depth-only occluder shell as well: after the opaque colour geometry, the
+/// `meshOccluderShell` pass draws it again with depth only, every vertex pushed `shrinkMeters`
+/// along its normal away from the camera, into the opaque depth the HZB copy, SSAO,
+/// transparency and the splat pass read. Whatever stands in for the mesh on screen (a captured
+/// splat twin) is then hidden behind the object's far side but never by the surface it sits on.
+/// With `drawsColor` off the mesh contributes nothing but that depth: shadows, physics and
+/// picking keep using it because `RenderComponent.isVisible` is untouched. Blend-mode submeshes
+/// are left out of the shell and stop drawing with the colour. The policy that drives this
+/// (when, how fast, from what distance) belongs to the application system that owns the
+/// component. Adding or removing it takes the entity out of, or back into, static batching the
+/// next time the batcher evaluates it, and a batch-eligible mesh then casts its shadow on its
+/// own: the owning system calls `BatchingSystem.notifyEntityMaterialChanged` and
+/// `RenderPasses.invalidateShadowEntityCache()` when it adds or removes the component.
+public class MeshOccluderComponent: Component {
+    /// Metres the shell moves away from the camera along the normals.
+    public var shrinkMeters: Float = 0.02
+    /// Whether the mesh still draws its colour in the opaque pass (dithered when a
+    /// `MeshFadeComponent` is present). Off once the stand-in is fully shown.
+    public var drawsColor = true
+
+    public required init() {}
 }
 
-/// Per-entity settings of the mesh-to-splat swap, seeded from the scene's
-/// `UntoldGaussianAssetRecordV1` when the twin comes from a `.untold` file.
-public struct GaussianTwinOptions: Sendable, Equatable {
-    /// Camera distance to the mesh's bounds centre below which the swap arms and runs;
-    /// 0 swaps at any distance.
-    public var swapDistanceMeters: Float
-    /// Added to `swapDistanceMeters` before the swap reverts, so a camera hovering at the
-    /// threshold does not flip the object back and forth.
-    public var hysteresisMeters: Float
-    /// Length of the cross-fade in seconds (wall-clock), both ways.
-    public var crossFadeDuration: Float
-    /// Metres the depth-only occluder shell is shrunk along the mesh normals while the splat
-    /// is shown, so splats on and just outside the surface are not hidden by their own mesh.
-    public var occluderShrinkMeters: Float
-    /// Exposure offset in EV applied to the splat on top of its capture exposure.
-    public var exposureOffsetEV: Float
-    /// See `GaussianComponent.useRealWorldTint`.
-    public var useRealWorldTint: Bool
-
-    public init(
-        swapDistanceMeters: Float = 0,
-        hysteresisMeters: Float = 0.5,
-        crossFadeDuration: Float = 0.25,
-        occluderShrinkMeters: Float = 0.02,
-        exposureOffsetEV: Float = 0,
-        useRealWorldTint: Bool = false
-    ) {
-        self.swapDistanceMeters = swapDistanceMeters
-        self.hysteresisMeters = hysteresisMeters
-        self.crossFadeDuration = crossFadeDuration
-        self.occluderShrinkMeters = occluderShrinkMeters
-        self.exposureOffsetEV = exposureOffsetEV
-        self.useRealWorldTint = useRealWorldTint
+/// Screen-door cross-fade of a mesh's colour, the 8x8 Bayer dither the LOD and tile fades use:
+/// `.fadeOut` discards more pixels as `progress` rises, `.fadeIn` keeps more. Applied after the
+/// LOD and tile fades, so the app system that owns the component wins over them. While present
+/// the entity draws on its own, outside static batching, once the batcher re-evaluates it
+/// (`BatchingSystem.notifyEntityMaterialChanged`; also `RenderPasses.invalidateShadowEntityCache()`
+/// so a batch-eligible mesh keeps casting its shadow on its own meanwhile).
+public class MeshFadeComponent: Component {
+    public enum Direction: Sendable, Equatable {
+        case fadeIn
+        case fadeOut
     }
+
+    /// 0...1 progress of the fade.
+    public var progress: Float = 0
+    public var direction: Direction = .fadeOut
+
+    public required init() {}
 }
 
-/// Links a mesh entity to the captured splat that stands in for it up close. `GaussianTwinSystem`
-/// loads the payload onto the same entity as a `GaussianComponent`, cross-fades the two and
-/// keeps the mesh's depth (shrunk shell), shadows, collider and picking on while the splat is
-/// shown. Attached by the `.untold` loader from a `gaussianAsset` record with the `meshTwin`
-/// flag, or by `setEntityGaussianTwin(entityId:payloadURL:options:)`.
-public class GaussianTwinComponent: Component {
-    /// The `.untoldgs` (or `.ply`) file loaded when the swap arms.
+/// The `gaussianAsset` record a `.untold` scene attached to this entity
+/// (`UntoldGaussianAssetRecordV1`), carried as data by the loader and nothing more: an
+/// application system decides what to do with it (a mesh twin swap, a window world, an
+/// environment). The payload path is resolved next to the scene file when the scene loads.
+public class GaussianAssetLinkComponent: Component {
     public var payloadURL: URL?
-    public var options = GaussianTwinOptions()
-    public internal(set) var state: GaussianTwinState = .armed
-    /// 0...1 progress of the running cross-fade (`.crossFading` and `.reverting` only).
-    public internal(set) var fadeProgress: Float = 0
-    /// Set once a payload load has failed; the swap then stays armed and does not retry.
-    public internal(set) var loadFailed = false
+    /// See `UntoldGaussianAssetFlags`.
+    public var flags: UInt32 = 0
+    /// The record's LOD table: number of levels (0 means one), splat count per level coarsest
+    /// first, and the screen height in pixels above which the next finer level is preferred.
+    public var lodCount: Int = 0
+    public var lodSplatCounts: [UInt32] = []
+    public var lodSwitchScreenHeights: [Float] = []
+    /// Metres the mesh twin's depth-only occluder shell is shrunk (`MeshOccluderComponent`).
+    public var occluderShrinkMeters: Float = 0.02
+    /// Editor exposure offset in EV (`GaussianComponent.exposureOffsetEV`).
+    public var exposureOffsetEV: Float = 0
+    /// Camera distance at which a twin swap arms; 0 means always.
+    public var swapDistanceMeters: Float = 0
 
-    /// The payload was applied to the entity's `GaussianComponent` (resident on the GPU).
-    var payloadResident = false
-    /// GPU bytes of the resident payload, kept apart from the mesh's own bytes in the
-    /// memory ledger so unloading one representation does not drop the other's accounting.
-    var payloadGPUBytes = 0
-    /// Local-space box of the resident payload; the mesh box is grown to include it whenever
-    /// the mesh (re)registers.
-    var payloadBoundingBox: (min: simd_float3, max: simd_float3)?
-    /// Bumped on every link, relink and unlink; a load task applies only if it still matches.
-    var loadGeneration: UInt32 = 0
-    var loadTask: Task<Void, Never>?
+    public var isMeshTwin: Bool {
+        flags & UntoldGaussianAssetFlags.meshTwin != 0
+    }
+
+    public var isEnvironment: Bool {
+        flags & UntoldGaussianAssetFlags.environment != 0
+    }
+
+    public var isWindowWorld: Bool {
+        flags & UntoldGaussianAssetFlags.windowWorld != 0
+    }
 
     public required init() {}
 }

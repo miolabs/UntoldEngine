@@ -1643,9 +1643,11 @@ public class BatchingSystem: @unchecked Sendable {
             return nil
         }
 
-        // A mesh twin that is loading, fading or swapped to its splat needs its own draw
-        // (dither, colour off, occluder shell); an armed twin batches like any other mesh.
-        if let twin = scene.get(component: GaussianTwinComponent.self, for: entityId), twin.state != .armed {
+        // A mesh with an occluder shell or an app-driven fade needs its own draw (dither,
+        // colour off, shell); it re-joins a batch once those components are gone.
+        if scene.get(component: MeshOccluderComponent.self, for: entityId) != nil
+            || scene.get(component: MeshFadeComponent.self, for: entityId) != nil
+        {
             return nil
         }
 

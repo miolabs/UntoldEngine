@@ -109,7 +109,7 @@ environment/grid
                             └── spotShadow
                                     └── model ───────────────────── gaussian
                                     └── batchedModel                    │
-                                            └── gaussianTwinShell ──────┤
+                                            └── meshOccluderShell ──────┤
                                                     └── hzbDepthSource  │
                                                             └── ssao    │
                                                                     └── lightPass
@@ -168,7 +168,7 @@ The shadow map produced here is consumed by the TBDR light sub-pass inside `mode
 ### G-Buffer Passes (TBDR)
 
 ```
-model → batchedModel → gaussianTwinShell → hzbDepthSource → ssao → lightPass
+model → batchedModel → meshOccluderShell → hzbDepthSource → ssao → lightPass
 ```
 
 This is the core of the tile-based deferred rendering (TBDR) pipeline. Opaque geometry and lighting are encoded inside one Metal render encoder through `combinedModelLightExecution`. Geometry first writes raw surface data into G-Buffer attachments:
@@ -192,7 +192,7 @@ The batched opaque phase uses **cluster-level frustum culling**: it calls `visib
 
 After the opaque draws finish, the light sub-pass runs a full-screen quad with `fragmentLightShaderTBDR`. The shader reads the G-Buffer attachments with framebuffer fetch (`[[color(N)]]`) and writes the lit result into attachment 5. Shadow maps and IBL lookup textures still come from normal Metal texture bindings, but albedo, normals, position, material, and emissive data are consumed directly from tile memory.
 
-`gaussianTwinShell` runs in its own encoder on the resolved opaque depth: every mesh whose captured splat twin is shown (`GaussianTwinComponent` fading or swapped) is drawn once more depth-only, pushed inward along its normals by the twin's margin. The swapped mesh draws no colour in `model`, so this shell is what keeps its depth continuous for the HZB copy, SSAO, transparency and the splat pass's occlusion snapshot; the unshrunk mesh keeps casting shadows through the shadow passes as before. The pass encodes nothing when no twin is active.
+`meshOccluderShell` runs in its own encoder on the resolved opaque depth: every mesh carrying a `MeshOccluderComponent` is drawn once more depth-only, pushed along its normals away from the camera by the component's margin. A mesh whose colour is switched off (`drawsColor == false`, e.g. while a captured splat twin stands in for it) draws nothing in `model`, so this shell is what keeps its depth continuous for the HZB copy, SSAO, transparency and the splat pass's occlusion snapshot; the unshrunk mesh keeps casting shadows through the shadow passes as before. The pass encodes nothing when no entity carries the component.
 
 `hzbDepthSource` copies the opaque depth after all opaque geometry has been written. That stored depth texture feeds both the next-frame HZB build and the SSAO pass.
 
@@ -233,10 +233,10 @@ Draws wireframe AABB overlays for debug purposes. Runs last in the geometry chai
 ### Gaussian Pass
 
 ```swift
-RenderPass(id: "gaussian", dependencies: ["model", "gaussianTwinShell"])
+RenderPass(id: "gaussian", dependencies: ["model", "meshOccluderShell"])
 ```
 
-Renders the back-to-front-sorted Gaussian splats using the indices produced by the bitonic sort. This pass **depends on "model"** and on the twin shell because it snapshots the depth buffer they populated — splats use that depth to correctly composite against solid geometry, and a swapped mesh twin's depth only exists in the shell.
+Renders the back-to-front-sorted Gaussian splats using the indices produced by the bitonic sort. This pass **depends on "model"** and on the occluder shells because it snapshots the depth buffer they populated — splats use that depth to correctly composite against solid geometry, and a colour-off mesh's depth only exists in its shell.
 
 Note that Gaussian **does not** depend on `lightPass`, `transparency`, or the post-processing chain. It runs in parallel with those in the dependency graph and merges back at `precomp`.
 
@@ -392,7 +392,7 @@ The completion handler fires on the GPU thread when the command buffer finishes 
 [GPU render] environment/grid
 [GPU render] shadow + batchedShadow   (depth from light POV)
 [GPU render] model                    (opaque + batched geometry → memoryless G-Buffer, then TBDR lighting)
-[GPU render] gaussianTwinShell        (depth-only shrunk shells of meshes shown as splats)
+[GPU render] meshOccluderShell        (depth-only shrunk shells, MeshOccluderComponent)
 [GPU render] hzbDepthSource           (copy opaque depth for HZB/SSAO)
 [GPU render] ssao                     (depth-only occlusion)
 [GPU render] lightPass                (ordering stub; lighting already ran in model)

@@ -112,62 +112,56 @@ load with an "exceeds maximum" error. Cook large captures with a splat budget
 (`UntoldGSCookOptions.maxSplatCount`, `untoldengine export --splat-max-count`) that fits
 every platform the asset ships on, or split the scene into streamed tiles.
 
-## Mesh twins: swapping a mesh for its captured splat
+## A splat standing in for a mesh: shells, fades and scene links
 
-A captured object looks best as a splat up close and costs least as a mesh far away. A
-**twin** links the two on one entity: the mesh is what the scene ships (it batches, casts
-shadows, collides and is picked like any other mesh), and its captured splat stands in for it
-whenever the camera is near.
+A captured object looks best as a splat up close and costs least as a mesh far away. The engine
+gives an application the pieces to swap between the two on one entity without popping; the
+policy that drives them (when to load, from what distance, how fast to fade) belongs to an
+application-side system built on these pieces (see the proposal's §4.5).
 
-### Linking the twin
+- **A splat on a mesh entity.** `setEntityGaussianAsync(entityId:url:opacityScale:)` attaches a
+  `.untoldgs` (or `.ply`) to an entity that already draws a mesh. The load is two phases a
+  caller can also drive itself: `loadGaussianSplatPayload(url:)` reads and encodes off the main
+  thread, `setEntityGaussian(entityId:payload:opacityScale:)` attaches the result under the
+  world-mutation gate, so a system can check under its own gate whether the load is still
+  wanted before applying it. The mesh stays the primary representation: the splat's bytes ride
+  beside the mesh's `MemoryBudgetManager` entry (`auxiliaryMeshBytes`, so mesh streaming in and
+  out leaves them intact) and the entity keeps the mesh's bounding box, with the splat's own box
+  on `GaussianComponent.localBoundingBox`. `removeEntityGaussian` drops the splat (and a
+  progressive splat's tiers) and only its share of the ledger. Starting with `opacityScale: 0`
+  keeps it resident but hidden.
+- **`GaussianComponent.opacityScale`** weighs every splat's opacity: 0 hides the entity and skips
+  its cull, values between cross-fade.
+- **`MeshFadeComponent`** dithers the mesh's colour with the LOD screen-door: `.fadeOut` discards
+  more pixels as `progress` rises, `.fadeIn` keeps more. Applied after the LOD and tile fades.
+- **`MeshOccluderComponent`** draws the mesh a second time depth-only, pushed `shrinkMeters` along
+  its normals away from the camera (the `meshOccluderShell` render pass, after the opaque colour
+  and before the HZB copy and the splat pass). The splat then passes the depth test on and just
+  outside the surface, and is hidden behind the object's far side. With `drawsColor` off the
+  mesh contributes nothing but that depth: shadows, physics and picking keep using it because
+  `RenderComponent.isVisible` is untouched. Soft objects differ from their mesh by centimetres,
+  so raise the margin until the front of the capture stops clipping. Blend-mode submeshes are
+  left out of the shell and stop drawing with the colour.
+- **`GaussianAssetLinkComponent`** carries a `.untold` scene's `gaussianAsset` record
+  (`UntoldGaussianAssetRecordV1`: payload path resolved next to the scene file, flags such as
+  `meshTwin`, occluder margin, exposure offset, swap distance) onto the entity as data.
+  `setEntityMesh`/`setEntityMeshAsync` attach it; nothing is loaded.
+- A mesh carrying a `MeshOccluderComponent` or `MeshFadeComponent` is excluded from static
+  batching when the batcher next evaluates it, and re-admitted once they are gone. The system
+  that adds or removes them tells the batcher with
+  `BatchingSystem.shared.notifyEntityMaterialChanged(entityId:)`; the group is rebuilt over a
+  few frames, during which the batch still draws the mesh.
+- `GaussianDebugOptions.shared.disableOccluderShell` turns the shells off for bisecting.
 
-A `.untold` scene links a twin through a `gaussianAsset` record (core chunk 25,
-`UntoldGaussianAssetRecordV1`) carrying the `meshTwin` flag for the entity;
-`setEntityMesh`/`setEntityMeshAsync` then attach the twin automatically, with the record's
-margin, exposure offset and swap distance as its settings, and the payload path resolved next
-to the scene file (or as the flattened bundle basename, like textures). From code, link any
-mesh entity yourself:
-
-```swift
-setEntityGaussianTwin(
-    entityId: chair,
-    filename: "chair",               // chair.untoldgs (a .ply works too)
-    withExtension: "untoldgs",
-    options: GaussianTwinOptions(
-        swapDistanceMeters: 4,       // 0 = always prefer the splat
-        hysteresisMeters: 0.5,       // revert only beyond 4.5 m
-        crossFadeDuration: 0.25,     // seconds, wall-clock
-        occluderShrinkMeters: 0.02,  // the shell's margin under the surface
-        exposureOffsetEV: 0,         // on top of the capture exposure
-        useRealWorldTint: false      // XR: tint by the real-world lighting estimate
-    )
-)
-```
-
-Nothing loads at link time. `GaussianTwinSystem` runs every frame and walks the swap through
-its states (`GaussianTwinComponent.state`):
-
-| State | On screen |
-|---|---|
-| `armed` | The mesh, as usual. The payload may already be resident from an earlier swap. |
-| `loading` | Still the mesh — nothing changes until the payload is on the GPU. |
-| `crossFading` | The mesh dithers out (the LOD screen-door) while the splat's opacity ramps in, over `crossFadeDuration`. |
-| `swapped` | The splat. The mesh draws no colour, but keeps writing depth as a shrunk shell, casting shadows, colliding and being picked. |
-| `reverting` | The reverse fade, when the camera leaves `swapDistanceMeters + hysteresisMeters`. Ends `armed`; the payload stays resident so the next swap is instant. |
-
-The **occluder shell** is the mesh itself drawn depth-only, pushed `occluderShrinkMeters`
-along its normals away from the camera (the `gaussianTwinShell` render pass, after the opaque
-colour and before the HZB copy and the splat pass). Splats on and just outside the surface
-survive the splat pass's depth test; splats on the far side of the object are hidden. Soft
-objects can differ from their mesh by centimetres, so raise the margin until the front of the
-capture stops clipping. Blend-mode submeshes are left out of the shell and stop drawing once
-swapped. Where splats cannot be drawn at all (the iOS simulator has no splat pipelines) twins
-stay armed and the mesh keeps showing.
+A typical swap: load the payload with `opacityScale: 0` when the camera is near; add a
+`MeshOccluderComponent`; add a `MeshFadeComponent` with `direction = .fadeOut` and raise its
+`progress` and the splat's `opacityScale` together to 1 over 250 ms; then set `drawsColor =
+false` and remove the fade. Reverse the steps when the camera leaves.
 
 ### Calibrating the capture
 
 Splats are unlit emissive surfaces composited in linear light before the look and output
-transforms, so a twin is tone-mapped once, like an emissive mesh next to it. The preprocess
+transforms, so a splat is tone-mapped once, like an emissive mesh next to it. The preprocess
 applies one linear gain per entity, `GaussianComponent.colorGain`: the capture white balance
 from the `.untoldgs` header, times `2^(exposureOffsetEV − captureExposureEV)`. A capture
 recorded at +1 EV therefore comes back to the scene's neutral exposure by itself, and the
@@ -175,28 +169,6 @@ per-asset offset (the editor slider, `exposureOffsetEV` in the scene record) pus
 way. With `useRealWorldTint` the colour is also multiplied by the XR lighting estimate's tint
 whenever `RuntimeEnvironmentLightingStore` is in `.realWorldEstimate` mode with a valid
 estimate, so a capture made under neutral light takes on the colour of the room.
-
-`GaussianComponent.opacityScale` is the per-entity opacity weight the swap animates; apps can
-set it on any splat entity (0 hides it without unloading, and skips its cull).
-
-### What to expect
-
-- Distance is measured from the camera to the entity's bounds centre, like the LOD system.
-- The cross-fade counts wall-clock frame time (each frame's step is capped at 100 ms), so it
-  lasts `crossFadeDuration` at any refresh rate above 10 Hz.
-- While the swap is not `armed` the entity leaves static batching and draws on its own; it
-  re-joins its batch after reverting.
-- The mesh's bounding box grows to the union with the splat's box on load, and again whenever
-  the mesh re-registers (streaming); it never shrinks.
-- The splat's bytes are tracked beside the mesh's `MemoryBudgetManager` entry
-  (`auxiliaryMeshBytes`), so mesh streaming in and out leaves them intact; mesh eviction
-  never frees the splat.
-- A batched twin leaves its batch group when the swap starts and re-joins after reverting;
-  the group is rebuilt over a few frames, during which the mesh is still drawn by the group.
-- Calling `setEntityGaussian` on a twin entity hands that splat to the swap as its resident
-  payload; removing the splat while swapped snaps the mesh back.
-- `GaussianDebugOptions.shared.disableTwinShell` turns the shell off for bisecting an artefact.
-- `removeEntityGaussianTwin(entityId:)` unlinks the twin, drops the splat and shows the mesh.
 
 ## Progressive Gaussian Splats
 
