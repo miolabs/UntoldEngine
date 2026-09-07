@@ -539,7 +539,6 @@ var gaussianDecodePipeline: ComputePipeline {
     }
 }
 
-
 var gaussianFinalizeSharedVisibleSetPipeline: ComputePipeline {
     get {
         let state = CoreRuntimeGlobals.shared

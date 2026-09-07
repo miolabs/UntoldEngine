@@ -79,6 +79,12 @@ private func dispatchOverVisibleSplats(
     }
 }
 
+/// The shared visible set handed to a command buffer's completed handler: the buffer is only
+/// read there, after the GPU has finished with it, so the capture is safe.
+private struct GaussianSharedVisibleSetReadback: @unchecked Sendable {
+    let buffer: MTLBuffer
+}
+
 private struct GaussianVisibleCountUpdate: @unchecked Sendable {
     let entityId: EntityID
     let component: GaussianComponent
@@ -492,8 +498,9 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
 
     // Profiling readback of the shared set, two or three frames late like the per-entity one.
     // Overflow means splats were dropped this frame: reported once per change, not every frame.
+    let completedVisibleSet = GaussianSharedVisibleSetReadback(buffer: sharedVisibleSet)
     commandBuffer.addCompletedHandler { _ in
-        let set = sharedVisibleSet.contents().load(as: GaussianVisibleSet.self)
+        let set = completedVisibleSet.buffer.contents().load(as: GaussianVisibleSet.self)
         let previousOverflow = GaussianSharedWorkingSet.shared.lastOverflowCount
         GaussianSharedWorkingSet.shared.recordCompletedFrame(visibleCount: Int(set.visibleCount), overflowCount: Int(set.overflowCount))
         if set.overflowCount > 0, Int(set.overflowCount) != previousOverflow {
