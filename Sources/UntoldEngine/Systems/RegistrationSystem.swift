@@ -182,6 +182,10 @@ private func registerComponentCleanupHandlers() {
         removeEntityGaussian(entityId: entityId)
     }
 
+    ComponentRegistry.register(componentType: GaussianTwinComponent.self, handlerId: "gaussianTwin", priority: 29) { entityId in
+        removeEntityGaussianTwin(entityId: entityId)
+    }
+
     ComponentRegistry.register(componentType: CameraComponent.self, handlerId: "camera", priority: 30) { entityId in
         removeEntityCamera(entityId: entityId)
     }
@@ -658,8 +662,17 @@ private func registerUntoldProgressiveStubEntity(
         sc.unloadRadius = Float.greatestFiniteMagnitude
     }
     setDefaultEntitySceneChannels(entityId: childEntityId, channels: defaultSceneChannels(forName: uniqueAssetName))
+    // The twin arms now and waits for the stub's geometry to stream in before it can swap.
+    attachGaussianTwinIfLinked(entityId: childEntityId, node: node)
 
     return childEntityId
+}
+
+/// Links the node's splat twin (a `gaussianAsset` record flagged `meshTwin`) to the entity that
+/// carries the node's mesh. Nothing is loaded here; `GaussianTwinSystem` does that on demand.
+private func attachGaussianTwinIfLinked(entityId: EntityID, node: RuntimeAssetNode) {
+    guard let twin = node.gaussianTwin else { return }
+    setEntityGaussianTwin(entityId: entityId, payloadURL: twin.payloadURL, options: twin.twinOptions)
 }
 
 /// Register all renderable nodes in a .untold RuntimeAsset as OCC stub entities.
@@ -874,6 +887,7 @@ private func registerUntoldRuntimeAsset(
             handleError(.assetDataMissing, "Node '\(assetName)' in '\(filename).\(withExtension)' has no renderable primitives")
             return false
         }
+        attachGaussianTwinIfLinked(entityId: entityId, node: matchedNode)
         return true
     }
 
@@ -947,6 +961,7 @@ private func registerUntoldRuntimeAsset(
             url: url,
             prebuiltMeshes: prebuiltMeshes[node.id]
         )
+        attachGaussianTwinIfLinked(entityId: targetEntityId, node: node)
     }
 
     // Register animation clips embedded in the asset (e.g. redplayer.untold walk/run cycles).
@@ -3100,6 +3115,10 @@ func registerRenderComponent(entityId: EntityID, meshes: [Mesh], url: URL, asset
     let boundingBox = Mesh.computeMeshBoundingBox(for: resolvedMeshes)
 
     localTransformComponent.boundingBox = boundingBox
+    // A mesh that (re)registers under a resident splat twin keeps covering the splat too.
+    if let twin = scene.get(component: GaussianTwinComponent.self, for: entityId) {
+        expandBoundingBoxWithGaussianTwinPayload(localTransform: localTransformComponent, twin: twin)
+    }
 
     OctreeSystem.shared.registerEntity(entityId)
 
@@ -3337,6 +3356,9 @@ struct GaussianLoadResult {
     let encodedSplatBuffer: MTLBuffer
     let sphericalHarmonicsBuffer: MTLBuffer?
     let sphericalHarmonicsMetadata: GaussianSHMetadata?
+    /// Capture exposure and white balance from a `.untoldgs` header (0 and 1 for a `.ply`).
+    var captureExposureEV: Float = 0
+    var captureWhiteBalance = SIMD3<Float>(repeating: 1)
     /// Sum of all GPU buffer bytes above, for `MemoryBudgetManager` registration.
     let estimatedGPUBytes: Int
     /// Local-space bounding box computed from the actual loaded splat positions, for
@@ -3557,13 +3579,16 @@ func buildGaussianLoadResultFromUntoldGS(url: URL) -> GaussianLoadResult? {
     if GaussianChunkLoader.isAvailable {
         do {
             let loaded = try GaussianChunkLoader.load(url: url)
-            return buildGaussianLoadResult(
+            guard var result = buildGaussianLoadResult(
                 encodedSplatBuffer: loaded.encodedSplatBuffer,
                 splatCount: UInt(loaded.splatCount),
                 sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
                 sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
                 boundingBox: loaded.boundingBox
-            )
+            ) else { return nil }
+            result.captureExposureEV = loaded.captureExposureEV
+            result.captureWhiteBalance = loaded.captureWhiteBalance
+            return result
         } catch {
             handleError(.assetDataMissing, "Failed to load .untoldgs Gaussian asset \(url.lastPathComponent): \(error)")
             return nil
@@ -3580,12 +3605,17 @@ func buildGaussianLoadResultFromUntoldGS(url: URL) -> GaussianLoadResult? {
     let packedSphericalHarmonics = asset.shMetadata.map {
         PackedGaussianSphericalHarmonics(coefficients: asset.shCoefficients, metadata: $0)
     }
-    return buildGaussianLoadResult(
+    guard var result = buildGaussianLoadResult(
         encodedSplats: asset.encodedSplats,
         packedSphericalHarmonics: packedSphericalHarmonics,
         meanSquaredSplatExtent: asset.meanSquaredSplatExtent,
         sourceDescription: url.lastPathComponent
-    )
+    ) else { return nil }
+    if let header = try? UntoldGSFormat.readHeaderV3(from: url) {
+        result.captureExposureEV = header.captureExposureEV
+        result.captureWhiteBalance = header.captureWhiteBalance
+    }
+    return result
 }
 
 func buildGaussianComponentFromUntoldGS(url: URL) -> (
@@ -3613,7 +3643,18 @@ func buildGaussianComponentFromUntoldGS(url: URL) -> (
 /// Registers `GaussianComponent` on `entityId` from a built `GaussianLoadResult` and records
 /// its GPU footprint with `MemoryBudgetManager`. Must be called from within a world-mutation
 /// gate (`withWorldMutationGate`).
+///
+/// On a mesh entity with a `GaussianTwinComponent` the mesh stays the entity's primary
+/// representation: its ledger entry gains the splat's bytes instead of being replaced, and its
+/// bounding box (which drives culling of the mesh and its occluder shell, shadow casting,
+/// octree raycasts and picking) grows to the union with the splat's box rather than being
+/// overwritten.
 private func applyGaussianLoadResult(_ result: GaussianLoadResult, to entityId: EntityID) {
+    // Release a splat already on the entity first: re-assigning the component slot would
+    // leave the old instance and its Metal buffers alive (see `copyGaussianComponentBuffers`).
+    if scene.get(component: GaussianComponent.self, for: entityId) != nil {
+        removeEntityGaussian(entityId: entityId)
+    }
     registerComponent(entityId: entityId, componentType: GaussianComponent.self)
 
     guard let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) else {
@@ -3622,11 +3663,52 @@ private func applyGaussianLoadResult(_ result: GaussianLoadResult, to entityId: 
     }
 
     copyGaussianLoadResult(result, to: gaussianComponent)
+
+    if let twin = scene.get(component: GaussianTwinComponent.self, for: entityId) {
+        // Whoever loaded it (the twin system or a direct setEntityGaussian call), the splat
+        // is now the twin's resident payload: the swap decides when it shows.
+        MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: result.estimatedGPUBytes)
+        twin.payloadGPUBytes = result.estimatedGPUBytes
+        twin.payloadBoundingBox = result.boundingBox
+        twin.payloadResident = true
+        gaussianComponent.opacityScale = gaussianTwinSplatOpacity(state: twin.state, progress: twin.fadeProgress)
+        if let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId) {
+            expandBoundingBoxWithGaussianTwinPayload(localTransform: localTransform, twin: twin)
+            OctreeSystem.shared.markDirty(entityId)
+        }
+        return
+    }
+
     MemoryBudgetManager.shared.registerMesh(entityId: entityId, meshSizeBytes: result.estimatedGPUBytes)
 
     if let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId) {
         localTransform.boundingBox = result.boundingBox
     }
+}
+
+/// Grows the mesh's box to the union with the twin's resident splat box. The mesh box drives
+/// culling of the mesh and its occluder shell, shadow casting, octree raycasts and picking, so
+/// it must cover both representations; it never shrinks here.
+func expandBoundingBoxWithGaussianTwinPayload(localTransform: LocalTransformComponent, twin: GaussianTwinComponent) {
+    guard let payloadBox = twin.payloadBoundingBox else { return }
+    let box = localTransform.boundingBox
+    localTransform.boundingBox = (
+        min: simd_min(box.min, payloadBox.min),
+        max: simd_max(box.max, payloadBox.max)
+    )
+}
+
+/// Applies a twin's loaded payload to its mesh entity (see `GaussianTwinSystem`): registers the
+/// splat (hidden until the cross-fade brings it in) and hands it the twin's exposure offset and
+/// tint setting. Must be called under the world-mutation gate.
+func applyGaussianTwinPayload(_ result: GaussianLoadResult, to entityId: EntityID, twin: GaussianTwinComponent) {
+    applyGaussianLoadResult(result, to: entityId)
+    guard twin.payloadResident, let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) else {
+        twin.loadFailed = true
+        return
+    }
+    gaussianComponent.exposureOffsetEV = twin.options.exposureOffsetEV
+    gaussianComponent.useRealWorldTint = twin.options.useRealWorldTint
 }
 
 func copyGaussianLoadResult(_ result: GaussianLoadResult, to gaussianComponent: GaussianComponent) {
@@ -3637,6 +3719,8 @@ func copyGaussianLoadResult(_ result: GaussianLoadResult, to gaussianComponent: 
     gaussianComponent.encodedSplatData = result.encodedSplatBuffer
     gaussianComponent.sphericalHarmonicsData = result.sphericalHarmonicsBuffer
     gaussianComponent.sphericalHarmonicsMetadata = result.sphericalHarmonicsMetadata
+    gaussianComponent.captureExposureEV = result.captureExposureEV
+    gaussianComponent.captureWhiteBalance = result.captureWhiteBalance
 }
 
 public enum GaussianSource {
@@ -4542,6 +4626,21 @@ func removeEntityGaussian(entityId: EntityID) {
         gaussianComponent.gaussianVisibleCount.removeAll()
         gaussianComponent.visibleSplatCountForRendering = 0
         scene.remove(component: GaussianComponent.self, from: entityId)
+        if let twin = scene.get(component: GaussianTwinComponent.self, for: entityId) {
+            // The mesh keeps its own ledger entry; only the splat's share goes. With no splat
+            // to show, the swap goes back to the mesh at once (a swapped twin would otherwise
+            // keep its colour off and its shell on, leaving a hole where the object was).
+            MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: 0)
+            twin.payloadGPUBytes = 0
+            twin.payloadBoundingBox = nil
+            twin.payloadResident = false
+            if twin.state != .armed {
+                twin.state = .armed
+                twin.fadeProgress = 0
+                BatchingSystem.shared.notifyEntityMaterialChanged(entityId: entityId)
+            }
+            return
+        }
         // Idempotent — safe to call again if `unloadGaussian` already unregistered this
         // entity as part of a streaming unload. Keeps MemoryBudgetManager's ledger accurate
         // for entities destroyed directly (e.g. a non-streamed setEntityGaussian caller).

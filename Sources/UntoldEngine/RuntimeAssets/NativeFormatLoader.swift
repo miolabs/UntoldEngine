@@ -56,7 +56,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             indexChunkData: indexChunkData,
             edgeIndexChunkData: edgeIndexChunkData,
             jointIndexChunkData: jointIndexChunkData,
-            jointWeightChunkData: jointWeightChunkData
+            jointWeightChunkData: jointWeightChunkData,
+            baseURL: url.deletingLastPathComponent()
         )
 
         return try RuntimeAsset(
@@ -92,11 +93,13 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         indexChunkData: Data,
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
-        jointWeightChunkData: Data?
+        jointWeightChunkData: Data?,
+        baseURL: URL
     ) throws -> [RuntimeAssetNode] {
         guard decoded.header.fileType != .animation else { return [] }
         let entitiesByID = Dictionary(uniqueKeysWithValues: decoded.entities.map { ($0.entityId, $0) })
         let runtimeSkeletonsByEntity = try makeRuntimeSkeletonsByEntity(decoded: decoded)
+        let gaussianTwinsByEntity = try makeRuntimeGaussianTwinsByEntity(decoded: decoded, baseURL: baseURL)
         var worldTransformsByID: [UInt32: simd_float4x4] = [:]
         var visiting: Set<UInt32> = []
 
@@ -135,9 +138,41 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 edgeIndexChunkData: edgeIndexChunkData,
                 jointIndexChunkData: jointIndexChunkData,
                 jointWeightChunkData: jointWeightChunkData,
-                runtimeSkeletonsByEntity: runtimeSkeletonsByEntity
+                runtimeSkeletonsByEntity: runtimeSkeletonsByEntity,
+                gaussianTwinsByEntity: gaussianTwinsByEntity
             )
         }
+    }
+
+    /// The `gaussianAsset` records flagged as mesh twins, keyed by the entity they attach to.
+    /// The payload path is resolved next to the `.untold` file (or as the flattened bundle
+    /// basename, like textures); a missing file is not an error here — the swap reports it
+    /// when it first tries to load.
+    private func makeRuntimeGaussianTwinsByEntity(
+        decoded: UntoldDecodedAsset,
+        baseURL: URL
+    ) throws -> [UInt32: RuntimeGaussianTwinSource] {
+        var twins: [UInt32: RuntimeGaussianTwinSource] = [:]
+        for record in decoded.gaussianAssets where record.flags & UntoldGaussianAssetFlags.meshTwin != 0 {
+            guard twins[record.entityId] == nil else {
+                Logger.logWarning(message: "[NativeFormatLoader] Entity \(record.entityId) has more than one meshTwin gaussianAsset record; keeping the first")
+                continue
+            }
+            guard let path = try decoded.string(at: record.payloadPathOffset),
+                  let payloadURL = resolvedURL(from: path, baseURL: baseURL)
+            else { continue }
+            if let entity = decoded.entities.first(where: { $0.entityId == record.entityId }), entity.meshRecordCount == 0 {
+                Logger.logWarning(message: "[NativeFormatLoader] meshTwin gaussianAsset record on entity \(record.entityId), which has no mesh to swap from; ignored")
+                continue
+            }
+            twins[record.entityId] = RuntimeGaussianTwinSource(
+                payloadURL: payloadURL,
+                occluderShrinkMeters: record.occluderShrinkMeters,
+                exposureOffsetEV: record.exposureOffsetEV,
+                swapDistanceMeters: record.swapDistanceMeters
+            )
+        }
+        return twins
     }
 
     private func makeRuntimeLights(decoded: UntoldDecodedAsset) throws -> [RuntimeLightSource] {
@@ -271,7 +306,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
-        runtimeSkeletonsByEntity: [UInt32: RuntimeSkeleton]
+        runtimeSkeletonsByEntity: [UInt32: RuntimeSkeleton],
+        gaussianTwinsByEntity: [UInt32: RuntimeGaussianTwinSource] = [:]
     ) throws -> RuntimeAssetNode {
         let nodeName = try decoded.string(at: entity.nameOffset) ?? "entity_\(entity.entityId)"
         let meshStart = Int(entity.firstMeshRecordIndex)
@@ -305,7 +341,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             localBounds: entity.localBounds,
             worldBounds: entity.worldBounds,
             skeleton: runtimeSkeletonsByEntity[entity.entityId],
-            primitives: primitives
+            primitives: primitives,
+            gaussianTwin: primitives.isEmpty ? nil : gaussianTwinsByEntity[entity.entityId]
         )
     }
 

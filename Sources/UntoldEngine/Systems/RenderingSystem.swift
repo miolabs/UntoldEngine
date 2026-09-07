@@ -227,6 +227,7 @@ let gameModeReservedPassIDs: Set<String> = [
     "pointShadow",
     "model",
     "batchedModel",
+    "gaussianTwinShell",
     "hzbDepthSource",
     "ssao",
     "lightPass",
@@ -401,8 +402,9 @@ private func buildGameModeGraphWithCompilation() throws -> CompiledRenderGraphRe
     )
     builder.addPass(spatialDebugPass)
 
-    // Gaussian pass depends on model pass - needs depth buffer from 3D models
-    let gaussianPass = RenderPass(id: "gaussian", dependencies: ["model"], execute: RenderPasses.gaussianExecution)
+    // Gaussian pass depends on the model pass and the twin shell - it snapshots the opaque
+    // depth they wrote to occlude splats.
+    let gaussianPass = RenderPass(id: "gaussian", dependencies: ["model", "gaussianTwinShell"], execute: RenderPasses.gaussianExecution)
     builder.addPass(gaussianPass)
 
     let beforePostProcessID = builder.resolveStage(.beforePostProcess, after: spatialDebugPass.id) ?? spatialDebugPass.id
@@ -582,10 +584,19 @@ func gBufferPass(graph: inout [String: RenderPass], shadowPass: RenderPass) {
     let batchedModelPass = RenderPass(id: "batchedModel", dependencies: [modelPass.id], execute: nil)
     graph[batchedModelPass.id] = batchedModelPass
 
+    // Depth-only shells of mesh twins shown as splats, written into the resolved opaque
+    // depth after all colour geometry so the HZB copy, SSAO and the splat snapshot see them.
+    let gaussianTwinShellPass = RenderPass(
+        id: "gaussianTwinShell",
+        dependencies: [batchedModelPass.id],
+        execute: RenderPasses.gaussianTwinShellExecution
+    )
+    graph[gaussianTwinShellPass.id] = gaussianTwinShellPass
+
     // HZB depth copy must happen after all opaque geometry is drawn.
     let hzbDepthSourcePass = RenderPass(
         id: "hzbDepthSource",
-        dependencies: [batchedModelPass.id],
+        dependencies: [gaussianTwinShellPass.id],
         execute: RenderPasses.copyOpaqueDepthForHZBExecution
     )
     graph[hzbDepthSourcePass.id] = hzbDepthSourcePass
