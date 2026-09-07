@@ -1643,6 +1643,12 @@ public class BatchingSystem: @unchecked Sendable {
             return nil
         }
 
+        // A mesh twin that is loading, fading or swapped to its splat needs its own draw
+        // (dither, colour off, occluder shell); an armed twin batches like any other mesh.
+        if let twin = scene.get(component: GaussianTwinComponent.self, for: entityId), twin.state != .armed {
+            return nil
+        }
+
         // Identity-preserved streamed objects must stay individually renderable/selectable.
         if shouldPreserveSceneEntityIdentity(entityId: entityId) { return nil }
 

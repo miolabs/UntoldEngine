@@ -107,6 +107,113 @@ public class GaussianComponent: Component {
     var visibleSplatCountForRendering: UInt = 0
     var splatCount: UInt = 0
 
+    /// Multiplier on every splat's opacity this frame: 1 draws the asset as captured, 0 hides
+    /// it without unloading (nothing is compacted into the frame), values between cross-fade.
+    /// The twin swap drives it; apps may set it directly.
+    public var opacityScale: Float = 1
+    /// Exposure the capture was recorded at, from the `.untoldgs` header (0 for `.ply`), and
+    /// its white balance as an RGB multiplier (1 for none). Baked by the cook, read on load.
+    public internal(set) var captureExposureEV: Float = 0
+    public internal(set) var captureWhiteBalance = SIMD3<Float>(repeating: 1)
+    /// Per-asset exposure offset in EV on top of the capture exposure (the editor's slider,
+    /// `UntoldGaussianAssetRecordV1.exposureOffsetEV` in a scene).
+    public var exposureOffsetEV: Float = 0
+    /// In XR, multiply the colour by the real-world lighting estimate's tint
+    /// (`RuntimeEnvironmentLightingStore`, while its mode is `.realWorldEstimate` and the
+    /// latest estimate is valid), so a capture made under neutral light takes on the colour of
+    /// the room it is shown in. Off by default; the twin swap turns it on from its options.
+    public var useRealWorldTint = false
+
+    /// The linear gain the preprocess applies to this asset's colour: the capture white balance
+    /// and 2^(offset − capture exposure), which brings a capture recorded at +1 EV back to the
+    /// scene's neutral exposure and lets the per-asset offset push it either way. The real-world
+    /// tint is applied on top by the preprocess when `useRealWorldTint` is set. Splats are unlit
+    /// emissive surfaces composited before the look and output transforms, so this is the only
+    /// place the capture is calibrated to the scene (proposal §4.5, Lighting).
+    public var colorGain: SIMD3<Float> {
+        captureWhiteBalance * pow(2, exposureOffsetEV - captureExposureEV)
+    }
+
+    public required init() {}
+}
+
+/// Where a mesh entity with a captured splat twin (`GaussianTwinComponent`) stands in the swap.
+public enum GaussianTwinState: Int, Sendable, Equatable {
+    /// The mesh is drawn as usual; the splat is not shown (it may or may not be resident).
+    case armed
+    /// The splat payload is being read; nothing changes on screen until it is resident.
+    case loading
+    /// The mesh colour dithers out while the splat's opacity ramps in, over `crossFadeDuration`.
+    case crossFading
+    /// The splat is shown. The mesh keeps writing depth (as a shrunk shell), shadows and physics.
+    case swapped
+    /// The reverse fade: the mesh dithers back in while the splat ramps out.
+    case reverting
+}
+
+/// Per-entity settings of the mesh-to-splat swap, seeded from the scene's
+/// `UntoldGaussianAssetRecordV1` when the twin comes from a `.untold` file.
+public struct GaussianTwinOptions: Sendable, Equatable {
+    /// Camera distance to the mesh's bounds centre below which the swap arms and runs;
+    /// 0 swaps at any distance.
+    public var swapDistanceMeters: Float
+    /// Added to `swapDistanceMeters` before the swap reverts, so a camera hovering at the
+    /// threshold does not flip the object back and forth.
+    public var hysteresisMeters: Float
+    /// Length of the cross-fade in seconds (wall-clock), both ways.
+    public var crossFadeDuration: Float
+    /// Metres the depth-only occluder shell is shrunk along the mesh normals while the splat
+    /// is shown, so splats on and just outside the surface are not hidden by their own mesh.
+    public var occluderShrinkMeters: Float
+    /// Exposure offset in EV applied to the splat on top of its capture exposure.
+    public var exposureOffsetEV: Float
+    /// See `GaussianComponent.useRealWorldTint`.
+    public var useRealWorldTint: Bool
+
+    public init(
+        swapDistanceMeters: Float = 0,
+        hysteresisMeters: Float = 0.5,
+        crossFadeDuration: Float = 0.25,
+        occluderShrinkMeters: Float = 0.02,
+        exposureOffsetEV: Float = 0,
+        useRealWorldTint: Bool = false
+    ) {
+        self.swapDistanceMeters = swapDistanceMeters
+        self.hysteresisMeters = hysteresisMeters
+        self.crossFadeDuration = crossFadeDuration
+        self.occluderShrinkMeters = occluderShrinkMeters
+        self.exposureOffsetEV = exposureOffsetEV
+        self.useRealWorldTint = useRealWorldTint
+    }
+}
+
+/// Links a mesh entity to the captured splat that stands in for it up close. `GaussianTwinSystem`
+/// loads the payload onto the same entity as a `GaussianComponent`, cross-fades the two and
+/// keeps the mesh's depth (shrunk shell), shadows, collider and picking on while the splat is
+/// shown. Attached by the `.untold` loader from a `gaussianAsset` record with the `meshTwin`
+/// flag, or by `setEntityGaussianTwin(entityId:payloadURL:options:)`.
+public class GaussianTwinComponent: Component {
+    /// The `.untoldgs` (or `.ply`) file loaded when the swap arms.
+    public var payloadURL: URL?
+    public var options = GaussianTwinOptions()
+    public internal(set) var state: GaussianTwinState = .armed
+    /// 0...1 progress of the running cross-fade (`.crossFading` and `.reverting` only).
+    public internal(set) var fadeProgress: Float = 0
+    /// Set once a payload load has failed; the swap then stays armed and does not retry.
+    public internal(set) var loadFailed = false
+
+    /// The payload was applied to the entity's `GaussianComponent` (resident on the GPU).
+    var payloadResident = false
+    /// GPU bytes of the resident payload, kept apart from the mesh's own bytes in the
+    /// memory ledger so unloading one representation does not drop the other's accounting.
+    var payloadGPUBytes = 0
+    /// Local-space box of the resident payload; the mesh box is grown to include it whenever
+    /// the mesh (re)registers.
+    var payloadBoundingBox: (min: simd_float3, max: simd_float3)?
+    /// Bumped on every link, relink and unlink; a load task applies only if it still matches.
+    var loadGeneration: UInt32 = 0
+    var loadTask: Task<Void, Never>?
+
     public required init() {}
 }
 

@@ -405,6 +405,35 @@ public struct RuntimeAnimationClip: Sendable, Equatable {
     }
 }
 
+/// A captured splat linked to a mesh node as its twin (a `.untold` `gaussianAsset` record with
+/// the `meshTwin` flag): the payload to load and the swap settings baked by the cook.
+public struct RuntimeGaussianTwinSource: Sendable, Equatable {
+    public var payloadURL: URL
+    public var occluderShrinkMeters: Float
+    public var exposureOffsetEV: Float
+    public var swapDistanceMeters: Float
+
+    public init(
+        payloadURL: URL,
+        occluderShrinkMeters: Float = 0.02,
+        exposureOffsetEV: Float = 0,
+        swapDistanceMeters: Float = 0
+    ) {
+        self.payloadURL = payloadURL
+        self.occluderShrinkMeters = occluderShrinkMeters
+        self.exposureOffsetEV = exposureOffsetEV
+        self.swapDistanceMeters = swapDistanceMeters
+    }
+
+    public var twinOptions: GaussianTwinOptions {
+        GaussianTwinOptions(
+            swapDistanceMeters: swapDistanceMeters,
+            occluderShrinkMeters: occluderShrinkMeters,
+            exposureOffsetEV: exposureOffsetEV
+        )
+    }
+}
+
 public struct RuntimeAssetNode: Sendable, Equatable {
     public var id: UInt32
     public var parentID: UInt32?
@@ -415,6 +444,8 @@ public struct RuntimeAssetNode: Sendable, Equatable {
     public var worldBounds: RuntimeAABB
     public var skeleton: RuntimeSkeleton?
     public var primitives: [RuntimeMeshPrimitive]
+    /// The splat twin this mesh node swaps to up close, when the scene links one.
+    public var gaussianTwin: RuntimeGaussianTwinSource?
 
     public init(
         id: UInt32,
@@ -425,7 +456,8 @@ public struct RuntimeAssetNode: Sendable, Equatable {
         localBounds: RuntimeAABB,
         worldBounds: RuntimeAABB,
         skeleton: RuntimeSkeleton? = nil,
-        primitives: [RuntimeMeshPrimitive]
+        primitives: [RuntimeMeshPrimitive],
+        gaussianTwin: RuntimeGaussianTwinSource? = nil
     ) {
         self.id = id
         self.parentID = parentID
@@ -436,6 +468,7 @@ public struct RuntimeAssetNode: Sendable, Equatable {
         self.worldBounds = worldBounds
         self.skeleton = skeleton
         self.primitives = primitives
+        self.gaussianTwin = gaussianTwin
     }
 }
 

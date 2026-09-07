@@ -991,6 +991,23 @@ public func InitWireframeOcclusionDepthPipeline() -> RenderPipeline? {
     )
 }
 
+/// Depth-only draw of a mesh whose splat twin is shown in its place, shrunk along the normals
+/// by the twin's margin (`vertexGaussianTwinShellShader`). Runs in its own encoder on the
+/// resolved opaque depth after the G-buffer pass, before the HZB copy and the splat pass
+/// snapshot it, so both see the shell.
+public func InitGaussianTwinShellPipeline() -> RenderPipeline? {
+    CreatePipeline(
+        vertexShader: "vertexGaussianTwinShellShader",
+        fragmentShader: nil,
+        vertexDescriptor: createModelVertexDescriptor(),
+        colorFormats: [.invalid],
+        depthFormat: renderInfo.depthPixelFormat,
+        depthCompareFunction: .lessEqual,
+        depthEnabled: true,
+        name: "Gaussian Twin Shell Pipeline"
+    )
+}
+
 public func InitSpatialDebugPipeline() -> RenderPipeline? {
     CreatePipeline(
         vertexShader: "vertexSpatialDebugShader",
@@ -1049,6 +1066,7 @@ public func DefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)
         (.debug, InitDebugPipeline),
         (.transparency, InitTransparencyPipeline),
         (.wireframe, InitWireframePipeline),
+        (.gaussianTwinShell, InitGaussianTwinShellPipeline),
     ]
 }
 
