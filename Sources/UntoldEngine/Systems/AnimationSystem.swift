@@ -425,12 +425,15 @@ public func setFootIKEnabled(entityId: EntityID, enabled: Bool) {
 }
 
 /// Enables or disables stance locking for the entity's foot IK chains:
-/// while a foot is planted (its animated world velocity is below the
-/// enter threshold) the IK target pins to the world position where it
-/// landed, absorbing residual root-motion slide; the lock releases when
-/// the animation swings the foot away, with a short catch-up decay.
-/// Requires foot IK chains to be configured and enabled.
-public func setFootIKStanceLocking(entityId: EntityID, enabled: Bool) {
+/// while a foot is planted the IK target pins to the world position where
+/// it landed, absorbing slide; the lock releases when the foot lifts, with
+/// a short catch-up decay. `source` says what counts as planted: the
+/// displayed ankle's own speed (the default: catches slide baked into a
+/// clip's root motion), or the playing clip's contact (`.clipContact`: a
+/// foot the clip holds still stays pinned through a transition, the
+/// root-velocity crossfade or the heading warp, and lets go only when the
+/// clip lifts it). Requires foot IK chains to be configured and enabled.
+public func setFootIKStanceLocking(entityId: EntityID, enabled: Bool, source: FootIKStanceLockSource = .displayedFoot) {
     let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
     guard animationComponents.isEmpty == false else {
         handleError(.noAnimationComponent, entityId)
@@ -445,7 +448,10 @@ public func setFootIKStanceLocking(entityId: EntityID, enabled: Bool) {
             )
         }
         animationComponent.footIK.stanceLockEnabled = enabled
+        animationComponent.footIK.lockSource = source
         animationComponent.footIK.lockStates = []
+        animationComponent.footIK.rawClip = nil
+        animationComponent.footIK.rawAnkles = []
     }
 }
 
