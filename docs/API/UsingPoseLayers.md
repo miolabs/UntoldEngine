@@ -74,9 +74,11 @@ the inertialized transition applied — and before foot IK plants the feet:
    uses) toward the target: within reach the hand lands on it; beyond
    reach the target is pulled in to `reach` (default 95%) of the chain's
    length along the same direction, so the arm points without locking the
-   elbow. The elbow keeps the bend plane the pose already has — the
-   layer's posture decides where the elbows go — and the solved rotations
-   blend in by the influence.
+   elbow. The target itself is eased over a short halflife (80 ms), so a
+   tracked head that jitters or a player who moves abruptly pulls the
+   hands over a few frames instead of one. The elbow keeps the bend plane
+   the pose already has — the layer's posture decides where the elbows go
+   — and the solved rotations blend in by the influence.
 
 Motion matching reads feet and hips before any of this and never sees
 the layer, so a layered character matches exactly as an unlayered one.

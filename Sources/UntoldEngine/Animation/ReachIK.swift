@@ -51,6 +51,12 @@ struct ReachIKState {
 
     /// World-space target; kept while the influence fades out.
     var targetWorld: simd_float3?
+    /// The target the solve actually uses: eases toward `targetWorld` with
+    /// `targetHalflife`, so a target that jumps (a tracked head that
+    /// jitters, a player who teleports) moves the hands over a few frames
+    /// instead of one. Nil until the first target.
+    var smoothedTarget: simd_float3?
+    var targetHalflife: Float = 0.08
     var weight: Float = 0
     var targetWeight: Float = 0
     var halflife: Float = 0.25
@@ -106,12 +112,21 @@ func applyReachIK(
         animationComponent.reachIK.weight = animationComponent.reachIK.targetWeight
     }
     let weight = animationComponent.reachIK.weight
-    guard weight > 1e-4, let targetWorld = animationComponent.reachIK.targetWorld else {
+    guard weight > 1e-4, let rawTarget = animationComponent.reachIK.targetWorld else {
         if animationComponent.reachIK.targetWeight <= 0 {
             animationComponent.reachIK.targetWorld = nil
+            animationComponent.reachIK.smoothedTarget = nil
         }
         return
     }
+    let targetWorld: simd_float3
+    if let previous = animationComponent.reachIK.smoothedTarget {
+        let ease = 1 - exp(-ln2 * deltaTime / max(animationComponent.reachIK.targetHalflife, 1e-4))
+        targetWorld = previous + (rawTarget - previous) * ease
+    } else {
+        targetWorld = rawTarget
+    }
+    animationComponent.reachIK.smoothedTarget = targetWorld
 
     let chains = animationComponent.reachIK.resolvedChains(skeleton: skeleton)
     guard chains.isEmpty == false else { return }

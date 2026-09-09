@@ -175,6 +175,23 @@ final class AnimationPoseLayerTests: XCTestCase {
         XCTAssertLessThan(simd_distance(handPosition(), simd_float3(0, 1.4, 0.57)), 0.01)
     }
 
+    func testReachFollowsAJumpingTargetOverSeveralFrames() {
+        configureReach()
+        setReachIKTarget(entityId: entityId, worldPosition: simd_float3(0.3, 1.0, 0.2), weight: 1, halflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        let before = handPosition()
+        // The target jumps to the other side: the hand crosses over in a
+        // few frames, not one.
+        setReachIKTarget(entityId: entityId, worldPosition: simd_float3(-0.3, 1.0, 0.2), weight: 1, halflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        let afterOne = handPosition()
+        XCTAssertLessThan(abs(afterOne.x - before.x), 0.15)
+        for _ in 0 ..< 40 {
+            AnimationSystem.shared.update(deltaTime)
+        }
+        XCTAssertLessThan(simd_distance(handPosition(), simd_float3(-0.3, 1.0, 0.2)), 0.01)
+    }
+
     func testReachEasesOutWhenReleased() {
         configureReach()
         setReachIKTarget(entityId: entityId, worldPosition: simd_float3(0, 1.4, 5), weight: 1, halflife: 0)
