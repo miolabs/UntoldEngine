@@ -287,9 +287,14 @@ extension GeometryStreamingSystem {
     }
 }
 
+/// The resident bytes of one tier: packed or encoded records, harmonics, the chunk table with its
+/// visible-chunk lists, and a whole-buffer entity's per-slot index buffers. The frame's shared
+/// working set is budgeted and carried by its own ledger entry
+/// (`MemoryBudgetManager.setGaussianWorkingSetBytes`), so no share of it is counted here.
 private func gaussianComponentEstimatedBytes(_ component: GaussianComponent) -> Int {
     var total = 0
     total += component.encodedSplatData?.length ?? 0
+    total += component.packedSplatData?.length ?? 0
     total += component.sphericalHarmonicsData?.length ?? 0
     for buffer in component.gaussianVisibleIndices {
         total += buffer?.length ?? 0
@@ -297,7 +302,6 @@ private func gaussianComponentEstimatedBytes(_ component: GaussianComponent) -> 
     for buffer in component.gaussianVisibleCount {
         total += buffer?.length ?? 0
     }
-    // Its share of the shared working set (see buildGaussianLoadResult).
-    total += maxInFlightCommandBuffers * GaussianSharedWorkingSet.bytesPerSplatPerSlot * Int(component.splatCount)
+    total += component.chunkTable?.gpuBytes ?? 0
     return total
 }

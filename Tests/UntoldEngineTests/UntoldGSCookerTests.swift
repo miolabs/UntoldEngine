@@ -91,13 +91,21 @@ final class UntoldGSCookerTests: XCTestCase {
     }
 
     func testSplatBudgetPresetsMatchTheRuntimeLimits() {
-        XCTAssertEqual(UntoldGSCookOptions.splatBudgetMobile, 5_242_880)
-        XCTAssertEqual(UntoldGSCookOptions.splatBudgetMac, 16_777_216)
+        XCTAssertEqual(UntoldGSCookOptions.splatBudgetMobile, 20_000_000)
+        XCTAssertEqual(UntoldGSCookOptions.splatBudgetMac, 40_000_000)
         #if os(macOS)
             XCTAssertEqual(GaussianRuntimeLimits.maxSplatsPerEntity, GaussianRuntimeLimits.maxSplatsPerEntityMac)
+            XCTAssertEqual(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity, GaussianRuntimeLimits.maxWholeBufferSplatsPerEntityMac)
         #else
             XCTAssertEqual(GaussianRuntimeLimits.maxSplatsPerEntity, GaussianRuntimeLimits.maxSplatsPerEntityMobile)
+            XCTAssertEqual(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity, GaussianRuntimeLimits.maxWholeBufferSplatsPerEntityMobile)
         #endif
+        // The whole-buffer path (.ply, CPU-decoded .untoldgs) keeps about 60 bytes per splat
+        // resident against the per-chunk path's 16, so its cap is the old, lower one.
+        XCTAssertEqual(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntityMobile, 5_242_880)
+        XCTAssertEqual(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntityMac, 16_777_216)
+        XCTAssertLessThan(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntityMobile, GaussianRuntimeLimits.maxSplatsPerEntityMobile)
+        XCTAssertLessThan(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntityMac, GaussianRuntimeLimits.maxSplatsPerEntityMac)
     }
 
     func testCookFailsWhenNothingSurvives() {

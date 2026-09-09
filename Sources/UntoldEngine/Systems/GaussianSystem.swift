@@ -92,6 +92,39 @@ private struct GaussianVisibleCountUpdate: @unchecked Sendable {
     let splatCount: UInt
 }
 
+/// The whole-buffer per-splat cull's inputs (`gaussianFrustumCull`).
+private struct GaussianSplatCullInputs {
+    var uniforms: Uniforms
+    var totalSplats: UInt32
+    var clipGuardBand: Float = gaussianCullClipGuardBand
+    var hzbReverseZ: UInt32
+    var hzbOcclusionBias: Float = gaussianCullHZBOcclusionBias
+    var hzbValid: UInt32
+}
+
+private func bindGaussianSplatCullInputs(
+    _ encoder: MTLComputeCommandEncoder,
+    pipelineState: MTLComputePipelineState,
+    inputs: GaussianSplatCullInputs,
+    encodedSplatData: MTLBuffer,
+    visibleIndices: MTLBuffer,
+    visibleCount: MTLBuffer,
+    hzbTexture: MTLTexture?
+) {
+    var inputs = inputs
+    encoder.setComputePipelineState(pipelineState)
+    encoder.setBuffer(encodedSplatData, offset: 0, index: Int(gaussianEncodedSplatIndex.rawValue))
+    encoder.setBytes(&inputs.uniforms, length: MemoryLayout<Uniforms>.stride, index: Int(gaussianUniformIndex.rawValue))
+    encoder.setBytes(&inputs.totalSplats, length: MemoryLayout<UInt32>.stride, index: Int(gaussianNumberOfSplatsIndex.rawValue))
+    encoder.setBuffer(visibleIndices, offset: 0, index: Int(gaussianVisibleIndicesIndex.rawValue))
+    encoder.setBuffer(visibleCount, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
+    encoder.setBytes(&inputs.clipGuardBand, length: MemoryLayout<Float>.stride, index: Int(gaussianIndicesIndex.rawValue))
+    encoder.setBytes(&inputs.hzbReverseZ, length: MemoryLayout<UInt32>.stride, index: Int(gaussianCullHZBReverseZIndex.rawValue))
+    encoder.setBytes(&inputs.hzbOcclusionBias, length: MemoryLayout<Float>.stride, index: Int(gaussianCullHZBOcclusionBiasIndex.rawValue))
+    encoder.setBytes(&inputs.hzbValid, length: MemoryLayout<UInt32>.stride, index: Int(gaussianCullHZBValidIndex.rawValue))
+    encoder.setTexture(hzbTexture, index: Int(gaussianCullHZBDepthPyramidTextureIndex.rawValue))
+}
+
 func initGuassianComputePipelines() {
     if renderInfo.device == nil {
         handleError(.metalDeviceNotFound)
@@ -115,6 +148,24 @@ func initGuassianComputePipelines() {
 
     createComputePipeline(into: &gaussianDecodePipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianDecodeChunks", pipelineName: "Gaussian Decode Chunks")
 
+    createComputePipeline(into: &gaussianResetVisibleChunkSetPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianResetVisibleChunkSet", pipelineName: "Gaussian Reset Visible Chunk Set")
+
+    createComputePipeline(into: &gaussianChunkCullPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianChunkCull", pipelineName: "Gaussian Chunk Cull")
+
+    createComputePipeline(into: &gaussianFinalizeVisibleChunksPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianFinalizeVisibleChunks", pipelineName: "Gaussian Finalize Visible Chunks")
+
+    createComputePipeline(into: &gaussianChunkDecodePreprocessPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianChunkDecodePreprocess", pipelineName: "Gaussian Chunk Decode Preprocess")
+
+    createComputePipeline(into: &gaussianResetBudgetRequestPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianResetBudgetRequest", pipelineName: "Gaussian Reset Budget Request")
+
+    createComputePipeline(into: &gaussianComputeBudgetScalePipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianComputeBudgetScale", pipelineName: "Gaussian Compute Budget Scale")
+
+    createComputePipeline(into: &gaussianComputeChunkQuotasPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianComputeChunkQuotas", pipelineName: "Gaussian Compute Chunk Quotas")
+
+    createComputePipeline(into: &gaussianPublishBudgetStatePipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianPublishBudgetState", pipelineName: "Gaussian Publish Budget State")
+
+    createComputePipeline(into: &gaussianReserveBudgetSplatsPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianReserveBudgetSplats", pipelineName: "Gaussian Reserve Budget Splats")
+
     createComputePipeline(into: &radixClearHistogramPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianRadixClearHistogram", pipelineName: "Radix Clear")
 
     createComputePipeline(into: &radixHistogramPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianRadixHistogram", pipelineName: "Radix Histogram")
@@ -124,6 +175,56 @@ func initGuassianComputePipelines() {
     createComputePipeline(into: &radixScanPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianRadixScan", pipelineName: "Radix Scan")
 
     createComputePipeline(into: &radixScatterPipeline, device: renderInfo.device, library: renderInfo.library, functionName: "gaussianRadixScatter", pipelineName: "Radix Scatter")
+}
+
+/// The previous frame's HZB as the splat culls read it: valid only when the pyramid exists and
+/// the debug switch leaves it on (the fallback texture is then never sampled).
+private func gaussianHZBInputs() -> (valid: Bool, texture: MTLTexture?) {
+    let valid = renderInfo.hzbIsValid && textureResources.hzbDepthPyramid != nil
+        && !GaussianDebugOptions.shared.disableHZBOcclusionCull
+    return (valid, textureResources.hzbDepthPyramid ?? textureResources.depthMap)
+}
+
+/// The head-centre matrices of one entity this frame, shared by the cull and the preprocess.
+private struct GaussianEntityFrameMatrices {
+    let modelMatrix: simd_float4x4
+    let viewMatrix: simd_float4x4
+    let effectiveCameraPosition: simd_float3
+    let uniforms: Uniforms
+
+    init(worldTransform: WorldTransformComponent, cameraComponent: CameraComponent) {
+        modelMatrix = simd_mul(worldTransform.space, .identity)
+        // Entity transforms are never modified when the scene root moves (SceneRootTransform
+        // applies its offset to the camera instead, as a "virtual camera" trick — see
+        // SceneRootTransform.swift). worldTransform.space above is therefore in entity space,
+        // so the camera side of this product must go through effectiveViewMatrix, not the raw
+        // per-eye viewSpace — otherwise the cull silently drifts out of sync with where the
+        // draw pass (which already uses effectiveViewMatrix) actually renders the splats as
+        // soon as the scene root is translated/rotated (e.g. via SpatialManipulationSystem's
+        // pinch-drag).
+        viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
+        effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        var gaussianUniform = Uniforms()
+        gaussianUniform.modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
+        gaussianUniform.viewMatrix = viewMatrix
+        gaussianUniform.modelMatrix = modelMatrix
+        gaussianUniform.cameraPosition = effectiveCameraPosition
+        gaussianUniform.projectionMatrix = renderInfo.perspectiveSpace
+        uniforms = gaussianUniform
+    }
+}
+
+/// A chunked entity whose chunk cull ran this frame and whose quotas are still to be granted.
+private struct GaussianChunkedEntityFrame {
+    let chunkTable: GaussianChunkTable
+    let visibleChunks: MTLBuffer
+    let chunkSet: MTLBuffer
+}
+
+/// The working-set budget of this frame in splats: the resident total with the debug switch on
+/// (nothing is ever truncated), otherwise `GaussianSharedWorkingSet.budgetSplats()`.
+func gaussianWorkingSetBudget(residentSplats: Int) -> Int {
+    GaussianDebugOptions.shared.disableWorkingSetBudget ? max(1, residentSplats) : GaussianSharedWorkingSet.budgetSplats()
 }
 
 public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
@@ -157,13 +258,29 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     let transformId = getComponentId(for: WorldTransformComponent.self)
     let gaussianId = getComponentId(for: GaussianComponent.self)
     let entities = queryEntitiesWithComponentIds([transformId, gaussianId], in: scene)
-    guard !entities.isEmpty else { return }
-
-    // The frame's shared working set must hold every splat the entities can contribute.
-    let residentSplats = entities.reduce(0) { total, entityId in
-        total + Int(scene.get(component: GaussianComponent.self, for: entityId)?.splatCount ?? 0)
+    let workingSet = GaussianSharedWorkingSet.shared
+    guard !entities.isEmpty else {
+        // The budget scale the last scene settled at must not fade the next one in.
+        workingSet.noteFrameWithoutEntities()
+        return
     }
-    guard GaussianSharedWorkingSet.shared.ensureCapacity(residentSplats, device: renderInfo.device) else {
+
+    // The frame's shared working set: sized to the budget (never above the resident total, which
+    // no frame can exceed, and never below the whole-buffer entities' total, which is not
+    // budgeted). Whole-buffer entities append whatever their cull keeps and reserve that count
+    // out of the budget first; chunked entities are fitted to the rest through per-chunk quotas
+    // below, so the set never overflows.
+    var residentSplats = 0
+    var wholeBufferSplats = 0
+    for entityId in entities {
+        guard let component = scene.get(component: GaussianComponent.self, for: entityId) else { continue }
+        residentSplats += Int(component.splatCount)
+        if !component.isChunked {
+            wholeBufferSplats += Int(component.splatCount)
+        }
+    }
+    let budget = gaussianWorkingSetBudget(residentSplats: residentSplats)
+    guard let capacity = workingSet.fitCapacity(residentSplats: residentSplats, budget: budget, wholeBufferSplats: wholeBufferSplats, device: renderInfo.device) else {
         handleError(.bufferAllocationFailed, "Gaussian shared working set")
         return
     }
@@ -171,6 +288,19 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
     computeEncoder.label = "Gaussian Frustum Culling"
 
+    // Chunked (.untoldgs) entities cull chunk by chunk and are fitted to the budget; their
+    // kernels and the frame's budget state are needed for that. A frame without them draws
+    // only the whole-buffer entities (a chunked entity is never loaded without the kernels).
+    let chunkPipelines = GaussianChunkCullPipelineStates.current()
+    let budgetState = workingSet.budgetState
+    let frameSlot = min(renderInfo.currentInFlightFrameSlot, maxInFlightCommandBuffers - 1)
+    if let chunkPipelines, let budgetState {
+        encodeGaussianBudgetReset(computeEncoder, pipelines: chunkPipelines, budgetState: budgetState)
+        profileTotals.dispatchCount += 1
+    }
+    let hzb = gaussianHZBInputs()
+
+    var chunkedEntities: [GaussianChunkedEntityFrame] = []
     var visibleCountUpdates: [GaussianVisibleCountUpdate] = []
 
     for entityId in entities {
@@ -182,27 +312,80 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             handleError(.noWorldTransformComponent, entityId)
             continue
         }
+        profileTotals.include(component: gaussianComponent)
+        activeSplatTotal += activeGaussianSortCount(gaussianComponent)
+        let matrices = GaussianEntityFrameMatrices(worldTransform: worldTransformComponent, cameraComponent: cameraComponent)
+
+        if gaussianComponent.isChunked {
+            guard let chunkPipelines, let budgetState, let chunkTable = gaussianComponent.chunkTable,
+                  frameSlot < chunkTable.visibleChunks.count, frameSlot < chunkTable.visibleChunkSets.count
+            else {
+                handleError(.pipelineStateNulled, "Gaussian chunk kernels")
+                continue
+            }
+            // Chunk level: one thread per chunk appends the chunks whose padded box passes either
+            // eye's frustum (and the HZB) to this slot's visible-chunk list and finalizes it into
+            // indirect arguments, adding the entity's visible splat total to the frame's budget
+            // request. The quotas follow once every entity's request is in; the fused per-chunk
+            // pass in executeGaussianPreprocess then decodes, tests and compacts the survivors.
+            // A hidden entity (opacityScale 0: resident but not shown) lists no chunk at all.
+            let visibleChunks = chunkTable.visibleChunks[frameSlot]
+            let chunkSet = chunkTable.visibleChunkSets[frameSlot]
+            let chunkConstants = gaussianChunkCullConstants(
+                chunkTable: chunkTable,
+                modelMatrix: matrices.modelMatrix,
+                viewMatrix: matrices.viewMatrix,
+                hzbValid: hzb.valid,
+                forceAllVisible: gaussianComponent.opacityScale <= 0 ? false : GaussianDebugOptions.shared.disableChunkCull
+            )
+            if gaussianComponent.opacityScale <= 0 {
+                profileTotals.dispatchCount += encodeGaussianEmptyChunkSet(computeEncoder, pipelines: chunkPipelines, chunkSet: chunkSet, budgetState: budgetState)
+                gaussianComponent.visibleSplatCountForRendering = 0
+                continue
+            }
+            profileTotals.dispatchCount += encodeGaussianChunkCull(
+                computeEncoder,
+                pipelines: chunkPipelines,
+                chunkTable: chunkTable,
+                visibleChunks: visibleChunks,
+                chunkSet: chunkSet,
+                budgetState: budgetState,
+                constants: chunkConstants,
+                hzbTexture: hzb.texture
+            )
+            chunkedEntities.append(GaussianChunkedEntityFrame(chunkTable: chunkTable, visibleChunks: visibleChunks, chunkSet: chunkSet))
+            // The record's first word is the quota sum once the quotas are in: an upper bound on
+            // what the fused pass appends for this entity.
+            visibleCountUpdates.append(
+                GaussianVisibleCountUpdate(
+                    entityId: entityId,
+                    component: gaussianComponent,
+                    visibleCount: chunkSet,
+                    splatCount: gaussianComponent.splatCount
+                )
+            )
+            continue
+        }
+
+        // Whole-buffer entities (.ply, CPU-decoded .untoldgs): the per-splat cull over the
+        // encoded buffer into the per-slot visible-index list. Cull/depth-key/radix-sort write
+        // these buffers fresh every frame; slot per in-flight frame (mirrors spaceUniform's
+        // indexing) so an overlapping newer frame can't clobber data an older in-flight frame's
+        // draw is still reading — see the comment on GaussianComponent's declaration.
         guard !gaussianComponent.gaussianVisibleIndices.isEmpty,
               !gaussianComponent.gaussianVisibleCount.isEmpty
         else {
             handleError(.bufferAllocationFailed, "Gaussian culling buffers")
             continue
         }
-        // Cull/depth-key/radix-sort write these buffers fresh every frame; slot per
-        // in-flight frame (mirrors spaceUniform's indexing) so an overlapping newer frame
-        // can't clobber data an older in-flight frame's draw is still reading — see the
-        // comment on GaussianComponent's declaration.
-        let frameSlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianVisibleIndices.count - 1)
+        let entitySlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianVisibleIndices.count - 1)
         guard let encodedSplatData = gaussianComponent.encodedSplatData,
-              let visibleIndices = gaussianComponent.gaussianVisibleIndices[frameSlot],
-              let visibleCount = gaussianComponent.gaussianVisibleCount[frameSlot]
+              let visibleIndices = gaussianComponent.gaussianVisibleIndices[entitySlot],
+              let visibleCount = gaussianComponent.gaussianVisibleCount[entitySlot]
         else {
             handleError(.bufferAllocationFailed, "Gaussian culling buffers")
             continue
         }
-
-        profileTotals.include(component: gaussianComponent)
-        activeSplatTotal += activeGaussianSortCount(gaussianComponent)
 
         computeEncoder.setComputePipelineState(resetPipelineState)
         computeEncoder.setBuffer(visibleCount, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
@@ -221,53 +404,26 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             continue
         }
 
-        let modelMatrix = simd_mul(worldTransformComponent.space, .identity)
-        // Entity transforms are never modified when the scene root moves (SceneRootTransform
-        // applies its offset to the camera instead, as a "virtual camera" trick — see
-        // SceneRootTransform.swift). worldTransformComponent.space above is therefore in
-        // entity space, so the camera side of this product must go through
-        // effectiveViewMatrix, not the raw per-eye viewSpace — otherwise this cull silently
-        // drifts out of sync with where the draw pass (which already uses
-        // effectiveViewMatrix) actually renders the splats as soon as the scene root is
-        // translated/rotated (e.g. via SpatialManipulationSystem's pinch-drag).
-        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
-
-        var gaussianUniform = Uniforms()
-        gaussianUniform.modelViewMatrix = modelViewMatrix
-        gaussianUniform.viewMatrix = viewMatrix
-        gaussianUniform.modelMatrix = modelMatrix
-        gaussianUniform.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
-        gaussianUniform.projectionMatrix = renderInfo.perspectiveSpace
-
-        var totalSplats = UInt32(gaussianComponent.splatCount)
-        var clipGuardBand: Float = 0.25
-
-        // Coarse per-splat HZB occlusion pre-cull, fused into this same dispatch — see
-        // the comment in gaussianFrustumCull (BitonicSort.metal). Reuses the exact same
-        // temporal HZB pyramid mesh occlusion culling builds each frame
+        // Coarse per-splat HZB occlusion pre-cull, fused into the per-splat dispatch — see
+        // the comment in gaussianClipCentrePassesCull (BitonicSort.metal). Reuses the exact
+        // same temporal HZB pyramid mesh occlusion culling builds each frame
         // (buildHZBDepthPyramid); hzbIsValid guarantees hzbDepthPyramid is non-nil when
-        // true, so the fallback texture below is only ever actually read when the flag
-        // (and therefore the shader's own occlusion branch) is off.
-        let hzbValid = renderInfo.hzbIsValid && textureResources.hzbDepthPyramid != nil
-            && !GaussianDebugOptions.shared.disableHZBOcclusionCull
-        var hzbValidFlag: UInt32 = hzbValid ? 1 : 0
-        var hzbReverseZFlag: UInt32 = renderInfo.reverseZEnabled ? 1 : 0
-        var hzbOcclusionBias: Float = 0.02
-
-        computeEncoder.setComputePipelineState(cullPipelineState)
-        computeEncoder.setBuffer(encodedSplatData, offset: 0, index: Int(gaussianEncodedSplatIndex.rawValue))
-        computeEncoder.setBytes(&gaussianUniform, length: MemoryLayout<Uniforms>.stride, index: Int(gaussianUniformIndex.rawValue))
-        computeEncoder.setBytes(&totalSplats, length: MemoryLayout<UInt32>.stride, index: Int(gaussianNumberOfSplatsIndex.rawValue))
-        computeEncoder.setBuffer(visibleIndices, offset: 0, index: Int(gaussianVisibleIndicesIndex.rawValue))
-        computeEncoder.setBuffer(visibleCount, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
-        computeEncoder.setBytes(&clipGuardBand, length: MemoryLayout<Float>.stride, index: Int(gaussianIndicesIndex.rawValue))
-        computeEncoder.setBytes(&hzbReverseZFlag, length: MemoryLayout<UInt32>.stride, index: Int(gaussianCullHZBReverseZIndex.rawValue))
-        computeEncoder.setBytes(&hzbOcclusionBias, length: MemoryLayout<Float>.stride, index: Int(gaussianCullHZBOcclusionBiasIndex.rawValue))
-        computeEncoder.setBytes(&hzbValidFlag, length: MemoryLayout<UInt32>.stride, index: Int(gaussianCullHZBValidIndex.rawValue))
-        computeEncoder.setTexture(
-            textureResources.hzbDepthPyramid ?? textureResources.depthMap,
-            index: Int(gaussianCullHZBDepthPyramidTextureIndex.rawValue)
+        // true, so the fallback texture is only ever actually read when the flag (and
+        // therefore the shader's own occlusion branch) is off.
+        let splatCullInputs = GaussianSplatCullInputs(
+            uniforms: matrices.uniforms,
+            totalSplats: UInt32(gaussianComponent.splatCount),
+            hzbReverseZ: renderInfo.reverseZEnabled ? 1 : 0,
+            hzbValid: hzb.valid ? 1 : 0
+        )
+        bindGaussianSplatCullInputs(
+            computeEncoder,
+            pipelineState: cullPipelineState,
+            inputs: splatCullInputs,
+            encodedSplatData: encodedSplatData,
+            visibleIndices: visibleIndices,
+            visibleCount: visibleCount,
+            hzbTexture: hzb.texture
         )
 
         let tew = cullPipelineState.threadExecutionWidth
@@ -288,6 +444,13 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         computeEncoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
         profileTotals.dispatchCount += 1
 
+        // The count this entity will append unbudgeted, reserved out of the budget before the
+        // chunked entities are fitted to it.
+        if let chunkPipelines, let budgetState {
+            encodeGaussianBudgetReserve(computeEncoder, pipelines: chunkPipelines, visibleSet: visibleCount, budgetState: budgetState)
+            profileTotals.dispatchCount += 1
+        }
+
         visibleCountUpdates.append(
             GaussianVisibleCountUpdate(
                 entityId: entityId,
@@ -296,6 +459,32 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
                 splatCount: gaussianComponent.splatCount
             )
         )
+    }
+
+    // Every chunked entity's request and every whole-buffer entity's reservation is in: fit the
+    // chunked entities to what is left of the capacity. The scale kernel takes a fall of the
+    // target at once and smooths a rise against the previous frame's scale (unless a frame
+    // without splat entities went by), each entity's quota pass grants its visible chunks
+    // floor(scale × splats), and the state is published for this slot's readback.
+    if let chunkPipelines, let budgetState {
+        let scaleConstants = gaussianBudgetScaleConstants(budget: capacity, resetHysteresis: workingSet.takeHysteresisReset())
+        encodeGaussianBudgetScale(computeEncoder, pipelines: chunkPipelines, budgetState: budgetState, constants: scaleConstants)
+        profileTotals.dispatchCount += 1
+        for chunked in chunkedEntities {
+            encodeGaussianChunkQuotas(
+                computeEncoder,
+                pipelines: chunkPipelines,
+                chunkTable: chunked.chunkTable,
+                visibleChunks: chunked.visibleChunks,
+                chunkSet: chunked.chunkSet,
+                budgetState: budgetState
+            )
+            profileTotals.dispatchCount += 1
+        }
+        if let readback = workingSet.budgetReadback(slot: frameSlot) {
+            encodeGaussianBudgetPublish(computeEncoder, pipelines: chunkPipelines, budgetState: budgetState, readback: readback)
+            profileTotals.dispatchCount += 1
+        }
     }
 
     computeEncoder.endEncoding()
@@ -322,7 +511,7 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         stage: "FrustumCull",
         startTime: profileStart,
         totals: profileTotals,
-        extra: "previousActiveSplats=\(activeSplatTotal)"
+        extra: "previousActiveSplats=\(activeSplatTotal) budget=\(budget) capacity=\(capacity) resident=\(residentSplats) wholeBuffer=\(wholeBufferSplats) chunkedEntities=\(chunkedEntities.count)"
     )
 }
 
@@ -339,11 +528,19 @@ func gaussianRealWorldTint() -> SIMD3<Float>? {
     return lighting.tintColor
 }
 
-/// Compacts every entity's visible splats into the frame's shared working set: one thread per
-/// entry of the entity's cull list (indirect from its GaussianVisibleSet) computes the footprint
-/// and colour once for the head-centre view, appends a GaussianWorkingSetSplat record and a
-/// depth key. Runs after executeGaussianFrustumCulling and before executeRadixSort, which sorts
-/// the shared keys once for all entities.
+/// The budget state of a completed frame, read from the slot the frame published to.
+private struct GaussianBudgetReadback: @unchecked Sendable {
+    let buffer: MTLBuffer?
+}
+
+/// Compacts every entity's visible splats into the frame's shared working set. A whole-buffer
+/// entity dispatches one thread per entry of its cull list (indirect from its GaussianVisibleSet)
+/// through `gaussianPreprocess`; a chunked entity dispatches one threadgroup per visible chunk
+/// (indirect from its chunk record) through `gaussianChunkDecodePreprocess`, which decodes the
+/// first quota records of the chunk, tests each against the frame's views and projects the
+/// survivors. Both compute the footprint and colour once for the head-centre view and append a
+/// GaussianWorkingSetSplat record and a depth key. Runs after executeGaussianFrustumCulling and
+/// before executeRadixSort, which sorts the shared keys once for all entities.
 public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
     let profileStart = gaussianProfilingStartTime()
     var profileTotals = GaussianProfileTotals()
@@ -388,6 +585,8 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
     }
     let capacityValue = workingSet.capacity
     var capacity = UInt32(capacityValue)
+    let chunkPipelines = GaussianChunkCullPipelineStates.current()
+    let hzb = gaussianHZBInputs()
 
     guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
     computeEncoder.label = "Gaussian Preprocess"
@@ -399,7 +598,6 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
     computeEncoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
     profileTotals.dispatchCount += 1
 
-    computeEncoder.setComputePipelineState(preprocessPipelineState)
     let realWorldTint = gaussianRealWorldTint()
 
     // The draw resolves each record's entity index through this exact enumeration, even on a
@@ -407,6 +605,7 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
     workingSet.setEntityOrder(Array(entities.prefix(Int(gaussianMaxEntitiesPerFrame))), slot: frameSlot)
 
     let colorByLOD = SpatialDebugVisualization.shared.colorRenderablesByLOD
+    let viewport = renderInfo.viewPort ?? simd_float2(1, 1)
 
     for (entityIndex, entityId) in entities.enumerated() {
         guard let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) else {
@@ -422,8 +621,8 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
             break
         }
 
-        // Sized on the GPU from this frame's cull (dispatchOverVisibleSplats); the CPU count
-        // is a stale readback and only feeds the profile line.
+        // Sized on the GPU from this frame's cull (dispatchOverVisibleSplats, the chunk record);
+        // the CPU count is a stale readback and only feeds the profile line.
         let splatCount = Int(gaussianComponent.splatCount)
         guard splatCount > 0 else { continue }
         activeSplatTotal += activeGaussianSortCount(gaussianComponent)
@@ -432,39 +631,14 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
             handleError(.noWorldTransformComponent, entityId)
             continue
         }
-        // Same frame-slot indexing as executeGaussianFrustumCulling — must match, since this
-        // reads that same frame's cull output.
-        guard !gaussianComponent.gaussianVisibleIndices.isEmpty, !gaussianComponent.gaussianVisibleCount.isEmpty else {
-            handleError(.bufferAllocationFailed, "Gaussian preprocess buffers")
-            continue
-        }
-        let entitySlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianVisibleIndices.count - 1)
-        guard let encodedSplatData = gaussianComponent.encodedSplatData,
-              let visibleIndices = gaussianComponent.gaussianVisibleIndices[entitySlot],
-              let visibleCount = gaussianComponent.gaussianVisibleCount[min(entitySlot, gaussianComponent.gaussianVisibleCount.count - 1)]
-        else {
-            handleError(.bufferAllocationFailed, "Gaussian preprocess buffers")
-            continue
-        }
-
-        let modelMatrix = simd_mul(worldTransformComponent.space, .identity)
 
         // Same effectiveViewMatrix/effectiveCameraPosition requirement as the cull pass — see
-        // the comment on executeGaussianFrustumCulling. This is the head-centre view: the
-        // footprint and colour are computed once; the draw re-projects the centre per eye.
-        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
-        let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
-
-        var gaussianUniform = Uniforms()
-        gaussianUniform.modelViewMatrix = modelViewMatrix
-        gaussianUniform.viewMatrix = viewMatrix
-        gaussianUniform.modelMatrix = modelMatrix
-        gaussianUniform.cameraPosition = effectiveCameraPosition
-        gaussianUniform.projectionMatrix = renderInfo.perspectiveSpace
-
+        // GaussianEntityFrameMatrices. This is the head-centre view: the footprint and colour
+        // are computed once; the draw re-projects the centre per eye.
+        let matrices = GaussianEntityFrameMatrices(worldTransform: worldTransformComponent, cameraComponent: cameraComponent)
+        var gaussianUniform = matrices.uniforms
         var localNumGaussians = UInt32(splatCount)
-        var viewport = renderInfo.viewPort
+        var viewportBytes = viewport
         var shMetadata = gaussianComponent.sphericalHarmonicsMetadata ?? GaussianSHMetadata(
             degree: 0,
             coefficientsPerChannel: 0,
@@ -472,8 +646,8 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
             _pad0: 0
         )
         var localCameraPosition = gaussianLocalCameraPosition(
-            cameraWorldPosition: effectiveCameraPosition,
-            modelMatrix: modelMatrix
+            cameraWorldPosition: matrices.effectiveCameraPosition,
+            modelMatrix: matrices.modelMatrix
         )
 
         var entityConstants = GaussianPreprocessEntityConstants()
@@ -491,12 +665,70 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
             entityConstants.debugColor = simd_float4(color.x, color.y, color.z, 1.0)
         }
 
+        if gaussianComponent.isChunked {
+            guard let chunkPipelines, let chunkTable = gaussianComponent.chunkTable,
+                  let packedSplats = gaussianComponent.packedSplatData,
+                  frameSlot < chunkTable.visibleChunks.count, frameSlot < chunkTable.visibleChunkSets.count
+            else {
+                handleError(.pipelineStateNulled, "Gaussian chunk kernels")
+                continue
+            }
+            // Same frame, same matrices as the chunk cull: the per-splat test inside the fused
+            // pass uses the eye view-projections (either eye in stereo) and the HZB the chunk
+            // stage used, and the projection the head-centre uniforms above.
+            let inputs = GaussianChunkPreprocessInputs(
+                packedSplats: packedSplats,
+                chunkTable: chunkTable,
+                visibleChunks: chunkTable.visibleChunks[frameSlot],
+                uniforms: gaussianUniform,
+                cullConstants: gaussianChunkCullConstants(
+                    chunkTable: chunkTable,
+                    modelMatrix: matrices.modelMatrix,
+                    viewMatrix: matrices.viewMatrix,
+                    hzbValid: hzb.valid
+                ),
+                viewport: viewport,
+                sphericalHarmonics: gaussianComponent.sphericalHarmonicsData,
+                shMetadata: shMetadata,
+                localCameraPosition: localCameraPosition,
+                entityConstants: entityConstants,
+                hzbTexture: hzb.texture
+            )
+            encodeGaussianChunkDecodePreprocess(
+                computeEncoder,
+                pipelineState: chunkPipelines.decodePreprocess,
+                inputs: inputs,
+                chunkSet: chunkTable.visibleChunkSets[frameSlot],
+                sharedRecords: sharedRecords,
+                sharedKeys: sharedKeys,
+                sharedVisibleSet: sharedVisibleSet
+            )
+            profileTotals.dispatchCount += 1
+            continue
+        }
+
+        // Whole-buffer entities: same frame-slot indexing as executeGaussianFrustumCulling —
+        // must match, since this reads that same frame's cull output.
+        guard !gaussianComponent.gaussianVisibleIndices.isEmpty, !gaussianComponent.gaussianVisibleCount.isEmpty else {
+            handleError(.bufferAllocationFailed, "Gaussian preprocess buffers")
+            continue
+        }
+        let entitySlot = min(renderInfo.currentInFlightFrameSlot, gaussianComponent.gaussianVisibleIndices.count - 1)
+        guard let encodedSplatData = gaussianComponent.encodedSplatData,
+              let visibleIndices = gaussianComponent.gaussianVisibleIndices[entitySlot],
+              let visibleCount = gaussianComponent.gaussianVisibleCount[min(entitySlot, gaussianComponent.gaussianVisibleCount.count - 1)]
+        else {
+            handleError(.bufferAllocationFailed, "Gaussian preprocess buffers")
+            continue
+        }
+
+        computeEncoder.setComputePipelineState(preprocessPipelineState)
         computeEncoder.setBuffer(encodedSplatData, offset: 0, index: Int(gaussianPreprocessSplatIndex.rawValue))
         computeEncoder.setBytes(&gaussianUniform, length: MemoryLayout<Uniforms>.stride, index: Int(gaussianPreprocessUniformIndex.rawValue))
         computeEncoder.setBytes(&localNumGaussians, length: MemoryLayout<UInt32>.stride, index: Int(gaussianPreprocessNumOfSplatsIndex.rawValue))
         computeEncoder.setBuffer(visibleIndices, offset: 0, index: Int(gaussianPreprocessVisibleIndicesIndex.rawValue))
         computeEncoder.setBuffer(visibleCount, offset: 0, index: Int(gaussianPreprocessVisibleCountIndex.rawValue))
-        computeEncoder.setBytes(&viewport, length: MemoryLayout<simd_float2>.stride, index: Int(gaussianPreprocessViewportIndex.rawValue))
+        computeEncoder.setBytes(&viewportBytes, length: MemoryLayout<simd_float2>.stride, index: Int(gaussianPreprocessViewportIndex.rawValue))
         computeEncoder.setBuffer(
             gaussianComponent.sphericalHarmonicsData ?? encodedSplatData,
             offset: 0,
@@ -528,24 +760,33 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
 
     computeEncoder.endEncoding()
 
-    // Profiling readback of the shared set, two or three frames late like the per-entity one.
-    // Overflow means splats were dropped this frame: reported once per change, not every frame.
+    // Profiling readback of the shared set and the budget state, two or three frames late like
+    // the per-entity one. Overflow means splats were dropped this frame by arrival order, which
+    // the reservation and the quotas are fitted to rule out: reported once per change, not
+    // every frame.
     let completedVisibleSet = GaussianSharedVisibleSetReadback(buffer: sharedVisibleSet)
+    let completedBudget = GaussianBudgetReadback(buffer: chunkPipelines == nil ? nil : workingSet.budgetReadback(slot: frameSlot))
     commandBuffer.addCompletedHandler { _ in
         let set = completedVisibleSet.buffer.contents().load(as: GaussianVisibleSet.self)
+        let budgetState = completedBudget.buffer?.contents().load(as: GaussianBudgetState.self)
         let previousOverflow = GaussianSharedWorkingSet.shared.lastOverflowCount
-        GaussianSharedWorkingSet.shared.recordCompletedFrame(visibleCount: Int(set.visibleCount), overflowCount: Int(set.overflowCount))
+        GaussianSharedWorkingSet.shared.recordCompletedFrame(visibleCount: Int(set.visibleCount), overflowCount: Int(set.overflowCount), budgetState: budgetState)
         if set.overflowCount > 0, Int(set.overflowCount) != previousOverflow {
             handleError(.bufferAllocationFailed, "Gaussian shared working set overflowed: \(set.overflowCount) visible splats dropped (capacity \(capacityValue))")
         }
     }
 
     profileTotals.sharedWorkingSetBytes = workingSet.residentBytes
+    let lastBudget = workingSet.lastBudgetState
     logGaussianProfile(
         stage: "Preprocess",
         startTime: profileStart,
         totals: profileTotals,
-        extra: "activeSplats=\(activeSplatTotal) sharedCapacity=\(workingSet.capacity) lastShared=\(workingSet.lastVisibleCount) lastOverflow=\(workingSet.lastOverflowCount)"
+        extra: String(
+            format: "activeSplats=%d sharedCapacity=%d lastShared=%d lastOverflow=%d budget=%u requested=%u reserved=%u quota=%u scale=%.3f targetScale=%.3f",
+            activeSplatTotal, workingSet.capacity, workingSet.lastVisibleCount, workingSet.lastOverflowCount,
+            lastBudget.budget, lastBudget.requestedSplats, lastBudget.reservedSplats, lastBudget.quotaSplats, lastBudget.scale, lastBudget.targetScale
+        )
     )
 }
 

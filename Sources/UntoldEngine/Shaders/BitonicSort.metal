@@ -69,31 +69,25 @@ kernel void gaussianFinalizeVisibleSet(
     visibleSet->baseInstance = 0u;
 }
 
-kernel void gaussianFrustumCull(
-    const device EncodedGaussianSplat *splats [[buffer(gaussianEncodedSplatIndex)]],
-    constant Uniforms &uniforms [[buffer(gaussianUniformIndex)]],
-    constant uint &numOfSplats [[buffer(gaussianNumberOfSplatsIndex)]],
-    constant float &clipGuardBand [[buffer(gaussianIndicesIndex)]],
-    device uint *visibleIndices [[buffer(gaussianVisibleIndicesIndex)]],
-    device atomic_uint *visibleCount [[buffer(gaussianVisibleCountIndex)]],
-    constant uint &hzbReverseZ [[buffer(gaussianCullHZBReverseZIndex)]],
-    constant float &hzbOcclusionBias [[buffer(gaussianCullHZBOcclusionBiasIndex)]],
-    constant uint &hzbValid [[buffer(gaussianCullHZBValidIndex)]],
-    texture2d<float, access::sample> hzbDepthPyramid [[texture(gaussianCullHZBDepthPyramidTextureIndex)]],
-    uint index [[thread_position_in_grid]])
+// The per-splat visibility test on an already projected centre, shared by gaussianFrustumCull
+// (one thread per resident splat, head-centre view) and gaussianChunkDecodePreprocess
+// (GaussianChunkPreprocess.metal, one threadgroup per visible chunk, either eye) so the two
+// paths keep exactly the same splats: centre inside the guard-banded clip volume, then
+// optionally not behind the previous frame's HZB.
+inline bool gaussianClipCentrePassesCull(
+    float4 centerClip,
+    float clipGuardBand,
+    uint hzbReverseZ,
+    float hzbOcclusionBias,
+    uint hzbValid,
+    texture2d<float, access::sample> hzbDepthPyramid)
 {
-    if (index >= numOfSplats) return;
-
-    float4 centerClip = uniforms.projectionMatrix *
-                        uniforms.modelViewMatrix *
-                        float4(splats[index].position, 1.0f);
-
-    if (centerClip.w <= 0.0f) return;
+    if (centerClip.w <= 0.0f) return false;
 
     float limit = max(0.0f, 1.0f + clipGuardBand);
     float2 ndc = centerClip.xy / centerClip.w;
-    if (abs(ndc.x) > limit || abs(ndc.y) > limit) return;
-    if (centerClip.z < -centerClip.w * clipGuardBand || centerClip.z > centerClip.w * limit) return;
+    if (abs(ndc.x) > limit || abs(ndc.y) > limit) return false;
+    if (centerClip.z < -centerClip.w * clipGuardBand || centerClip.z > centerClip.w * limit) return false;
 
     // Coarse per-splat occlusion pre-cull against the same (previous-frame, temporal) HZB
     // pyramid mesh occlusion culling already builds and uses (see HZBCompute.metal). A
@@ -112,8 +106,46 @@ kernel void gaussianFrustumCull(
         bool occluded = (hzbReverseZ != 0u)
             ? (splatDepth < hzbDepth - hzbOcclusionBias)
             : (splatDepth > hzbDepth + hzbOcclusionBias);
-        if (occluded) return;
+        if (occluded) return false;
     }
+    return true;
+}
+
+// The whole-buffer kernel's form of the test: the centre projected through the head-centre
+// model-view and projection.
+inline bool gaussianSplatPassesCull(
+    float3 position,
+    constant Uniforms &uniforms,
+    float clipGuardBand,
+    uint hzbReverseZ,
+    float hzbOcclusionBias,
+    uint hzbValid,
+    texture2d<float, access::sample> hzbDepthPyramid)
+{
+    float4 centerClip = uniforms.projectionMatrix *
+                        uniforms.modelViewMatrix *
+                        float4(position, 1.0f);
+    return gaussianClipCentrePassesCull(centerClip, clipGuardBand, hzbReverseZ, hzbOcclusionBias, hzbValid, hzbDepthPyramid);
+}
+
+// One thread per resident splat: the whole-buffer cull for entities without a chunk table
+// (.ply, CPU-decoded .untoldgs). Chunked entities test per splat inside
+// gaussianChunkDecodePreprocess instead.
+kernel void gaussianFrustumCull(
+    const device EncodedGaussianSplat *splats [[buffer(gaussianEncodedSplatIndex)]],
+    constant Uniforms &uniforms [[buffer(gaussianUniformIndex)]],
+    constant uint &numOfSplats [[buffer(gaussianNumberOfSplatsIndex)]],
+    constant float &clipGuardBand [[buffer(gaussianIndicesIndex)]],
+    device uint *visibleIndices [[buffer(gaussianVisibleIndicesIndex)]],
+    device atomic_uint *visibleCount [[buffer(gaussianVisibleCountIndex)]],
+    constant uint &hzbReverseZ [[buffer(gaussianCullHZBReverseZIndex)]],
+    constant float &hzbOcclusionBias [[buffer(gaussianCullHZBOcclusionBiasIndex)]],
+    constant uint &hzbValid [[buffer(gaussianCullHZBValidIndex)]],
+    texture2d<float, access::sample> hzbDepthPyramid [[texture(gaussianCullHZBDepthPyramidTextureIndex)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= numOfSplats) return;
+    if (!gaussianSplatPassesCull(splats[index].position, uniforms, clipGuardBand, hzbReverseZ, hzbOcclusionBias, hzbValid, hzbDepthPyramid)) return;
 
     uint writeIndex = atomic_fetch_add_explicit(visibleCount, 1u, memory_order_relaxed);
     visibleIndices[writeIndex] = index;

@@ -3256,7 +3256,7 @@ func removeEntityMesh(entityId: EntityID) {
 
     // A splat that stays resident after its mesh left becomes the entity's only
     // representation again: its bytes take over the ledger entry.
-    if let gaussian = scene.get(component: GaussianComponent.self, for: entityId), gaussian.encodedSplatData != nil {
+    if let gaussian = scene.get(component: GaussianComponent.self, for: entityId), gaussian.hasResidentSplats {
         MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: 0)
         MemoryBudgetManager.shared.registerMesh(entityId: entityId, meshSizeBytes: gaussian.estimatedGPUBytes)
         if let box = gaussian.localBoundingBox, let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId) {
@@ -3490,7 +3490,7 @@ func registerRenderComponent(entityId: EntityID, meshes: [Mesh], url: URL, asset
     // A mesh that (re)registers on an entity with a resident splat makes the splat the
     // secondary representation: its bytes move beside the mesh entry (registerMesh replaced
     // the entry).
-    if let gaussian = scene.get(component: GaussianComponent.self, for: entityId), gaussian.encodedSplatData != nil {
+    if let gaussian = scene.get(component: GaussianComponent.self, for: entityId), gaussian.hasResidentSplats {
         MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: gaussian.estimatedGPUBytes)
     }
 }
@@ -3716,20 +3716,28 @@ public func loadRawMesh(
 /// there is a single implementation of the PLY-parse/buffer-build/SH-pack pipeline.
 struct GaussianLoadResult {
     let splatCount: UInt
-    // One buffer per in-flight frame slot (see the comment on GaussianComponent's matching
-    // fields) — written fresh every frame by the cull, so a single shared buffer would let an
-    // overlapping newer frame's writes clobber data an older in-flight frame is still reading.
-    // The sort keys and draw records are per frame and shared across entities
+    // Whole-buffer entities: one buffer per in-flight frame slot (see the comment on
+    // GaussianComponent's matching fields) — written fresh every frame by the cull, so a single
+    // shared buffer would let an overlapping newer frame's writes clobber data an older
+    // in-flight frame is still reading. Empty for a chunked entity, whose per-slot lists live on
+    // its chunk table. The sort keys and draw records are per frame and shared across entities
     // (GaussianSharedWorkingSet), not per entity.
     let gaussianVisibleIndices: [MTLBuffer]
     let gaussianVisibleCount: [MTLBuffer]
-    let encodedSplatBuffer: MTLBuffer
+    /// The whole-buffer entity's `EncodedGaussianSplat` records; nil for a chunked entity.
+    let encodedSplatBuffer: MTLBuffer?
+    /// The chunked entity's resident 16-byte `.untoldgs` records; nil for a whole-buffer entity.
+    let packedSplatBuffer: MTLBuffer?
     let sphericalHarmonicsBuffer: MTLBuffer?
     let sphericalHarmonicsMetadata: GaussianSHMetadata?
     /// Capture exposure and white balance from a `.untoldgs` header (0 and 1 for a `.ply`).
     var captureExposureEV: Float = 0
     var captureWhiteBalance = SIMD3<Float>(repeating: 1)
-    /// Sum of all GPU buffer bytes above, for `MemoryBudgetManager` registration.
+    /// The `.untoldgs` chunk table kept from the load (see `GaussianChunkTable`); nil for a
+    /// `.ply` or a CPU-decoded asset.
+    let chunkTable: GaussianChunkTable?
+    /// Sum of all GPU buffer bytes above, for `MemoryBudgetManager` registration. The frame's
+    /// shared working set is budgeted and has its own ledger entry, so no share of it is here.
     let estimatedGPUBytes: Int
     /// Local-space bounding box computed from the actual loaded splat positions, for
     /// `LocalTransformComponent.boundingBox` — see `computeGaussianSplatBoundingBox`.
@@ -3746,8 +3754,10 @@ func buildGaussianLoadResult(
     meanSquaredSplatExtent: Float = 0,
     sourceDescription: String
 ) -> GaussianLoadResult? {
-    guard encodedSplats.count <= Int(maxNumOfGaussians) else {
-        handleError(.bufferAllocationFailed, "Too many Gaussian splats: \(encodedSplats.count) exceeds maximum \(maxNumOfGaussians)")
+    // The whole-buffer path costs about 60 bytes per splat resident, so its cap is lower than
+    // the per-chunk path's (GaussianRuntimeLimits).
+    guard encodedSplats.count <= GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity else {
+        handleError(.bufferAllocationFailed, "Too many Gaussian splats: \(encodedSplats.count) exceeds maximum \(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity) for the whole-buffer path")
         return nil
     }
 
@@ -3798,8 +3808,9 @@ func buildGaussianLoadResult(
     )
 }
 
-/// Builds the per-frame buffers around an already GPU-resident encoded splat buffer (from
-/// the CPU encode above or the `.untoldgs` GPU decode in `GaussianChunkLoader`).
+/// Builds the per-frame buffers around an already GPU-resident encoded splat buffer (from the
+/// CPU encode above, or a `.untoldgs` decoded whole by `GaussianChunkLoader.decodeEncodedSplats`
+/// when the per-chunk kernels are unavailable): the whole-buffer path a `.ply` takes.
 func buildGaussianLoadResult(
     encodedSplatBuffer: MTLBuffer,
     splatCount: UInt,
@@ -3845,18 +3856,52 @@ func buildGaussianLoadResult(
     }
     estimatedGPUBytes += encodedSplatBuffer.length
     estimatedGPUBytes += sphericalHarmonicsBuffer?.length ?? 0
-    // This entity's share of the frame's shared working set (GaussianSharedWorkingSet grows to
-    // the resident total), so the memory budget sees the same per-splat cost the per-entity
-    // sort-key and precomputed buffers used to carry.
-    estimatedGPUBytes += maxInFlightCommandBuffers * GaussianSharedWorkingSet.bytesPerSplatPerSlot * Int(splatCount)
 
     return GaussianLoadResult(
         splatCount: splatCount,
         gaussianVisibleIndices: gaussianVisibleIndices,
         gaussianVisibleCount: gaussianVisibleCount,
         encodedSplatBuffer: encodedSplatBuffer,
+        packedSplatBuffer: nil,
         sphericalHarmonicsBuffer: sphericalHarmonicsBuffer,
         sphericalHarmonicsMetadata: sphericalHarmonicsMetadata,
+        chunkTable: nil,
+        estimatedGPUBytes: estimatedGPUBytes,
+        boundingBox: boundingBox
+    )
+}
+
+/// Builds the per-frame buffers of a chunked `.untoldgs` entity around its resident packed
+/// records and chunk table (`GaussianChunkLoader.load`): the per-slot visible-chunk list and
+/// record, so the frame can cull whole chunks and decode only the survivors' quotas
+/// (see GaussianChunkCull.swift). No encoded buffer and no per-slot index buffers exist on
+/// this path — per splat, only the 16-byte record and its harmonics stay resident.
+func buildGaussianLoadResult(
+    packedSplatBuffer: MTLBuffer,
+    splatCount: UInt,
+    sphericalHarmonicsBuffer: MTLBuffer?,
+    sphericalHarmonicsMetadata: GaussianSHMetadata?,
+    boundingBox: (min: simd_float3, max: simd_float3),
+    chunkTable: GaussianChunkTable
+) -> GaussianLoadResult? {
+    guard let allocated = allocateGaussianVisibleChunkBuffers(for: chunkTable) else {
+        handleError(.bufferAllocationFailed, "Gaussian visible-chunk buffers are nil")
+        return nil
+    }
+
+    var estimatedGPUBytes = packedSplatBuffer.length
+    estimatedGPUBytes += sphericalHarmonicsBuffer?.length ?? 0
+    estimatedGPUBytes += allocated.gpuBytes
+
+    return GaussianLoadResult(
+        splatCount: splatCount,
+        gaussianVisibleIndices: [],
+        gaussianVisibleCount: [],
+        encodedSplatBuffer: nil,
+        packedSplatBuffer: packedSplatBuffer,
+        sphericalHarmonicsBuffer: sphericalHarmonicsBuffer,
+        sphericalHarmonicsMetadata: sphericalHarmonicsMetadata,
+        chunkTable: allocated,
         estimatedGPUBytes: estimatedGPUBytes,
         boundingBox: boundingBox
     )
@@ -3937,21 +3982,41 @@ func buildGaussianLoadResultFromPLY(url: URL, sourceDescription: String) throws 
     )
 }
 
-/// Builds GPU buffers for a `.untoldgs` file. Version-3 chunks are read by byte range and
-/// decoded by the `gaussianDecodeChunks` kernel (`GaussianChunkLoader`); when that pipeline is
-/// unavailable the file is decoded on the CPU through `UntoldGSFormat.read`.
+/// Builds GPU buffers for a `.untoldgs` file. Version-3 chunks are read by byte range into the
+/// resident packed buffer (`GaussianChunkLoader`) and decoded every frame by the fused per-chunk
+/// pass; when those kernels are unavailable but the decode kernel is, the records are expanded
+/// once (`decodeEncodedSplats`) into the whole-buffer path a `.ply` takes; with neither the file
+/// is decoded on the CPU through `UntoldGSFormat.read`.
 /// Returns `nil` on any failure, calling `handleError` internally — callers just guard-return.
 func buildGaussianLoadResultFromUntoldGS(url: URL) -> GaussianLoadResult? {
     if GaussianChunkLoader.isAvailable {
         do {
             let loaded = try GaussianChunkLoader.load(url: url)
-            guard var result = buildGaussianLoadResult(
-                encodedSplatBuffer: loaded.encodedSplatBuffer,
-                splatCount: UInt(loaded.splatCount),
-                sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
-                sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
-                boundingBox: loaded.boundingBox
-            ) else { return nil }
+            var result: GaussianLoadResult?
+            if GaussianChunkCullPipelineStates.current() != nil {
+                result = buildGaussianLoadResult(
+                    packedSplatBuffer: loaded.packedSplatBuffer,
+                    splatCount: UInt(loaded.splatCount),
+                    sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
+                    sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
+                    boundingBox: loaded.boundingBox,
+                    chunkTable: loaded.chunkTable
+                )
+            } else {
+                // Expanded to 48-byte records plus index buffers: the whole-buffer path's cap.
+                guard loaded.splatCount <= GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity else {
+                    handleError(.bufferAllocationFailed, "Too many Gaussian splats: \(loaded.splatCount) exceeds maximum \(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity) for the whole-buffer path (\(url.lastPathComponent), per-chunk kernels unavailable)")
+                    return nil
+                }
+                result = try buildGaussianLoadResult(
+                    encodedSplatBuffer: GaussianChunkLoader.decodeEncodedSplats(loaded),
+                    splatCount: UInt(loaded.splatCount),
+                    sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
+                    sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
+                    boundingBox: loaded.boundingBox
+                )
+            }
+            guard var result else { return nil }
             result.captureExposureEV = loaded.captureExposureEV
             result.captureWhiteBalance = loaded.captureWhiteBalance
             return result
@@ -4121,7 +4186,9 @@ func copyGaussianLoadResult(_ result: GaussianLoadResult, to gaussianComponent: 
     gaussianComponent.visibleSplatCountForRendering = result.splatCount
     gaussianComponent.gaussianVisibleIndices = result.gaussianVisibleIndices.map { $0 as MTLBuffer? }
     gaussianComponent.gaussianVisibleCount = result.gaussianVisibleCount.map { $0 as MTLBuffer? }
+    gaussianComponent.chunkTable = result.chunkTable
     gaussianComponent.encodedSplatData = result.encodedSplatBuffer
+    gaussianComponent.packedSplatData = result.packedSplatBuffer
     gaussianComponent.sphericalHarmonicsData = result.sphericalHarmonicsBuffer
     gaussianComponent.sphericalHarmonicsMetadata = result.sphericalHarmonicsMetadata
     gaussianComponent.captureExposureEV = result.captureExposureEV
@@ -5025,10 +5092,12 @@ public func removeEntityGaussian(entityId: EntityID) {
     if let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) {
         // Release Metal buffers
         gaussianComponent.encodedSplatData = nil
+        gaussianComponent.packedSplatData = nil
         gaussianComponent.sphericalHarmonicsData = nil
         gaussianComponent.sphericalHarmonicsMetadata = nil
         gaussianComponent.gaussianVisibleIndices.removeAll()
         gaussianComponent.gaussianVisibleCount.removeAll()
+        gaussianComponent.chunkTable = nil
         gaussianComponent.visibleSplatCountForRendering = 0
         gaussianComponent.estimatedGPUBytes = 0
         gaussianComponent.localBoundingBox = nil

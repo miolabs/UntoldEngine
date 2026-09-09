@@ -58,6 +58,15 @@ private final class CoreRuntimeGlobals: @unchecked Sendable {
     var gaussianPreprocessPipeline = ComputePipeline()
     var gaussianFinalizeSharedVisibleSetPipeline = ComputePipeline()
     var gaussianDecodePipeline = ComputePipeline()
+    var gaussianResetVisibleChunkSetPipeline = ComputePipeline()
+    var gaussianChunkCullPipeline = ComputePipeline()
+    var gaussianFinalizeVisibleChunksPipeline = ComputePipeline()
+    var gaussianChunkDecodePreprocessPipeline = ComputePipeline()
+    var gaussianResetBudgetRequestPipeline = ComputePipeline()
+    var gaussianComputeBudgetScalePipeline = ComputePipeline()
+    var gaussianComputeChunkQuotasPipeline = ComputePipeline()
+    var gaussianPublishBudgetStatePipeline = ComputePipeline()
+    var gaussianReserveBudgetSplatsPipeline = ComputePipeline()
     var radixClearHistogramPipeline = ComputePipeline()
     var radixHistogramPipeline = ComputePipeline()
     var radixScanPerTGPipeline = ComputePipeline()
@@ -536,6 +545,195 @@ var gaussianDecodePipeline: ComputePipeline {
         state.lock.lock()
         defer { state.lock.unlock() }
         yield &state.gaussianDecodePipeline
+    }
+}
+
+var gaussianResetVisibleChunkSetPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianResetVisibleChunkSetPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianResetVisibleChunkSetPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianResetVisibleChunkSetPipeline
+    }
+}
+
+var gaussianChunkCullPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianChunkCullPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianChunkCullPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianChunkCullPipeline
+    }
+}
+
+var gaussianFinalizeVisibleChunksPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianFinalizeVisibleChunksPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianFinalizeVisibleChunksPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianFinalizeVisibleChunksPipeline
+    }
+}
+
+var gaussianChunkDecodePreprocessPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianChunkDecodePreprocessPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianChunkDecodePreprocessPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianChunkDecodePreprocessPipeline
+    }
+}
+
+var gaussianResetBudgetRequestPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianResetBudgetRequestPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianResetBudgetRequestPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianResetBudgetRequestPipeline
+    }
+}
+
+var gaussianComputeBudgetScalePipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianComputeBudgetScalePipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianComputeBudgetScalePipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianComputeBudgetScalePipeline
+    }
+}
+
+var gaussianComputeChunkQuotasPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianComputeChunkQuotasPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianComputeChunkQuotasPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianComputeChunkQuotasPipeline
+    }
+}
+
+var gaussianPublishBudgetStatePipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianPublishBudgetStatePipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianPublishBudgetStatePipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianPublishBudgetStatePipeline
+    }
+}
+
+var gaussianReserveBudgetSplatsPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianReserveBudgetSplatsPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianReserveBudgetSplatsPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianReserveBudgetSplatsPipeline
     }
 }
 
