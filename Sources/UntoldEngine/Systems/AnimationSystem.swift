@@ -219,6 +219,19 @@ private func updateAnimationSystem(deltaTime: Float) {
             to: &animationComponent.localPose,
             deltaTime: deltaTime
         )
+        // The override layer (an upper-body posture) and reach IK shape the
+        // displayed pose before the feet are planted.
+        applyPoseLayer(
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            deltaTime: deltaTime
+        )
+        applyReachIK(
+            entityId: entity,
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            deltaTime: deltaTime
+        )
         // Foot IK corrects the final pose: plant feet on real geometry
         // after root motion and transitions have settled the pose.
         applyFootIK(
@@ -472,6 +485,126 @@ public func setFootIKGroundQuery(entityId: EntityID, query: FootIKGroundQuery?) 
 
     for (_, animationComponent) in animationComponents {
         animationComponent.footIK.groundQuery = query
+    }
+}
+
+/// Configures the pose layer's joint subset: every joint at or under the
+/// given paths (both clavicles, for the arms). Reconfiguring keeps the
+/// layer's clip and weight. See `setPoseLayerClip`.
+public func setPoseLayerMask(entityId: EntityID, rootJointPaths: [String]) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.poseLayer.maskRootPaths = rootJointPaths
+        animationComponent.poseLayer.invalidateResolution()
+    }
+}
+
+/// Plays the named clip on the pose layer: it loops on its own clock, and
+/// the local rotations of the masked joints (`setPoseLayerMask`) follow it
+/// by the layer's weight (`setPoseLayerWeight`) on top of whatever the
+/// entity plays or motion-matches. The layer's previous clip fades out
+/// over `transitionHalflife` (zero cuts); restating the current clip is a
+/// no-op. The clip must be loaded on the entity.
+public func setPoseLayerClip(entityId: EntityID, name: String, transitionHalflife: Float = defaultAnimationTransitionHalflife) {
+    guard hasAnyAnimationComponent(entityId: entityId) else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    let matchingComponents = animationComponentsContainingClip(entityId: entityId, name: name)
+    guard matchingComponents.isEmpty == false else {
+        handleError(.noAnimationClip, name, entityId)
+        return
+    }
+
+    for (_, animationComponent, animationClip) in matchingComponents {
+        animationComponent.poseLayer.play(animationClip, halflife: transitionHalflife)
+    }
+}
+
+/// Eases the pose layer's influence to `weight` — 0 leaves the base pose
+/// untouched, 1 replaces the masked joints' rotations — over `halflife`.
+public func setPoseLayerWeight(entityId: EntityID, weight: Float, halflife: Float = 0.2) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.poseLayer.targetWeight = min(max(weight, 0), 1)
+        animationComponent.poseLayer.weightHalflife = max(halflife, 0)
+        if halflife <= 0 {
+            animationComponent.poseLayer.weight = animationComponent.poseLayer.targetWeight
+        }
+    }
+}
+
+/// Configures the arm chains reach IK bends toward a target
+/// (`setReachIKTarget`). Chains whose joint paths do not exist in the
+/// skeleton are ignored.
+public func setReachIKChains(entityId: EntityID, chains: [ReachIKChainDescriptor]) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.reachIK.descriptors = chains
+        animationComponent.reachIK.invalidateResolution()
+    }
+}
+
+/// Points the reach chains at a world position: a hand lands on it within
+/// reach and points at it beyond, the arm extended to `reach` of its
+/// length. The influence eases to `weight` over `halflife`; a nil position
+/// eases it back out.
+public func setReachIKTarget(
+    entityId: EntityID,
+    worldPosition: simd_float3?,
+    weight: Float = 1,
+    halflife: Float = 0.25,
+    reach: Float = 0.95
+) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        if let worldPosition {
+            animationComponent.reachIK.targetWorld = worldPosition
+            animationComponent.reachIK.targetWeight = min(max(weight, 0), 1)
+        } else {
+            animationComponent.reachIK.targetWeight = 0
+        }
+        animationComponent.reachIK.halflife = max(halflife, 0)
+        animationComponent.reachIK.reach = min(max(reach, 0.05), 1)
+        if halflife <= 0 {
+            animationComponent.reachIK.weight = animationComponent.reachIK.targetWeight
+        }
+    }
+}
+
+/// Per-chain multipliers on the reach influence, index-aligned with the
+/// chains: 0 leaves that arm to the pose, 1 gives it the full influence —
+/// one hand lunging while the other holds back.
+public func setReachIKChainWeights(entityId: EntityID, weights: [Float]) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.reachIK.chainWeights = weights
     }
 }
 
