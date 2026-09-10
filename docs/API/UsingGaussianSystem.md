@@ -107,8 +107,9 @@ A baked `.untoldgs` asset keeps its chunk table after the load: the per-chunk de
 (`GaussianChunkDecodeConstants`, 48 bytes per chunk — the chunk's centre bounding box, its
 log-scale range, its first splat and count) stay on the GPU, and the file's index stays on the
 CPU (`GaussianComponent.chunkTable`). Its splats stay resident as the file's own 16-byte
-records (`GaussianComponent.packedSplatData`) and are decoded every frame, only for the chunks
-in view: the engine first tests whole chunks — the centre box padded by the largest splat the
+records (`GaussianComponent.packedSplatData`) — or, above the **paging threshold**, live in a
+bounded **page pool** of 256-rank tiers that the frames fill from disk on demand (below) — and
+are decoded every frame, only for the chunks in view: the engine first tests whole chunks — the centre box padded by the largest splat the
 chunk holds, against the camera frustum and, when available, the previous frame's depth
 pyramid — then fits the survivors to the working-set budget, and only then runs one fused pass
 per visible chunk that decodes, tests, projects and compacts its splats (see
@@ -117,6 +118,60 @@ In a stereo frame a chunk, and a splat, is kept when either eye sees it; the dep
 built from the last eye drawn, is consulted only for that eye. With the budget unlimited the
 picture is the same as the whole-buffer path's; what changes is how many splats the frame reads
 when part of the asset is off screen or behind an occluder.
+
+### Paging above the threshold
+
+An asset whose unpadded records (16 B plus SH per splat) exceed the paging threshold —
+64 MiB on Apple Vision Pro, iPhone, iPad and Apple TV, 512 MiB on the Mac
+(`GaussianPagingPolicy.pagingThresholdBytes…`, never above the residency budget) — is not
+read at load. What stays resident is the chunk table (48 B per chunk on the GPU, the file's
+index on the CPU) plus, per in-flight frame, a residency table, a page table and a demand
+table (about 4 MB for 20 M splats); the records go into a **page pool**: fixed slots, each
+holding one **tier** of one chunk — 256 ranks, 4 KiB of core records, plus the matching
+harmonics in a sibling pool. A chunk is resident as a prefix of tiers, and because the bake
+orders every chunk by importance, a chunk's first tier is what the budget draws of it in most
+views: the heads of a whole 20 M-splat asset (76 MiB) fit a 256 MiB pool with room for the
+near chunks' deeper tiers. The pool takes what a quarter of `MemoryBudgetManager.geometryBudget`
+leaves after the pools already allocated, capped at the asset and at 256 MiB (1 GiB on the
+Mac); it is fixed for the life of the entity and carried by the entity's `MemoryBudgetManager`
+entry in place of the file's bytes, so streaming eviction weighs and frees the pool.
+
+Every frame the chunk cull writes each chunk's seen screen area into the frame's demand
+table; the pager (`GaussianPageManager`) reads it back three frames later, wants for each
+demanded chunk the ranks the budget would grant it with a 25 % headroom (the density cap
+rule, or a fill density when the frame fits, so an empty pool never asks for the whole
+asset), and reads the missing tiers from disk — near and large chunks first, empty chunks
+before top-ups, the chunk the camera stands in first of all — straight into free pool slots
+on a background queue. A chunk with nothing resident is not listed and asks nothing of the
+budget; a partially resident one is listed with its resident ranks, so the budget sees only
+what can be drawn. Arriving tiers fade in over 16 frames. A tier is given up when its chunk
+has not been seen for 30 ticks, when it sits above what the frame wants for 45 ticks, or when
+a candidate is worth 1.5× more and the tier is past its 30-tick minimum residency; an
+evicted tier is not asked for again for 15 ticks, so glancing away and back reloads nothing
+and equal chunks at the pool's boundary never ping-pong. A chunk is CRC-checked the moment
+it becomes fully resident; a read that fails backs off (8, 32, 128 ticks) and faults the
+chunk on the third failure; a file that changes under the entity faults the asset — its
+resident pages keep drawing — until a periodic reopen (every 300 ticks) finds a file with the
+same index again and adopts its identity. Cook assets meant for
+Apple Vision Pro at spherical-harmonics degree 2 or below: at degree 3 a slot is 15 KiB and
+a 256 MiB pool holds only most of a 20 M asset's heads.
+
+Read the state through `gaussianPagingStats(entityId:)` (`GaussianPagingStats`: the pool,
+the resident slots and chunks, the reads pending and in flight, what the last tick issued,
+mapped and evicted, the candidates that found no slot, the faulted and corrupt chunks, the
+pager's state) or the `[Gaussian][FrustumCull]` profile line (`paged=… pool=… pages=…
+pending=… issued=… committed=… evicted=… saturated=… faults=…`).
+
+The paging is exercised from the file itself by `GaussianPagingTest.testLargeSyntheticAssetPagesWithinItsPool`
+(`Tests/UntoldEngineRenderTests`): a 300 k-splat synthetic slab against a 1 MiB pool over 120
+real frames. `UNTOLD_PERF_GAUSSIAN_PAGING=1` adds 4 M- and 20 M-splat runs against a 64 MiB
+residency budget — minutes to bake the first time (about 3 GB of memory for the 20 M bake),
+cached in the temporary directory — and `UNTOLD_PERF_GAUSSIAN_PAGING_SPLAT_COUNT=<n>` keeps
+only the sizes up to `n` (`4000000` for the 4 M run alone). Each run checks the pool is what
+the policy sizes it (the budget, or the whole asset when that is smaller: a 4 M asset without
+harmonics is 64,000,000 B and fits every tier, so nothing saturates and nothing is evicted; a
+20 M asset saturates the pool on purpose) and prints the resident bytes, the frame at which
+80 % of the slots had been committed and the worst frame time.
 
 ### The budget
 
@@ -175,7 +230,7 @@ targetScale=… density=… targetDensity=… visibleChunks=… fill=…`, `LogC
 
 | Resident per splat | `.untoldgs` (chunked) | `.ply` / CPU-decoded (whole buffer) |
 |---|---|---|
-| Splat record | 16 B packed | 48 B encoded |
+| Splat record | 16 B packed; above the paging threshold a pool of 256-rank tiers (4 KiB + SH per slot), not the file | 48 B encoded |
 | Visible index, per frame in flight | — (visible-chunk lists: 16 B per chunk per slot) | 4 B |
 | Spherical harmonics | 0 / 9 / 24 / 45 B (degree 0–3) | same |
 | Chunk table | 48 B per chunk | — |
@@ -186,7 +241,9 @@ with their per-slot readbacks), carried by its own `MemoryBudgetManager` entry
 (`setGaussianWorkingSetBytes`), not by the entities. A million-splat `.untoldgs` at degree 3
 therefore keeps about 61 MB resident (16 B + 45 B per splat, plus about 70 KB of chunk table
 and visible-chunk lists at 1024 splats per chunk) where the same asset used to cost about
-320 MB.
+320 MB. A 20 M-splat asset without harmonics (320 MB of records) pages on Apple Vision Pro:
+a 256 MiB pool of 65,536 tiers, plus about 4 MB of chunk table and per-slot tables, is what
+it keeps resident, and every head of the asset fits it.
 
 - `GaussianDebugOptions.shared.disableChunkCull` keeps every chunk, so the fused pass walks
   the whole asset as the whole-buffer cull does for a `.ply` — for bisecting, and for A/B timing
@@ -199,16 +256,35 @@ and visible-chunk lists at 1024 splats per chunk) where the same asset used to c
   requested`, instead of weighting the quotas by screen area — the pre-weighting rule, byte
   for byte, for an A/B of what the weighting moves. (With `disableChunkCull` and this off, the
   chunks no view keeps carry the minimum screen area and are cut first on a truncated frame.)
+- `GaussianDebugOptions.shared.disablePaging` loads every `.untoldgs` whole-resident whatever
+  its size (at the next load); `freezePaging` holds every paged entity's resident set — no
+  read, no eviction — so the image is a function of the camera alone, for bisecting;
+  `disablePageFade` shows an arriving tier at once; `residencyDebugTint` colours each splat of
+  a paged entity by its chunk's resident fraction (green whole, red head-only). The knobs live
+  on `GaussianPagingPolicy`: `pagingThresholdBytesOverride` (0 pages every chunked asset — the
+  editor's "simulate paging"), `residencyBudgetBytesOverride`, the hold-off, surplus,
+  minimum-residency and reload-cooldown ticks, the per-tick read, byte and commit caps,
+  `fadeFrames`, `verifyPagedChunkCRC`. On a paged entity `disableChunkCull` forces only the
+  resident ranks (a chunk no view keeps is never demanded, so its ranks never load),
+  `disableWorkingSetBudget` wants every rank of every demanded chunk and sizes the set to the
+  pool (a debug A/B, not a shipping mode: 65,536 tiers of 256 ranks is a 16.7 M-splat set),
+  `disableScreenWeightedQuotas` wants the uniform rule's ranks at the fill scale over the
+  demanded counts (not at the read-back cap, which scales the resident ranks and would have
+  the wants chase residency) while the demand keeps the real area, and
+  `disableHZBOcclusionCull` demands and loads occluded chunks.
 - A `.ply` asset, or a `.untoldgs` decoded on the CPU because the decode kernel is unavailable
   (or expanded once at load because the per-chunk kernels are), has no chunk table and keeps
   the per-splat cull over its whole encoded buffer.
 
 ## Per-entity splat limit
 
-A `.untoldgs` splat keeps 16 bytes plus its spherical harmonics resident (see the table above),
-so the runtime caps one entity at `GaussianRuntimeLimits.maxSplatsPerEntity`: 20,000,000
-splats on Apple Vision Pro, iPhone, iPad and Apple TV (320 MB of records, 1.2 GB with degree-3
-harmonics), 40,000,000 on the Mac. The whole-buffer path — a `.ply`, or a `.untoldgs` decoded
+A `.untoldgs` splat keeps 16 bytes plus its spherical harmonics resident (see the table above)
+up to the paging threshold, and above it only what fits the page pool — so the runtime caps
+one entity at `GaussianRuntimeLimits.maxSplatsPerEntity`, 20,000,000 splats on Apple Vision
+Pro, iPhone, iPad and Apple TV (a 256 MiB pool holds every head of such an asset without
+harmonics; with degree-3 harmonics a slot is 15 KiB and the pool holds most of the heads, so
+cook Apple Vision Pro assets at degree 2 or below), 40,000,000 on the Mac (where a 20 M asset
+without harmonics stays whole-resident below the 512 MiB threshold and pages with harmonics). The whole-buffer path — a `.ply`, or a `.untoldgs` decoded
 whole because the per-chunk kernels are unavailable — keeps about 60 bytes per splat (the
 48-byte record and three 4-byte visible indices) plus harmonics, so it keeps the lower cap,
 `GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity`: 5,242,880 splats on Apple Vision Pro,
@@ -341,7 +417,10 @@ Progressive assets use `.untoldgs` tier files:
 
 `lod0` is the finest/full-resolution tier. Higher LOD numbers are progressively coarser.
 The engine loads the coarsest tier first, then `GaussianLODSystem` requests finer tiers
-based on camera distance (see [Overdraw-aware LOD selection](#overdraw-aware-lod-selection)
+based on camera distance. A tier above the paging threshold pages with its own pool; before
+the LOD system switches to it, the tier **warms**: the frame culls its demand beside the
+current tier's and its pager fills it, and the switch waits until 80 % of the ranks the frame
+wants are resident (or 90 ticks have passed) so a paged tier never comes in empty (see [Overdraw-aware LOD selection](#overdraw-aware-lod-selection)
 below for a second, distance-independent signal that can also hold an entity on a coarser
 tier).
 
@@ -442,7 +521,11 @@ engine has no way to unload them again on its own.
 For that case, register the entity with `GeometryStreamingSystem` instead, via
 `setEntityGaussianStreaming`, which loads and unloads it automatically based on camera
 distance — the same way it already handles the surrounding streamed tile geometry. It can
-stream either one whole Gaussian file or a progressive `.untoldgs` tier set.
+stream either one whole Gaussian file or a progressive `.untoldgs` tier set. A splat above the
+paging threshold registers its page pool and tables with `MemoryBudgetManager`, not the file,
+and the pool goes with the entity when it is unloaded; under OS memory pressure every pool
+takes a soft target (half its slots on a warning, a quarter on critical) for a while and
+stops reading above it (see [geometryStreamingSystem.md](../Architecture/geometryStreamingSystem.md)).
 
 ### API overview
 
@@ -543,7 +626,8 @@ Parameters:
 
 Use `.progressive(...)` with `setEntityGaussianStreaming` when you want tile-driven
 load/unload behavior plus the same coarse-to-fine refinement (including the
-[overdraw-aware LOD clamp](#overdraw-aware-lod-selection)) described above.
+[overdraw-aware LOD clamp](#overdraw-aware-lod-selection) and the warmth gate of a paged
+tier) described above.
 
 Progressive tier filenames must follow this pattern:
 
