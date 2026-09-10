@@ -400,6 +400,10 @@ struct GaussianSplatIndexResolver {
 struct GaussianLegacyTwin {
     let result: GaussianLoadResult
 
+    init(result: GaussianLoadResult) {
+        self.result = result
+    }
+
     init(loaded: GaussianChunkLoadResult) throws {
         let encoded = try GaussianChunkLoader.decodeEncodedSplats(loaded)
         result = try XCTUnwrap(buildGaussianLoadResult(
@@ -525,5 +529,324 @@ enum GaussianSyntheticAsset {
         options.log2ChunkSplats = log2ChunkSplats
         options.shDegree = degree
         try UntoldGSFormat.write(splats: splats, options: options, to: url)
+    }
+}
+
+// MARK: - Paging
+
+/// A page source over the file's bytes in memory, for the paging tests: a read completes at
+/// once, or blocks until the test advances the source's tick past its latency
+/// (`latencyTicks`, `advance()`, `deliverAll()`); reads of `holdChunks` block until released;
+/// `failChunks` throw; `corruptChunks` serve a flipped byte; after `identityChangesAfterRead`
+/// successful reads every read throws `.fileChanged` and `reopen()` fails until
+/// `restoreIdentity()`. Every read is logged by chunk, rank and bytes.
+final class GaussianTestPageSource: GaussianPageSource, @unchecked Sendable {
+    struct ReadRecord: Equatable {
+        let chunk: Int
+        let firstRank: Int
+        let rankCount: Int
+        let bytes: Int
+        /// Whether the range is the chunk's core block (else its harmonics).
+        let core: Bool
+    }
+
+    /// Every source the factory override created, newest last.
+    static var created: [GaussianTestPageSource] {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        return _created
+    }
+
+    static func resetCreated() {
+        registryLock.lock()
+        _created.removeAll()
+        registryLock.unlock()
+    }
+
+    /// Installs the override; the sources it creates are listed in `created`.
+    static func install() {
+        GaussianPageSourceFactory.override = { url in
+            let source = try GaussianTestPageSource(url: url)
+            record(source)
+            return source
+        }
+    }
+
+    /// Lists a source a custom override created.
+    static func record(_ source: GaussianTestPageSource) {
+        registryLock.lock()
+        _created.append(source)
+        registryLock.unlock()
+    }
+
+    private static let registryLock = NSLock()
+    private nonisolated(unsafe) static var _created: [GaussianTestPageSource] = []
+
+    let url: URL
+    let index: UntoldGSIndex
+    private let data: Data
+    private let lock = NSLock()
+    private let condition = NSCondition()
+    private var _identity: GaussianFileIdentity
+    private let originalIdentity: GaussianFileIdentity
+    private var identityChanged = false
+    private var successfulReads = 0
+    private var _tick = 0
+    private var _blockedReads = 0
+    private var released = false
+    private var _closed = false
+    private var _reopenCount = 0
+    private var _log: [ReadRecord] = []
+    private var _bytesRequested = 0
+
+    var latencyTicks = 0
+    /// Chunks whose reads never complete until released. Published under the condition's lock:
+    /// a worker between its hold check and its wait holds that lock, so the change and its
+    /// broadcast cannot slip into the gap and leave a released read asleep.
+    var holdChunks: Set<Int> {
+        get { lock.lock(); defer { lock.unlock() }; return _holdChunks }
+        set {
+            condition.lock()
+            lock.lock()
+            _holdChunks = newValue
+            lock.unlock()
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
+    private var _holdChunks: Set<Int> = []
+    var failChunks: [Int: GaussianPagingError] {
+        get { lock.lock(); defer { lock.unlock() }; return _failChunks }
+        set { lock.lock(); _failChunks = newValue; lock.unlock() }
+    }
+
+    private var _failChunks: [Int: GaussianPagingError] = [:]
+    var corruptChunks: Set<Int> {
+        get { lock.lock(); defer { lock.unlock() }; return _corruptChunks }
+        set { lock.lock(); _corruptChunks = newValue; lock.unlock() }
+    }
+
+    private var _corruptChunks: Set<Int> = []
+    var identityChangesAfterRead: Int? {
+        get { lock.lock(); defer { lock.unlock() }; return _identityChangesAfterRead }
+        set { lock.lock(); _identityChangesAfterRead = newValue; lock.unlock() }
+    }
+
+    private var _identityChangesAfterRead: Int?
+
+    init(url: URL) throws {
+        self.url = url
+        data = try Data(contentsOf: url)
+        index = try UntoldGSFormat.readIndex(from: data)
+        let identity = GaussianFileIdentity(fileSize: UInt64(data.count), inode: 1, modificationSeconds: 1, modificationNanoseconds: 0)
+        _identity = identity
+        originalIdentity = identity
+    }
+
+    var identity: GaussianFileIdentity {
+        lock.lock()
+        defer { lock.unlock() }
+        return _identity
+    }
+
+    var closed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _closed
+    }
+
+    var reopenCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _reopenCount
+    }
+
+    var requestLog: [ReadRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _log
+    }
+
+    var bytesRequested: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _bytesRequested
+    }
+
+    /// Reads currently blocked on their latency or a hold.
+    var blockedReads: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return _blockedReads
+    }
+
+    /// One tick of latency passes: reads due at or before it complete.
+    func advance() {
+        condition.lock()
+        _tick += 1
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    /// Every blocked read completes (holds included).
+    func deliverAll() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func release(chunk: Int) {
+        condition.lock()
+        lock.lock()
+        _holdChunks.remove(chunk)
+        lock.unlock()
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    /// The file "changes": reads and reopens fail until `restoreIdentity()`.
+    func changeIdentity() {
+        lock.lock()
+        identityChanged = true
+        _identity = GaussianFileIdentity(fileSize: originalIdentity.fileSize, inode: 2, modificationSeconds: 2, modificationNanoseconds: 0)
+        lock.unlock()
+    }
+
+    func restoreIdentity() {
+        lock.lock()
+        identityChanged = false
+        _identityChangesAfterRead = nil
+        lock.unlock()
+    }
+
+    /// The chunk a file range belongs to, and its first rank and rank count within it.
+    func locate(offset: UInt64, count: Int) -> ReadRecord? {
+        for (chunkIndex, chunk) in index.chunks.enumerated() {
+            guard offset >= chunk.payloadOffset, offset < chunk.payloadOffset + UInt64(chunk.payloadBytes) else { continue }
+            let relative = Int(offset - chunk.payloadOffset)
+            let shBytes = index.header.shBytesPerSplat
+            if relative < Int(chunk.coreBytes) {
+                return ReadRecord(chunk: chunkIndex, firstRank: relative / UntoldGSFormat.coreRecordSize, rankCount: count / UntoldGSFormat.coreRecordSize, bytes: count, core: true)
+            }
+            guard shBytes > 0 else { return nil }
+            let shRelative = relative - Int(chunk.coreBytes)
+            return ReadRecord(chunk: chunkIndex, firstRank: shRelative / shBytes, rankCount: count / shBytes, bytes: count, core: false)
+        }
+        return nil
+    }
+
+    func read(offset: UInt64, count: Int, into destination: UnsafeMutableRawPointer) throws {
+        guard let record = locate(offset: offset, count: count) else {
+            throw GaussianPagingError.truncated
+        }
+        lock.lock()
+        _log.append(record)
+        _bytesRequested += count
+        let closedNow = _closed
+        lock.unlock()
+        if closedNow { throw GaussianPagingError.closed }
+
+        // Latency and holds.
+        condition.lock()
+        let due = _tick + latencyTicks
+        var blocked = false
+        while !released {
+            lock.lock()
+            let held = _holdChunks.contains(record.chunk)
+            lock.unlock()
+            if !held, _tick >= due { break }
+            if !blocked {
+                blocked = true
+                _blockedReads += 1
+            }
+            condition.wait()
+        }
+        if blocked { _blockedReads -= 1 }
+        condition.unlock()
+
+        lock.lock()
+        defer { lock.unlock() }
+        if _closed { throw GaussianPagingError.closed }
+        if let error = _failChunks[record.chunk], record.core {
+            throw error
+        }
+        if identityChanged {
+            throw GaussianPagingError.fileChanged
+        }
+        let start = Int(offset)
+        guard start + count <= data.count else { throw GaussianPagingError.truncated }
+        data.withUnsafeBytes { bytes in
+            destination.copyMemory(from: bytes.baseAddress! + start, byteCount: count)
+        }
+        if _corruptChunks.contains(record.chunk), record.core, count > 3 {
+            destination.storeBytes(of: destination.load(fromByteOffset: 3, as: UInt8.self) ^ 0x5A, toByteOffset: 3, as: UInt8.self)
+        }
+        successfulReads += 1
+        if let limit = _identityChangesAfterRead, successfulReads >= limit {
+            identityChanged = true
+            _identity = GaussianFileIdentity(fileSize: originalIdentity.fileSize, inode: 2, modificationSeconds: 2, modificationNanoseconds: 0)
+        }
+    }
+
+    func reopen() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        _reopenCount += 1
+        if _closed { throw GaussianPagingError.closed }
+        if identityChanged { throw GaussianPagingError.fileChanged }
+        _identity = originalIdentity
+    }
+
+    func close() {
+        lock.lock()
+        _closed = true
+        lock.unlock()
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+/// A whole-buffer twin of a partially resident paged entity: the same records expanded once,
+/// with every rank at or beyond its chunk's resident prefix at opacity 0 and the resident tail
+/// faded by the opacity band the fused pass applies to a truncated chunk (quota = resident
+/// ranks), so a frame of the paged entity and a frame of the twin draw the same splats.
+struct GaussianPartialTwin {
+    let result: GaussianLoadResult
+
+    /// `residentRanks` per chunk index (missing = whole).
+    init(loaded: GaussianChunkLoadResult, residentRanks: [Int: Int]) throws {
+        let encoded = try GaussianChunkLoader.decodeEncodedSplats(loaded)
+        let splats = encoded.contents().bindMemory(to: EncodedGaussianSplat.self, capacity: loaded.splatCount)
+        var firstSplat = 0
+        for (chunkIndex, chunk) in loaded.index.chunks.enumerated() {
+            let count = Int(chunk.splatCount)
+            if let resident = residentRanks[chunkIndex], resident < count {
+                for rank in 0 ..< count {
+                    let factor = rank < resident
+                        ? GaussianChunkCullMath.opacityBandFactor(rank: UInt32(rank), quota: UInt32(resident), splatCount: UInt32(count))
+                        : 0
+                    var splat = splats[firstSplat + rank]
+                    splat.colorAndOpacity.w = Float16(Float(splat.colorAndOpacity.w) * factor)
+                    splats[firstSplat + rank] = splat
+                }
+            }
+            firstSplat += count
+        }
+        result = try XCTUnwrap(buildGaussianLoadResult(
+            encodedSplatBuffer: encoded,
+            splatCount: UInt(loaded.splatCount),
+            sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
+            sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
+            boundingBox: loaded.boundingBox
+        ))
+    }
+
+    /// Runs `body` with `component` swapped onto the whole-buffer path over the twin's buffers.
+    func withLegacyBuffers<T>(_ component: GaussianComponent, _ body: () throws -> T) rethrows -> T {
+        try GaussianLegacyTwin(result: result).withLegacyBuffers(component, body)
     }
 }
