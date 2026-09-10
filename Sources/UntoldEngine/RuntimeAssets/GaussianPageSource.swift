@@ -6,7 +6,10 @@
 //  a protocol for a synchronous, thread-safe range read plus the file identity and index the
 //  pager validates against, its file implementation over `pread` on a retained descriptor
 //  (`UntoldGSFilePageSource`), and the factory tests replace to inject latency, failures and
-//  corruption (`GaussianPageSourceFactory.override`).
+//  corruption (`GaussianPageSourceFactory.override`). The same range read serves the tiers of the
+//  page pool and the pieces of a file's coarse section (per-chunk-lod-tiers), which the pager
+//  reads into the entity's coarse records buffer; the source's index carries the coarse index
+//  (`UntoldGSIndex.coarse`) from the open.
 //
 // Copyright (C) Untold Engine Studios
 //

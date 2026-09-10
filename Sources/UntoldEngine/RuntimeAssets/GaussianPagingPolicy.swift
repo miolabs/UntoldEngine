@@ -7,8 +7,10 @@
 //  frame wants (the quota rule with headroom, or a fill density when the frame fits), the load
 //  priority, the eviction classes and their hysteresis, the retire ring that keeps a freed pool
 //  slot out of use while a frame may still read it, the coalescing of a chunk's tiers into one
-//  read, and the per-tick I/O caps. Everything here is CPU-testable without Metal
-//  (GaussianPagingPolicyTests).
+//  read, the per-tick I/O caps, and the per-chunk coarse levels' share of it (per-chunk-lod-tiers):
+//  which levels of a file's coarse section fit beside the pool, how the section is cut into the
+//  pieces the pager streams, and how the level rule zeroes the fine wants of a chunk drawn
+//  coarse. Everything here is CPU-testable without Metal (GaussianPagingPolicyTests).
 //
 // Copyright (C) Untold Engine Studios
 //
@@ -54,6 +56,21 @@ public enum GaussianPagingPolicy {
     /// Soft pool targets under memory pressure: warning and critical.
     public static let pressureFractionWarning: Float = 0.5
     public static let pressureFractionCritical: Float = 0.25
+    /// The share of the residency budget an entity's per-chunk coarse levels may take beside its
+    /// pool (per-chunk-lod-tiers): both levels when they fit it, else the coarsest alone, else
+    /// none. The coarse records live outside the pool, in their own buffer charged to the ledger.
+    public static let coarseBudgetFraction = 0.2
+
+    /// Replaces `coarseBudgetFraction` (tests, the editor); nil restores it.
+    public static var coarseBudgetFractionOverride: Double? {
+        get { storage.coarseBudgetFractionOverride }
+        set { storage.coarseBudgetFractionOverride = newValue }
+    }
+
+    /// The fraction in effect.
+    public static var coarseBudgetFractionInEffect: Double {
+        coarseBudgetFractionOverride ?? coarseBudgetFraction
+    }
 
     /// Replaces the residency budget (25 % of the geometry budget) with an exact figure.
     public static var residencyBudgetBytesOverride: Int? {
@@ -250,6 +267,57 @@ public enum GaussianPagingPolicy {
         return min(assetBytes, poolMaxBytes, budget)
     }
 
+    // MARK: Coarse levels (per-chunk-lod-tiers)
+
+    /// How many of a file's coarse levels stay resident beside the pool: `coarseBytesPerLevel`
+    /// holds the record bytes of each level, finest first (the file's level 1, then level 2).
+    /// Every level when their sum fits `fraction × residencyBudgetBytes − allocatedBytes` (the
+    /// coarse bytes other entities already hold), else the coarsest level alone when it fits,
+    /// else none — the runtime then draws the fine records only, as before the levels existed.
+    public static func coarseResidentLevels(coarseBytesPerLevel: [Int], residencyBudgetBytes: Int, allocatedBytes: Int = 0, fraction: Double = coarseBudgetFractionInEffect) -> Int {
+        guard !coarseBytesPerLevel.isEmpty else { return 0 }
+        let bound = Double(max(0, residencyBudgetBytes)) * max(0, fraction) - Double(max(0, allocatedBytes))
+        let total = coarseBytesPerLevel.reduce(0, +)
+        if Double(total) <= bound { return coarseBytesPerLevel.count }
+        if coarseBytesPerLevel.count > 1, let coarsest = coarseBytesPerLevel.last, Double(coarsest) <= bound { return 1 }
+        return 0
+    }
+
+    /// The most bytes one piece of the coarse section carries through the read queue: half the
+    /// in-flight cap, so a piece never starves the tier reads of the same tick, at least a page.
+    public static func coarsePieceBytes(maxPageBytesInFlight: Int = maxPageBytesInFlight) -> Int {
+        max(UntoldGSFormat.pageAlignment, maxPageBytesInFlight / 2)
+    }
+
+    /// The pieces the pager reads the coarse region `[rangeStart, rangeEnd)` in: sequential from
+    /// the start (the coarsest level lies first in the file), each at most `pieceBytes`, landing
+    /// in the records buffer at `fileOffset − rangeStart`. Deterministic, so an entry's pieces
+    /// are known before any read.
+    public static func coarsePieces(rangeStart: UInt64, rangeEnd: UInt64, pieceBytes: Int) -> [GaussianCoarsePiece] {
+        guard rangeEnd > rangeStart, pieceBytes > 0 else { return [] }
+        var pieces: [GaussianCoarsePiece] = []
+        var cursor = rangeStart
+        while cursor < rangeEnd {
+            let count = Int(min(UInt64(pieceBytes), rangeEnd - cursor))
+            pieces.append(GaussianCoarsePiece(fileOffset: cursor, byteCount: count, bufferOffset: Int(cursor - rangeStart)))
+            cursor += UInt64(count)
+        }
+        return pieces
+    }
+
+    /// The residency struct `GaussianPageManager.map` writes when ranks `[firstRank, firstRank +
+    /// rankCount)` of a chunk land at tick `now`: the new resident prefix, the fade from the
+    /// first arrived rank, the arrival frame — and the coarse availability bits `previous`
+    /// carried, which ride in the same struct and must survive every rewrite.
+    public static func mappedResidency(previous: GaussianChunkResidency, firstRank: Int, rankCount: Int, now: UInt32) -> GaussianChunkResidency {
+        GaussianChunkResidency(
+            residentRanks: UInt32(firstRank + rankCount),
+            fadeFromRank: UInt32(firstRank),
+            arrivalFrame: now,
+            coarseAvailable: previous.coarseAvailable
+        )
+    }
+
     // MARK: Wanted ranks
 
     /// The density at which the demanded chunks together would consume the whole room the
@@ -279,6 +347,15 @@ public enum GaussianPagingPolicy {
     /// its resident ranks, so applying that cap to the full count has no fixed point (the wants
     /// would grow to the whole chunk once the pool held the headroom, then shrink again). The
     /// fill scale over the full demanded counts does: resident 1.25 × s × n, cap 0.8, quota s × n.
+    ///
+    /// A chunk of an entity with coarse levels (`coarse`, per-chunk-lod-tiers) wants **0** fine
+    /// ranks when the level rule (`GaussianChunkCullMath.level`) picks a coarse level for it at
+    /// the same cap (or fill density) and the frame's density floor — evaluated as if the chunk
+    /// drew fine last frame, the finer assumption inside the hysteresis band, so a chunk near a
+    /// boundary keeps its fine tiers while the GPU still draws it coarse — and the fine ranks
+    /// above otherwise. Fine counts as available whatever is resident: the want is what decides
+    /// whether to fetch it. Off under `uniformQuotas` and `disableWorkingSetBudget` (levels are
+    /// off there too).
     public static func wantedRanks(
         splatCount: UInt32,
         area: Float,
@@ -286,14 +363,36 @@ public enum GaussianPagingPolicy {
         fillDensity: Float,
         fillScale: Float = 1,
         uniformQuotas: Bool,
-        disableWorkingSetBudget: Bool
+        disableWorkingSetBudget: Bool,
+        coarse: GaussianCoarseWantInputs? = nil
     ) -> UInt32 {
         if disableWorkingSetBudget { return splatCount }
         if uniformQuotas {
             return GaussianChunkCullMath.quota(scale: fillScale, splatCount: splatCount)
         }
         let cap = densityCap.isFinite ? densityCap : fillDensity
+        if let coarse, coarseLevel(coarse, splatCount: splatCount, area: area, cap: cap, previous: 0) != 0 {
+            return 0
+        }
         return GaussianChunkCullMath.quota(densityCap: cap, splatCount: splatCount, screenArea: area)
+    }
+
+    /// The level the rule picks for a chunk of `splatCount` seen with `area` at `cap` (finite: the
+    /// read-back cap or the fill density) given the coarse inputs and the level drawn last tick
+    /// (`previous`; 0 for the finer assumption of the wants): the CPU's mirror of the GPU's choice.
+    /// `fineAvailable` false (nothing resident) drops fine from the mask, as the GPU's rule does.
+    public static func coarseLevel(_ coarse: GaussianCoarseWantInputs, splatCount: UInt32, area: Float, cap: Float, previous: Int, fineAvailable: Bool = true) -> Int {
+        guard area > 0 else { return 0 }
+        return GaussianChunkCullMath.level(
+            densityCap: cap,
+            densityFloor: coarse.densityFloor,
+            splatCount: splatCount,
+            screenArea: area,
+            previous: previous,
+            available: fineAvailable ? coarse.availabilityMask : coarse.availabilityMask & ~1,
+            tierShifts: coarse.tierShifts,
+            levelMode: coarse.levelMode
+        )
     }
 
     /// The ranks to keep resident for a chunk that wants `want`: the want with the headroom,
@@ -376,12 +475,14 @@ public enum GaussianPagingPolicy {
             taken[chunk, default: 0] += 1
         }
 
-        // 1. Stale chunks, oldest demand first, every tier from the top down.
+        // 1. Stale chunks, oldest demand first, every tier from the top down. A chunk whose level
+        // is cross-fading (`.levelFade`) is no victim in any class, pressure included: its
+        // outgoing fine window is still drawn.
         var stale: [(chunk: Int, lastDemand: UInt32)] = []
         var demandedResident: [Int] = []
         for chunk in resident {
             let state = states[chunk]
-            guard state.residentRanks > 0, !state.flags.contains(.loading) else { continue }
+            guard state.residentRanks > 0, !state.flags.contains(.loading), !state.flags.contains(.levelFade) else { continue }
             if inputs.tick &- state.lastDemandTick > inputs.holdOffTicks {
                 stale.append((chunk, state.lastDemandTick))
             } else {
@@ -513,6 +614,7 @@ public enum GaussianPagingPolicy {
         private var _warmFraction: Float = 0.8
         private var _warmTimeoutTicks: UInt32 = 90
         private var _pressureTicks: UInt32 = 600
+        private var _coarseBudgetFractionOverride: Double?
 
         func reset() {
             lock.lock()
@@ -535,6 +637,12 @@ public enum GaussianPagingPolicy {
             _warmFraction = 0.8
             _warmTimeoutTicks = 90
             _pressureTicks = 600
+            _coarseBudgetFractionOverride = nil
+        }
+
+        var coarseBudgetFractionOverride: Double? {
+            get { lock.lock(); defer { lock.unlock() }; return _coarseBudgetFractionOverride }
+            set { lock.lock(); _coarseBudgetFractionOverride = newValue; lock.unlock() }
         }
 
         var residencyBudgetBytesOverride: Int? {
@@ -645,6 +753,9 @@ public struct GaussianChunkPageState: Equatable, Sendable {
         public static let faulted = Flags(rawValue: 1 << 1)
         /// The last arrival is still fading in; not topped up until it is done.
         public static let fadeActive = Flags(rawValue: 1 << 2)
+        /// The chunk's level changed within the last `fadeFrames` ticks (per-chunk-lod-tiers):
+        /// its fine tiers may be the outgoing window of the cross-fade and are no victim.
+        public static let levelFade = Flags(rawValue: 1 << 3)
     }
 
     /// 0, R, 2R, …, n: the resident prefix.
@@ -666,8 +777,64 @@ public struct GaussianChunkPageState: Equatable, Sendable {
     /// Ranks from here up arrived at `arrivalTick` (mirrored into the residency table).
     public var fadeFromRank: UInt16 = 0
     public var arrivalTick: UInt32 = 0
+    /// The CPU's mirror of the level the chunk draws (0 fine, 1, 2), from the same rule the quota
+    /// pass runs, updated each tick the chunk is demanded; never read back from the GPU.
+    public var drawnLevel: UInt8 = 0
+    /// The tick `drawnLevel` last changed (the `.levelFade` clock).
+    public var levelSwitchTick: UInt32 = 0
 
     public init() {}
+}
+
+/// The inputs of the level rule the pager evaluates for a chunk of an entity with coarse levels
+/// (per-chunk-lod-tiers): the entity's tier shifts, the chunk's runtime level 1 and 2 counts,
+/// which levels have landed for it (`GaussianChunkResidency.coarseAvailable`: bit 0 level 1,
+/// bit 1 level 2), the frame's density floor and level mode.
+public struct GaussianCoarseWantInputs: Equatable, Sendable {
+    public var tierShifts: (Int, Int)
+    public var counts: (UInt32, UInt32)
+    public var available: UInt32
+    public var densityFloor: Float
+    public var levelMode: GaussianLevelMode
+
+    public init(tierShifts: (Int, Int), counts: (UInt32, UInt32), available: UInt32, densityFloor: Float = .infinity, levelMode: GaussianLevelMode = .auto) {
+        self.tierShifts = tierShifts
+        self.counts = counts
+        self.available = available
+        self.densityFloor = densityFloor
+        self.levelMode = levelMode
+    }
+
+    /// The rule's availability mask with fine available (bit 0) and each landed level with a
+    /// non-zero count (bits 1, 2).
+    public var availabilityMask: UInt32 {
+        1
+            | ((available & 1) != 0 && counts.0 > 0 ? 2 : 0)
+            | ((available & 2) != 0 && counts.1 > 0 ? 4 : 0)
+    }
+
+    public static func == (lhs: GaussianCoarseWantInputs, rhs: GaussianCoarseWantInputs) -> Bool {
+        lhs.tierShifts == rhs.tierShifts && lhs.counts == rhs.counts && lhs.available == rhs.available
+            && lhs.densityFloor == rhs.densityFloor && lhs.levelMode == rhs.levelMode
+    }
+}
+
+/// One piece of a coarse section read through the pager's queue: `byteCount` bytes at
+/// `fileOffset`, landing in the entity's coarse records buffer at `bufferOffset`.
+public struct GaussianCoarsePiece: Equatable, Sendable {
+    public let fileOffset: UInt64
+    public let byteCount: Int
+    public let bufferOffset: Int
+
+    public init(fileOffset: UInt64, byteCount: Int, bufferOffset: Int) {
+        self.fileOffset = fileOffset
+        self.byteCount = byteCount
+        self.bufferOffset = bufferOffset
+    }
+
+    public var end: UInt64 {
+        fileOffset + UInt64(byteCount)
+    }
 }
 
 /// The eviction classes, in the order they are tried.

@@ -496,6 +496,12 @@ enum GaussianSyntheticAsset {
         }
         var options = UntoldGSWriteOptions()
         options.log2ChunkSplats = 10
+        // Section-free: the slab is the fixture of the budget and paging suites, whose frames are
+        // compared against whole-buffer twins; the per-chunk level tests bake their own levelled
+        // variant (and the writer's automatic policy would add a section to every slab of at
+        // least 64 chunks).
+        options.coarseLevels = nil
+        options.coarseLevelsAutomatic = false
         let start = CFAbsoluteTimeGetCurrent()
         try UntoldGSFormat.write(splats: splats, options: options, to: url)
         print("[GaussianSyntheticAsset] baked \(splatCount) splats in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start)) s -> \(url.path)")
@@ -548,6 +554,9 @@ final class GaussianTestPageSource: GaussianPageSource, @unchecked Sendable {
         let bytes: Int
         /// Whether the range is the chunk's core block (else its harmonics).
         let core: Bool
+        /// A piece of the coarse section (per-chunk-lod-tiers): the file level whose records the
+        /// range starts in, `chunk` −1 and no ranks; 0 for a tier read.
+        var coarseLevel: Int = 0
     }
 
     /// Every source the factory override created, newest last.
@@ -733,6 +742,15 @@ final class GaussianTestPageSource: GaussianPageSource, @unchecked Sendable {
             guard shBytes > 0 else { return nil }
             let shRelative = relative - Int(chunk.coreBytes)
             return ReadRecord(chunk: chunkIndex, firstRank: shRelative / shBytes, rankCount: count / shBytes, bytes: count, core: false)
+        }
+        // A piece of the coarse section: the level whose range holds the start of the piece.
+        let header = index.header
+        if header.hasCoarseLevels, offset >= header.coarsePayloadOffset, offset < header.fileSize {
+            for level in 1 ... index.coarseLevelCount {
+                guard let range = index.coarseLevelRange(level: level), range.contains(offset) else { continue }
+                return ReadRecord(chunk: -1, firstRank: 0, rankCount: 0, bytes: count, core: false, coarseLevel: level)
+            }
+            return ReadRecord(chunk: -1, firstRank: 0, rankCount: 0, bytes: count, core: false, coarseLevel: index.coarseLevelCount)
         }
         return nil
     }

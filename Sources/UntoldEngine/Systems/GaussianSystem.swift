@@ -217,11 +217,16 @@ private struct GaussianEntityFrameMatrices {
     }
 }
 
-/// A chunked entity whose chunk cull ran this frame and whose quotas are still to be granted.
+/// A chunked entity whose chunk cull ran this frame and whose quotas are still to be granted:
+/// with its coarse levels (per-chunk-lod-tiers) and this slot's residency when it has them, so
+/// the quota pass chooses each chunk's level from the same buffers the cull read.
 private struct GaussianChunkedEntityFrame {
     let chunkTable: GaussianChunkTable
     let visibleChunks: MTLBuffer
     let chunkSet: MTLBuffer
+    let residency: MTLBuffer?
+    let levels: GaussianChunkLevelBuffers?
+    let levelConstants: GaussianChunkLevelConstants
 }
 
 /// The working-set budget of this frame in splats: the resident total with the debug switch on
@@ -307,6 +312,15 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     // Read once per frame so the chunk culls and the scale kernel agree on the quota rule.
     let uniformQuotas = GaussianDebugOptions.shared.disableScreenWeightedQuotas
     let pagingSwitches = GaussianPagingFrameSwitches()
+    // The level rule's frame-wide inputs (per-chunk-lod-tiers): the density floor of the frame's
+    // viewport, and the tier shifts the solve charges — the maximum over the entities with
+    // coarse levels: a larger shift draws fine further under a chunk's own density, so the
+    // maximum is the most fine-leaning rule and the solve charges fine wherever any entity still
+    // draws fine (the minimum would charge an entity with larger shifts a coarse count where its
+    // own rule still draws the fine quota, and the fused pass would overflow the working set).
+    let frameViewport = renderInfo.viewPort ?? simd_float2(1, 1)
+    let frameDensityFloor = gaussianDensityFloor(viewport: frameViewport)
+    var maximumTierShifts: (UInt32, UInt32)?
 
     var chunkedEntities: [GaussianChunkedEntityFrame] = []
     var visibleCountUpdates: [GaussianVisibleCountUpdate] = []
@@ -371,8 +385,39 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
                     freeze: pagingSwitches.freeze,
                     frameIndex: renderInfo.frameIndex,
                     fadeFrames: pagingSwitches.fadeFrames,
-                    debugMode: pagingSwitches.debugMode
+                    debugMode: pagingSwitches.debugMode,
+                    densityFloor: frameDensityFloor,
+                    levelMode: pagingSwitches.levelMode,
+                    levelFadeFrames: pagingSwitches.levelFadeFrames
                 ))
+            }
+            // The entity's coarse levels this frame (per-chunk-lod-tiers): the level buffers and
+            // constants the cull, the quota pass and the fused pass share, on one clock — the
+            // pager's tick, or the whole-resident entity's executed-frame counter, stepped here
+            // once per frame before any pass reads it. Without levels (no section, they did not
+            // fit, or the pager faulted them) the stand-ins and hasCoarse = 0: the paths as before.
+            var levels: GaussianChunkLevelBuffers?
+            var levelConstants = GaussianChunkLevelConstants()
+            if let coarse = gaussianActiveCoarseTable(gaussianComponent) {
+                let frameIndex: UInt32
+                if let pagerBindings {
+                    frameIndex = pagerBindings.constants.frameIndex
+                } else {
+                    gaussianComponent.chunkTable?.executedFrames &+= 1
+                    frameIndex = gaussianComponent.chunkTable?.executedFrames ?? 0
+                }
+                levels = coarse.levelBuffers
+                levelConstants = gaussianChunkLevelConstants(
+                    coarse: coarse,
+                    frameIndex: frameIndex,
+                    cull: chunkConstants,
+                    viewport: frameViewport,
+                    fadeFrames: pagingSwitches.levelFadeFrames,
+                    levelMode: pagingSwitches.levelMode,
+                    debugTint: pagingSwitches.levelDebugTint
+                )
+                let shifts = (levelConstants.tierShift1, levelConstants.tierShift2)
+                maximumTierShifts = maximumTierShifts.map { (max($0.0, shifts.0), max($0.1, shifts.1)) } ?? shifts
             }
             profileTotals.dispatchCount += encodeGaussianChunkCull(
                 computeEncoder,
@@ -385,9 +430,18 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
                 constants: chunkConstants,
                 hzbTexture: hzb.texture,
                 residency: pagerBindings?.residency,
-                demand: pagerBindings?.demand
+                demand: pagerBindings?.demand,
+                levels: levels,
+                levelConstants: levelConstants
             )
-            chunkedEntities.append(GaussianChunkedEntityFrame(chunkTable: chunkTable, visibleChunks: visibleChunks, chunkSet: chunkSet))
+            chunkedEntities.append(GaussianChunkedEntityFrame(
+                chunkTable: chunkTable,
+                visibleChunks: visibleChunks,
+                chunkSet: chunkSet,
+                residency: pagerBindings?.residency,
+                levels: levels,
+                levelConstants: levelConstants
+            ))
             // The paged tiers the LOD system is about to switch to warm beside the live entity:
             // a demand-only cull of each (its own chunk table, the live entity's views) and a
             // full tick of its pager, which issues the tier's reads like the live entity's so
@@ -546,7 +600,13 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     // min(splats, floor(cap × screen area)), and the state and the histogram are published for
     // this slot's readback.
     if let chunkPipelines, let budgetState, let densityHistogram {
-        let scaleConstants = gaussianBudgetScaleConstants(budget: capacity, resetHysteresis: workingSet.takeHysteresisReset(), uniformQuotas: uniformQuotas)
+        let scaleConstants = gaussianBudgetScaleConstants(
+            budget: capacity,
+            resetHysteresis: workingSet.takeHysteresisReset(),
+            uniformQuotas: uniformQuotas,
+            densityFloor: frameDensityFloor,
+            tierShifts: maximumTierShifts ?? (0, 0)
+        )
         encodeGaussianBudgetScale(computeEncoder, pipelines: chunkPipelines, budgetState: budgetState, densityHistogram: densityHistogram, constants: scaleConstants)
         profileTotals.dispatchCount += 1
         for chunked in chunkedEntities {
@@ -556,7 +616,10 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
                 chunkTable: chunked.chunkTable,
                 visibleChunks: chunked.visibleChunks,
                 chunkSet: chunked.chunkSet,
-                budgetState: budgetState
+                budgetState: budgetState,
+                residency: chunked.residency,
+                levels: chunked.levels,
+                levelConstants: chunked.levelConstants
             )
             profileTotals.dispatchCount += 1
         }
@@ -601,12 +664,18 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     )
 }
 
-/// The paging switches of one frame, read once so every entity's tick agrees.
+/// The paging and level switches of one frame, read once so every entity's tick, cull and quota
+/// pass agree.
 private struct GaussianPagingFrameSwitches {
     let disableWorkingSetBudget: Bool
     let freeze: Bool
     let fadeFrames: UInt32
     let debugMode: UInt32
+    /// The per-chunk levels' switches (per-chunk-lod-tiers): the mode, the cross-fade frames (0
+    /// with `disableLevelCrossFade`) and the level tint.
+    let levelMode: GaussianLevelMode
+    let levelFadeFrames: UInt32
+    let levelDebugTint: Bool
 
     init() {
         let options = GaussianDebugOptions.shared
@@ -614,6 +683,9 @@ private struct GaussianPagingFrameSwitches {
         freeze = options.freezePaging
         fadeFrames = options.disablePageFade ? 0 : GaussianPagingPolicy.fadeFrames
         debugMode = options.residencyDebugTint ? 1 : 0
+        levelMode = options.gaussianLevelMode
+        levelFadeFrames = options.disableLevelCrossFade ? 0 : GaussianPagingPolicy.fadeFrames
+        levelDebugTint = options.levelDebugTint
     }
 }
 
@@ -692,6 +764,7 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
     let chunkPipelines = GaussianChunkCullPipelineStates.current()
     let hzb = gaussianHZBInputs()
     let uniformQuotas = GaussianDebugOptions.shared.disableScreenWeightedQuotas
+    let levelSwitches = GaussianPagingFrameSwitches()
 
     guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
     computeEncoder.label = "Gaussian Preprocess"
@@ -783,19 +856,36 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
             // stage used, and the projection the head-centre uniforms above. A paged entity
             // reads the pool through this slot's page table as the tick left it.
             let pagerBindings = gaussianComponent.pager?.bindings(slot: frameSlot)
+            let cullConstants = gaussianChunkCullConstants(
+                chunkTable: chunkTable,
+                modelMatrix: matrices.modelMatrix,
+                viewMatrix: matrices.viewMatrix,
+                hzbValid: hzb.valid,
+                uniformQuotas: uniformQuotas,
+                paged: pagerBindings == nil ? 0 : 1
+            )
+            // The coarse levels the cull and the quota pass of this frame ran with, on the same
+            // clock (the pager's tick, or the executed-frame counter the cull stepped).
+            var levels: GaussianChunkLevelBuffers?
+            var levelConstants = GaussianChunkLevelConstants()
+            if let coarse = gaussianActiveCoarseTable(gaussianComponent) {
+                levels = coarse.levelBuffers
+                levelConstants = gaussianChunkLevelConstants(
+                    coarse: coarse,
+                    frameIndex: pagerBindings?.constants.frameIndex ?? chunkTable.executedFrames,
+                    cull: cullConstants,
+                    viewport: viewport,
+                    fadeFrames: levelSwitches.levelFadeFrames,
+                    levelMode: levelSwitches.levelMode,
+                    debugTint: levelSwitches.levelDebugTint
+                )
+            }
             let inputs = GaussianChunkPreprocessInputs(
                 packedSplats: packedSplats,
                 chunkTable: chunkTable,
                 visibleChunks: chunkTable.visibleChunks[frameSlot],
                 uniforms: gaussianUniform,
-                cullConstants: gaussianChunkCullConstants(
-                    chunkTable: chunkTable,
-                    modelMatrix: matrices.modelMatrix,
-                    viewMatrix: matrices.viewMatrix,
-                    hzbValid: hzb.valid,
-                    uniformQuotas: uniformQuotas,
-                    paged: pagerBindings == nil ? 0 : 1
-                ),
+                cullConstants: cullConstants,
                 viewport: viewport,
                 sphericalHarmonics: gaussianComponent.sphericalHarmonicsData,
                 shMetadata: shMetadata,
@@ -804,7 +894,9 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
                 hzbTexture: hzb.texture,
                 residency: pagerBindings?.residency,
                 pageTable: pagerBindings?.pageTable,
-                pagingConstants: pagerBindings?.constants ?? GaussianChunkPagingConstants()
+                pagingConstants: pagerBindings?.constants ?? GaussianChunkPagingConstants(),
+                levels: levels,
+                levelConstants: levelConstants
             )
             encodeGaussianChunkDecodePreprocess(
                 computeEncoder,
@@ -902,10 +994,11 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
         startTime: profileStart,
         totals: profileTotals,
         extra: String(
-            format: "activeSplats=%d sharedCapacity=%d lastShared=%d lastOverflow=%d budget=%u requested=%u reserved=%u quota=%u scale=%.3f targetScale=%.3f density=%.4g targetDensity=%.4g visibleChunks=%u fill=%.3f",
+            format: "activeSplats=%d sharedCapacity=%d lastShared=%d lastOverflow=%d budget=%u requested=%u reserved=%u quota=%u scale=%.3f targetScale=%.3f density=%.4g targetDensity=%.4g visibleChunks=%u fill=%.3f coarseChunks=%u coarseSplats=%u transition=%u%@",
             activeSplatTotal, workingSet.capacity, workingSet.lastVisibleCount, workingSet.lastOverflowCount,
             lastBudget.budget, lastBudget.requestedSplats, lastBudget.reservedSplats, lastBudget.quotaSplats, lastBudget.scale, lastBudget.targetScale,
-            Double(lastBudget.densityCap), Double(lastDensity.targetDensity), lastDensity.visibleChunks, fill
+            Double(lastBudget.densityCap), Double(lastDensity.targetDensity), lastDensity.visibleChunks, fill,
+            lastBudget.coarseChunks, lastBudget.coarseSplats, lastBudget.transitionSplats, profileTotals.coarseSummary
         )
     )
 }

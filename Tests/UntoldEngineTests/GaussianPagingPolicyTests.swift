@@ -6,7 +6,11 @@
 //  under the density cap with headroom, the fill density when the frame fits, the uniform and
 //  budget-off modes, the fixed point the headroom gives the density solve, the load priority,
 //  the eviction classes and their hysteresis (margin, pin, cooldown, hold-off), the retire ring,
-//  the coalescing of a chunk's tiers into one read, the pool sizing and the resident estimate.
+//  the coalescing of a chunk's tiers into one read, the pool sizing and the resident estimate,
+//  and the per-chunk coarse levels' share (per-chunk-lod-tiers): the wants a chunk drawn coarse
+//  gives up, the finer assumption inside the hysteresis band, the fit check, the pieces of the
+//  coarse section, the eviction exclusion of a chunk mid-fade and the residency rewrite that
+//  carries the availability bits.
 //
 // Copyright (C) Untold Engine Studios
 //
@@ -414,6 +418,162 @@ final class GaussianPagingPolicyTests: XCTestCase {
         XCTAssertEqual(GaussianPagingPolicy.coalesceRequest(chunk: tiny, firstRank: 0, rankCount: 16, slots: [5], ranksPerPage: 16, shBytesPerSplat: 0).core, [GaussianPageReadRange(fileOffset: 16384, byteCount: 256, poolOffset: 5 * 256)])
     }
 
+    // MARK: - Coarse levels (per-chunk-lod-tiers)
+
+    /// Level 1 at ratio 3 (tier shift 4), level 2 at ratio 6 (shift 10), both landed, on a
+    /// 1024-splat chunk.
+    private func coarseInputs(available: UInt32 = 3, densityFloor: Float = .infinity, levelMode: GaussianLevelMode = .auto) -> GaussianCoarseWantInputs {
+        GaussianCoarseWantInputs(tierShifts: (4, 10), counts: (128, 16), available: available, densityFloor: densityFloor, levelMode: levelMode)
+    }
+
+    func testWantedRanksZeroInCoarseRegime() {
+        let n: UInt32 = 1024
+        // Density n / A six octaves (twelve tiers) above the cap: level 2 by the rule (fine holds
+        // down to four tiers under, level 1 down to ten), no fine rank wanted.
+        let area: Float = 1024 / (1024 * 64)
+        let cap: Float = 1024
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(), splatCount: n, area: area, cap: cap, previous: 0), 2)
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs()), 0, "a chunk drawn coarse wants no fine rank")
+        // Three octaves above the cap: level 1, still nothing.
+        let areaL1: Float = 1024 / (1024 * 8)
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(), splatCount: n, area: areaL1, cap: cap, previous: 0), 1)
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: areaL1, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs()), 0)
+        // The same chunk with nothing landed yet wants the fine quota: there is no level to draw instead.
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs(available: 0)), GaussianChunkCullMath.quota(densityCap: cap, splatCount: n, screenArea: area))
+        // A near chunk (its density at the cap) wants the fine quota as without levels.
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: 1, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs()), GaussianChunkCullMath.quota(densityCap: cap, splatCount: n, screenArea: 1))
+        // The fill density stands in for an infinite cap, the floor lowers the effective cap (the
+        // level only: the want of a fine chunk is still on the fill density).
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: .infinity, fillDensity: cap, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs()), 0)
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: .infinity, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs(densityFloor: cap)), 0, "the density floor draws the far chunk coarse on a fitting frame")
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: 1, densityCap: .infinity, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs(densityFloor: cap)), n)
+        // Levels off: the fine-only mode, the uniform rule and the budget switch want as before.
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs(levelMode: .fineOnly)), GaussianChunkCullMath.quota(densityCap: cap, splatCount: n, screenArea: area))
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: .infinity, fillScale: 0.5, uniformQuotas: true, disableWorkingSetBudget: false, coarse: coarseInputs()), 512)
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: true, coarse: coarseInputs()), n)
+        // The coarse-only mode draws the coarsest landed level whatever the cap.
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: 1, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs(levelMode: .coarseOnly)), 0)
+        // The mask: fine, plus each landed level with a count.
+        XCTAssertEqual(coarseInputs().availabilityMask, 7)
+        XCTAssertEqual(coarseInputs(available: 2).availabilityMask, 5)
+        XCTAssertEqual(GaussianCoarseWantInputs(tierShifts: (4, 10), counts: (0, 16), available: 3).availabilityMask, 5, "a level the chunk is too small for is not available")
+    }
+
+    func testWantedRanksFinerInsideBand() {
+        let n: UInt32 = 1024
+        // Δ = tier(cap) − tier(n / A) = −4 exactly: the band between the level-1 threshold and the
+        // one-tier hysteresis the GPU applies when the chunk drew level 1 last frame.
+        let cap: Float = 1024
+        let area: Float = 1024 / 4096
+        XCTAssertEqual(GaussianChunkCullMath.densityTier(density: cap) - GaussianChunkCullMath.densityTier(density: Float(n) / area), -4)
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(), splatCount: n, area: area, cap: cap, previous: 0), 0, "from fine: fine")
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(), splatCount: n, area: area, cap: cap, previous: 1), 1, "from level 1: level 1, the band")
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs()), GaussianChunkCullMath.quota(densityCap: cap, splatCount: n, screenArea: area), "the wants take the finer assumption: the fine tiers stay while the GPU still draws level 1")
+        // One octave further: level 1 from either side, nothing wanted.
+        let areaBelow: Float = area / 2
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(), splatCount: n, area: areaBelow, cap: cap, previous: 0), 1)
+        XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: areaBelow, densityCap: cap, fillDensity: .infinity, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarseInputs()), 0)
+        // The mirror with nothing resident steps to the next coarser available level.
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(), splatCount: n, area: 1, cap: cap, previous: 0, fineAvailable: false), 1, "fine wanted but not resident: level 1")
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(available: 2), splatCount: n, area: 1, cap: cap, previous: 0, fineAvailable: false), 2, "only level 2 landed")
+        XCTAssertEqual(GaussianPagingPolicy.coarseLevel(coarseInputs(available: 0), splatCount: n, area: 1, cap: cap, previous: 0, fineAvailable: false), 0, "nothing available: the wanted level (the cull lists no such chunk)")
+    }
+
+    func testCoarseResidentLevelsFitCheck() {
+        // The Vision Pro figures of the 20 M asset at ratios 3, 6: 40 MB of level 1, 5 MB of
+        // level 2, a 75 MiB residency budget (300 MiB geometry budget) → level 2 only.
+        let l1 = 40_000_000
+        let l2 = 5_000_000
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1, l2], residencyBudgetBytes: 75 << 20, fraction: 0.2), 1)
+        // A 900 MiB geometry budget (225 MiB residency): both.
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1, l2], residencyBudgetBytes: 225 << 20, fraction: 0.2), 2)
+        // Ratios 4, 7 halve the bytes: still level 2 only at 75 MiB.
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1 / 2, l2 / 2], residencyBudgetBytes: 75 << 20, fraction: 0.2), 1)
+        // A budget too small for the coarsest: none.
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1, l2], residencyBudgetBytes: 16 << 20, fraction: 0.2), 0)
+        // One level in the file: it, or nothing.
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l2], residencyBudgetBytes: 75 << 20, fraction: 0.2), 1)
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l2], residencyBudgetBytes: 16 << 20, fraction: 0.2), 0)
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [], residencyBudgetBytes: 75 << 20), 0)
+        // Bytes other entities hold come off the bound; the override replaces the fraction.
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1, l2], residencyBudgetBytes: 225 << 20, allocatedBytes: 10 << 20, fraction: 0.2), 1)
+        XCTAssertEqual(GaussianPagingPolicy.coarseBudgetFractionInEffect, GaussianPagingPolicy.coarseBudgetFraction)
+        GaussianPagingPolicy.coarseBudgetFractionOverride = 0.6
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1, l2], residencyBudgetBytes: 75 << 20), 2, "60 % of 75 MiB holds both")
+        GaussianPagingPolicy.resetKnobs()
+        XCTAssertEqual(GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1, l2], residencyBudgetBytes: 75 << 20), 1)
+    }
+
+    func testCoarsePiecesAreSequentialFromTheStart() {
+        let pieceBytes = GaussianPagingPolicy.coarsePieceBytes(maxPageBytesInFlight: 4 << 20)
+        XCTAssertEqual(pieceBytes, 2 << 20, "half the in-flight cap")
+        XCTAssertEqual(GaussianPagingPolicy.coarsePieceBytes(maxPageBytesInFlight: 1000), UntoldGSFormat.pageAlignment, "at least a page")
+        let start: UInt64 = 16384 * 7
+        let end = start + UInt64(5 * pieceBytes + 100)
+        let pieces = GaussianPagingPolicy.coarsePieces(rangeStart: start, rangeEnd: end, pieceBytes: pieceBytes)
+        XCTAssertEqual(pieces.count, 6)
+        var cursor = start
+        for (index, piece) in pieces.enumerated() {
+            XCTAssertEqual(piece.fileOffset, cursor, "piece \(index) follows the previous")
+            XCTAssertEqual(piece.bufferOffset, Int(piece.fileOffset - start))
+            XCTAssertEqual(piece.byteCount, index < 5 ? pieceBytes : 100)
+            cursor = piece.end
+        }
+        XCTAssertEqual(cursor, end)
+        XCTAssertTrue(GaussianPagingPolicy.coarsePieces(rangeStart: 10, rangeEnd: 10, pieceBytes: pieceBytes).isEmpty)
+    }
+
+    func testVictimsExcludeLevelFade() {
+        let R = 256
+        let tick: UInt32 = 200
+        var inputs = GaussianEvictionInputs(tick: tick, ranksPerPage: R)
+        inputs.holdOffTicks = 30
+        inputs.surplusTicks = 45
+        inputs.minResidencyTicks = 30
+        inputs.candidatePriority = 100
+        // Chunk 0 stale, chunk 1 surplus, chunk 2 a displaceable tail — every class — each with
+        // a level fade running; chunk 3 the same tail without one.
+        var states = [
+            resident(512, area: 0.9, lastDemand: 100, needed: 512),
+            resident(768, area: 0.3, lastDemand: tick, needed: 200, mappedAt: 100, surplusSince: 150),
+            resident(256, area: 0.2, lastDemand: tick, needed: 256, mappedAt: 100),
+            resident(256, area: 0.25, lastDemand: tick, needed: 256, mappedAt: 100),
+        ]
+        for chunk in 0 ..< 3 {
+            states[chunk].flags.insert(.levelFade)
+        }
+        let victims = GaussianPagingPolicy.selectVictims(states: states, resident: [0, 1, 2, 3], count: 10, inputs: inputs)
+        XCTAssertEqual(victims, [GaussianEvictionVictim(chunk: 3, tier: 0, kind: .displacement)], "a chunk mid-fade is no victim in any class")
+        inputs.pressure = true
+        XCTAssertEqual(GaussianPagingPolicy.selectVictims(states: states, resident: [0, 1, 2, 3], count: 10, inputs: inputs).map(\.chunk), [3], "under pressure too")
+        // The flag lifted: the classes as before.
+        for chunk in 0 ..< 3 {
+            states[chunk].flags.remove(.levelFade)
+        }
+        inputs.pressure = false
+        XCTAssertEqual(GaussianPagingPolicy.selectVictims(states: states, resident: [0, 1, 2, 3], count: 10, inputs: inputs).count, 7, "two stale tiers, two surplus tiers, three tails")
+        // A fading chunk is still no load candidate for the arrival fade, and a level fade alone
+        // does not stop a top-up.
+        var state = GaussianChunkPageState()
+        state.neededRanks = 512
+        state.residentRanks = 256
+        state.flags = [.levelFade]
+        XCTAssertTrue(GaussianPagingPolicy.isLoadCandidate(state, tick: tick))
+    }
+
+    func testMapPreservesCoarseAvailable() {
+        let previous = GaussianChunkResidency(residentRanks: 256, fadeFromRank: 0, arrivalFrame: 3, coarseAvailable: 3)
+        let mapped = GaussianPagingPolicy.mappedResidency(previous: previous, firstRank: 256, rankCount: 256, now: 9)
+        XCTAssertEqual(mapped.residentRanks, 512)
+        XCTAssertEqual(mapped.fadeFromRank, 256)
+        XCTAssertEqual(mapped.arrivalFrame, 9)
+        XCTAssertEqual(mapped.coarseAvailable, 3, "the availability bits ride in the struct and survive the rewrite")
+        let fresh = GaussianPagingPolicy.mappedResidency(previous: GaussianChunkResidency(residentRanks: 0, fadeFromRank: 0, arrivalFrame: 0, coarseAvailable: 2), firstRank: 0, rankCount: 256, now: 1)
+        XCTAssertEqual(fresh.residentRanks, 256)
+        XCTAssertEqual(fresh.coarseAvailable, 2)
+        XCTAssertEqual(MemoryLayout<GaussianChunkResidency>.offset(of: \.coarseAvailable), 12)
+    }
+
     // MARK: - Sizing
 
     func testResidentEstimateBytes() {
@@ -505,5 +665,56 @@ final class GaussianPagingPolicyTests: XCTestCase {
             registry.release(reservation)
         }
         XCTAssertEqual(registry.allocatedBytes, baseline)
+    }
+
+    /// The coarse levels' share of the residency budget is one ledger for every levelled
+    /// entity (per-chunk-lod-tiers): a claim is sized against the bytes the others hold under
+    /// the registry's lock, counts in `coarseBytes` — beside the pools, not in `allocatedBytes`
+    /// — until it is released, and a `GaussianCoarseClaim` releases it when dropped.
+    func testCoarseClaimsShareTheCoarseBudget() {
+        let registry = GaussianPagePoolRegistry.shared
+        let baselineCoarse = registry.coarseBytes
+        let baselinePools = registry.allocatedBytes
+        let l1 = 40 << 20
+        let l2 = 5 << 20
+        let budget = 300 << 20 // 20 % = 60 MiB: both levels once, the coarsest for the next, then nothing
+        let claim: () -> (GaussianCoarseReservation, Int) = {
+            var levels = 0
+            let reservation = registry.reserveCoarse { held in
+                levels = GaussianPagingPolicy.coarseResidentLevels(coarseBytesPerLevel: [l1, l2], residencyBudgetBytes: budget, allocatedBytes: held - baselineCoarse, fraction: 0.2)
+                return levels == 2 ? l1 + l2 : (levels == 1 ? l2 : 0)
+            }
+            return (reservation, levels)
+        }
+        let (first, firstLevels) = claim()
+        XCTAssertEqual(firstLevels, 2, "the first entity keeps both levels")
+        XCTAssertEqual(registry.coarseBytes - baselineCoarse, l1 + l2)
+        XCTAssertEqual(registry.allocatedBytes, baselinePools, "the coarse share is beside the pools")
+        let (second, secondLevels) = claim()
+        XCTAssertEqual(secondLevels, 1, "the second sees 45 MiB held and keeps the coarsest alone")
+        let (third, thirdLevels) = claim()
+        XCTAssertEqual(thirdLevels, 1, "50 MiB held: the coarsest still fits")
+        let (fourth, fourthLevels) = claim()
+        XCTAssertEqual(fourthLevels, 1, "55 MiB held")
+        let (fifth, fifthLevels) = claim()
+        XCTAssertEqual(fifthLevels, 0, "60 MiB held: nothing left of the share")
+        XCTAssertEqual(registry.coarseBytes - baselineCoarse, l1 + 4 * l2)
+        registry.releaseCoarse(fifth)
+        registry.releaseCoarse(first)
+        XCTAssertEqual(registry.coarseBytes - baselineCoarse, 3 * l2, "released bytes come back to the share")
+        let (sixth, sixthLevels) = claim()
+        XCTAssertEqual(sixthLevels, 2, "15 MiB held: both fit again")
+        for reservation in [second, third, fourth, sixth] {
+            registry.releaseCoarse(reservation)
+        }
+        registry.releaseCoarse(sixth)
+        XCTAssertEqual(registry.coarseBytes, baselineCoarse, "a second release is a no-op")
+
+        // A claim object gives the bytes back when it is dropped.
+        var token: GaussianCoarseClaim? = GaussianCoarseClaim(reservation: registry.reserveCoarse { _ in l2 }, bytes: l2)
+        XCTAssertEqual(token?.bytes, l2)
+        XCTAssertEqual(registry.coarseBytes - baselineCoarse, l2)
+        token = nil
+        XCTAssertEqual(registry.coarseBytes, baselineCoarse)
     }
 }

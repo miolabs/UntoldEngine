@@ -139,10 +139,13 @@ public class GaussianComponent: Component {
     }
 
     /// The most splats the frame can ever draw of this entity: the pool's records for a paged
-    /// entity, the whole asset otherwise — what the working set is sized against.
+    /// entity, the whole asset otherwise, plus the coarse records of its per-chunk levels (a
+    /// fading chunk draws its outgoing window beside the incoming one) — what the working set is
+    /// sized against.
     var residentSplatCount: Int {
-        guard let pager else { return Int(splatCount) }
-        return min(Int(splatCount), pager.slotCount * pager.ranksPerPage)
+        let coarse = chunkTable?.coarse?.recordCount ?? 0
+        guard let pager else { return Int(splatCount) + coarse }
+        return min(Int(splatCount), pager.slotCount * pager.ranksPerPage) + coarse
     }
 
     /// Multiplier on every splat's opacity this frame: 1 draws the asset as captured, 0 hides

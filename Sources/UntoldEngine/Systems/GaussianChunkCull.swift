@@ -766,13 +766,16 @@ func makeGaussianVisibleChunkSet(visibleChunks: UInt32, visibleSplats: UInt32) -
 /// seeded with every chunk visible. An entity with coarse levels lists up to two entries per
 /// chunk (the incoming window and, while a switch fades, the outgoing one): `entriesPerChunk`
 /// 2 sizes the lists for it. Returns nil when a buffer cannot be made.
-func allocateGaussianVisibleChunkBuffers(for table: GaussianChunkTable, entriesPerChunk: Int = 1) -> GaussianChunkTable? {
+func allocateGaussianVisibleChunkBuffers(for table: GaussianChunkTable, entriesPerChunk: Int? = nil) -> GaussianChunkTable? {
     guard let device = renderInfo.device else { return nil }
     let entries: [GaussianVisibleChunk] = table.index.chunks.enumerated().map { index, chunk in
         GaussianVisibleChunk(chunkIndex: UInt32(index), splatCount: chunk.splatCount, quota: chunk.splatCount, screenArea: Float(chunk.splatCount))
     }
     let splatTotal = entries.reduce(UInt32(0)) { $0 &+ $1.splatCount }
-    let listLength = max(1, entries.count * max(1, entriesPerChunk)) * MemoryLayout<GaussianVisibleChunk>.stride
+    // Two entries per chunk for an entity with coarse levels (the incoming window and, while a
+    // switch fades, the outgoing one), one otherwise.
+    let perChunk = entriesPerChunk ?? (table.hasCoarse ? 2 : 1)
+    let listLength = max(1, entries.count * max(1, perChunk)) * MemoryLayout<GaussianVisibleChunk>.stride
 
     var result = table
     result.visibleChunks = []
@@ -972,6 +975,40 @@ func gaussianChunkLevelConstants(
     constants.paged = cull.paged
     constants.uniformQuotas = cull.uniformQuotas
     return constants
+}
+
+/// The level constants of an entity whose chunk table carries a coarse table: the resident levels
+/// and their ratios from it, the frame clock from the caller (the pager's tick, or
+/// `GaussianChunkTable.executedFrames`), the switches from the frame.
+func gaussianChunkLevelConstants(
+    coarse: GaussianCoarseTable,
+    frameIndex: UInt32,
+    cull: GaussianChunkCullConstants,
+    viewport: simd_float2? = nil,
+    fadeFrames: UInt32 = GaussianDebugOptions.shared.disableLevelCrossFade ? 0 : GaussianPagingPolicy.fadeFrames,
+    levelMode: GaussianLevelMode = GaussianDebugOptions.shared.gaussianLevelMode,
+    debugTint: Bool = GaussianDebugOptions.shared.levelDebugTint,
+    maxSplatsPerPixel: Float = GaussianRuntimeLimits.maxSplatsPerPixel
+) -> GaussianChunkLevelConstants {
+    gaussianChunkLevelConstants(
+        levelCount: coarse.levelCount,
+        ratioLog2: coarse.ratioLog2,
+        frameIndex: frameIndex,
+        cull: cull,
+        viewport: viewport,
+        fadeFrames: fadeFrames,
+        levelMode: levelMode,
+        debugTint: debugTint,
+        maxSplatsPerPixel: maxSplatsPerPixel
+    )
+}
+
+/// The coarse levels a component draws this frame: its chunk table's coarse table, unless the
+/// pager faulted them (a CRC mismatch on a piece: the entity then draws fine only for good).
+func gaussianActiveCoarseTable(_ component: GaussianComponent) -> GaussianCoarseTable? {
+    guard let coarse = component.chunkTable?.coarse else { return nil }
+    if component.pager?.coarseFaulted == true { return nil }
+    return coarse
 }
 
 /// Encodes one entity's chunk cull for one in-flight slot on an open compute encoder: reset the

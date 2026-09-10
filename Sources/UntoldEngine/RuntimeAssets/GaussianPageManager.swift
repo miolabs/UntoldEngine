@@ -15,6 +15,21 @@
 //  the next tick. One lock guards what the I/O threads touch (the inbox, the generation, the
 //  state); everything else is render-thread-only.
 //
+//  A file with per-chunk coarse levels (per-chunk-lod-tiers) hands the pager the levels that
+//  fit beside the pool (`GaussianPagerCoarseInputs`): their records buffer, outside the pool,
+//  and the file range it holds. The pager streams that range through the same read queue in
+//  pieces of half the in-flight cap, sequential from the coarsest level (first in the file),
+//  every piece before the tier requests of its tick while the coarsest level is still landing
+//  and at most one piece per tick after that, so the heads are not starved; the worker checks
+//  the CRC of every level payload lying wholly inside its piece, the tick the ones straddling
+//  two pieces once both have landed, and marks each verified chunk-level available in the
+//  residency table (`GaussianChunkResidency.coarseAvailable`, journaled like the ranks) — the
+//  cull then lists a non-resident chunk for its finest landed level. A mismatch faults the
+//  entity's coarse levels (`coarseFaulted`): the driver binds `hasCoarse = 0` from then on and
+//  the entity draws fine only, as before the levels existed. The wants of a chunk the level
+//  rule draws coarse are zero, so its fine tiers leave as surplus, and a chunk whose level
+//  changed within the fade window is no eviction victim (`.levelFade`).
+//
 // Copyright (C) Untold Engine Studios
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
@@ -54,6 +69,16 @@ public struct GaussianPagingStats: Equatable, Sendable {
     public var corruptChunks = 0
     public var tick: UInt32 = 0
     public var state: GaussianPagerState = .active
+    /// The per-chunk coarse levels (per-chunk-lod-tiers): resident runtime levels (0 none), the
+    /// records buffer's bytes, the bytes of its pieces landed and verified, the chunk-levels
+    /// marked available, the pieces issued over the pager's life, and whether a CRC mismatch
+    /// faulted the levels (the entity then draws fine only).
+    public var coarseLevels = 0
+    public var coarseBytes = 0
+    public var coarseBytesLanded = 0
+    public var coarseChunkLevelsAvailable = 0
+    public var coarseReadsIssued = 0
+    public var coarseFaulted = false
 
     public init() {}
 }
@@ -78,6 +103,21 @@ struct GaussianPagerFrameInputs {
     var fadeFrames: UInt32 = GaussianPagingPolicy.fadeFrames
     /// `GaussianChunkPagingConstants.debugMode`.
     var debugMode: UInt32 = 0
+    /// The level rule's inputs for the wants of an entity with coarse levels (per-chunk-lod-tiers):
+    /// the frame's density floor (`GaussianChunkLevelConstants.densityFloor`), level mode, and
+    /// the frames a level switch cross-fades over (0 with `disableLevelCrossFade`: no `.levelFade`).
+    var densityFloor: Float = .infinity
+    var levelMode: GaussianLevelMode = .auto
+    var levelFadeFrames: UInt32 = GaussianPagingPolicy.fadeFrames
+}
+
+/// The coarse section a paged entity streams (per-chunk-lod-tiers): the records buffer the
+/// pieces land in (`GaussianCoarseTable.recordsBuffer`), the file range it holds and the file
+/// levels resident, finest first (`GaussianCoarseTable.fileLevels`).
+struct GaussianPagerCoarseInputs {
+    let recordsBuffer: MTLBuffer
+    let recordsRange: Range<UInt64>
+    let fileLevels: [Int]
 }
 
 /// The buffers and constants the frame binds for one slot of a paged entity.
@@ -99,6 +139,11 @@ public struct GaussianPagingEvent: Equatable, Sendable {
         case failed
         case corrupt
         case faulted
+        /// A piece of the coarse section issued / landed and verified (`tier` = the piece index,
+        /// `chunk` −1), and a coarse payload that failed its CRC (`chunk` = its chunk).
+        case coarseIssued
+        case coarseCommitted
+        case coarseCorrupt
     }
 
     public let tick: UInt32
@@ -139,6 +184,50 @@ struct GaussianPageCompletion {
     let result: Result<Void, GaussianPagingError>
 }
 
+/// One piece of the coarse section (per-chunk-lod-tiers): read into the entity's coarse records
+/// buffer at the piece's offset, then the CRC of every level payload lying wholly inside it
+/// (`entries`, indices into the manager's sorted coarse entries). No pool slot, no page table.
+struct GaussianCoarseReadRequest: @unchecked Sendable {
+    let manager: GaussianPageManager
+    let generation: UInt32
+    let pieceIndex: Int
+    let piece: GaussianCoarsePiece
+    let entries: Range<Int>
+
+    var byteCount: Int {
+        piece.byteCount
+    }
+}
+
+struct GaussianCoarseCompletion {
+    let request: GaussianCoarseReadRequest
+    let result: Result<Void, GaussianPagingError>
+}
+
+/// An item of the pager's read queue: a tier read into the pool, or a coarse piece.
+enum GaussianPagerRead: @unchecked Sendable {
+    case tier(GaussianPageReadRequest)
+    case coarse(GaussianCoarseReadRequest)
+
+    var byteCount: Int {
+        switch self {
+        case let .tier(request): request.byteCount
+        case let .coarse(request): request.byteCount
+        }
+    }
+}
+
+/// One level payload of the coarse section as the pager tracks it: the runtime level it is
+/// (1-based; the runtime's level 1 is the file's finest resident level), its chunk, its entry,
+/// and the first and last piece its bytes fall in.
+struct GaussianPagerCoarseEntry {
+    let level: Int
+    let chunk: Int
+    let entry: UntoldGSChunkEntry
+    let firstPiece: Int
+    let lastPiece: Int
+}
+
 /// Memory-pressure levels the pools react to (`GaussianPagePoolRegistry.noteMemoryPressure`).
 public enum GaussianPagePressureLevel: Sendable {
     case warning
@@ -150,6 +239,30 @@ public enum GaussianPagePressureLevel: Sendable {
 /// by `GaussianPageManager.init`, or released when the load fails.
 public struct GaussianPagePoolReservation: Equatable, Sendable {
     fileprivate let id: UInt64
+}
+
+/// A claim on the coarse levels' share of the residency budget (per-chunk-lod-tiers), held for
+/// as long as the entity keeps its coarse records.
+public struct GaussianCoarseReservation: Equatable, Sendable {
+    fileprivate let id: UInt64
+}
+
+/// A levelled entity's claim on the coarse share, released when its last reference goes — the
+/// entity's `GaussianCoarseTable`, dropped with the chunk table at removal — so the next fit
+/// check sees the bytes this entity no longer holds.
+final class GaussianCoarseClaim: @unchecked Sendable {
+    let reservation: GaussianCoarseReservation
+    /// The record bytes claimed.
+    let bytes: Int
+
+    init(reservation: GaussianCoarseReservation, bytes: Int) {
+        self.reservation = reservation
+        self.bytes = bytes
+    }
+
+    deinit {
+        GaussianPagePoolRegistry.shared.releaseCoarse(reservation)
+    }
 }
 
 /// Every live pool and every reservation in progress: their total bytes, so a second paged
@@ -171,6 +284,8 @@ public final class GaussianPagePoolRegistry: @unchecked Sendable {
     private var reservations: [UInt64: Int] = [:]
     private var nextReservation: UInt64 = 1
     private var _allocatedBytes = 0
+    private var coarseClaims: [UInt64: Int] = [:]
+    private var _coarseBytes = 0
 
     private init() {}
 
@@ -179,6 +294,37 @@ public final class GaussianPagePoolRegistry: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _allocatedBytes
+    }
+
+    /// The coarse record bytes every levelled entity holds beside the pools
+    /// (per-chunk-lod-tiers): what the next entity's fit check sizes its levels against, so the
+    /// coarse share of the residency budget is shared by the entities rather than taken by each.
+    public var coarseBytes: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _coarseBytes
+    }
+
+    /// Claims coarse bytes in one step: `bytes` is given the coarse bytes held so far and returns
+    /// the size to claim, under the lock, so concurrent loads fit their levels against each
+    /// other. Held until `releaseCoarse` (a `GaussianCoarseClaim` does so when it is dropped).
+    public func reserveCoarse(bytes: (_ coarseBytes: Int) -> Int) -> GaussianCoarseReservation {
+        lock.lock()
+        defer { lock.unlock() }
+        let claimed = max(0, bytes(_coarseBytes))
+        let id = nextReservation
+        nextReservation &+= 1
+        coarseClaims[id] = claimed
+        _coarseBytes += claimed
+        return GaussianCoarseReservation(id: id)
+    }
+
+    /// Gives a coarse claim back (the entity's levels are gone, or the load failed).
+    public func releaseCoarse(_ reservation: GaussianCoarseReservation) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let bytes = coarseClaims.removeValue(forKey: reservation.id) else { return }
+        _coarseBytes -= bytes
     }
 
     /// Claims pool bytes in one step: `bytes` is given the bytes allocated so far and returns
@@ -287,6 +433,7 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private var inbox: [GaussianPageCompletion] = []
+    private var coarseInbox: [GaussianCoarseCompletion] = []
     private var _generation: UInt32 = 0
     private var _state: GaussianPagerState = .active
     private var _pendingReads = 0
@@ -319,7 +466,41 @@ public final class GaussianPageManager: @unchecked Sendable {
     private var demandStampFrame: [UInt64]
     private var residentChunks = Set<Int>()
     private var fading: [Int] = []
+    /// Chunks whose `.levelFade` is running (per-chunk-lod-tiers).
+    private var levelFading: [Int] = []
     private var lastReopenTick: UInt32 = 0
+
+    // MARK: Coarse levels (per-chunk-lod-tiers; render-thread state)
+
+    let coarse: GaussianPagerCoarseInputs?
+    /// The pieces the section is read in, sequential from the coarsest level.
+    let coarsePieces: [GaussianCoarsePiece]
+    /// Every level payload in file order, with the pieces it spans.
+    private let coarseEntries: [GaussianPagerCoarseEntry]
+    /// Per piece, the entries lying wholly inside it (verified by its worker).
+    private let coarsePieceEntries: [Range<Int>]
+    /// The entries that straddle two pieces (verified by the tick once both landed), and which are done.
+    private let coarseStraddlers: [Int]
+    private var coarseStraddlerDone: [Bool]
+    /// The end of the coarsest level's range: pieces below it precede the tick's tier requests
+    /// without limit; past it one piece per tick.
+    private let coarseFirstLevelEnd: UInt64
+    private let coarseTierShifts: (Int, Int)
+    private var coarseNextPiece = 0
+    /// The pieces awaiting a retry, in failure order; each is due at `coarseRetryAfterTick`.
+    private var coarseRetry: [Int] = []
+    private var coarseRetryAfterTick: [UInt32]
+    private var coarseLanded: [Bool]
+    /// Per piece, the I/O failures since its last success: the retry schedule of the tier
+    /// reads (`GaussianPagingPolicy.retryTicks`), and the levels fault when one piece exhausts it.
+    private var coarseFailures: [UInt8]
+    private var coarseBytesLanded = 0
+    private var coarseAvailableCount = 0
+    private var coarseReadsIssued = 0
+    private var reportedCoarseFault = false
+    /// A coarse payload failed its CRC (or its pieces kept failing): the levels are off for this
+    /// entity for good; the driver binds `hasCoarse = 0` and the wants ignore the levels.
+    public private(set) var coarseFaulted = false
     /// The budget state's frame count at the first tick: a readback that has not moved past it
     /// predates this entity's frames (another scene's cap) and is not applied.
     private var baselineFrameCount: UInt32?
@@ -356,7 +537,7 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// occupy no thread: a worker that finishes starts the next one.
     private let maxRunningReads: Int
     private var _runningReads = 0
-    private var _pendingRequests: [GaussianPageReadRequest] = []
+    private var _pendingRequests: [GaussianPagerRead] = []
     private var _pendingHead = 0
 
     /// Takes the pools and the nine per-slot tables the loader allocated, initialises the tables
@@ -374,11 +555,74 @@ public final class GaussianPageManager: @unchecked Sendable {
         slotCount: Int,
         ranksPerPage: Int,
         pagesPerChunk: Int,
-        reservation: GaussianPagePoolReservation? = nil
+        reservation: GaussianPagePoolReservation? = nil,
+        coarse: GaussianPagerCoarseInputs? = nil
     ) {
         self.source = source
         self.index = index
         self.label = label
+        self.coarse = coarse
+        // The coarse section's plan: the pieces of its range, every level payload in file order
+        // with the pieces it spans, and per piece the payloads its worker verifies.
+        if let coarse {
+            let pieceBytes = GaussianPagingPolicy.coarsePieceBytes()
+            let base = coarse.recordsRange.lowerBound
+            coarsePieces = GaussianPagingPolicy.coarsePieces(rangeStart: base, rangeEnd: coarse.recordsRange.upperBound, pieceBytes: pieceBytes)
+            var entries: [GaussianPagerCoarseEntry] = []
+            for (runtimeLevel, fileLevel) in coarse.fileLevels.enumerated() {
+                for chunk in index.chunks.indices {
+                    guard let entry = index.coarseEntry(level: fileLevel, chunk: chunk) else { continue }
+                    let first = Int((entry.payloadOffset - base) / UInt64(pieceBytes))
+                    let last = Int((entry.payloadOffset + UInt64(entry.payloadBytes) - 1 - base) / UInt64(pieceBytes))
+                    entries.append(GaussianPagerCoarseEntry(level: runtimeLevel + 1, chunk: chunk, entry: entry, firstPiece: first, lastPiece: last))
+                }
+            }
+            entries.sort { $0.entry.payloadOffset < $1.entry.payloadOffset }
+            coarseEntries = entries
+            var pieceEntries = Array(repeating: 0 ..< 0, count: coarsePieces.count)
+            var straddlers: [Int] = []
+            var cursor = 0
+            for piece in coarsePieces.indices {
+                while cursor < entries.count, entries[cursor].lastPiece < piece {
+                    cursor += 1
+                }
+                var start = cursor
+                while start < entries.count, entries[start].firstPiece == piece, entries[start].lastPiece != piece {
+                    straddlers.append(start)
+                    start += 1
+                }
+                var end = start
+                while end < entries.count, entries[end].firstPiece == piece, entries[end].lastPiece == piece {
+                    end += 1
+                }
+                pieceEntries[piece] = start ..< end
+                cursor = end
+            }
+            coarsePieceEntries = pieceEntries
+            coarseStraddlers = straddlers
+            coarseStraddlerDone = Array(repeating: false, count: straddlers.count)
+            coarseLanded = Array(repeating: false, count: coarsePieces.count)
+            coarseRetryAfterTick = Array(repeating: 0, count: coarsePieces.count)
+            coarseFailures = Array(repeating: 0, count: coarsePieces.count)
+            let coarsestRange = coarse.fileLevels.last.flatMap { index.coarseLevelRange(level: $0) }
+            coarseFirstLevelEnd = coarsestRange?.upperBound ?? base
+            let ratios = coarse.fileLevels.map { index.header.coarseRatioLog2[$0 - 1] }
+            coarseTierShifts = (
+                GaussianChunkCullMath.tierShift(ratioLog2: ratios[0]),
+                GaussianChunkCullMath.tierShift(ratioLog2: ratios[min(1, ratios.count - 1)])
+            )
+        } else {
+            coarsePieces = []
+            coarseEntries = []
+            coarsePieceEntries = []
+            coarseStraddlers = []
+            coarseStraddlerDone = []
+            coarseLanded = []
+            coarseRetryAfterTick = []
+            coarseFailures = []
+            coarseFirstLevelEnd = 0
+            coarseTierShifts = (0, 0)
+        }
         self.corePool = corePool
         self.shPool = shPool
         self.residencyTables = residencyTables
@@ -450,6 +694,26 @@ public final class GaussianPageManager: @unchecked Sendable {
         return slot == kGaussianPageSlotInvalid ? nil : slot
     }
 
+    /// The coarse levels landed and verified for a chunk, as the master residency holds them
+    /// (bit 0 the runtime's level 1, bit 1 its level 2; tests, the inspector).
+    public func coarseAvailable(of chunk: Int) -> UInt32 {
+        masterResidency[chunk].coarseAvailable
+    }
+
+    /// Whether every piece of the coarse section has landed.
+    public var coarseSectionLanded: Bool {
+        coarse != nil && !coarseLanded.contains(false)
+    }
+
+    /// The runtime levels' splat counts of a chunk (the level-2 count is the level-1 count when
+    /// one level is resident), 0 without levels.
+    func coarseCounts(chunk: Int) -> (UInt32, UInt32) {
+        guard let coarse else { return (0, 0) }
+        let m1 = index.coarseEntry(level: coarse.fileLevels[0], chunk: chunk)?.splatCount ?? 0
+        let m2 = coarse.fileLevels.count > 1 ? (index.coarseEntry(level: coarse.fileLevels[1], chunk: chunk)?.splatCount ?? 0) : m1
+        return (m1, m2)
+    }
+
     /// Free slots and slots waiting in the retire ring (tests).
     public var freeSlotCount: Int {
         freeSlots.count
@@ -506,12 +770,15 @@ public final class GaussianPageManager: @unchecked Sendable {
         _stats.state = .closed
         var dropped: [GaussianPageReadRequest] = inbox.map(\.request)
         inbox.removeAll()
+        coarseInbox.removeAll()
         let pending = _pendingRequests[_pendingHead...]
         for request in pending {
             _pendingReads -= 1
             _bytesInFlight -= request.byteCount
+            if case let .tier(tierRequest) = request {
+                dropped.append(tierRequest)
+            }
         }
-        dropped.append(contentsOf: pending)
         _pendingRequests.removeAll()
         _pendingHead = 0
         _stats.pendingReads = _pendingReads
@@ -580,11 +847,13 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
         addFreeSlots(recycled)
 
-        // 2. Landed reads.
+        // 2. Landed reads, and the coarse pieces that landed.
         committed += drainInbox(now: now, fadeFrames: frame.fadeFrames)
+        drainCoarseInbox(now: now)
 
         // 3. Fades that are done.
         expireFades(now: now, fadeFrames: frame.fadeFrames)
+        expireLevelFades(now: now, fadeFrames: frame.levelFadeFrames)
 
         // 4. A faulted source tries to reopen periodically.
         var active = state == .active
@@ -667,6 +936,14 @@ public final class GaussianPageManager: @unchecked Sendable {
         stats.faultedChunks = faultedChunkCount
         stats.corruptChunks = corruptChunkCount
         stats.tick = now
+        if let coarse {
+            stats.coarseLevels = coarseFaulted ? 0 : coarse.fileLevels.count
+            stats.coarseBytes = coarse.recordsBuffer.length
+            stats.coarseBytesLanded = coarseBytesLanded
+            stats.coarseChunkLevelsAvailable = coarseAvailableCount
+            stats.coarseReadsIssued = coarseReadsIssued
+            stats.coarseFaulted = coarseFaulted
+        }
         lock.lock()
         stats.pendingReads = _pendingReads
         stats.bytesInFlight = _bytesInFlight
@@ -735,7 +1012,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
         let resident = UInt32(request.firstRank + request.rankCount)
         // The coarse availability bits (per-chunk-lod-tiers) ride in the same struct and survive the rewrite.
-        masterResidency[chunk] = GaussianChunkResidency(residentRanks: resident, fadeFromRank: UInt32(request.firstRank), arrivalFrame: now, coarseAvailable: masterResidency[chunk].coarseAvailable)
+        masterResidency[chunk] = GaussianPagingPolicy.mappedResidency(previous: masterResidency[chunk], firstRank: request.firstRank, rankCount: request.rankCount, now: now)
         var state = states[chunk]
         state.residentRanks = UInt16(resident)
         state.fadeFromRank = UInt16(request.firstRank)
@@ -829,6 +1106,201 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
     }
 
+    /// The level cross-fades that are done: `.levelFade` held the chunk's tiers for `fadeFrames`
+    /// ticks from its last level change (per-chunk-lod-tiers).
+    private func expireLevelFades(now: UInt32, fadeFrames: UInt32) {
+        guard !levelFading.isEmpty else { return }
+        levelFading.removeAll { chunk in
+            let done = fadeFrames == 0 || now &- states[chunk].levelSwitchTick >= fadeFrames
+            if done { states[chunk].flags.remove(.levelFade) }
+            return done
+        }
+    }
+
+    // MARK: Coarse levels (per-chunk-lod-tiers)
+
+    /// Issues the coarse section's pieces at the head of a tick's reads: the retries that are
+    /// due first, then the cursor, sequential from the coarsest level — every piece the in-flight
+    /// cap allows while the coarsest level is still landing, one piece per tick after it. Returns
+    /// the pieces issued.
+    private func issueCoarseReads(now: UInt32) -> Int {
+        guard coarse != nil, !coarseFaulted else { return 0 }
+        lock.lock()
+        var inFlight = _bytesInFlight
+        let generation = _generation
+        lock.unlock()
+        let byteCap = GaussianPagingPolicy.maxPageBytesInFlight
+        var issued = 0
+        var issuedPastFirstLevel = 0
+        while true {
+            let pieceIndex: Int
+            var retryPosition: Int?
+            if let position = coarseRetry.firstIndex(where: { coarseRetryAfterTick[$0] <= now }) {
+                pieceIndex = coarseRetry[position]
+                retryPosition = position
+            } else if coarseNextPiece < coarsePieces.count {
+                pieceIndex = coarseNextPiece
+            } else {
+                break
+            }
+            let piece = coarsePieces[pieceIndex]
+            if piece.fileOffset >= coarseFirstLevelEnd {
+                guard issuedPastFirstLevel == 0 else { break }
+            }
+            guard inFlight == 0 || inFlight + piece.byteCount <= byteCap else { break }
+            if let retryPosition {
+                coarseRetry.remove(at: retryPosition)
+            } else {
+                coarseNextPiece += 1
+            }
+            if piece.fileOffset >= coarseFirstLevelEnd { issuedPastFirstLevel += 1 }
+            let request = GaussianCoarseReadRequest(manager: self, generation: generation, pieceIndex: pieceIndex, piece: piece, entries: coarsePieceEntries[pieceIndex])
+            log(.coarseIssued, chunk: -1, tier: pieceIndex, slot: kGaussianPageSlotInvalid)
+            enqueue(.coarse(request))
+            inFlight += piece.byteCount
+            issued += 1
+            coarseReadsIssued += 1
+        }
+        return issued
+    }
+
+    /// The worker: the piece into the records buffer, then the CRC of every level payload wholly
+    /// inside it against its entry.
+    private func performCoarse(_ request: GaussianCoarseReadRequest) -> Result<Void, GaussianPagingError> {
+        lock.lock()
+        let closed = _state == .closed || request.generation != _generation
+        lock.unlock()
+        if closed { return .failure(.closed) }
+        guard let coarse else { return .failure(.closed) }
+        let base = coarse.recordsBuffer.contents()
+        do {
+            try source.read(offset: request.piece.fileOffset, count: request.piece.byteCount, into: base + request.piece.bufferOffset)
+        } catch let error as GaussianPagingError {
+            return .failure(error)
+        } catch {
+            return .failure(.ioFailure(errno: EIO))
+        }
+        for entryIndex in request.entries where !verifyCoarseEntry(coarseEntries[entryIndex]) {
+            return .failure(.corrupt(chunk: coarseEntries[entryIndex].chunk))
+        }
+        return .success(())
+    }
+
+    /// The CRC of one level payload in the records buffer against its entry.
+    private func verifyCoarseEntry(_ entry: GaussianPagerCoarseEntry) -> Bool {
+        guard let coarse else { return false }
+        let offset = Int(entry.entry.payloadOffset - coarse.recordsRange.lowerBound)
+        let bytes = UnsafeRawBufferPointer(start: UnsafeRawPointer(coarse.recordsBuffer.contents()) + offset, count: Int(entry.entry.coreBytes))
+        var crc = UntoldGSCRC32.initialValue
+        UntoldGSCRC32.update(&crc, bytes)
+        return UntoldGSCRC32.finalize(crc) == entry.entry.crc32
+    }
+
+    private func completeCoarse(_ request: GaussianCoarseReadRequest, result: Result<Void, GaussianPagingError>) {
+        lock.lock()
+        _pendingReads -= 1
+        _bytesInFlight -= request.byteCount
+        _stats.pendingReads = _pendingReads
+        _stats.bytesInFlight = _bytesInFlight
+        if _state != .closed, request.generation == _generation {
+            coarseInbox.append(GaussianCoarseCompletion(request: request, result: result))
+        }
+        let closeSource = _state == .closed && _pendingReads == 0
+        lock.unlock()
+        if closeSource {
+            source.close()
+        }
+    }
+
+    /// The landed pieces: their payloads become available, the straddling payloads whose pieces
+    /// have all landed are verified here, a failed piece is retried on the tier reads' schedule
+    /// (`retryTicks`: three times with a growing back-off, counted per piece, so a stall across
+    /// several pieces costs each one retry; the levels fault when one piece exhausts it), a
+    /// corrupt payload faults the levels, a changed file faults the asset as a tier does.
+    private func drainCoarseInbox(now: UInt32) {
+        lock.lock()
+        let completions = coarseInbox
+        coarseInbox.removeAll(keepingCapacity: true)
+        let generation = _generation
+        lock.unlock()
+        guard !completions.isEmpty else { return }
+        for completion in completions {
+            let request = completion.request
+            guard request.generation == generation else { continue }
+            switch completion.result {
+            case .success:
+                guard !coarseFaulted else { continue }
+                coarseLanded[request.pieceIndex] = true
+                coarseFailures[request.pieceIndex] = 0
+                coarseBytesLanded += request.byteCount
+                for entryIndex in request.entries {
+                    markCoarse(coarseEntries[entryIndex])
+                }
+                log(.coarseCommitted, chunk: -1, tier: request.pieceIndex, slot: kGaussianPageSlotInvalid)
+                verifyStraddlers(touching: request.pieceIndex)
+            case let .failure(error):
+                switch error {
+                case .closed:
+                    continue
+                case let .corrupt(chunk):
+                    faultCoarse(reason: "the coarse level of chunk \(chunk) failed its CRC", chunk: chunk)
+                case .fileChanged, .truncated:
+                    // Re-issued as soon as the source is reopened.
+                    coarseRetryAfterTick[request.pieceIndex] = now
+                    coarseRetry.append(request.pieceIndex)
+                    faultAsset(reason: "\(error)", now: now)
+                case .ioFailure:
+                    coarseFailures[request.pieceIndex] &+= 1
+                    let failures = Int(coarseFailures[request.pieceIndex])
+                    if failures > GaussianPagingPolicy.retryTicks.count {
+                        faultCoarse(reason: "piece \(request.pieceIndex) of the coarse section could not be read (\(error))", chunk: -1)
+                    } else {
+                        coarseRetryAfterTick[request.pieceIndex] = now &+ GaussianPagingPolicy.retryTicks[failures - 1]
+                        coarseRetry.append(request.pieceIndex)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verifies the payloads straddling `piece` and a neighbour once every piece they span has landed.
+    private func verifyStraddlers(touching piece: Int) {
+        for (position, entryIndex) in coarseStraddlers.enumerated() where !coarseStraddlerDone[position] {
+            let entry = coarseEntries[entryIndex]
+            guard entry.firstPiece <= piece, piece <= entry.lastPiece else { continue }
+            guard (entry.firstPiece ... entry.lastPiece).allSatisfy({ coarseLanded[$0] }) else { continue }
+            coarseStraddlerDone[position] = true
+            if verifyCoarseEntry(entry) {
+                markCoarse(entry)
+            } else {
+                faultCoarse(reason: "the coarse level of chunk \(entry.chunk) failed its CRC", chunk: entry.chunk)
+                return
+            }
+        }
+    }
+
+    /// One chunk-level landed and verified: its bit in the residency table, journaled to every slot.
+    private func markCoarse(_ entry: GaussianPagerCoarseEntry) {
+        let bit = UInt32(1) << UInt32(entry.level - 1)
+        guard masterResidency[entry.chunk].coarseAvailable & bit == 0 else { return }
+        masterResidency[entry.chunk].coarseAvailable |= bit
+        coarseAvailableCount += 1
+        journal(entry.chunk)
+    }
+
+    /// The coarse levels are off for this entity for good: reported once; the availability bits
+    /// stay (the driver binds `hasCoarse = 0`, so no kernel reads them).
+    private func faultCoarse(reason: String, chunk: Int) {
+        guard !coarseFaulted else { return }
+        coarseFaulted = true
+        coarseRetry.removeAll()
+        log(.coarseCorrupt, chunk: chunk, tier: 0, slot: kGaussianPageSlotInvalid)
+        if !reportedCoarseFault {
+            reportedCoarseFault = true
+            report("\(reason) in \(label); its coarse levels are off, the entity draws its fine records only")
+        }
+    }
+
     // MARK: Demand and wants
 
     /// This slot's demand words when they are this entity's and recent, else the CPU seed
@@ -905,11 +1377,26 @@ public final class GaussianPageManager: @unchecked Sendable {
         let reserved = stale ? 0 : Int(state.reservedSplats)
         let fill = GaussianPagingPolicy.fillDensity(budget: frame.budget, reservedSplats: reserved, demandedArea: totalArea)
         let fillScale = GaussianPagingPolicy.fillScale(budget: frame.budget, reservedSplats: reserved, demandedSplats: totalSplats)
+        // The level rule's inputs when the entity draws its coarse levels this frame: a chunk the
+        // rule draws coarse wants no fine rank (its tiers leave as surplus), and the CPU keeps a
+        // mirror of the level drawn to hold the tiers of a chunk mid-fade (`.levelFade`).
+        let levelsOn = coarse != nil && !coarseFaulted && !frame.uniformQuotas && !frame.disableWorkingSetBudget && frame.levelMode != .fineOnly
+        let effectiveCap = cap.isFinite ? cap : fill
         var neededTotal = 0
         var residentOfNeeded = 0
         for chunk in demanded {
             let count = index.chunks[chunk].splatCount
             var state = states[chunk]
+            var coarseInputs: GaussianCoarseWantInputs?
+            if levelsOn {
+                coarseInputs = GaussianCoarseWantInputs(
+                    tierShifts: coarseTierShifts,
+                    counts: coarseCounts(chunk: chunk),
+                    available: masterResidency[chunk].coarseAvailable,
+                    densityFloor: frame.densityFloor,
+                    levelMode: frame.levelMode
+                )
+            }
             let want = GaussianPagingPolicy.wantedRanks(
                 splatCount: count,
                 area: state.lastArea,
@@ -917,8 +1404,18 @@ public final class GaussianPageManager: @unchecked Sendable {
                 fillDensity: fill,
                 fillScale: fillScale,
                 uniformQuotas: frame.uniformQuotas,
-                disableWorkingSetBudget: frame.disableWorkingSetBudget
+                disableWorkingSetBudget: frame.disableWorkingSetBudget,
+                coarse: coarseInputs
             )
+            let drawn = coarseInputs.map { UInt8(GaussianPagingPolicy.coarseLevel($0, splatCount: count, area: state.lastArea, cap: effectiveCap, previous: Int(state.drawnLevel), fineAvailable: state.residentRanks > 0)) } ?? 0
+            if drawn != state.drawnLevel {
+                state.drawnLevel = drawn
+                state.levelSwitchTick = now
+                if frame.levelFadeFrames > 0, !state.flags.contains(.levelFade) {
+                    state.flags.insert(.levelFade)
+                    levelFading.append(chunk)
+                }
+            }
             let needed = GaussianPagingPolicy.neededRanks(want: want, splatCount: count)
             state.neededRanks = UInt16(needed)
             let residentTiers = tiers(state.residentRanks)
@@ -946,6 +1443,9 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     private func issueReads(demanded: [Int], now: UInt32, pressureTarget: Int?) -> (issued: Int, evicted: Int) {
         var evicted = 0
+        // The coarse section's pieces first: outside the pool, counted in the bytes in flight the
+        // tier requests below respect.
+        let coarseIssued = issueCoarseReads(now: now)
         let residentSlots = slotCount - freeSlots.count - retiring.total
 
         // Under pressure: down to the soft target, nothing issued above it, and nothing issued
@@ -961,7 +1461,7 @@ public final class GaussianPageManager: @unchecked Sendable {
                 evict(chunk: victim.chunk, tier: victim.tier, now: now)
                 evicted += 1
             }
-            return (0, evicted)
+            return (coarseIssued, evicted)
         }
         var issuableSlots = pressureTarget.map { max(0, $0 - residentSlots) } ?? Int.max
 
@@ -976,7 +1476,7 @@ public final class GaussianPageManager: @unchecked Sendable {
             guard missing > 0 else { continue }
             candidates.append((chunk, priority, missing))
         }
-        guard !candidates.isEmpty else { return (0, evicted) }
+        guard !candidates.isEmpty else { return (coarseIssued, evicted) }
         candidates.sort { $0.priority > $1.priority }
         let maxReads = GaussianPagingPolicy.maxPageReadsPerTick
         if candidates.count > maxReads {
@@ -1027,7 +1527,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
 
         // Issue in priority order while the caps allow and free slots suffice.
-        var issued = 0
+        var issued = coarseIssued
         var issuedBytes = 0
         lock.lock()
         let inFlight = _bytesInFlight
@@ -1094,7 +1594,7 @@ public final class GaussianPageManager: @unchecked Sendable {
                 log(.issued, chunk: chunk, tier: firstTier + offset, slot: slot, priority: candidate.priority)
             }
             states[chunk].flags.insert(.loading)
-            enqueue(request)
+            enqueue(.tier(request))
             issued += 1
             issuedBytes += bytes
         }
@@ -1212,7 +1712,7 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// Queues a request and starts it if a running slot is free. Nothing blocks on the queue:
     /// at most `maxRunningReads` of this pager's reads occupy a thread, the rest wait in the
     /// list in issue (priority) order until a worker finishes and pulls the next one.
-    private func enqueue(_ request: GaussianPageReadRequest) {
+    private func enqueue(_ request: GaussianPagerRead) {
         lock.lock()
         _pendingReads += 1
         _bytesInFlight += request.byteCount
@@ -1224,7 +1724,7 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// Dispatches waiting requests while running slots are free.
     private func startPendingReads() {
         lock.lock()
-        var starting: [GaussianPageReadRequest] = []
+        var starting: [GaussianPagerRead] = []
         while _runningReads < maxRunningReads, _pendingHead < _pendingRequests.count {
             starting.append(_pendingRequests[_pendingHead])
             _pendingHead += 1
@@ -1240,9 +1740,17 @@ public final class GaussianPageManager: @unchecked Sendable {
         lock.unlock()
         for request in starting {
             GaussianPageManager.queue.async {
-                let manager = request.manager
-                let result = manager.perform(request)
-                manager.complete(request, result: result)
+                let manager: GaussianPageManager
+                switch request {
+                case let .tier(tierRequest):
+                    manager = tierRequest.manager
+                    let result = manager.perform(tierRequest)
+                    manager.complete(tierRequest, result: result)
+                case let .coarse(coarseRequest):
+                    manager = coarseRequest.manager
+                    let result = manager.performCoarse(coarseRequest)
+                    manager.completeCoarse(coarseRequest, result: result)
+                }
                 manager.lock.lock()
                 manager._runningReads -= 1
                 manager.lock.unlock()

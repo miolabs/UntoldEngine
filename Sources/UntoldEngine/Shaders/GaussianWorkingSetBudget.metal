@@ -186,11 +186,13 @@ kernel void gaussianComputeBudgetScale(
     const uint requested = listed - transition;
     const uint reserved = state->reservedSplats;
     const uint frameCount = state->frameCount;
-    // The request fits when it is within what the reservation leaves of the budget; only a
-    // truncated frame aims for the headroom's share, so a scene that exactly fills the set
-    // keeps every splat.
+    // The request fits when the whole of it — the outgoing windows are drawn too — is within
+    // what the reservation leaves of the budget; only a truncated frame aims for the headroom's
+    // share, so a scene that exactly fills the set keeps every splat. A frame that fits without
+    // its windows but not with them is truncated: the incoming entries are fitted to the room
+    // the windows leave, so the set never overflows while a switch fades.
     const uint available = constants.budget > reserved ? constants.budget - reserved : 0u;
-    const bool fits = constants.forceUnitScale != 0u || requested <= available;
+    const bool fits = constants.forceUnitScale != 0u || listed <= available;
     const float room = max(constants.headroom * (float)constants.budget - (float)reserved - (float)transition, 0.0f);
     float target = 1.0f;
     if (!fits) {

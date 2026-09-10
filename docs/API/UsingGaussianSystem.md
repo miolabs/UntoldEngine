@@ -173,6 +173,68 @@ harmonics is 64,000,000 B and fits every tier, so nothing saturates and nothing 
 20 M asset saturates the pool on purpose) and prints the resident bytes, the frame at which
 80 % of the slots had been committed and the worst frame time.
 
+### Per-chunk coarse levels
+
+A `.untoldgs` cooked with per-chunk coarse levels (the default for assets of at least 64
+chunks: `--splat-coarse-levels auto`, see [untoldgsFormat.md](../Architecture/untoldgsFormat.md)
+and the CLI doc) carries, beside every chunk's fine records, one or two importance-sorted
+**merged** levels of it — level 1 about n/8 splats, level 2 about n/64 at the default ratios
+`3, 6` — in a section a reader that predates it never sees. The runtime draws them where a
+prefix of fine splats would leave holes:
+
+- A **far chunk** — one whose fine density `n / A` (splats per unit of screen area) lies far
+  above the frame's density cap — draws a coarse level instead of a thin prefix of its fine
+  ranks: level 1 from two octaves (four half-octave tiers) under its own density, level 2 from
+  five. The level is chosen in the quota pass from the same cap the quotas apply, with integer
+  tier arithmetic, and the density solve charges every candidate cap with the same rule
+  (`R(d)`), so the cap and the levels share one fixed point and nothing oscillates. Moving to a
+  finer level needs one more tier than moving coarser (hysteresis), and a chunk draws the level
+  it has: a level not resident steps to the next coarser one that is, else to the next finer.
+- A fitting frame (cap `+inf`) still draws the far field coarse when it would exceed
+  `GaussianRuntimeLimits.maxSplatsPerPixel` (default 1) fine splats per pixel of the viewport:
+  the **density floor** lowers the cap the level rule sees, never the quota.
+- A **paged chunk with nothing resident** draws its coarsest landed level from its first visible
+  frame — the pager streams the section through its read queue coarsest level first, in pieces
+  of half the in-flight cap, before the tier reads while the coarsest level lands and one piece a
+  tick after that — and its fine head fades in on top when it arrives, the coarse level fading
+  out on the same clock. A chunk the rule draws coarse wants **no** fine rank, so its tiers leave
+  the pool as surplus and the pool holds fine ranks only for chunks that draw them.
+- Every switch cross-fades over `GaussianPagingPolicy.fadeFrames` (16) frames with the
+  coverage-preserving weights `1 − (1 − α)^w` in and `1 − (1 − α)^(1 − w)` out, so the
+  transmittance of a surface both levels cover stays `1 − α` throughout; the outgoing window is
+  listed as a second visible-chunk entry, reserved in the budget one frame ahead
+  (`transitionSplats`), and its fine tiers are no eviction victim while it fades.
+- Coarse splats count against the working set like fine ones; charging far chunks their level
+  count instead of a fine prefix lowers the request, so the solved cap rises and the freed
+  budget flows to the near field.
+
+The coarse records live **outside the page pool**, in a per-entity buffer charged to the
+entity's `MemoryBudgetManager` entry beside the pool, and stay resident for the life of the
+entity. They are given `GaussianPagingPolicy.coarseBudgetFraction` (20 %) of the residency
+budget: both levels when they fit it, else the coarsest level alone (the runtime then switches
+fine ↔ level 2 directly, a larger but still faded step), else none — logged once per load, the
+entity then draws its fine records only as before the levels existed. At the default 300 MiB
+geometry budget (75 MiB residency budget) a 20 M-splat asset at ratios `3, 6` (45 MB of coarse
+records) keeps its level 2 alone (5 MB); ratios `4, 7` halve the bytes, and a geometry budget of
+900 MiB keeps both. A coarse payload that fails its CRC — at load for a whole-resident entity
+(the load fails, as for a fine chunk), as its piece lands for a paged one — faults the entity's
+levels: the frame binds `hasCoarse = 0` and draws fine only, reported once.
+
+Residuals: the frame a down-switch is detected cuts the fine prefix to the new level's count one
+frame before the fade begins (band-softened, at a few pixels of screen); a coarse level carries
+the DC colour only, beside fine ranks with harmonics during a near fade; the chunk's cull box is
+the fine box, so a merged splat's tail beyond it at the very edge of the frustum can be culled
+with the chunk for the frames of a fade (the 0.25 guard band covers realistic clusters); the
+level-1 pieces of a paged entity land over its first ≈ 20 ticks on mobile, during which chunks
+that would draw level 1 draw level 2 and then switch with a fade.
+
+Read the state through `gaussianPagingStats(entityId:)` (`coarseLevels`, `coarseBytes`,
+`coarseBytesLanded`, `coarseChunkLevelsAvailable`, `coarseReadsIssued`, `coarseFaulted`) and
+the profile lines: `[Gaussian][FrustumCull]` gains `coarseEntities=… coarseBytes=…
+coarseLanded=… coarseLevelsAvailable=… coarseReads=… coarseFaulted=…`, `[Gaussian][Preprocess]`
+`coarseChunks=… coarseSplats=… transition=…` (the entries drawn coarse, their quota sum and the
+outgoing windows reserved on the last read-back frame).
+
 ### The budget
 
 The shared working set holds at most `GaussianRuntimeLimits.workingSetSplats` records:
@@ -234,6 +296,7 @@ targetScale=… density=… targetDensity=… visibleChunks=… fill=…`, `LogC
 | Visible index, per frame in flight | — (visible-chunk lists: 16 B per chunk per slot) | 4 B |
 | Spherical harmonics | 0 / 9 / 24 / 45 B (degree 0–3) | same |
 | Chunk table | 48 B per chunk | — |
+| Coarse levels (when cooked and fitting) | 16 B per coarse record (≈ 14 % of the core bytes at ratios `3, 6`, 1.6 % for level 2 alone), outside the pool, plus 48 B per level per chunk and 8 B of level state per chunk; visible-chunk lists 32 B per chunk per slot | — |
 
 The shared working set costs 3 × 72 B × budget once, whatever is loaded (216 MB for a million
 splats), plus about 9 KB of fixed state (the budget state and the 2064-byte density histogram
@@ -272,6 +335,16 @@ it keeps resident, and every head of the asset fits it.
   demanded counts (not at the read-back cap, which scales the resident ranks and would have
   the wants chase residency) while the demand keeps the real area, and
   `disableHZBOcclusionCull` demands and loads occluded chunks.
+- `GaussianDebugOptions.shared.gaussianLevelMode` chooses how an entity with per-chunk coarse
+  levels draws: `.auto` (the level rule), `.fineOnly` (the fine records only — byte for byte the
+  frame of a file without a coarse section, the A/B of what the levels change) or `.coarseOnly`
+  (every chunk at its coarsest available level, the twin comparison); `disableLevelCrossFade`
+  switches levels at once instead of over 16 frames; `levelDebugTint` colours every splat by its
+  chunk's level (white fine, yellow level 1, red level 2, over the residency tint).
+  `GaussianRuntimeLimits.maxSplatsPerPixelOverride` moves the density floor (0 or a non-finite
+  value switches it off; nil restores 1), `GaussianPagingPolicy.coarseBudgetFractionOverride` the
+  share of the residency budget the coarse records may take. Under `disableScreenWeightedQuotas`
+  and `disableWorkingSetBudget` the levels are off (every chunk fine).
 - A `.ply` asset, or a `.untoldgs` decoded on the CPU because the decode kernel is unavailable
   (or expanded once at load because the per-chunk kernels are), has no chunk table and keeps
   the per-splat cull over its whole encoded buffer.
