@@ -122,20 +122,39 @@ encoding is reserved by the `sphericalHarmonicsPalette` flag and rejected by the
 - `UntoldGSFormat.write(splats:options:)` / `write(splats:options:to:)` encode `[UntoldGSSplat]`: Morton order, chunking, per-chunk ranges, tree, page-aligned sections, CRCs. `UntoldGSWriteOptions` carries chunk size, SH degree, the asset-level bounding box and `meanSquaredSplatExtent` of the tier.
 - `UntoldGSFormat.read(from:)` returns `UntoldGSAsset` in the layout the renderer consumes (every chunk decoded on the CPU). `readHeader(from:)` returns the baked bounding box through a bounded `FileHandle` read; `readHeaderV3` and `readIndex` expose the full header, chunk index and tree.
 - `UntoldGSFile(url:)` opens a file, parses only the prefix, and serves `chunkPayload(at:)` by byte range with CRC verification; `decodeChunk(at:)` and `decodeAll()` decode on the CPU.
-- `UntoldGSPacking` holds the pure pack/unpack functions for the record and the Morton key; `UntoldGSCRC32` the checksum; `UntoldGSSplat` converts from the importer's `GaussianSplat` and to `EncodedGaussianSplat`.
+- `GaussianPageSource` is the byte source of a paged asset (`GaussianPageManager`): the index, the file identity (size, inode, modification time), a synchronous thread-safe range read, a reopen after a fault and a close. `UntoldGSFilePageSource(url:)` implements it over `pread` on a descriptor kept for the life of the entity (validated at open exactly as `UntoldGSFile` validates, no read-ahead); `GaussianPageSourceFactory.override` lets tests inject one.
+- `UntoldGSPacking` holds the pure pack/unpack functions for the record and the Morton key; `UntoldGSCRC32` the checksum (slicing by eight, whole through `checksum(_:)` or streamed through `initialValue` / `update` / `finalize`); `UntoldGSSplat` converts from the importer's `GaussianSplat` and to `EncodedGaussianSplat`.
 
 `bakeGaussianSplatProgressiveTiers` writes every progressive tier as a version-3 file.
 
 ## Runtime load
 
-`GaussianChunkLoader.load(url:)` reads every chunk by byte range (CRC-verified) into one
-packed staging buffer, binds the SH bytes as stored, and runs the `gaussianDecodeChunks`
-kernel (one threadgroup per chunk, `GaussianChunkDecodeConstants` per chunk) to expand the
-16-byte records into `EncodedGaussianSplat` for the existing cull, sort and draw passes.
+`GaussianChunkLoader.load(url:allowPaging:)` keeps the chunk table resident (the 48-byte
+`GaussianChunkDecodeConstants` per chunk on the GPU, the `UntoldGSIndex` on the CPU) and
+binds the SH bytes as stored; the fused per-chunk pass (`gaussianChunkDecodePreprocess`)
+decodes the 16-byte records every frame, for the chunks in view only. Where the records live
+depends on the asset's size (`GaussianPagingPolicy`):
+
+- Below the paging threshold — 64 MiB of unpadded records (16 B plus SH per splat) on Apple
+  Vision Pro, iPhone, iPad and Apple TV, 512 MiB on the Mac, never above the residency
+  budget — every chunk is read by byte range (CRC-verified) into one resident packed buffer,
+  as before.
+- Above it the records live in a **page pool** of fixed slots, each holding one **tier** of
+  one chunk: 256 ranks (4 KiB of core records) plus the matching SH bytes in a sibling pool
+  with the same slot layout. A chunk is resident as a prefix of tiers, filled from the chunk
+  cull's demand frame by frame (`GaussianPageManager`); nothing is read at load. The pool is
+  sized from what a quarter of `MemoryBudgetManager.geometryBudget` leaves after the pools
+  already allocated, capped at the asset and at 256 MiB (1 GiB on the Mac). The chunk table
+  then also carries, per in-flight slot, a residency table, a page table and a demand table.
+  Because each chunk is sorted by importance and its decode constants are per chunk, a tier
+  reproduces the file's records bit for bit wherever its slot lands.
+
 `setEntityGaussian` with the `untoldgs` extension, the progressive tiers and the streaming
-path all go through it; when the kernel is unavailable the loader falls back to
-`UntoldGSFormat.read`, which decodes on the CPU. Metal fast resource loading and a resident
-page pool arrive with the shared-sort work.
+path all go through the loader; when the per-chunk kernels are unavailable the records are
+expanded once into `EncodedGaussianSplat` for the whole-buffer path (a paged load cannot be
+expanded, so paging needs the kernels), and without the decode kernel the loader falls back
+to `UntoldGSFormat.read`, which decodes on the CPU. Metal fast resource loading would be
+another `GaussianPageSource` behind the same protocol.
 
 ## Validation
 
@@ -147,5 +166,19 @@ cannot hold its core and SH blocks; tree nodes that span outside the index or re
 children behind them; a root that does not cover every chunk. `chunkPayload(at:)`
 additionally rejects a chunk whose CRC does not match.
 
+A paged asset is verified as it fills: the CRC covers the whole unpadded payload, so a chunk
+is checked the moment it becomes fully resident (over its tiers in file order, on the read's
+worker thread) and dropped and faulted if it fails; a chunk resident only as a head cannot be
+verified — `UntoldGSChunkEntry.reserved0` is the slot for a head CRC in a later revision.
+The page source keeps the file's identity (size, inode, modification time) and re-checks it
+when a read fails: a changed file faults the asset — its resident pages keep drawing and
+nothing new is read — until a periodic reopen (every `GaussianPagingPolicy.faultReopenTicks`,
+300 ticks) finds a file whose index equals the one the entity was loaded from; the file's
+identity is then adopted, so a byte-identical re-cook (a new inode or modification time, the
+same index and chunk CRCs) resumes the paging. A reopen attempted while a straggling read still
+holds the old descriptor is refused and tried again a period later.
+
 Tests: `Tests/UntoldEngineTests/UntoldGSFormatTests.swift` and the format cases in
-`Tests/UntoldEngineRenderTests/GaussianProgressiveLODTest.swift`.
+`Tests/UntoldEngineRenderTests/GaussianProgressiveLODTest.swift`; the paging in
+`Tests/UntoldEngineTests/GaussianPagingPolicyTests.swift` and
+`Tests/UntoldEngineRenderTests/GaussianPagingTest.swift`.
