@@ -10,7 +10,10 @@
 //  through the chunk path with the budget at a quarter of the visible count — once with the
 //  screen-weighted quotas and once with the uniform rule (disableScreenWeightedQuotas), with
 //  the PSNR of each against the unlimited frame over the near (bottom) and far (top) halves of
-//  the image — at a camera that sees about 30 % of the asset. Skipped unless
+//  the image — and paged from the file into a pool a quarter of the asset's size with the
+//  budget unlimited (frames to warm, pages, reads and evictions per frame, the pager's worst
+//  tick), plus a pool that holds the whole asset whose near half must match the unlimited
+//  frame — at a camera that sees about 30 % of the asset. Skipped unless
 //  UNTOLD_PERF_GAUSSIAN_CHUNK_CULL=1: the bakes take tens of seconds and the numbers are
 //  machine-specific, so this is a tool, not a gate.
 //
@@ -42,6 +45,7 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
     }
 
     override func tearDown() async throws {
+        GaussianPagingPolicy.resetKnobs()
         GaussianDebugOptions.shared.disableChunkCull = savedDisableChunkCull
         GaussianDebugOptions.shared.disableHZBOcclusionCull = savedDisableHZBOcclusionCull
         GaussianDebugOptions.shared.disableScreenWeightedQuotas = savedDisableScreenWeightedQuotas
@@ -149,6 +153,64 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         return (report(label, samples, cullOnly: cullOnly, warmup: warmup, component: component), samples.last?.visibleSplats ?? 0, image)
     }
 
+    /// The paged configuration: the asset loaded from the file into a pool of `poolBytes`,
+    /// warmed until no read is pending for five frames (at most 300), then measured like the
+    /// others; the line carries the pool, the pages, the reads and evictions per frame and the
+    /// pager's worst tick.
+    private func benchPaged(_ label: String, url: URL, index: UntoldGSIndex, poolBytes: Int, frames: Int, warmup: Int) throws -> (line: String, visibleSplats: Int, image: [Float16])? {
+        GaussianPagingPolicy.pagingThresholdBytesOverride = 0
+        GaussianPagingPolicy.residencyBudgetBytesOverride = poolBytes
+        defer {
+            GaussianPagingPolicy.pagingThresholdBytesOverride = nil
+            GaussianPagingPolicy.residencyBudgetBytesOverride = nil
+        }
+        GaussianSharedWorkingSet.shared.resetBudgetHysteresis()
+        _ = placeCameraSeeing(target: 0.30, index: index)
+        let loaded = try GaussianChunkLoader.load(url: url, allowPaging: true)
+        let pager = try XCTUnwrap(loaded.pager, "the asset pages into its pool")
+        let result = try XCTUnwrap(buildGaussianLoadResult(
+            packedSplatBuffer: loaded.packedSplatBuffer,
+            splatCount: UInt(loaded.splatCount),
+            sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
+            sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
+            boundingBox: loaded.boundingBox,
+            chunkTable: loaded.chunkTable,
+            pager: pager
+        ))
+        guard let component = addEntity(result) else { return nil }
+        defer { destroyAllEntities() }
+
+        var framesToWarm = 0
+        var quietFrames = 0
+        var worstTickMs: Double = 0
+        var issued = 0
+        var committed = 0
+        var evicted = 0
+        while quietFrames < 5, framesToWarm < 300 {
+            let start = CACurrentMediaTime()
+            renderer.draw(in: renderer.metalView)
+            worstTickMs = max(worstTickMs, (CACurrentMediaTime() - start) * 1000)
+            renderInfo.lastCommandBuffer?.waitUntilCompleted()
+            framesToWarm += 1
+            let stats = pager.stats
+            issued += stats.issuedThisTick
+            committed += stats.committedThisTick
+            evicted += stats.evictedThisTick
+            quietFrames = stats.pendingReads == 0 && stats.issuedThisTick == 0 ? quietFrames + 1 : 0
+        }
+        let samples = measure(frames: frames + warmup, component: component)
+        let cullOnly = measureCullOnly(frames: frames + warmup)
+        let image = renderGaussianSplatLayer()
+        let stats = pager.stats
+        let perFrame = Double(max(1, framesToWarm))
+        let line = report(label, samples, cullOnly: cullOnly, warmup: warmup, component: component)
+            + String(format: " pool=%@ pages=%d/%d framesToWarm=%d issued/frame=%.1f committed/frame=%.1f evicted/frame=%.1f tickMs(max)=%.2f saturated=%d faults=%d",
+                     gaussianFormatBytes(stats.poolBytes), stats.residentSlots, stats.slotCount, framesToWarm,
+                     Double(issued) / perFrame, Double(committed) / perFrame, Double(evicted) / perFrame, worstTickMs, stats.saturatedCandidates, stats.faultedChunks)
+        print("[GaussianChunkCullBenchmark] \(line)")
+        return (line, samples.last?.visibleSplats ?? 0, image)
+    }
+
     /// The two halves of a splat layer: the bottom half (the near content of the oblique view,
     /// the camera looking down at the slab) and the top half (the far content).
     private func halves(_ image: [Float16]) -> (near: [Float16], far: [Float16]) {
@@ -239,6 +301,21 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
                 uniformQuality = psnrByHalf(uniform.image, reference: reference)
             }
             GaussianDebugOptions.shared.disableScreenWeightedQuotas = false
+
+            // Paged from the file into a quarter of the asset, budget unlimited; then into a pool
+            // that holds every tier, whose near half must be the unlimited frame's.
+            GaussianRuntimeLimits.workingSetSplatsOverride = splatCount
+            let assetBytes = GaussianPagingPolicy.assetBytes(splatCount: loaded.splatCount, shBytesPerSplat: loaded.index.header.shBytesPerSplat)
+            if let paged = try benchPaged("\(prefix) chunk cull + fused pass, paged (pool = 25 %% of the asset), budget unlimited", url: url, index: loaded.index, poolBytes: assetBytes / 4, frames: frames, warmup: warmup) {
+                lines.append(paged.line)
+                let quality = psnrByHalf(paged.image, reference: reference)
+                print(String(format: "[GaussianChunkCullBenchmark] %@ PSNR vs unlimited, paged at a quarter pool — near half %.2f dB, far half %.2f dB", prefix, quality.near, quality.far))
+            }
+            if let whole = try benchPaged("\(prefix) chunk cull + fused pass, paged (pool = the asset), budget unlimited", url: url, index: loaded.index, poolBytes: assetBytes, frames: frames, warmup: warmup) {
+                let quality = psnrByHalf(whole.image, reference: reference)
+                print(String(format: "[GaussianChunkCullBenchmark] %@ PSNR vs unlimited, paged at a whole pool — near half %.2f dB, far half %.2f dB", prefix, quality.near, quality.far))
+                XCTAssertGreaterThanOrEqual(quality.near, 45, "a pool that holds every wanted tier draws the unlimited frame's near half")
+            }
             if let weightedQuality, let uniformQuality {
                 print(String(format: "[GaussianChunkCullBenchmark] %@ PSNR vs unlimited at a quarter budget — near half: weighted %.2f dB, uniform %.2f dB; far half: weighted %.2f dB, uniform %.2f dB",
                              prefix, weightedQuality.near, uniformQuality.near, weightedQuality.far, uniformQuality.far))
@@ -250,6 +327,6 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
             GaussianRuntimeLimits.workingSetSplatsOverride = nil
         }
 
-        XCTAssertEqual(lines.count, splatCounts.count * 5)
+        XCTAssertEqual(lines.count, splatCounts.count * 6)
     }
 }
