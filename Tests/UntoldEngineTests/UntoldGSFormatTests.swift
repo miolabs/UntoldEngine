@@ -145,6 +145,62 @@ final class UntoldGSFormatTests: XCTestCase {
         XCTAssertEqual(UntoldGSCRC32.checksum(Data()), 0)
     }
 
+    /// The reference the slicing loop is checked against: the byte-wise table loop the format
+    /// shipped with.
+    private func byteWiseCRC32(_ bytes: [UInt8]) -> UInt32 {
+        let table: [UInt32] = (0 ..< 256).map { index -> UInt32 in
+            var crc = UInt32(index)
+            for _ in 0 ..< 8 {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB8_8320 : crc >> 1
+            }
+            return crc
+        }
+        var crc: UInt32 = 0xFFFF_FFFF
+        for byte in bytes {
+            crc = table[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8)
+        }
+        return crc ^ 0xFFFF_FFFF
+    }
+
+    /// Slicing by eight equals the byte-wise loop for every length and alignment, and a
+    /// streamed `update` over random pieces equals the whole checksum.
+    func testCRC32SlicingMatchesTheByteWiseLoop() {
+        var generator = SystemRandomNumberGenerator()
+        var lengthsSeen = Set<Int>()
+        for iteration in 0 ..< 1000 {
+            let length = iteration < 32 ? iteration : Int.random(in: 0 ... 70000, using: &generator)
+            let offset = Int.random(in: 0 ... 7, using: &generator)
+            lengthsSeen.insert(length)
+            var storage = [UInt8](repeating: 0, count: offset + length)
+            for index in storage.indices {
+                storage[index] = UInt8.random(in: 0 ... 255, using: &generator)
+            }
+            let bytes = Array(storage[offset...])
+            let expected = byteWiseCRC32(bytes)
+            // Whole, at the chosen alignment.
+            let whole = storage.withUnsafeBytes { buffer -> UInt32 in
+                var crc = UntoldGSCRC32.initialValue
+                UntoldGSCRC32.update(&crc, UnsafeRawBufferPointer(rebasing: buffer[offset...]))
+                return UntoldGSCRC32.finalize(crc)
+            }
+            XCTAssertEqual(whole, expected, "length \(length) at offset \(offset)")
+            XCTAssertEqual(UntoldGSCRC32.checksum(Data(bytes)), expected)
+            // Streamed in random pieces.
+            var crc = UntoldGSCRC32.initialValue
+            var start = 0
+            storage.withUnsafeBytes { buffer in
+                while start < length {
+                    let piece = min(length - start, Int.random(in: 1 ... max(1, length / 3 + 1), using: &generator))
+                    UntoldGSCRC32.update(&crc, UnsafeRawBufferPointer(rebasing: buffer[(offset + start) ..< (offset + start + piece)]))
+                    start += piece
+                }
+            }
+            XCTAssertEqual(UntoldGSCRC32.finalize(crc), expected, "streamed, length \(length) at offset \(offset)")
+        }
+        XCTAssertGreaterThan(lengthsSeen.count, 500)
+        XCTAssertEqual(UntoldGSCRC32.finalize(UntoldGSCRC32.initialValue), 0, "no bytes: the empty checksum")
+    }
+
     func testImporterConversionAndEncodedLayout() {
         // PLY order (w, x, y, z): a 90° rotation about Y.
         let half = Float(0.5).squareRoot()

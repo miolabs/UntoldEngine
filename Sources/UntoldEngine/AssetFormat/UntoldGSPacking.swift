@@ -328,23 +328,79 @@ public enum UntoldGSPacking {
     }
 }
 
-/// CRC-32 (IEEE 802.3, reflected, polynomial 0xEDB88320) for per-chunk integrity.
+/// CRC-32 (IEEE 802.3, reflected, polynomial 0xEDB88320) for per-chunk integrity. Slicing by
+/// eight: eight bytes of input per step through eight 256-entry tables, about five times the
+/// byte-wise loop's throughput, with the same value; `update` streams the checksum over a
+/// payload that arrives in pieces (a chunk paged in tier by tier).
 public enum UntoldGSCRC32 {
-    private static let table: [UInt32] = (0 ..< 256).map { index -> UInt32 in
-        var crc = UInt32(index)
-        for _ in 0 ..< 8 {
-            crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB8_8320 : crc >> 1
+    /// `tables[0]` is the classic byte table; `tables[k][b]` is the CRC of byte `b` followed by
+    /// `k` zero bytes, so eight bytes fold in one step.
+    private static let tables: [[UInt32]] = {
+        var tables = [[UInt32]](repeating: [UInt32](repeating: 0, count: 256), count: 8)
+        for index in 0 ..< 256 {
+            var crc = UInt32(index)
+            for _ in 0 ..< 8 {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB8_8320 : crc >> 1
+            }
+            tables[0][index] = crc
         }
-        return crc
-    }
+        for slice in 1 ..< 8 {
+            for index in 0 ..< 256 {
+                let previous = tables[slice - 1][index]
+                tables[slice][index] = tables[0][Int(previous & 0xFF)] ^ (previous >> 8)
+            }
+        }
+        return tables
+    }()
 
+    /// The checksum of `data`, whole.
     public static func checksum(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xFFFF_FFFF
         data.withUnsafeBytes { buffer in
-            for byte in buffer {
-                crc = table[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8)
-            }
+            update(&crc, buffer)
         }
         return crc ^ 0xFFFF_FFFF
+    }
+
+    /// The initial running value of a streamed checksum; feed `update` the payload in any
+    /// pieces, in order, then finish with `finalize`.
+    public static let initialValue: UInt32 = 0xFFFF_FFFF
+
+    /// Folds `bytes` into the running checksum `crc` (started at `initialValue`).
+    public static func update(_ crc: inout UInt32, _ bytes: UnsafeRawBufferPointer) {
+        guard let base = bytes.baseAddress, bytes.count > 0 else { return }
+        var value = crc
+        var offset = 0
+        let count = bytes.count
+        // Byte by byte up to the first 8-byte boundary, so the wide loads are aligned.
+        while offset < count, (UInt(bitPattern: base + offset) & 7) != 0 {
+            value = tables[0][Int((value ^ UInt32(base.load(fromByteOffset: offset, as: UInt8.self))) & 0xFF)] ^ (value >> 8)
+            offset += 1
+        }
+        let t = tables
+        while offset + 8 <= count {
+            let word = base.load(fromByteOffset: offset, as: UInt64.self).littleEndian
+            let low = UInt32(truncatingIfNeeded: word) ^ value
+            let high = UInt32(truncatingIfNeeded: word >> 32)
+            value = t[7][Int(low & 0xFF)]
+                ^ t[6][Int((low >> 8) & 0xFF)]
+                ^ t[5][Int((low >> 16) & 0xFF)]
+                ^ t[4][Int(low >> 24)]
+                ^ t[3][Int(high & 0xFF)]
+                ^ t[2][Int((high >> 8) & 0xFF)]
+                ^ t[1][Int((high >> 16) & 0xFF)]
+                ^ t[0][Int(high >> 24)]
+            offset += 8
+        }
+        while offset < count {
+            value = t[0][Int((value ^ UInt32(base.load(fromByteOffset: offset, as: UInt8.self))) & 0xFF)] ^ (value >> 8)
+            offset += 1
+        }
+        crc = value
+    }
+
+    /// The checksum a streamed `update` sequence stands for.
+    public static func finalize(_ crc: UInt32) -> UInt32 {
+        crc ^ 0xFFFF_FFFF
     }
 }
