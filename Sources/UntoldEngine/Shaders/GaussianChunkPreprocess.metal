@@ -10,7 +10,10 @@
 //  either eye in stereo), evaluates the spherical harmonics by original index, and projects and
 //  appends a GaussianWorkingSetSplat record and depth key into the frame's shared working set
 //  exactly as gaussianPreprocess does. The last fifth of a truncated chunk's quota fades its
-//  opacity linearly to zero by rank, so a moving cut never pops.
+//  opacity linearly to zero by rank, so a moving cut never pops. For a paged entity
+//  (cull.paged != 0) the records live in a page pool of 256-rank tiers: the rank is mapped to
+//  its pool record through this slot's page table, the chunk's quota is bounded by its
+//  resident ranks, and a tier that arrived within the last fadeFrames frames fades in.
 //
 // Copyright (C) Untold Engine Studios
 //
@@ -76,6 +79,9 @@ kernel void gaussianChunkDecodePreprocess(
     device GaussianWorkingSetSplat            *workingSet    [[buffer(gaussianChunkPreprocessWorkingSetIndex)]],
     device uint64_t                           *sharedKeys    [[buffer(gaussianChunkPreprocessSharedKeysIndex)]],
     device atomic_uint                        *sharedVisibleCount [[buffer(gaussianChunkPreprocessSharedVisibleSetIndex)]],
+    const device GaussianChunkResidency       *residency     [[buffer(gaussianChunkPreprocessResidencyIndex)]],
+    const device uint                         *pageTable     [[buffer(gaussianChunkPreprocessPageTableIndex)]],
+    constant GaussianChunkPagingConstants     &paging        [[buffer(gaussianChunkPreprocessPagingConstantsIndex)]],
     texture2d<float, access::sample>          hzbDepthPyramid [[texture(gaussianChunkPreprocessHZBDepthPyramidTextureIndex)]],
     uint chunkSlot                                           [[threadgroup_position_in_grid]],
     uint localIndex                                          [[thread_position_in_threadgroup]],
@@ -87,14 +93,33 @@ kernel void gaussianChunkDecodePreprocess(
     }
     const GaussianVisibleChunk visibleChunk = visibleChunks[chunkSlot];
     const GaussianChunkDecodeConstants chunk = chunks[visibleChunk.chunkIndex];
-    const uint quota = min(visibleChunk.quota, chunk.splatCount);
+    // A whole-resident entity: every rank resident, nothing fading. A paged one: this slot's
+    // residency of the chunk (the cull already bounded the quota by it).
+    GaussianChunkResidency res = { chunk.splatCount, chunk.splatCount, 0u, 0u };
+    if (cull.paged != 0u) {
+        res = residency[visibleChunk.chunkIndex];
+    }
+    const uint quota = min(visibleChunk.quota, min(chunk.splatCount, res.residentRanks));
+    const uint pageRow = visibleChunk.chunkIndex * paging.pagesPerChunk;
+    const uint rankMask = (1u << paging.ranksPerPageLog2) - 1u;
 
     const float3 aabbMin = float3(chunk.aabbMinX, chunk.aabbMinY, chunk.aabbMinZ);
     const float3 aabbMax = float3(chunk.aabbMaxX, chunk.aabbMaxY, chunk.aabbMaxZ);
     const float logScaleRange = chunk.logScaleMax - chunk.logScaleMin;
 
     for (uint rank = localIndex; rank < quota; rank += threadsPerGroup) {
-        const uint splatIndex = chunk.firstSplat + rank;
+        uint splatIndex;
+        if (cull.paged != 0u) {
+            // The rank's tier through the page table; under the prefix invariant every tier
+            // below residentRanks is mapped, the test is defensive.
+            const uint page = pageTable[pageRow + (rank >> paging.ranksPerPageLog2)];
+            if (page == kGaussianPageSlotInvalid) {
+                continue;
+            }
+            splatIndex = (page << paging.ranksPerPageLog2) | (rank & rankMask);
+        } else {
+            splatIndex = chunk.firstSplat + rank;
+        }
         const uint4 record = packed[splatIndex];
 
         // The decode, word for word gaussianDecodeChunks (Gaussians.metal): the positions are
@@ -146,8 +171,14 @@ kernel void gaussianChunkDecodePreprocess(
         // truncated chunk's fading tail — gaussianOpacityBandFactor ramping toward zero near
         // the cut — shrinks its quad the same way any other low-opacity splat does; see
         // gaussianAdaptiveSigma (Gaussians.metal).
+        // An arriving tier of a paged entity fades in over fadeFrames executed frames, counted
+        // from its arrival tick, so the same residency and tick give the same image.
+        float fade = 1.0f;
+        if (cull.paged != 0u && paging.fadeFrames != 0u && rank >= res.fadeFromRank) {
+            fade = clamp((float)(paging.frameIndex - res.arrivalFrame + 1u) / (float)paging.fadeFrames, 0.0f, 1.0f);
+        }
         const float opacity = float(colorAndOpacity.w) * entity.opacityScale
-            * gaussianOpacityBandFactor(rank, quota, chunk.splatCount);
+            * gaussianOpacityBandFactor(rank, quota, chunk.splatCount) * fade;
         float sigma = gaussianAdaptiveSigma(opacity);
 
         float2 axis1 = float2(0.0f);
@@ -176,6 +207,11 @@ kernel void gaussianChunkDecodePreprocess(
                 splatIndex,
                 centerLocal - localCameraPosition
             ));
+        if (paging.debugMode == 1u) {
+            // Residency tint: green for a whole chunk, red for a head-only one.
+            const float resident = (float)res.residentRanks / (float)max(chunk.splatCount, 1u);
+            color = mix(float3(1.0f, 0.15f, 0.1f), float3(0.1f, 1.0f, 0.2f), resident);
+        }
         GaussianWorkingSetSplat out;
         out.positionAndEntity = float4(centerLocal, as_type<float>(entity.entityIndex));
         out.conicAndOpacity = float4(conic, opacity);

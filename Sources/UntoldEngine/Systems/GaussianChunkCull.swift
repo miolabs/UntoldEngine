@@ -606,13 +606,16 @@ func gaussianChunkCullViewProjections(
 /// The constants of one entity's chunk cull this frame. `uniformQuotas` is the frame's
 /// `GaussianDebugOptions.disableScreenWeightedQuotas`, read once per frame by the caller so the
 /// cull and the scale kernel agree (the fused pass's rebuilt constants carry it and ignore it).
+/// `paged` is 0 for a whole-resident entity, 1 for one whose records live in a page pool
+/// (`GaussianPageManager`), 2 for a demand-only cull of a warming tier.
 func gaussianChunkCullConstants(
     chunkTable: GaussianChunkTable,
     modelMatrix: simd_float4x4,
     viewMatrix: simd_float4x4,
     hzbValid: Bool,
     forceAllVisible: Bool = GaussianDebugOptions.shared.disableChunkCull,
-    uniformQuotas: Bool
+    uniformQuotas: Bool,
+    paged: UInt32 = 0
 ) -> GaussianChunkCullConstants {
     let views = gaussianChunkCullViewProjections(modelMatrix: modelMatrix, viewMatrix: viewMatrix)
     var constants = GaussianChunkCullConstants()
@@ -628,6 +631,7 @@ func gaussianChunkCullConstants(
     constants.hzbMipCount = UInt32(max(0, renderInfo.hzbMipCount))
     constants.forceAllVisible = forceAllVisible ? 1 : 0
     constants.uniformQuotas = uniformQuotas ? 1 : 0
+    constants.paged = paged
     return constants
 }
 
@@ -639,7 +643,9 @@ let gaussianDensityHistogramVisibleChunksOffset = MemoryLayout<GaussianBudgetDen
 /// record, one thread per chunk (binning every visible chunk into `densityHistogram`), finalize
 /// into indirect arguments and add the entity's visible splat total to `budgetState`'s request
 /// and its chunk count to the histogram. Serial on the encoder, so the quota and fused
-/// dispatches that follow see the final list. Returns the dispatch count.
+/// dispatches that follow see the final list. A paged entity (`constants.paged == 1`) binds
+/// this slot's residency and demand tables; an unpaged one binds the chunk table as a
+/// never-read stand-in at both indices. Returns the dispatch count.
 func encodeGaussianChunkCull(
     _ encoder: MTLComputeCommandEncoder,
     pipelines: GaussianChunkCullPipelineStates,
@@ -649,14 +655,46 @@ func encodeGaussianChunkCull(
     budgetState: MTLBuffer,
     densityHistogram: MTLBuffer,
     constants: GaussianChunkCullConstants,
-    hzbTexture: MTLTexture?
+    hzbTexture: MTLTexture?,
+    residency: MTLBuffer? = nil,
+    demand: MTLBuffer? = nil
 ) -> Int {
-    var constants = constants
-
     encoder.setComputePipelineState(pipelines.reset)
     encoder.setBuffer(chunkSet, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
     encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
 
+    encodeGaussianChunkCullDispatch(
+        encoder,
+        pipelines: pipelines,
+        chunkTable: chunkTable,
+        visibleChunks: visibleChunks,
+        chunkSet: chunkSet,
+        densityHistogram: densityHistogram,
+        constants: constants,
+        hzbTexture: hzbTexture,
+        residency: residency,
+        demand: demand
+    )
+
+    encodeGaussianFinalizeVisibleChunks(encoder, pipelines: pipelines, chunkSet: chunkSet, budgetState: budgetState, densityHistogram: densityHistogram)
+
+    return 3
+}
+
+/// The cull dispatch alone: one thread per chunk of `chunkTable`.
+private func encodeGaussianChunkCullDispatch(
+    _ encoder: MTLComputeCommandEncoder,
+    pipelines: GaussianChunkCullPipelineStates,
+    chunkTable: GaussianChunkTable,
+    visibleChunks: MTLBuffer,
+    chunkSet: MTLBuffer,
+    densityHistogram: MTLBuffer,
+    constants: GaussianChunkCullConstants,
+    hzbTexture: MTLTexture?,
+    residency: MTLBuffer?,
+    demand: MTLBuffer?
+) {
+    var constants = constants
     encoder.setComputePipelineState(pipelines.cull)
     encoder.setBuffer(chunkTable.constantsBuffer, offset: 0, index: Int(gaussianChunkCullChunkTableIndex.rawValue))
     encoder.setBytes(&constants, length: MemoryLayout<GaussianChunkCullConstants>.stride, index: Int(gaussianChunkCullConstantsIndex.rawValue))
@@ -667,6 +705,9 @@ func encodeGaussianChunkCull(
     encoder.setBuffer(chunkSet, offset: MemoryLayout<UInt32>.stride, index: Int(gaussianChunkCullChunkTotalIndex.rawValue))
     // The histogram's tiers as atomic words: 2t the splats, 2t + 1 the scaled area.
     encoder.setBuffer(densityHistogram, offset: 0, index: Int(gaussianChunkCullDensityHistogramIndex.rawValue))
+    // Paged entities only; the kernel never reads these with paged == 0.
+    encoder.setBuffer(residency ?? chunkTable.constantsBuffer, offset: 0, index: Int(gaussianChunkCullResidencyIndex.rawValue))
+    encoder.setBuffer(demand ?? chunkTable.constantsBuffer, offset: 0, index: Int(gaussianChunkCullDemandIndex.rawValue))
     encoder.setTexture(hzbTexture, index: Int(gaussianChunkCullHZBDepthPyramidTextureIndex.rawValue))
     let tew = pipelines.cull.threadExecutionWidth
     let block = max(min(256, pipelines.cull.maxTotalThreadsPerThreadgroup) / tew * tew, tew)
@@ -674,10 +715,39 @@ func encodeGaussianChunkCull(
         MTLSizeMake((chunkTable.chunkCount + block - 1) / block, 1, 1),
         threadsPerThreadgroup: MTLSizeMake(block, 1, 1)
     )
+}
 
-    encodeGaussianFinalizeVisibleChunks(encoder, pipelines: pipelines, chunkSet: chunkSet, budgetState: budgetState, densityHistogram: densityHistogram)
-
-    return 3
+/// Encodes a demand-only cull of a paged tier that is warming before the LOD system switches to
+/// it: one thread per chunk writes the chunk's seen screen area into `demand` and returns —
+/// no list, no record, nothing added to the frame's request or histogram. `constants.paged`
+/// must be 2 (the list and counters bound here are the tier's own slot buffers, which the
+/// kernel then never touches). Returns the dispatch count.
+func encodeGaussianChunkDemand(
+    _ encoder: MTLComputeCommandEncoder,
+    pipelines: GaussianChunkCullPipelineStates,
+    chunkTable: GaussianChunkTable,
+    visibleChunks: MTLBuffer,
+    chunkSet: MTLBuffer,
+    densityHistogram: MTLBuffer,
+    demand: MTLBuffer,
+    constants: GaussianChunkCullConstants,
+    hzbTexture: MTLTexture?
+) -> Int {
+    var constants = constants
+    constants.paged = 2
+    encodeGaussianChunkCullDispatch(
+        encoder,
+        pipelines: pipelines,
+        chunkTable: chunkTable,
+        visibleChunks: visibleChunks,
+        chunkSet: chunkSet,
+        densityHistogram: densityHistogram,
+        constants: constants,
+        hzbTexture: hzbTexture,
+        residency: nil,
+        demand: demand
+    )
+    return 1
 }
 
 /// The finalize of one entity's chunk record: indirect arguments, the request into `budgetState`
@@ -810,7 +880,9 @@ func encodeGaussianBudgetPublish(
 
 // MARK: - Fused decode and preprocess
 
-/// The per-entity inputs of `gaussianChunkDecodePreprocess` beyond the shared working set.
+/// The per-entity inputs of `gaussianChunkDecodePreprocess` beyond the shared working set. A
+/// paged entity (`cullConstants.paged == 1`) also binds this slot's residency and page tables
+/// and its paging constants; an unpaged one leaves them nil and the kernel never reads them.
 struct GaussianChunkPreprocessInputs {
     var packedSplats: MTLBuffer
     var chunkTable: GaussianChunkTable
@@ -823,6 +895,9 @@ struct GaussianChunkPreprocessInputs {
     var localCameraPosition: simd_float3
     var entityConstants: GaussianPreprocessEntityConstants
     var hzbTexture: MTLTexture?
+    var residency: MTLBuffer?
+    var pageTable: MTLBuffer?
+    var pagingConstants = GaussianChunkPagingConstants()
 }
 
 /// Threads per threadgroup of the fused pass: one threadgroup covers one chunk, striding when
@@ -861,6 +936,10 @@ func encodeGaussianChunkDecodePreprocess(
     encoder.setBuffer(sharedRecords, offset: 0, index: Int(gaussianChunkPreprocessWorkingSetIndex.rawValue))
     encoder.setBuffer(sharedKeys, offset: 0, index: Int(gaussianChunkPreprocessSharedKeysIndex.rawValue))
     encoder.setBuffer(sharedVisibleSet, offset: 0, index: Int(gaussianChunkPreprocessSharedVisibleSetIndex.rawValue))
+    // Paged entities only; with paged == 0 the kernel reads none of these.
+    encoder.setBuffer(inputs.residency ?? inputs.chunkTable.constantsBuffer, offset: 0, index: Int(gaussianChunkPreprocessResidencyIndex.rawValue))
+    encoder.setBuffer(inputs.pageTable ?? inputs.chunkTable.constantsBuffer, offset: 0, index: Int(gaussianChunkPreprocessPageTableIndex.rawValue))
+    encoder.setBytes(&inputs.pagingConstants, length: MemoryLayout<GaussianChunkPagingConstants>.stride, index: Int(gaussianChunkPreprocessPagingConstantsIndex.rawValue))
     encoder.setTexture(inputs.hzbTexture, index: Int(gaussianChunkPreprocessHZBDepthPyramidTextureIndex.rawValue))
 
     let threads = threadsPerThreadgroup ?? gaussianChunkPreprocessThreadsPerThreadgroup(chunkTable: inputs.chunkTable, pipelineState: pipelineState)
