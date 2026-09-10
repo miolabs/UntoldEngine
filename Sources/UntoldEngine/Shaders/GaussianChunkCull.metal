@@ -149,6 +149,15 @@ kernel void gaussianResetVisibleChunkSet(
 // keeps the budget's bound one-sided. With uniformQuotas the entry carries splatCount as its
 // area (density 1 for every chunk, the uniform rule) while the histogram still holds the real
 // areas for the readback.
+//
+// A paged entity (params.paged != 0, GaussianPageManager.swift) has its records in a page pool
+// and not every chunk resident. For every chunk the cull then writes the frame's demand word —
+// the chunk's seen screen area as float bits, 0 when no view keeps it (forceAllVisible does not
+// count; the real area even under uniformQuotas) — which the pager reads back three frames
+// later to decide what to load; with paged == 2 (a warming tier the LOD system is about to
+// switch to) that is all it does. A resident chunk is listed with drawable = min(splatCount,
+// residentRanks), so the request, the histogram and the quotas see only ranks the fused pass can
+// read; a chunk with no resident rank is not listed at all — it contributes nothing this frame.
 kernel void gaussianChunkCull(
     const device GaussianChunkDecodeConstants *chunks [[buffer(gaussianChunkCullChunkTableIndex)]],
     constant GaussianChunkCullConstants &params [[buffer(gaussianChunkCullConstantsIndex)]],
@@ -156,6 +165,8 @@ kernel void gaussianChunkCull(
     device atomic_uint *visibleSplatTotal [[buffer(gaussianChunkCullSplatTotalIndex)]],
     device atomic_uint *visibleChunkTotal [[buffer(gaussianChunkCullChunkTotalIndex)]],
     device atomic_uint *densityHistogram [[buffer(gaussianChunkCullDensityHistogramIndex)]],
+    const device GaussianChunkResidency *residency [[buffer(gaussianChunkCullResidencyIndex)]],
+    device uint *demand [[buffer(gaussianChunkCullDemandIndex)]],
     texture2d<float, access::sample> hzbDepthPyramid [[texture(gaussianChunkCullHZBDepthPyramidTextureIndex)]],
     uint chunkIndex [[thread_position_in_grid]])
 {
@@ -173,20 +184,28 @@ kernel void gaussianChunkCull(
     const bool keep1 = params.viewCount > 1u
         ? gaussianChunkVisibleInView(boxMin, boxMax, params.viewProjection1, params, params.hzbValid, hzbDepthPyramid, area1)
         : false;
-    const bool visible = keep0 || keep1 || params.forceAllVisible != 0u;
-    if (!visible) return;
+    const bool seen = keep0 || keep1;
     const float area = clamp(max(keep0 ? area0 : 0.0f, keep1 ? area1 : 0.0f), kGaussianScreenAreaMin, limit * limit);
+    uint drawable = chunk.splatCount;
+    if (params.paged != 0u) {
+        demand[chunkIndex] = seen ? as_type<uint>(area) : 0u;
+        if (params.paged == 2u) return;
+        drawable = min(drawable, residency[chunkIndex].residentRanks);
+        if (drawable == 0u) return;
+    }
+    const bool visible = seen || params.forceAllVisible != 0u;
+    if (!visible) return;
 
     const uint slot = atomic_fetch_add_explicit(visibleChunkTotal, 1u, memory_order_relaxed);
-    atomic_fetch_add_explicit(visibleSplatTotal, chunk.splatCount, memory_order_relaxed);
-    const uint tier = gaussianDensityTier((float)chunk.splatCount / area);
-    atomic_fetch_add_explicit(&densityHistogram[2u * tier], chunk.splatCount, memory_order_relaxed);
+    atomic_fetch_add_explicit(visibleSplatTotal, drawable, memory_order_relaxed);
+    const uint tier = gaussianDensityTier((float)drawable / area);
+    atomic_fetch_add_explicit(&densityHistogram[2u * tier], drawable, memory_order_relaxed);
     atomic_fetch_add_explicit(&densityHistogram[2u * tier + 1u], (uint)ceil(area * gaussianDensityTierFloor(tier)), memory_order_relaxed);
     GaussianVisibleChunk entry;
     entry.chunkIndex = chunkIndex;
-    entry.splatCount = chunk.splatCount;
-    entry.quota = chunk.splatCount;   // gaussianComputeChunkQuotas lowers it when the frame is over budget
-    entry.screenArea = params.uniformQuotas != 0u ? (float)chunk.splatCount : area;
+    entry.splatCount = drawable;
+    entry.quota = drawable;   // gaussianComputeChunkQuotas lowers it when the frame is over budget
+    entry.screenArea = params.uniformQuotas != 0u ? (float)drawable : area;
     visibleChunks[slot] = entry;
 }
 

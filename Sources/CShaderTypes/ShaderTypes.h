@@ -777,7 +777,7 @@ typedef struct{
     uint32_t hzbMipCount;
     uint32_t forceAllVisible;    // GaussianDebugOptions.disableChunkCull: every chunk is appended
     uint32_t uniformQuotas;      // GaussianDebugOptions.disableScreenWeightedQuotas: screenArea = splatCount, the uniform quota rule
-    uint32_t _pad0;
+    uint32_t paged;              // 0: every record resident; 1: a paged entity (the cull writes the demand table and lists resident ranks only, the fused pass reads the page pool); 2: demand only (a warming tier: write the demand word and return)
 }GaussianChunkCullConstants;  // 176 bytes
 
 typedef enum{
@@ -788,6 +788,8 @@ typedef enum{
     gaussianChunkCullChunkTotalIndex,      // atomic_uint: the chunk record's threadgroupCount (appended chunks), byte offset 4
     gaussianChunkCullBudgetStateIndex = 6, // gaussianFinalizeVisibleChunks: GaussianBudgetState whose requestedSplats the entity's total joins (the record itself sits at gaussianVisibleCountIndex, 5)
     gaussianChunkCullDensityHistogramIndex = 7, // gaussianChunkCull: the frame's GaussianBudgetDensityHistogram tiers as atomic_uint words (2t splats, 2t + 1 scaledArea); gaussianFinalizeVisibleChunks: its visibleChunks, bound at byte offset 524
+    gaussianChunkCullResidencyIndex = 8,   // GaussianChunkResidency[] of this slot (paged entities; a never-read stand-in otherwise)
+    gaussianChunkCullDemandIndex = 9,      // uint[] of this slot: the chunk's seen screen area as float bits, 0 unseen (paged entities; a never-read stand-in otherwise)
 }GaussianChunkCullBufferIndices;
 
 typedef enum{
@@ -880,6 +882,38 @@ typedef enum{
     gaussianBudgetDensityReadbackIndex = 8,  // gaussianPublishBudgetState: this frame slot's copy of the histogram
 }GaussianBudgetBufferIndices;
 
+// MARK: - Paged .untoldgs entities (GaussianPageManager.swift)
+
+/// Per chunk, per in-flight slot, of an entity whose records live in a page pool: how many of
+/// its first (most important) ranks are resident this frame — a prefix of 256-rank tiers, so
+/// 0, R, 2R, … up to the splat count — and the fade of the last arrival: the ranks from
+/// fadeFromRank up arrived at pager tick arrivalFrame and fade in over
+/// GaussianChunkPagingConstants.fadeFrames executed frames. All zero = absent: the cull lists no
+/// such chunk. The cull bounds the listed count by residentRanks, so the budget, the density
+/// histogram and the quotas see only drawable ranks.
+typedef struct{
+    uint32_t residentRanks;   //  0: 0, R, 2R, …, splatCount
+    uint32_t fadeFromRank;    //  4: ranks ≥ this arrived at arrivalFrame and fade in
+    uint32_t arrivalFrame;    //  8: pager tick of the last arrival
+    uint32_t _pad0;           // 12
+}GaussianChunkResidency;      // 16 bytes
+
+/// Per paged entity, set per frame: how the fused pass maps a rank of a chunk to a record of
+/// the page pool. Tier k of chunk c is pool slot pageTable[c × pagesPerChunk + k]; rank r of
+/// that chunk is pool record (slot << ranksPerPageLog2) | (r & (R − 1)), the same index into
+/// the core pool (uint4 per record) and the spherical-harmonics pool (shBytesPerSplat per record).
+typedef struct{
+    uint32_t pagesPerChunk;    //  0: splatsPerChunk / ranksPerPage (1 … 64)
+    uint32_t ranksPerPageLog2; //  4: log2(min(256, splatsPerChunk))
+    uint32_t frameIndex;       //  8: the pager's tick this frame
+    uint32_t fadeFrames;       // 12: frames an arriving tier fades in over; 0 = at once
+    uint32_t debugMode;        // 16: 0 none; 1 tint by resident fraction (GaussianDebugOptions.residencyDebugTint)
+    uint32_t _pad0[3];         // 20 … 31
+}GaussianChunkPagingConstants; // 32 bytes
+
+/// A page-table entry of a tier that is not resident.
+#define kGaussianPageSlotInvalid 0xFFFFFFFFu
+
 // MARK: - Fused decode, test, project and compact of .untoldgs entities (GaussianChunkPreprocess.metal)
 
 /// Bindings of gaussianChunkDecodePreprocess: one threadgroup per visible chunk, indirect from
@@ -899,6 +933,9 @@ typedef enum{
     gaussianChunkPreprocessWorkingSetIndex,      // GaussianWorkingSetSplat[], shared per frame
     gaussianChunkPreprocessSharedKeysIndex,      // uint64_t depth keys, shared per frame
     gaussianChunkPreprocessSharedVisibleSetIndex,// GaussianVisibleSet, shared per frame
+    gaussianChunkPreprocessResidencyIndex,       // 13: GaussianChunkResidency[] of this slot (paged entities; a never-read stand-in otherwise)
+    gaussianChunkPreprocessPageTableIndex,       // 14: uint[chunkCount × pagesPerChunk] of this slot: the pool slot of each tier, kGaussianPageSlotInvalid when absent
+    gaussianChunkPreprocessPagingConstantsIndex, // 15: GaussianChunkPagingConstants (setBytes)
 }GaussianChunkPreprocessBufferIndices;
 
 typedef enum{
