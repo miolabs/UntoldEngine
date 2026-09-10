@@ -6,8 +6,9 @@
 //  (GaussianChunkCull.metal), the working-set budget and its per-chunk quotas
 //  (GaussianWorkingSetBudget.metal) and the fused decode/test/project/compact pass
 //  (GaussianChunkPreprocess.metal) — the per-slot buffers a chunked entity carries, the
-//  per-frame constants, the encodes, and CPU mirrors of the chunk test, the quota and the
-//  opacity band for tests and callers that want to predict what the GPU keeps.
+//  per-frame constants, the encodes, and CPU mirrors of the chunk test, the screen area, the
+//  density histogram and its solve, the quota and the opacity band for tests and callers that
+//  want to predict what the GPU keeps.
 //
 // Copyright (C) Untold Engine Studios
 //
@@ -48,6 +49,44 @@ let gaussianBudgetMaxStepFraction: Float = 0.1
 /// from a dense view to one that fits the budget) does not crawl: from 0.06 to 1 in about 17
 /// frames instead of 30.
 let gaussianBudgetMinStep: Float = 0.05
+
+/// `gaussianBudgetDensityTierCount` and its neighbours (ShaderTypes.h) as Ints: the density
+/// histogram the weighted quotas are solved from holds 64 half-octave tiers of splats per view
+/// unit of screen area, the first starting at 2^-2; densities above the last tier clamp into it.
+let gaussianDensityTierCount = Int(gaussianBudgetDensityTierCount)
+let gaussianDensityTiersPerOctave = Int(gaussianBudgetDensityTiersPerOctave)
+let gaussianDensityTierLog2Floor = Int(gaussianBudgetDensityTierLog2Floor)
+
+/// Mirrors `kGaussianScreenAreaMin`: the smallest screen area a visible chunk is charged for,
+/// 2^-24 view units (a quarter of a pixel at 4K). A chunk no view keeps (`disableChunkCull`)
+/// carries it, so it is the densest chunk of the frame and is cut first.
+let gaussianScreenAreaMin: Float = 1 / 16_777_216
+
+/// The screen area of a chunk whose padded box reaches behind the eye (the chunk the camera
+/// stands in): the whole guard-banded clip volume, (1 + guard band)² — `kGaussianScreenAreaGuard`.
+let gaussianScreenAreaGuard: Float = (1 + gaussianCullClipGuardBand) * (1 + gaussianCullClipGuardBand)
+
+/// The smallest rise of the density cap per frame as a fraction of its target, so a climb from
+/// a low cap (or from the scale, after the uniform switch is flipped) finishes within about
+/// twenty frames.
+let gaussianBudgetDensityMinStepFraction: Float = 0.05
+
+/// Mirrors `kGaussianBudgetDensityClimbTail`: the fraction of the request a climb toward a
+/// fitting frame leaves to the whole — the cap climbs to the density below which all but the
+/// densest tail of the requested splats are whole (`GaussianChunkCullMath.climbDensity`) and
+/// becomes whole there, so the smallest chunks on screen set neither the step nor the frames
+/// of the climb.
+let gaussianBudgetDensityClimbTailFraction: Float = 0.05
+
+/// Bisection steps of the density solve on log2 of the cap, over the octaves from
+/// `gaussianBudgetDensityBisectionLog2Floor` to the density at which every chunk is whole:
+/// 24 steps over at most 46 octaves give the cap to 3 × 10⁻⁶ octaves.
+let gaussianBudgetDensityBisectionSteps = 24
+let gaussianBudgetDensityBisectionLog2Floor: Float = -16
+
+/// √2, the ratio between the lower bounds of two consecutive half-octave tiers; the single
+/// float the kernel compares the significand against, so CPU and GPU bin every float alike.
+let gaussianBudgetDensityTierRatio = Float(2).squareRoot()
 
 /// CPU mirror of the chunk test in `gaussianChunkCull` (GaussianChunkCull.metal), without the
 /// HZB part: the chunk's centre AABB padded by `extentPadding(logScaleMax:)` on every side,
@@ -94,6 +133,235 @@ enum GaussianChunkCullMath {
     static func paddedBox(aabbMin: simd_float3, aabbMax: simd_float3, logScaleMax: Float) -> (min: simd_float3, max: simd_float3) {
         let pad = extentPadding(logScaleMax: logScaleMax)
         return (aabbMin - simd_float3(repeating: pad), aabbMax + simd_float3(repeating: pad))
+    }
+
+    // MARK: Screen area (GaussianChunkCull.metal)
+
+    /// The clip-plane test of one box against one view-projection together with the box's
+    /// screen area in that view, in the operation order of the kernel's corner loop: the NDC
+    /// rect of the corners in front of the eye, clipped to the guard-banded view, as a fraction
+    /// of the view's width times its height — 1 for a box filling the view, 0 for a rejected
+    /// box, the whole guard-banded volume ((1 + guard band)²) for a box that reaches behind
+    /// the eye. The area is not clamped to `gaussianScreenAreaMin`; `chunkScreenArea` does that.
+    static func screenArea(
+        boxMin: simd_float3,
+        boxMax: simd_float3,
+        viewProjection: simd_float4x4,
+        clipGuardBand: Float = gaussianCullClipGuardBand
+    ) -> (passes: Bool, area: Float) {
+        let limit = max(0, 1 + clipGuardBand)
+        var outsideEveryCorner: UInt32 = 0x7F
+        var behind = false
+        var ndcMin = simd_float2(repeating: .infinity)
+        var ndcMax = simd_float2(repeating: -.infinity)
+        for i in 0 ..< 8 {
+            let corner = simd_float3(
+                (i & 1) != 0 ? boxMax.x : boxMin.x,
+                (i & 2) != 0 ? boxMax.y : boxMin.y,
+                (i & 4) != 0 ? boxMax.z : boxMin.z
+            )
+            let c = simd_mul(viewProjection, simd_float4(corner, 1))
+            var outside: UInt32 = 0
+            if c.w <= 0 { outside |= 0x01 }
+            if c.x < -c.w * limit { outside |= 0x02 }
+            if c.x > c.w * limit { outside |= 0x04 }
+            if c.y < -c.w * limit { outside |= 0x08 }
+            if c.y > c.w * limit { outside |= 0x10 }
+            if c.z < -c.w * clipGuardBand { outside |= 0x20 }
+            if c.z > c.w * limit { outside |= 0x40 }
+            outsideEveryCorner &= outside
+            if c.w > 0 {
+                let ndc = simd_float2(c.x, c.y) / c.w
+                ndcMin = simd_min(ndcMin, ndc)
+                ndcMax = simd_max(ndcMax, ndc)
+            } else {
+                behind = true
+            }
+        }
+        guard outsideEveryCorner == 0 else { return (false, 0) }
+        if behind { return (true, limit * limit) }
+        let lo = simd_clamp(ndcMin, simd_float2(repeating: -limit), simd_float2(repeating: limit))
+        let hi = simd_clamp(ndcMax, simd_float2(repeating: -limit), simd_float2(repeating: limit))
+        let extent = simd_max(hi - lo, simd_float2(repeating: 0)) * 0.5
+        return (true, extent.x * extent.y)
+    }
+
+    /// The screen area `gaussianChunkCull` writes for a chunk under `constants` (without the
+    /// HZB part): the larger of the areas of the views that keep its padded box (`viewCount`
+    /// 1 or 2), clamped to `gaussianScreenAreaMin ... (1 + guard band)²` — the minimum when no
+    /// view keeps it, as a `forceAllVisible` chunk gets — or `Float(splatCount)` when the
+    /// constants ask for uniform quotas.
+    static func chunkScreenArea(chunk: GaussianChunkDecodeConstants, constants: GaussianChunkCullConstants) -> Float {
+        if constants.uniformQuotas != 0 {
+            return Float(chunk.splatCount)
+        }
+        let box = paddedBox(
+            aabbMin: simd_float3(chunk.aabbMinX, chunk.aabbMinY, chunk.aabbMinZ),
+            aabbMax: simd_float3(chunk.aabbMaxX, chunk.aabbMaxY, chunk.aabbMaxZ),
+            logScaleMax: chunk.logScaleMax
+        )
+        let limit = max(0, 1 + constants.clipGuardBand)
+        var area: Float = 0
+        let view0 = screenArea(boxMin: box.min, boxMax: box.max, viewProjection: constants.viewProjection0, clipGuardBand: constants.clipGuardBand)
+        if view0.passes { area = max(area, view0.area) }
+        if constants.viewCount > 1 {
+            let view1 = screenArea(boxMin: box.min, boxMax: box.max, viewProjection: constants.viewProjection1, clipGuardBand: constants.clipGuardBand)
+            if view1.passes { area = max(area, view1.area) }
+        }
+        return min(max(area, gaussianScreenAreaMin), limit * limit)
+    }
+
+    // MARK: Density tiers and the histogram (GaussianChunkCull.metal, GaussianWorkingSetBudget.metal)
+
+    /// The histogram tier of a density (splats per view unit of area), from the float's own
+    /// exponent and significand exactly as the kernel takes it from `frexp` — never from a
+    /// logarithm, so CPU and GPU bin the same float identically: tier 2(e + 2) + 1 when the
+    /// significand is at least √2, else 2(e + 2), clamped to the 64 tiers.
+    static func densityTier(density: Float) -> Int {
+        guard density > 0 else { return 0 }
+        guard density.isFinite else { return gaussianDensityTierCount - 1 }
+        let exponent = Int(density.exponent)
+        let half = density.significand >= gaussianBudgetDensityTierRatio ? 1 : 0
+        let tier = gaussianDensityTiersPerOctave * (exponent - gaussianDensityTierLog2Floor) + half
+        return min(max(tier, 0), gaussianDensityTierCount - 1)
+    }
+
+    /// The lower density bound of tier `tier`: 2^(−2 + tier / 2), built as the kernel builds it
+    /// (√2 or 1 scaled by a power of two, bit-identical on both sides). Accepts the tier past the
+    /// last one, the density at which every chunk of the last tier is whole.
+    static func densityTierFloor(_ tier: Int) -> Float {
+        Float(sign: .plus, exponent: (tier >> 1) + gaussianDensityTierLog2Floor, significand: (tier & 1) != 0 ? gaussianBudgetDensityTierRatio : 1)
+    }
+
+    /// The histogram `gaussianChunkCull` accumulates for `chunks` (splat count and the real
+    /// screen area of each visible chunk): per tier the splats and Σ ceil(area × tier floor),
+    /// `visibleChunks` the count; the header fields are left at zero.
+    static func densityHistogram(chunks: [(splatCount: UInt32, screenArea: Float)]) -> GaussianBudgetDensityHistogram {
+        var tiers = [GaussianBudgetDensityTier](repeating: GaussianBudgetDensityTier(splats: 0, scaledArea: 0), count: gaussianDensityTierCount)
+        for chunk in chunks {
+            let tier = densityTier(density: Float(chunk.splatCount) / chunk.screenArea)
+            tiers[tier].splats &+= chunk.splatCount
+            tiers[tier].scaledArea &+= UInt32(ceil(chunk.screenArea * densityTierFloor(tier)))
+        }
+        var histogram = GaussianBudgetDensityHistogram()
+        histogram.setTiers(tiers)
+        histogram.visibleChunks = UInt32(chunks.count)
+        return histogram
+    }
+
+    /// The bounded grant G(d) = Σ_t min(splats_t, d × scaledArea_t / ρ_t): at least the sum
+    /// over the histogram's chunks of min(n, d × area) — the total the per-chunk rule grants
+    /// at cap `d` — since each tier's scaled area over-estimates its area; continuous and
+    /// non-decreasing in `d`. Summed in tier order in single precision, as the kernel sums it.
+    static func boundedGrant(histogram: GaussianBudgetDensityHistogram, density: Float) -> Float {
+        var total: Float = 0
+        for (tier, entry) in histogram.tierArray.enumerated() where entry.splats > 0 {
+            let area = Float(entry.scaledArea) / densityTierFloor(tier)
+            total += min(Float(entry.splats), density * area)
+        }
+        return total
+    }
+
+    /// The density at which every chunk of the histogram is whole: the floor of the tier past
+    /// the highest non-empty one; +inf when the histogram is empty.
+    static func fullDensity(histogram: GaussianBudgetDensityHistogram) -> Float {
+        guard let highest = histogram.tierArray.lastIndex(where: { $0.splats > 0 }) else { return .infinity }
+        return densityTierFloor(highest + 1)
+    }
+
+    /// The density a climb toward a fitting frame aims for and becomes whole at: the floor of
+    /// the tier above the densest tiers holding together at most `tailFraction` of the
+    /// histogram's splats (floor(tailFraction × request) splats), walked from the top — every
+    /// chunk outside that tail is whole there, and the tail's chunks, the smallest on screen,
+    /// become whole with the cap instead of setting its step; the full density when the tail
+    /// holds no whole tier, +inf when the histogram is empty.
+    static func climbDensity(histogram: GaussianBudgetDensityHistogram, tailFraction: Float = gaussianBudgetDensityClimbTailFraction) -> Float {
+        let tiers = histogram.tierArray
+        guard var tier = tiers.lastIndex(where: { $0.splats > 0 }) else { return .infinity }
+        let requested = tiers.reduce(UInt32(0)) { $0 &+ $1.splats }
+        let tail = UInt32(tailFraction * Float(requested))
+        var tailSplats: UInt32 = 0
+        while tier >= 0, tailSplats &+ tiers[tier].splats <= tail {
+            tailSplats &+= tiers[tier].splats
+            tier -= 1
+        }
+        return densityTierFloor(tier + 1)
+    }
+
+    /// The target density cap of a frame whose histogram sums to the request: +inf when the
+    /// request fits (`fits`) or is empty, 0 when nothing is granted, else the largest cap the
+    /// bisection on log2 finds with G(cap) ≤ `grant` — the lower endpoint of its last
+    /// interval, so the bound holds in the same float arithmetic.
+    static func densityCap(histogram: GaussianBudgetDensityHistogram, grant: UInt32, fits: Bool = false) -> Float {
+        let tiers = histogram.tierArray
+        let requested = tiers.reduce(UInt32(0)) { $0 &+ $1.splats }
+        if requested == 0 || fits { return .infinity }
+        if grant == 0 { return 0 }
+        let grantValue = Float(grant)
+        var lo = gaussianBudgetDensityBisectionLog2Floor
+        var hi = log2(fullDensity(histogram: histogram))
+        if boundedGrant(histogram: histogram, density: exp2(lo)) > grantValue { return 0 }
+        for _ in 0 ..< gaussianBudgetDensityBisectionSteps {
+            let mid = (lo + hi) * 0.5
+            if boundedGrant(histogram: histogram, density: exp2(mid)) <= grantValue {
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+        return exp2(lo)
+    }
+
+    /// The density cap applied after the hysteresis: the target when it is at or below the
+    /// previous frame's cap (a fall is taken at once; "whole", +inf, stays whole), else the
+    /// previous cap raised by at most max(`maxStepFraction` × previous, `minStepFraction` ×
+    /// the target — `climbDensity` when the target is +inf), never past the target, and +inf
+    /// once a climb toward a fitting frame reaches `climbDensity`. A previous cap of zero
+    /// climbs like any other (by the step, as the scale climbs from zero), so a chunked entity
+    /// that drew nothing beside a whole-buffer one that filled the set fades in rather than
+    /// pops when room appears. `takeTarget` (the first frame, a reset, the budget switched off,
+    /// no chunked request) takes the target, as does a previous cap that is not a number at or
+    /// above zero (a guard: the state never holds one).
+    static func smoothedDensityCap(
+        target: Float,
+        previous: Float,
+        climbDensity: Float,
+        takeTarget: Bool = false,
+        maxStepFraction: Float = gaussianBudgetMaxStepFraction,
+        minStepFraction: Float = gaussianBudgetDensityMinStepFraction
+    ) -> Float {
+        if takeTarget || !(previous >= 0) || target <= previous {
+            return target
+        }
+        let stepTarget = target.isInfinite ? climbDensity : target
+        let step = max(previous * maxStepFraction, minStepFraction * stepTarget)
+        var cap = min(previous + step, target)
+        if target.isInfinite, cap >= climbDensity {
+            cap = .infinity
+        }
+        return cap
+    }
+
+    /// Frames a rise of the density cap from `previous` to `target` takes through
+    /// `smoothedDensityCap` (with `climbDensity` standing in for an infinite target).
+    static func framesToReachDensity(target: Float, from previous: Float, climbDensity: Float? = nil) -> Int {
+        let climb = climbDensity ?? target
+        var cap = previous
+        var frames = 0
+        while cap < target, frames < 10000 {
+            cap = smoothedDensityCap(target: target, previous: cap, climbDensity: climb)
+            frames += 1
+        }
+        return frames
+    }
+
+    /// A visible chunk's quota under `densityCap`: its whole count when densityCap × screenArea
+    /// reaches it (+inf always does), else floor(densityCap × screenArea) — the one float product
+    /// the kernel computes.
+    static func quota(densityCap: Float, splatCount: UInt32, screenArea: Float) -> UInt32 {
+        let product = densityCap * screenArea
+        guard product < Float(splatCount) else { return splatCount }
+        return UInt32(max(0, floor(product)))
     }
 
     /// Visible if the padded box passes any of `viewProjections` (the frame's eyes; one in mono).
@@ -180,6 +448,33 @@ enum GaussianChunkCullMath {
     }
 }
 
+extension GaussianBudgetDensityHistogram {
+    /// The tiers as an array (the C array imports as a tuple).
+    var tierArray: [GaussianBudgetDensityTier] {
+        withUnsafeBytes(of: tiers) { Array($0.bindMemory(to: GaussianBudgetDensityTier.self)) }
+    }
+
+    /// One tier.
+    func tier(_ index: Int) -> GaussianBudgetDensityTier {
+        withUnsafeBytes(of: tiers) { $0.bindMemory(to: GaussianBudgetDensityTier.self)[index] }
+    }
+
+    /// Replaces the tiers with `values` (at most `gaussianDensityTierCount`; the rest stay).
+    mutating func setTiers(_ values: [GaussianBudgetDensityTier]) {
+        withUnsafeMutableBytes(of: &tiers) { bytes in
+            let tiers = bytes.bindMemory(to: GaussianBudgetDensityTier.self)
+            for (index, value) in values.prefix(tiers.count).enumerated() {
+                tiers[index] = value
+            }
+        }
+    }
+
+    /// The request the tiers hold: Σ splats.
+    var requestedSplats: UInt32 {
+        tierArray.reduce(UInt32(0)) { $0 &+ $1.splats }
+    }
+}
+
 /// The visible-chunk record with `visibleChunks` chunks holding `visibleSplats` splats counted as
 /// visible — a freshly loaded entity's state until its first chunk cull, with every chunk listed.
 func makeGaussianVisibleChunkSet(visibleChunks: UInt32, visibleSplats: UInt32) -> GaussianVisibleSet {
@@ -200,7 +495,7 @@ func makeGaussianVisibleChunkSet(visibleChunks: UInt32, visibleSplats: UInt32) -
 func allocateGaussianVisibleChunkBuffers(for table: GaussianChunkTable) -> GaussianChunkTable? {
     guard let device = renderInfo.device else { return nil }
     let entries: [GaussianVisibleChunk] = table.index.chunks.enumerated().map { index, chunk in
-        GaussianVisibleChunk(chunkIndex: UInt32(index), splatCount: chunk.splatCount, quota: chunk.splatCount, _pad0: 0)
+        GaussianVisibleChunk(chunkIndex: UInt32(index), splatCount: chunk.splatCount, quota: chunk.splatCount, screenArea: Float(chunk.splatCount))
     }
     let splatTotal = entries.reduce(UInt32(0)) { $0 &+ $1.splatCount }
     let listLength = max(1, entries.count) * MemoryLayout<GaussianVisibleChunk>.stride
@@ -308,13 +603,16 @@ func gaussianChunkCullViewProjections(
     return (headViewProjection, headViewProjection, 1)
 }
 
-/// The constants of one entity's chunk cull this frame.
+/// The constants of one entity's chunk cull this frame. `uniformQuotas` is the frame's
+/// `GaussianDebugOptions.disableScreenWeightedQuotas`, read once per frame by the caller so the
+/// cull and the scale kernel agree (the fused pass's rebuilt constants carry it and ignore it).
 func gaussianChunkCullConstants(
     chunkTable: GaussianChunkTable,
     modelMatrix: simd_float4x4,
     viewMatrix: simd_float4x4,
     hzbValid: Bool,
-    forceAllVisible: Bool = GaussianDebugOptions.shared.disableChunkCull
+    forceAllVisible: Bool = GaussianDebugOptions.shared.disableChunkCull,
+    uniformQuotas: Bool
 ) -> GaussianChunkCullConstants {
     let views = gaussianChunkCullViewProjections(modelMatrix: modelMatrix, viewMatrix: viewMatrix)
     var constants = GaussianChunkCullConstants()
@@ -329,12 +627,18 @@ func gaussianChunkCullConstants(
     constants.hzbReverseZ = renderInfo.reverseZEnabled ? 1 : 0
     constants.hzbMipCount = UInt32(max(0, renderInfo.hzbMipCount))
     constants.forceAllVisible = forceAllVisible ? 1 : 0
+    constants.uniformQuotas = uniformQuotas ? 1 : 0
     return constants
 }
 
+/// Byte offset of the histogram's visible-chunk counter, the word `gaussianFinalizeVisibleChunks`
+/// binds at `gaussianChunkCullDensityHistogramIndex`.
+let gaussianDensityHistogramVisibleChunksOffset = MemoryLayout<GaussianBudgetDensityHistogram>.offset(of: \.visibleChunks) ?? 524
+
 /// Encodes one entity's chunk cull for one in-flight slot on an open compute encoder: reset the
-/// record, one thread per chunk, finalize into indirect arguments and add the entity's visible
-/// splat total to `budgetState`'s request. Serial on the encoder, so the quota and fused
+/// record, one thread per chunk (binning every visible chunk into `densityHistogram`), finalize
+/// into indirect arguments and add the entity's visible splat total to `budgetState`'s request
+/// and its chunk count to the histogram. Serial on the encoder, so the quota and fused
 /// dispatches that follow see the final list. Returns the dispatch count.
 func encodeGaussianChunkCull(
     _ encoder: MTLComputeCommandEncoder,
@@ -343,6 +647,7 @@ func encodeGaussianChunkCull(
     visibleChunks: MTLBuffer,
     chunkSet: MTLBuffer,
     budgetState: MTLBuffer,
+    densityHistogram: MTLBuffer,
     constants: GaussianChunkCullConstants,
     hzbTexture: MTLTexture?
 ) -> Int {
@@ -360,6 +665,8 @@ func encodeGaussianChunkCull(
     // (visible chunks) at offset 4 — see GaussianVisibleSet.
     encoder.setBuffer(chunkSet, offset: 0, index: Int(gaussianChunkCullSplatTotalIndex.rawValue))
     encoder.setBuffer(chunkSet, offset: MemoryLayout<UInt32>.stride, index: Int(gaussianChunkCullChunkTotalIndex.rawValue))
+    // The histogram's tiers as atomic words: 2t the splats, 2t + 1 the scaled area.
+    encoder.setBuffer(densityHistogram, offset: 0, index: Int(gaussianChunkCullDensityHistogramIndex.rawValue))
     encoder.setTexture(hzbTexture, index: Int(gaussianChunkCullHZBDepthPyramidTextureIndex.rawValue))
     let tew = pipelines.cull.threadExecutionWidth
     let block = max(min(256, pipelines.cull.maxTotalThreadsPerThreadgroup) / tew * tew, tew)
@@ -368,41 +675,54 @@ func encodeGaussianChunkCull(
         threadsPerThreadgroup: MTLSizeMake(block, 1, 1)
     )
 
-    encoder.setComputePipelineState(pipelines.finalize)
-    encoder.setBuffer(chunkSet, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
-    encoder.setBuffer(budgetState, offset: 0, index: Int(gaussianChunkCullBudgetStateIndex.rawValue))
-    encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
+    encodeGaussianFinalizeVisibleChunks(encoder, pipelines: pipelines, chunkSet: chunkSet, budgetState: budgetState, densityHistogram: densityHistogram)
 
     return 3
 }
 
+/// The finalize of one entity's chunk record: indirect arguments, the request into `budgetState`
+/// and the visible chunk count into the histogram's counter (bound at its byte offset).
+private func encodeGaussianFinalizeVisibleChunks(
+    _ encoder: MTLComputeCommandEncoder,
+    pipelines: GaussianChunkCullPipelineStates,
+    chunkSet: MTLBuffer,
+    budgetState: MTLBuffer,
+    densityHistogram: MTLBuffer
+) {
+    encoder.setComputePipelineState(pipelines.finalize)
+    encoder.setBuffer(chunkSet, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
+    encoder.setBuffer(budgetState, offset: 0, index: Int(gaussianChunkCullBudgetStateIndex.rawValue))
+    encoder.setBuffer(densityHistogram, offset: gaussianDensityHistogramVisibleChunksOffset, index: Int(gaussianChunkCullDensityHistogramIndex.rawValue))
+    encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
+}
+
 /// Encodes an empty visible-chunk record for one entity — reset and finalize, no cull — so a
-/// hidden entity (opacityScale 0) lists no chunk, asks nothing of the budget and dispatches no
-/// threadgroup of the fused pass. Returns the dispatch count.
+/// hidden entity (opacityScale 0) lists no chunk, asks nothing of the budget, adds no chunk to
+/// the histogram and dispatches no threadgroup of the fused pass. Returns the dispatch count.
 func encodeGaussianEmptyChunkSet(
     _ encoder: MTLComputeCommandEncoder,
     pipelines: GaussianChunkCullPipelineStates,
     chunkSet: MTLBuffer,
-    budgetState: MTLBuffer
+    budgetState: MTLBuffer,
+    densityHistogram: MTLBuffer
 ) -> Int {
     encoder.setComputePipelineState(pipelines.reset)
     encoder.setBuffer(chunkSet, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
     encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
-    encoder.setComputePipelineState(pipelines.finalize)
-    encoder.setBuffer(chunkSet, offset: 0, index: Int(gaussianVisibleCountIndex.rawValue))
-    encoder.setBuffer(budgetState, offset: 0, index: Int(gaussianChunkCullBudgetStateIndex.rawValue))
-    encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
+    encodeGaussianFinalizeVisibleChunks(encoder, pipelines: pipelines, chunkSet: chunkSet, budgetState: budgetState, densityHistogram: densityHistogram)
     return 2
 }
 
 // MARK: - Budget and quotas
 
 /// The scale kernel's inputs for a frame whose shared set holds `budget` records.
-/// `resetHysteresis` makes the frame take its target as a first frame would.
+/// `resetHysteresis` makes the frame take its target as a first frame would; `uniformQuotas`
+/// is the frame's `disableScreenWeightedQuotas`, the value the chunk culls were given.
 func gaussianBudgetScaleConstants(
     budget: Int,
     forceUnitScale: Bool = GaussianDebugOptions.shared.disableWorkingSetBudget,
-    resetHysteresis: Bool = false
+    resetHysteresis: Bool = false,
+    uniformQuotas: Bool
 ) -> GaussianBudgetScaleConstants {
     var constants = GaussianBudgetScaleConstants()
     constants.budget = UInt32(max(0, min(budget, Int(UInt32.max))))
@@ -411,14 +731,21 @@ func gaussianBudgetScaleConstants(
     constants.maxStepFraction = gaussianBudgetMaxStepFraction
     constants.minStep = gaussianBudgetMinStep
     constants.resetHysteresis = resetHysteresis ? 1 : 0
+    constants.uniformQuotas = uniformQuotas ? 1 : 0
+    constants.densityMinStepFraction = gaussianBudgetDensityMinStepFraction
     return constants
 }
 
-/// Zeroes the frame's request, reservation and grant counters, before any entity's cull. One dispatch.
-func encodeGaussianBudgetReset(_ encoder: MTLComputeCommandEncoder, pipelines: GaussianChunkCullPipelineStates, budgetState: MTLBuffer) {
+/// One threadgroup of one thread per histogram tier: the shape of the budget reset and publish.
+private let gaussianDensityHistogramThreadgroup = MTLSizeMake(gaussianDensityTierCount, 1, 1)
+
+/// Zeroes the frame's request, reservation and grant counters and the density histogram, before
+/// any entity's cull. One dispatch of one threadgroup, a thread per tier.
+func encodeGaussianBudgetReset(_ encoder: MTLComputeCommandEncoder, pipelines: GaussianChunkCullPipelineStates, budgetState: MTLBuffer, densityHistogram: MTLBuffer) {
     encoder.setComputePipelineState(pipelines.resetBudget)
     encoder.setBuffer(budgetState, offset: 0, index: Int(gaussianBudgetStateIndex.rawValue))
-    encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
+    encoder.setBuffer(densityHistogram, offset: 0, index: Int(gaussianBudgetDensityHistogramIndex.rawValue))
+    encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: gaussianDensityHistogramThreadgroup)
 }
 
 /// Reserves one whole-buffer entity's visible count out of the frame's budget, after its
@@ -431,16 +758,18 @@ func encodeGaussianBudgetReserve(_ encoder: MTLComputeCommandEncoder, pipelines:
     encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
 }
 
-/// Turns the frame's request into its scale, after every entity's chunk cull. One dispatch.
-func encodeGaussianBudgetScale(_ encoder: MTLComputeCommandEncoder, pipelines: GaussianChunkCullPipelineStates, budgetState: MTLBuffer, constants: GaussianBudgetScaleConstants) {
+/// Turns the frame's request into its scale and, from the histogram, its density cap, after
+/// every entity's chunk cull. One dispatch.
+func encodeGaussianBudgetScale(_ encoder: MTLComputeCommandEncoder, pipelines: GaussianChunkCullPipelineStates, budgetState: MTLBuffer, densityHistogram: MTLBuffer, constants: GaussianBudgetScaleConstants) {
     var constants = constants
     encoder.setComputePipelineState(pipelines.budgetScale)
     encoder.setBuffer(budgetState, offset: 0, index: Int(gaussianBudgetStateIndex.rawValue))
     encoder.setBytes(&constants, length: MemoryLayout<GaussianBudgetScaleConstants>.stride, index: Int(gaussianBudgetScaleConstantsIndex.rawValue))
+    encoder.setBuffer(densityHistogram, offset: 0, index: Int(gaussianBudgetDensityHistogramIndex.rawValue))
     encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
 }
 
-/// Grants one entity's visible chunks their quotas at the frame's scale, after the scale
+/// Grants one entity's visible chunks their quotas at the frame's density cap, after the scale
 /// dispatch: one threadgroup striding over the visible-chunk list. One dispatch.
 func encodeGaussianChunkQuotas(
     _ encoder: MTLComputeCommandEncoder,
@@ -461,12 +790,22 @@ func encodeGaussianChunkQuotas(
     encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(threads, 1, 1))
 }
 
-/// Copies the frame's final budget state into `readback` for the CPU. One dispatch.
-func encodeGaussianBudgetPublish(_ encoder: MTLComputeCommandEncoder, pipelines: GaussianChunkCullPipelineStates, budgetState: MTLBuffer, readback: MTLBuffer) {
+/// Copies the frame's final budget state and density histogram into `readback` and
+/// `densityReadback` for the CPU. One dispatch of one threadgroup, a thread per tier.
+func encodeGaussianBudgetPublish(
+    _ encoder: MTLComputeCommandEncoder,
+    pipelines: GaussianChunkCullPipelineStates,
+    budgetState: MTLBuffer,
+    readback: MTLBuffer,
+    densityHistogram: MTLBuffer,
+    densityReadback: MTLBuffer
+) {
     encoder.setComputePipelineState(pipelines.publishBudget)
     encoder.setBuffer(budgetState, offset: 0, index: Int(gaussianBudgetStateIndex.rawValue))
     encoder.setBuffer(readback, offset: 0, index: Int(gaussianBudgetReadbackIndex.rawValue))
-    encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
+    encoder.setBuffer(densityHistogram, offset: 0, index: Int(gaussianBudgetDensityHistogramIndex.rawValue))
+    encoder.setBuffer(densityReadback, offset: 0, index: Int(gaussianBudgetDensityReadbackIndex.rawValue))
+    encoder.dispatchThreadgroups(MTLSizeMake(1, 1, 1), threadsPerThreadgroup: gaussianDensityHistogramThreadgroup)
 }
 
 // MARK: - Fused decode and preprocess
