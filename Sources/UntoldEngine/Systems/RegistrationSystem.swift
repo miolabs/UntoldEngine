@@ -3737,8 +3737,12 @@ struct GaussianLoadResult {
     /// The `.untoldgs` chunk table kept from the load (see `GaussianChunkTable`); nil for a
     /// `.ply` or a CPU-decoded asset.
     let chunkTable: GaussianChunkTable?
-    /// Sum of all GPU buffer bytes above, for `MemoryBudgetManager` registration. The frame's
-    /// shared working set is budgeted and has its own ledger entry, so no share of it is here.
+    /// The pager of a `.untoldgs` loaded above the paging threshold (`packedSplatBuffer` is its
+    /// page pool); nil when every record is resident.
+    var pager: GaussianPageManager?
+    /// Sum of all GPU buffer bytes above, for `MemoryBudgetManager` registration — a paged
+    /// entity's pool and tables, not its file. The frame's shared working set is budgeted and
+    /// has its own ledger entry, so no share of it is here.
     let estimatedGPUBytes: Int
     /// Local-space bounding box computed from the actual loaded splat positions, for
     /// `LocalTransformComponent.boundingBox` — see `computeGaussianSplatBoundingBox`.
@@ -3876,14 +3880,17 @@ func buildGaussianLoadResult(
 /// records and chunk table (`GaussianChunkLoader.load`): the per-slot visible-chunk list and
 /// record, so the frame can cull whole chunks and decode only the survivors' quotas
 /// (see GaussianChunkCull.swift). No encoded buffer and no per-slot index buffers exist on
-/// this path — per splat, only the 16-byte record and its harmonics stay resident.
+/// this path — per splat, only the 16-byte record and its harmonics stay resident; for a paged
+/// load (`pager`) the packed buffer is the page pool, so the estimate carries the pool and the
+/// per-slot tables, not the file.
 func buildGaussianLoadResult(
     packedSplatBuffer: MTLBuffer,
     splatCount: UInt,
     sphericalHarmonicsBuffer: MTLBuffer?,
     sphericalHarmonicsMetadata: GaussianSHMetadata?,
     boundingBox: (min: simd_float3, max: simd_float3),
-    chunkTable: GaussianChunkTable
+    chunkTable: GaussianChunkTable,
+    pager: GaussianPageManager? = nil
 ) -> GaussianLoadResult? {
     guard let allocated = allocateGaussianVisibleChunkBuffers(for: chunkTable) else {
         handleError(.bufferAllocationFailed, "Gaussian visible-chunk buffers are nil")
@@ -3903,6 +3910,7 @@ func buildGaussianLoadResult(
         sphericalHarmonicsBuffer: sphericalHarmonicsBuffer,
         sphericalHarmonicsMetadata: sphericalHarmonicsMetadata,
         chunkTable: allocated,
+        pager: pager,
         estimatedGPUBytes: estimatedGPUBytes,
         boundingBox: boundingBox
     )
@@ -3992,17 +4000,23 @@ func buildGaussianLoadResultFromPLY(url: URL, sourceDescription: String) throws 
 func buildGaussianLoadResultFromUntoldGS(url: URL) -> GaussianLoadResult? {
     if GaussianChunkLoader.isAvailable {
         do {
-            let loaded = try GaussianChunkLoader.load(url: url)
+            // Paging needs the per-chunk kernels: only a chunked entity can read a page pool.
+            let chunkKernels = GaussianChunkCullPipelineStates.current() != nil
+            let loaded = try GaussianChunkLoader.load(url: url, allowPaging: chunkKernels)
             var result: GaussianLoadResult?
-            if GaussianChunkCullPipelineStates.current() != nil {
+            if chunkKernels {
                 result = buildGaussianLoadResult(
                     packedSplatBuffer: loaded.packedSplatBuffer,
                     splatCount: UInt(loaded.splatCount),
                     sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
                     sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
                     boundingBox: loaded.boundingBox,
-                    chunkTable: loaded.chunkTable
+                    chunkTable: loaded.chunkTable,
+                    pager: loaded.pager
                 )
+                if result == nil {
+                    loaded.pager?.shutdown()
+                }
             } else {
                 // Expanded to 48-byte records plus index buffers: the whole-buffer path's cap.
                 guard loaded.splatCount <= GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity else {
@@ -4251,6 +4265,7 @@ func copyGaussianLoadResult(_ result: GaussianLoadResult, to gaussianComponent: 
     gaussianComponent.gaussianVisibleIndices = result.gaussianVisibleIndices.map { $0 as MTLBuffer? }
     gaussianComponent.gaussianVisibleCount = result.gaussianVisibleCount.map { $0 as MTLBuffer? }
     gaussianComponent.chunkTable = result.chunkTable
+    gaussianComponent.pager = result.pager
     gaussianComponent.encodedSplatData = result.encodedSplatBuffer
     gaussianComponent.packedSplatData = result.packedSplatBuffer
     gaussianComponent.sphericalHarmonicsData = result.sphericalHarmonicsBuffer
@@ -5158,6 +5173,11 @@ func removeEntityGaussianLOD(entityId: EntityID) {
 public func removeEntityGaussian(entityId: EntityID) {
     removeEntityGaussianLOD(entityId: entityId)
     if let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) {
+        // Stop the pager first: no read is issued after this, the ones in flight are dropped
+        // when they land, and the pools stay alive through the in-flight frames' command
+        // buffers and the requests themselves.
+        gaussianComponent.pager?.shutdown()
+        gaussianComponent.pager = nil
         // Release Metal buffers
         gaussianComponent.encodedSplatData = nil
         gaussianComponent.packedSplatData = nil
@@ -5180,6 +5200,13 @@ public func removeEntityGaussian(entityId: EntityID) {
         // for entities destroyed directly (e.g. a non-streamed setEntityGaussian caller).
         MemoryBudgetManager.shared.unregisterMesh(entityId: entityId)
     }
+}
+
+/// The paging state of a splat entity loaded above the paging threshold — the pool, what is
+/// resident, what is in flight, what was evicted and faulted — for the editor's inspector and
+/// the profile; nil for an entity whose records are all resident.
+public func gaussianPagingStats(entityId: EntityID) -> GaussianPagingStats? {
+    scene.get(component: GaussianComponent.self, for: entityId)?.pager?.stats
 }
 
 func removeEntityCamera(entityId: EntityID) {
