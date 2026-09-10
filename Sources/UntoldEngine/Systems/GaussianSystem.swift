@@ -273,11 +273,12 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     // budgeted). Whole-buffer entities append whatever their cull keeps and reserve that count
     // out of the budget first; chunked entities are fitted to the rest through per-chunk quotas
     // below, so the set never overflows.
+    // A paged entity counts its pool, not its file: no frame can draw more than the pool holds.
     var residentSplats = 0
     var wholeBufferSplats = 0
     for entityId in entities {
         guard let component = scene.get(component: GaussianComponent.self, for: entityId) else { continue }
-        residentSplats += Int(component.splatCount)
+        residentSplats += component.residentSplatCount
         if !component.isChunked {
             wholeBufferSplats += Int(component.splatCount)
         }
@@ -305,6 +306,7 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     let hzb = gaussianHZBInputs()
     // Read once per frame so the chunk culls and the scale kernel agree on the quota rule.
     let uniformQuotas = GaussianDebugOptions.shared.disableScreenWeightedQuotas
+    let pagingSwitches = GaussianPagingFrameSwitches()
 
     var chunkedEntities: [GaussianChunkedEntityFrame] = []
     var visibleCountUpdates: [GaussianVisibleCountUpdate] = []
@@ -344,12 +346,33 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
                 viewMatrix: matrices.viewMatrix,
                 hzbValid: hzb.valid,
                 forceAllVisible: gaussianComponent.opacityScale <= 0 ? false : GaussianDebugOptions.shared.disableChunkCull,
-                uniformQuotas: uniformQuotas
+                uniformQuotas: uniformQuotas,
+                paged: gaussianComponent.pager == nil ? 0 : 1
             )
+            // A hidden entity lists no chunk and its pager does not tick: no demand, no reads,
+            // its pages kept for when it reappears.
             if gaussianComponent.opacityScale <= 0 {
                 profileTotals.dispatchCount += encodeGaussianEmptyChunkSet(computeEncoder, pipelines: chunkPipelines, chunkSet: chunkSet, budgetState: budgetState, densityHistogram: densityHistogram)
                 gaussianComponent.visibleSplatCountForRendering = 0
                 continue
+            }
+            // A paged entity: the pager ticks before its cull is encoded — maps what landed,
+            // reads this slot's demand from the frame that last owned it (complete under the
+            // semaphore), issues reads, and brings this slot's residency and page tables up to
+            // date — then the cull binds them. Nothing is encoded by the tick.
+            var pagerBindings: GaussianPagerBindings?
+            if let pager = gaussianComponent.pager {
+                pagerBindings = pager.tick(slot: frameSlot, frame: GaussianPagerFrameInputs(
+                    cullConstants: chunkConstants,
+                    budgetState: workingSet.lastBudgetState,
+                    budget: budget,
+                    uniformQuotas: uniformQuotas,
+                    disableWorkingSetBudget: pagingSwitches.disableWorkingSetBudget,
+                    freeze: pagingSwitches.freeze,
+                    frameIndex: renderInfo.frameIndex,
+                    fadeFrames: pagingSwitches.fadeFrames,
+                    debugMode: pagingSwitches.debugMode
+                ))
             }
             profileTotals.dispatchCount += encodeGaussianChunkCull(
                 computeEncoder,
@@ -360,9 +383,54 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
                 budgetState: budgetState,
                 densityHistogram: densityHistogram,
                 constants: chunkConstants,
-                hzbTexture: hzb.texture
+                hzbTexture: hzb.texture,
+                residency: pagerBindings?.residency,
+                demand: pagerBindings?.demand
             )
             chunkedEntities.append(GaussianChunkedEntityFrame(chunkTable: chunkTable, visibleChunks: visibleChunks, chunkSet: chunkSet))
+            // The paged tiers the LOD system is about to switch to warm beside the live entity:
+            // a demand-only cull of each (its own chunk table, the live entity's views) and a
+            // full tick of its pager, which issues the tier's reads like the live entity's so
+            // the tier fills before the switch — nothing listed, nothing added to the budget;
+            // of the bindings the tick returns only the demand table is bound, to that cull.
+            if let lod = scene.get(component: GaussianLODComponent.self, for: entityId) {
+                for level in lod.lodLevels {
+                    guard let tier = level.buffers, let tierPager = tier.pager, tierPager !== gaussianComponent.pager, tierPager.warming,
+                          let tierTable = tier.chunkTable, frameSlot < tierTable.visibleChunks.count
+                    else { continue }
+                    let tierConstants = gaussianChunkCullConstants(
+                        chunkTable: tierTable,
+                        modelMatrix: matrices.modelMatrix,
+                        viewMatrix: matrices.viewMatrix,
+                        hzbValid: hzb.valid,
+                        forceAllVisible: false,
+                        uniformQuotas: uniformQuotas,
+                        paged: 2
+                    )
+                    let tierBindings = tierPager.tick(slot: frameSlot, frame: GaussianPagerFrameInputs(
+                        cullConstants: tierConstants,
+                        budgetState: workingSet.lastBudgetState,
+                        budget: budget,
+                        uniformQuotas: uniformQuotas,
+                        disableWorkingSetBudget: pagingSwitches.disableWorkingSetBudget,
+                        freeze: pagingSwitches.freeze,
+                        frameIndex: renderInfo.frameIndex,
+                        fadeFrames: pagingSwitches.fadeFrames,
+                        debugMode: pagingSwitches.debugMode
+                    ))
+                    profileTotals.dispatchCount += encodeGaussianChunkDemand(
+                        computeEncoder,
+                        pipelines: chunkPipelines,
+                        chunkTable: tierTable,
+                        visibleChunks: tierTable.visibleChunks[frameSlot],
+                        chunkSet: tierTable.visibleChunkSets[frameSlot],
+                        densityHistogram: densityHistogram,
+                        demand: tierBindings.demand,
+                        constants: tierConstants,
+                        hzbTexture: hzb.texture
+                    )
+                }
+            }
             // The record's first word is the quota sum once the quotas are in: an upper bound on
             // what the fused pass appends for this entity.
             visibleCountUpdates.append(
@@ -529,8 +597,24 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         stage: "FrustumCull",
         startTime: profileStart,
         totals: profileTotals,
-        extra: "previousActiveSplats=\(activeSplatTotal) budget=\(budget) capacity=\(capacity) resident=\(residentSplats) wholeBuffer=\(wholeBufferSplats) chunkedEntities=\(chunkedEntities.count)"
+        extra: "previousActiveSplats=\(activeSplatTotal) budget=\(budget) capacity=\(capacity) resident=\(residentSplats) wholeBuffer=\(wholeBufferSplats) chunkedEntities=\(chunkedEntities.count)\(profileTotals.pagingSummary)"
     )
+}
+
+/// The paging switches of one frame, read once so every entity's tick agrees.
+private struct GaussianPagingFrameSwitches {
+    let disableWorkingSetBudget: Bool
+    let freeze: Bool
+    let fadeFrames: UInt32
+    let debugMode: UInt32
+
+    init() {
+        let options = GaussianDebugOptions.shared
+        disableWorkingSetBudget = options.disableWorkingSetBudget
+        freeze = options.freezePaging
+        fadeFrames = options.disablePageFade ? 0 : GaussianPagingPolicy.fadeFrames
+        debugMode = options.residencyDebugTint ? 1 : 0
+    }
 }
 
 /// The real-world lighting estimate's colour, for splat entities that opt in through
@@ -696,7 +780,9 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
             }
             // Same frame, same matrices as the chunk cull: the per-splat test inside the fused
             // pass uses the eye view-projections (either eye in stereo) and the HZB the chunk
-            // stage used, and the projection the head-centre uniforms above.
+            // stage used, and the projection the head-centre uniforms above. A paged entity
+            // reads the pool through this slot's page table as the tick left it.
+            let pagerBindings = gaussianComponent.pager?.bindings(slot: frameSlot)
             let inputs = GaussianChunkPreprocessInputs(
                 packedSplats: packedSplats,
                 chunkTable: chunkTable,
@@ -707,14 +793,18 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
                     modelMatrix: matrices.modelMatrix,
                     viewMatrix: matrices.viewMatrix,
                     hzbValid: hzb.valid,
-                    uniformQuotas: uniformQuotas
+                    uniformQuotas: uniformQuotas,
+                    paged: pagerBindings == nil ? 0 : 1
                 ),
                 viewport: viewport,
                 sphericalHarmonics: gaussianComponent.sphericalHarmonicsData,
                 shMetadata: shMetadata,
                 localCameraPosition: localCameraPosition,
                 entityConstants: entityConstants,
-                hzbTexture: hzb.texture
+                hzbTexture: hzb.texture,
+                residency: pagerBindings?.residency,
+                pageTable: pagerBindings?.pageTable,
+                pagingConstants: pagerBindings?.constants ?? GaussianChunkPagingConstants()
             )
             encodeGaussianChunkDecodePreprocess(
                 computeEncoder,

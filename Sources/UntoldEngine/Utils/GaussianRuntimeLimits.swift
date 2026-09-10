@@ -3,9 +3,11 @@
 //  UntoldEngine
 //
 //  Size limits of the Gaussian splat runtime. A `.untoldgs` splat keeps its 16-byte core record
-//  and its spherical harmonics resident on the GPU and nothing else per splat — the frame's
-//  working set (records, keys) is shared by every entity and sized to a budget, not to the
-//  resident total — so the per-entity cap is a memory guard per platform, not a format limit.
+//  and its spherical harmonics resident on the GPU and nothing else per splat — or, above the
+//  paging threshold (`GaussianPagingPolicy`), only what fits a bounded page pool the frames
+//  fill on demand — the frame's working set (records, keys) is shared by every entity and sized
+//  to a budget, not to the resident total — so the per-entity cap is a memory guard per
+//  platform, not a format limit.
 //  A `.ply` (or a `.untoldgs` decoded on the CPU, or expanded at load because the per-chunk
 //  kernels are unavailable) keeps the 48-byte encoded record and a visible index per frame in
 //  flight instead, about 60 bytes per splat plus harmonics, so that whole-buffer path has its

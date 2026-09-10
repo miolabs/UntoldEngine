@@ -117,6 +117,10 @@ public class GaussianComponent: Component {
     /// the load so the frame can cull whole chunks before it looks at their splats. nil for a
     /// `.ply` or a CPU-decoded asset, which keep the per-splat cull over the whole buffer.
     var chunkTable: GaussianChunkTable?
+    /// The pager of a `.untoldgs` loaded above the paging threshold: `packedSplatData` is then
+    /// its page pool and the pager fills it from the cull's demand every frame. nil when every
+    /// record is resident. Shut down with the entity (`removeEntityGaussian`).
+    var pager: GaussianPageManager?
 
     /// Whether the entity holds splat data on the GPU, on either path.
     var hasResidentSplats: Bool {
@@ -127,6 +131,18 @@ public class GaussianComponent: Component {
     /// pass) rather than culling its encoded buffer whole.
     var isChunked: Bool {
         chunkTable != nil && packedSplatData != nil
+    }
+
+    /// Whether the records live in a page pool.
+    var isPaged: Bool {
+        pager != nil
+    }
+
+    /// The most splats the frame can ever draw of this entity: the pool's records for a paged
+    /// entity, the whole asset otherwise — what the working set is sized against.
+    var residentSplatCount: Int {
+        guard let pager else { return Int(splatCount) }
+        return min(Int(splatCount), pager.slotCount * pager.ranksPerPage)
     }
 
     /// Multiplier on every splat's opacity this frame: 1 draws the asset as captured, 0 hides
@@ -719,6 +735,7 @@ public class GaussianLODComponent: Component {
         for index in lodLevels.indices {
             lodLevels[index].loadTask?.cancel()
             lodLevels[index].loadTask = nil
+            lodLevels[index].buffers?.pager?.shutdown()
             lodLevels[index].buffers = nil
             lodLevels[index].residencyState = .notResident
         }

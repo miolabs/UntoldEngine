@@ -306,6 +306,9 @@ extension GeometryStreamingSystem {
 /// visible-chunk lists, and a whole-buffer entity's per-slot index buffers. The frame's shared
 /// working set is budgeted and carried by its own ledger entry
 /// (`MemoryBudgetManager.setGaussianWorkingSetBytes`), so no share of it is counted here.
+/// The GPU bytes a tier holds: its buffers and its chunk table — for a paged tier the page
+/// pool and the per-slot tables, never the file (`removeEntityGaussian` frees the pool with the
+/// entity through `GaussianPageManager.shutdown`).
 private func gaussianComponentEstimatedBytes(_ component: GaussianComponent) -> Int {
     var total = 0
     total += component.encodedSplatData?.length ?? 0

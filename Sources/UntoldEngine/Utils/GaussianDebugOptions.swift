@@ -26,6 +26,10 @@ public final class GaussianDebugOptions: @unchecked Sendable {
     private var _disableChunkCull = false
     private var _disableWorkingSetBudget = false
     private var _disableScreenWeightedQuotas = false
+    private var _disablePaging = false
+    private var _freezePaging = false
+    private var _disablePageFade = false
+    private var _residencyDebugTint = false
 
     /// Skips the per-splat test against the previous frame's HZB depth pyramid in
     /// `gaussianFrustumCull`. The frustum test still runs.
@@ -87,6 +91,36 @@ public final class GaussianDebugOptions: @unchecked Sendable {
     public var disableScreenWeightedQuotas: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _disableScreenWeightedQuotas }
         set { lock.lock(); _disableScreenWeightedQuotas = newValue; lock.unlock() }
+    }
+
+    /// Loads every `.untoldgs` whole-resident whatever its size, so no entity pages (takes
+    /// effect at the next load): the pre-paging behaviour, for an A/B of what the pool costs and
+    /// what its fill-in shows.
+    public var disablePaging: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _disablePaging }
+        set { lock.lock(); _disablePaging = newValue; lock.unlock() }
+    }
+
+    /// Holds every paged entity's resident set as it is: no read is issued, nothing is evicted
+    /// (reads already in flight still land). With the fade complete the image is then a
+    /// function of the camera alone — the determinism and bisecting switch.
+    public var freezePaging: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _freezePaging }
+        set { lock.lock(); _freezePaging = newValue; lock.unlock() }
+    }
+
+    /// Shows an arriving tier at once instead of fading it in over
+    /// `GaussianPagingPolicy.fadeFrames` frames (tests, the twin comparison).
+    public var disablePageFade: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _disablePageFade }
+        set { lock.lock(); _disablePageFade = newValue; lock.unlock() }
+    }
+
+    /// Tints every splat of a paged entity by its chunk's resident fraction — green whole,
+    /// yellow deep, red head-only — for the editor.
+    public var residencyDebugTint: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _residencyDebugTint }
+        set { lock.lock(); _residencyDebugTint = newValue; lock.unlock() }
     }
 
     /// The per-draw constants the splat fragment shader reads (see `GaussianTBDRDrawDebug`).

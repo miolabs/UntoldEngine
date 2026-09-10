@@ -178,9 +178,28 @@ public class GaussianLODSystem: @unchecked Sendable {
               let source = lodComponent.lodLevels[newLOD].buffers
         else { return }
 
+        // Only the tier being switched to warms: a tier the selection targeted earlier and
+        // left (the hysteresis picked the current one again, the overdraw clamp held it back)
+        // stops, or its demand-only cull, its tick and its reads would go on every frame for
+        // the life of the entity.
+        for level in lodComponent.lodLevels {
+            if let pager = level.buffers?.pager, pager !== source.pager, pager.warming {
+                pager.warming = false
+            }
+        }
+
         if newLOD == lodComponent.currentLOD, scene.get(component: GaussianComponent.self, for: entityId) != nil {
             return
         }
+
+        // A paged tier switches in only once its pool holds most of what the frame wants:
+        // until then it warms — the frame culls its demand beside the current tier's and the
+        // pager fills it — while the current tier keeps drawing. Re-evaluated every update.
+        if let pager = source.pager, !pager.isWarm {
+            pager.warming = true
+            return
+        }
+        source.pager?.warming = false
 
         withWorldMutationGate {
             // Reuse the entity's existing GaussianComponent if it already has one — scene.assign
@@ -278,6 +297,7 @@ func copyGaussianComponentBuffers(from source: GaussianComponent, to destination
     destination.gaussianVisibleIndices = source.gaussianVisibleIndices
     destination.gaussianVisibleCount = source.gaussianVisibleCount
     destination.chunkTable = source.chunkTable
+    destination.pager = source.pager
     destination.encodedSplatData = source.encodedSplatData
     destination.packedSplatData = source.packedSplatData
     destination.sphericalHarmonicsData = source.sphericalHarmonicsData
