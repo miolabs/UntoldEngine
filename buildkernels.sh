@@ -8,15 +8,19 @@
 
 set -e
 
-MACOS_MIN=14.0
-IOS_MIN=17.0
-TVOS_MIN=17.0
-XROS_MIN=2.0
+# Earlier versions of this script left .air intermediates in the kernels directory, which
+# SwiftPM flags as unhandled files; clear any stale ones from an existing checkout first.
+rm -f Sources/UntoldEngine/UntoldEngineKernels/*.air
 
 cd Sources/UntoldEngine/UntoldEngineKernels
 
 # .air files are compiler intermediates that embed this machine's paths; keep them out of the package tree.
 airDir="${TMPDIR:-/tmp}"
+
+MACOS_MIN=14.0
+IOS_MIN=17.0
+TVOS_MIN=17.0
+XROS_MIN=2.0
 
 # mac (device)
 xcrun -sdk macosx metal -mmacosx-version-min=$MACOS_MIN UntoldEngineKernels.metal -c -o "$airDir/UntoldEngineKernels.air"
