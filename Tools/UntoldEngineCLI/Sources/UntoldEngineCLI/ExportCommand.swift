@@ -98,6 +98,12 @@ struct ExportCommand: ParsableCommand {
     @Option(name: .customLong("splat-chunk-splats"), help: "Gaussian .ply export only: splats per chunk, a power of two between 2 and 16384 (1024 for objects, 4096 for environments)")
     var splatChunkSplats: Int = 1024
 
+    @Option(name: .customLong("splat-coarse-levels"), help: "Gaussian .ply export only: per-chunk coarse levels baked into the file: auto (the --splat-coarse-ratio-log2 levels for tiers of at least \(UntoldGSFormat.coarseLevelsAutomaticMinimumChunks) chunks, none below), 0 (never), 1 or 2 (always)")
+    var splatCoarseLevels: String = "auto"
+
+    @Option(name: .customLong("splat-coarse-ratio-log2"), help: "Gaussian .ply export only: log2 of the merge ratio per coarse level, comma-separated and strictly increasing, each 1...log2(--splat-chunk-splats); level L holds one merged splat per 2^ratio fine splats of a chunk")
+    var splatCoarseRatioLog2: String = "3,6"
+
     @Option(name: .customLong("splat-sh-degree"), help: "Gaussian .ply export only: spherical-harmonics degree to keep, 0...3 (default: the source degree)")
     var splatSHDegree: Int?
 
@@ -310,6 +316,7 @@ struct ExportCommand: ParsableCommand {
         // across source captures), not something to copy anywhere.
         for tier in bakeResult.tiers {
             printSuccess("Exported: \(tier.url.path) (meanSquaredSplatExtent: \(tier.meanSquaredSplatExtent))")
+            printInfo("  " + coarseLevelSummary(tier.coarseReport))
         }
 
         // boundingBoxHalfExtent is NOT baked into the files (the engine can auto-compute it for
@@ -318,6 +325,23 @@ struct ExportCommand: ParsableCommand {
         // for the streaming path, which requires a real box before any tier is ever read.
         let halfExtent = (bakeResult.boundingBoxMax - bakeResult.boundingBoxMin) * 0.5
         printInfo("boundingBoxHalfExtent: (\(halfExtent.x), \(halfExtent.y), \(halfExtent.z))")
+    }
+
+    /// `coarse levels: 2 (128 + 16 per 1024-chunk), 2,812,608 records, 45.0 MB`, or `none`.
+    private func coarseLevelSummary(_ report: UntoldGSCoarseLevelReport?) -> String {
+        guard let report else { return "coarse levels: none" }
+        let perChunk = report.recordsPerFullChunk(splatsPerChunk: splatChunkSplats).map(String.init).joined(separator: " + ")
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        let records = formatter.string(from: NSNumber(value: report.recordCount)) ?? "\(report.recordCount)"
+        let size = report.bytes >= 1_000_000
+            ? String(format: "%.1f MB", Double(report.bytes) / 1_000_000)
+            : String(format: "%.1f KB", Double(report.bytes) / 1000)
+        var summary = "coarse levels: \(report.levelCount) (\(perChunk) per \(splatChunkSplats)-chunk), \(records) records, \(size)"
+        if report.chunksWithoutLevels > 0 {
+            summary += ", \(report.chunksWithoutLevels) chunks too small for a level"
+        }
+        return summary
     }
 
     // MARK: - Gaussian cooking flags
@@ -346,6 +370,7 @@ struct ExportCommand: ParsableCommand {
         options.cropMargin = splatCropMargin
         options.isEnvironment = splatEnvironment
         options.antialiased = splatAntialiased
+        options.coarseLevels = try parseCoarseLevels(log2ChunkSplats: options.log2ChunkSplats)
         if let splatCrop {
             let values = try parseFloats(splatCrop, count: 6, option: "--splat-crop")
             options.cropMin = SIMD3<Float>(values[0], values[1], values[2])
@@ -367,6 +392,49 @@ struct ExportCommand: ParsableCommand {
             translation: translation
         )
         return options
+    }
+
+    /// `--splat-coarse-levels auto|0|1|2` with `--splat-coarse-ratio-log2 a,b`: the ratios are
+    /// checked here (strictly increasing, 1…log2 of the chunk size, one per level) so a bad flag
+    /// fails before the PLY is read.
+    private func parseCoarseLevels(log2ChunkSplats: UInt8) throws -> UntoldGSCoarseLevelPolicy {
+        let ratioText = splatCoarseRatioLog2.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let ratios = ratioText.map { Int($0) }
+        guard !ratios.isEmpty, ratios.count <= UntoldGSFormat.maxCoarseLevels, !ratios.contains(nil) else {
+            throw ExportError.invalidSplatFlag("--splat-coarse-ratio-log2 expects one or two comma-separated integers")
+        }
+        let ratioValues = ratios.compactMap(\.self)
+        let levels = splatCoarseLevels.trimmingCharacters(in: .whitespaces).lowercased()
+        // Under `auto` the writer clamps the ratios to the chunk size (a 16-splat chunk cannot
+        // hold a 1 : 64 level); asked for explicitly they must fit.
+        let maximumRatio = levels == "auto" ? Int(UntoldGSFormat.maxLog2ChunkSplats) : Int(log2ChunkSplats)
+        var previous = 0
+        for ratio in ratioValues {
+            guard ratio > previous, ratio <= maximumRatio else {
+                throw ExportError.invalidSplatFlag("--splat-coarse-ratio-log2 must increase strictly within 1...\(maximumRatio) (log2 of --splat-chunk-splats)")
+            }
+            previous = ratio
+        }
+
+        func levelOptions(count: Int) throws -> UntoldGSCoarseLevelOptions {
+            guard ratioValues.count >= count else {
+                throw ExportError.invalidSplatFlag("--splat-coarse-ratio-log2 needs \(count) values for \(count) coarse levels")
+            }
+            var options = UntoldGSCoarseLevelOptions.default
+            options.levelCount = count
+            options.ratioLog2 = ratioValues.prefix(count).map { UInt8($0) }
+            return options
+        }
+        switch levels {
+        case "auto":
+            return try .automatic(template: levelOptions(count: min(ratioValues.count, UntoldGSFormat.maxCoarseLevels)))
+        case "0":
+            return .off
+        case "1", "2":
+            return try .levels(levelOptions(count: Int(levels) ?? 1))
+        default:
+            throw ExportError.invalidSplatFlag("--splat-coarse-levels must be auto, 0, 1 or 2")
+        }
     }
 
     private func parseFloats(_ text: String, count: Int, option: String) throws -> [Float] {

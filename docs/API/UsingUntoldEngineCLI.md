@@ -243,6 +243,17 @@ sets the chunk size (1024 for objects, 4096 with `--splat-environment` for rooms
 larger). Values that start with a minus sign must use the `--option=value` form. The
 command prints how many splats were kept and pruned per reason.
 
+`--splat-coarse-levels auto|0|1|2` (default `auto`) bakes per-chunk coarse levels into the
+file — one or two importance-sorted merged versions of every chunk (a merged splat per 8 and
+per 64 fine splats at the default `--splat-coarse-ratio-log2 3,6`), which a runtime can draw in
+place of a far or not-yet-loaded chunk. `auto` bakes the levels for tiers of at least 64 chunks
+and nothing below (small assets bake byte-identically to a file without the section); `0` never,
+`1` and `2` always. The ratios must increase strictly and lie within 1…log2 of
+`--splat-chunk-splats`; `4,7` halves the section's size. Two levels at the defaults add about
+14 % to the records of a 1024-splat-chunk file. The command prints, per tier, `coarse levels: 2
+(128 + 16 per 1024-chunk), 2,812,608 records, 45.0 MB` (or `none`). A runtime that predates the
+section ignores it and draws the fine records.
+
 `--splat-max-count N` keeps at most N splats, dropping the least important first (opacity
 times the geometric mean of the scales). The runtime refuses to load an entity above its
 per-platform cap — 20,000,000 splats on Apple Vision Pro, iPhone, iPad and Apple TV,

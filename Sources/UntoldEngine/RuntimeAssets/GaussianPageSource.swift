@@ -75,7 +75,8 @@ public protocol GaussianPageSource: AnyObject, Sendable {
 /// The file source: `pread` on a descriptor opened at load and kept for the life of the
 /// entity, so an atomic replace (a rename over the file) keeps the old inode readable until
 /// a read fails or `reopen()` runs. Validated at open exactly as `UntoldGSFile` validates:
-/// header, size against `header.fileSize`, prefix and index through `UntoldGSFormat.readIndex`.
+/// header, size against `header.fileSize`, prefix, coarse index and index through
+/// `UntoldGSFormat.readIndex`.
 public final class UntoldGSFilePageSource: GaussianPageSource, @unchecked Sendable {
     public let url: URL
     public let index: UntoldGSIndex
@@ -128,9 +129,13 @@ public final class UntoldGSFilePageSource: GaussianPageSource, @unchecked Sendab
         guard identity.fileSize == header.fileSize else {
             throw UntoldGSError.sizeMismatch("file has \(identity.fileSize) bytes, header declares \(header.fileSize)")
         }
-        var prefix = [UInt8](repeating: 0, count: UntoldGSIndex.prefixSize(header: header))
-        try readFully(descriptor: descriptor, offset: 0, into: &prefix)
-        let index = try UntoldGSFormat.readIndex(from: Data(prefix))
+        // The prefix through the tree and, when the file carries coarse levels, the coarse index
+        // after the fine payloads: two bounded reads, never a payload.
+        let index = try UntoldGSFormat.readIndex(header: header) { offset, count in
+            var bytes = [UInt8](repeating: 0, count: count)
+            try readFully(descriptor: descriptor, offset: offset, into: &bytes)
+            return Data(bytes)
+        }
         succeeded = true
         return (descriptor, identity, index)
     }

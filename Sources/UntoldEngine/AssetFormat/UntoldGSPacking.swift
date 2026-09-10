@@ -328,6 +328,31 @@ public enum UntoldGSPacking {
     }
 }
 
+/// The sRGB transfer curve the shaders apply to the stored display-referred colour
+/// (`gaussianSRGBToLinear` in `Gaussians.metal`), mirrored so the coarsener averages colours in
+/// linear space and maps the mean back once.
+public enum UntoldGSColor {
+    /// Display-referred (sRGB-encoded) → linear, per channel; negative input clamps to 0.
+    public static func linear(fromDisplay color: SIMD3<Float>) -> SIMD3<Float> {
+        SIMD3<Float>(linear(fromDisplay: color.x), linear(fromDisplay: color.y), linear(fromDisplay: color.z))
+    }
+
+    public static func linear(fromDisplay value: Float) -> Float {
+        let c = max(value, 0)
+        return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+    }
+
+    /// Linear → display-referred (sRGB-encoded), per channel; the inverse of `linear(fromDisplay:)`.
+    public static func display(fromLinear color: SIMD3<Float>) -> SIMD3<Float> {
+        SIMD3<Float>(display(fromLinear: color.x), display(fromLinear: color.y), display(fromLinear: color.z))
+    }
+
+    public static func display(fromLinear value: Float) -> Float {
+        let l = max(value, 0)
+        return l <= 0.003_130_8 ? l * 12.92 : 1.055 * pow(l, 1 / 2.4) - 0.055
+    }
+}
+
 /// CRC-32 (IEEE 802.3, reflected, polynomial 0xEDB88320) for per-chunk integrity. Slicing by
 /// eight: eight bytes of input per step through eight 256-entry tables, about five times the
 /// byte-wise loop's throughput, with the same value; `update` streams the checksum over a

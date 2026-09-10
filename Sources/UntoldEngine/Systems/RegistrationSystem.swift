@@ -4810,7 +4810,9 @@ private func nearestSelectedBucketDistanceSquared(
 }
 
 /// Write options shared by every tier of one bake: the source SH degree, the asset-level
-/// bounding box (so it stays stable across LOD switches) and this tier's overdraw statistic.
+/// bounding box (so it stays stable across LOD switches), this tier's overdraw statistic and the
+/// coarse-level policy (resolved per tier by the writer, so each `_lodN` file decides on its own
+/// chunk count).
 private func gaussianTierWriteOptions(
     asset: GaussianSplatAsset,
     boundingBox: (min: simd_float3, max: simd_float3),
@@ -4831,10 +4833,17 @@ private func gaussianTierWriteOptions(
 }
 
 /// One baked `.untoldgs` tier plus the bake-time statistic needed for overdraw estimation —
-/// see `estimatedGaussianOverdraw`.
+/// see `estimatedGaussianOverdraw` — and the per-chunk coarse section it carries, if any.
 public struct GaussianLODTier {
     public let url: URL
     public let meanSquaredSplatExtent: Float
+    public let coarseReport: UntoldGSCoarseLevelReport?
+
+    public init(url: URL, meanSquaredSplatExtent: Float, coarseReport: UntoldGSCoarseLevelReport? = nil) {
+        self.url = url
+        self.meanSquaredSplatExtent = meanSquaredSplatExtent
+        self.coarseReport = coarseReport
+    }
 }
 
 /// Result of `bakeGaussianSplatProgressiveTiers`: the baked tiers plus a single asset-level
@@ -4889,13 +4898,13 @@ public func bakeGaussianSplatProgressiveTiers(
         let resultURL = outputBaseURL
         let allIndices = Array(asset.splats.indices)
         let tierExtent = meanSquaredSplatExtent(asset.splats, keeping: allIndices)
-        try UntoldGSFormat.write(
+        let written = try UntoldGSFormat.writeReporting(
             splats: makeUntoldGSSplats(asset: asset, keeping: allIndices),
             options: gaussianTierWriteOptions(asset: asset, boundingBox: assetBoundingBox, meanSquaredSplatExtent: tierExtent, cookOptions: cookOptions),
             to: resultURL
         )
         return GaussianProgressiveBakeResult(
-            tiers: [GaussianLODTier(url: resultURL, meanSquaredSplatExtent: tierExtent)],
+            tiers: [GaussianLODTier(url: resultURL, meanSquaredSplatExtent: tierExtent, coarseReport: written.coarse)],
             boundingBoxMin: assetBoundingBox.min,
             boundingBoxMax: assetBoundingBox.max,
             cookReport: cooked.report
@@ -4917,12 +4926,12 @@ public func bakeGaussianSplatProgressiveTiers(
             .appendingPathComponent("\(baseName)_lod\(tierIndex)")
             .appendingPathExtension("untoldgs")
         let tierExtent = meanSquaredSplatExtent(asset.splats, keeping: keptIndices)
-        try UntoldGSFormat.write(
+        let written = try UntoldGSFormat.writeReporting(
             splats: makeUntoldGSSplats(asset: asset, keeping: keptIndices),
             options: gaussianTierWriteOptions(asset: asset, boundingBox: assetBoundingBox, meanSquaredSplatExtent: tierExtent, cookOptions: cookOptions),
             to: tierURL
         )
-        tiers.append(GaussianLODTier(url: tierURL, meanSquaredSplatExtent: tierExtent))
+        tiers.append(GaussianLODTier(url: tierURL, meanSquaredSplatExtent: tierExtent, coarseReport: written.coarse))
     }
     return GaussianProgressiveBakeResult(
         tiers: tiers,

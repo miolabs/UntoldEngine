@@ -75,6 +75,10 @@ public struct UntoldGSCookOptions: Sendable {
     public var isEnvironment = false
     public var captureExposureEV: Float = 0
     public var captureWhiteBalance = SIMD3<Float>(repeating: 1)
+    /// Per-chunk coarse levels: `.automatic` bakes two levels when the tier has at least
+    /// `UntoldGSFormat.coarseLevelsAutomaticMinimumChunks` (64) chunks, `.off` never,
+    /// `.levels(options)` always. Every `_lodN` tier of a progressive bake resolves on its own.
+    public var coarseLevels: UntoldGSCoarseLevelPolicy = .automatic
 
     public init() {}
 
@@ -93,6 +97,57 @@ public struct UntoldGSCookOptions: Sendable {
         }
         transform.columns.3 = SIMD4<Float>(translation, 1)
         return transform
+    }
+}
+
+/// Whether a cook bakes the optional per-chunk coarse levels (`UntoldGSCoarsener`).
+public enum UntoldGSCoarseLevelPolicy: Sendable, Equatable {
+    /// `template` (its ratios clamped to the chunk size) for tiers of at least
+    /// `UntoldGSFormat.coarseLevelsAutomaticMinimumChunks` chunks; none below.
+    case automatic(template: UntoldGSCoarseLevelOptions)
+    /// Never a coarse section.
+    case off
+    /// These levels, whatever the tier's size.
+    case levels(UntoldGSCoarseLevelOptions)
+
+    /// Two levels at the default ratios above the threshold: the default policy.
+    public static let automatic = UntoldGSCoarseLevelPolicy.automatic(template: .default)
+
+    /// `.levels` with `count` levels at the default ratios.
+    public static func levels(count: Int) -> UntoldGSCoarseLevelPolicy {
+        var options = UntoldGSCoarseLevelOptions.default
+        options.levelCount = count
+        return .levels(options)
+    }
+}
+
+/// The coarse section a bake wrote, for the CLI's report and the editor.
+public struct UntoldGSCoarseLevelReport: Sendable, Equatable {
+    public var levelCount: Int
+    /// `ratioLog2[L − 1]` per level.
+    public var ratioLog2: [UInt8]
+    /// Merged records per level, over every chunk.
+    public var recordsPerLevel: [Int]
+    /// Bytes of the section (index, records and padding).
+    public var bytes: Int
+    /// Chunks below `minimumChunkSplats`, which got no level.
+    public var chunksWithoutLevels: Int
+
+    public init(levelCount: Int, ratioLog2: [UInt8], recordsPerLevel: [Int], bytes: Int, chunksWithoutLevels: Int) {
+        self.levelCount = levelCount
+        self.ratioLog2 = ratioLog2
+        self.recordsPerLevel = recordsPerLevel
+        self.bytes = bytes
+        self.chunksWithoutLevels = chunksWithoutLevels
+    }
+
+    public var recordCount: Int {
+        recordsPerLevel.reduce(0, +)
+    }
+
+    /// Merged records per level of a full chunk of `splatsPerChunk`, e.g. `[128, 16]` at 1024.
+    public func recordsPerFullChunk(splatsPerChunk: Int) -> [Int] {
+        ratioLog2.map { max(1, splatsPerChunk >> Int($0)) }
     }
 }
 
@@ -246,7 +301,8 @@ public enum UntoldGSCooker {
         return selected
     }
 
-    /// Write options that carry the cook's chunk size, flags, transform and capture lighting.
+    /// Write options that carry the cook's chunk size, flags, transform, capture lighting and
+    /// coarse-level policy (`.automatic` is resolved by the writer, which knows the chunk count).
     public static func writeOptions(for options: UntoldGSCookOptions) -> UntoldGSWriteOptions {
         var write = UntoldGSWriteOptions()
         write.log2ChunkSplats = options.log2ChunkSplats
@@ -255,6 +311,17 @@ public enum UntoldGSCooker {
         write.splatToMesh = options.transform
         write.captureExposureEV = options.captureExposureEV
         write.captureWhiteBalance = options.captureWhiteBalance
+        switch options.coarseLevels {
+        case let .automatic(template):
+            write.coarseLevels = template
+            write.coarseLevelsAutomatic = true
+        case .off:
+            write.coarseLevels = nil
+            write.coarseLevelsAutomatic = false
+        case let .levels(levels):
+            write.coarseLevels = levels
+            write.coarseLevelsAutomatic = false
+        }
         return write
     }
 

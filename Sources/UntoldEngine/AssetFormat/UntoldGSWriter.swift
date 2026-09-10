@@ -38,13 +38,45 @@ public struct UntoldGSWriteOptions: Sendable {
     public var splatToMesh: simd_float4x4 = matrix_identity_float4x4
     public var captureExposureEV: Float = 0
     public var captureWhiteBalance = SIMD3<Float>(repeating: 1)
+    /// Per-chunk coarse levels to bake into the optional section (`UntoldGSCoarsener`). With
+    /// `coarseLevelsAutomatic` off, `nil` writes no section and a value always writes one.
+    public var coarseLevels: UntoldGSCoarseLevelOptions?
+    /// Bake `coarseLevels ?? .default` only when the tier has at least
+    /// `UntoldGSFormat.coarseLevelsAutomaticMinimumChunks` chunks and its chunks are large enough
+    /// for a level at all (`minimumChunkSplats`), with the ratios clamped to the chunk size, and
+    /// write no section otherwise — so small assets bake exactly as they did before the section
+    /// existed. Off, `coarseLevels` decides on its own.
+    public var coarseLevelsAutomatic = true
 
     public init() {}
+}
+
+/// What `UntoldGSFormat.writeReporting` baked beyond the fine chunks.
+public struct UntoldGSWriteReport: Sendable, Equatable {
+    public var chunkCount: Int
+    /// The coarse section, or nil when none was written.
+    public var coarse: UntoldGSCoarseLevelReport?
+
+    public init(chunkCount: Int, coarse: UntoldGSCoarseLevelReport? = nil) {
+        self.chunkCount = chunkCount
+        self.coarse = coarse
+    }
 }
 
 public extension UntoldGSFormat {
     /// Encodes `splats` into a complete version-3 file image.
     static func write(splats: [UntoldGSSplat], options: UntoldGSWriteOptions = .init()) throws -> Data {
+        try writeReporting(splats: splats, options: options).data
+    }
+
+    /// Encodes `splats` into a complete version-3 file image and reports what was baked.
+    static func writeReporting(splats: [UntoldGSSplat], options: UntoldGSWriteOptions = .init()) throws -> (data: Data, report: UntoldGSWriteReport) {
+        try writeReporting(splats: splats, options: options, serialCoarsening: false)
+    }
+
+    /// `writeReporting` with the coarsener's chunk loop optionally forced onto one thread (tests
+    /// pin that the scheduling never changes a byte).
+    internal static func writeReporting(splats: [UntoldGSSplat], options: UntoldGSWriteOptions, serialCoarsening: Bool) throws -> (data: Data, report: UntoldGSWriteReport) {
         guard !splats.isEmpty else { throw UntoldGSError.invalidInput("no splats to write") }
         guard options.shDegree <= maxSHDegree else {
             throw UntoldGSError.unsupported("spherical-harmonics degree \(options.shDegree)")
@@ -74,6 +106,23 @@ public extension UntoldGSFormat {
             Array(order[start ..< min(start + splatsPerChunk, order.count)])
         }
 
+        // The coarse levels: automatic above the chunk-count threshold (the template's ratios
+        // clamped to the chunk size), or exactly what was asked for.
+        let coarseOptions: UntoldGSCoarseLevelOptions? = try {
+            if options.coarseLevelsAutomatic {
+                let template = options.coarseLevels ?? .default
+                try template.validate(log2ChunkSplats: maxLog2ChunkSplats)
+                // Below the chunk-count threshold, or with chunks too small for any chunk to
+                // have a level, no section at all.
+                guard chunkRanges.count >= coarseLevelsAutomaticMinimumChunks, splatsPerChunk >= template.minimumChunkSplats else { return nil }
+                let clamped = template.clamped(toLog2ChunkSplats: options.log2ChunkSplats)
+                return clamped.levelCount > 0 ? clamped : nil
+            }
+            guard let requested = options.coarseLevels else { return nil }
+            try requested.validate(log2ChunkSplats: options.log2ChunkSplats)
+            return requested
+        }()
+
         let headerSection = alignedToPage(headerSize)
         let chunkIndexOffset = headerSection
         let chunkIndexSection = alignedToPage(chunkRanges.count * chunkEntrySize)
@@ -93,6 +142,15 @@ public extension UntoldGSFormat {
             payloads.append(encoded.payload)
         }
 
+        // The merge seeds on the Morton order of each chunk (`chunkRanges`), not the importance
+        // order the fine payload took; one chunk per iteration, results by chunk index. The
+        // chunk's splats are gathered inside the work item, so one chunk's copy lives per thread
+        // rather than a second copy of the whole tier for the pass.
+        var coarseLevels: [UntoldGSCoarseLevels] = []
+        if let coarseOptions {
+            coarseLevels = try coarsenChunks(splats, ranges: chunkRanges, options: coarseOptions, serial: serialCoarsening)
+        }
+
         let nodes = try buildTree(entries: &entries, leafMaxChunks: max(1, options.leafMaxChunks))
         let nodeTreeOffset = chunkIndexOffset + chunkIndexSection
         let nodeTreeSection = alignedToPage(nodes.count * treeNodeSize)
@@ -103,7 +161,7 @@ public extension UntoldGSFormat {
             entries[index].payloadOffset = UInt64(cursor)
             cursor += Int(entries[index].payloadBytes)
         }
-        let fileSize = cursor
+        var fileSize = cursor
 
         var flags: UInt32 = 0
         if options.shDegree > 0 {
@@ -114,6 +172,57 @@ public extension UntoldGSFormat {
         }
         if options.isEnvironment {
             flags |= UntoldGSFlags.environment
+        }
+
+        // The coarse section: the level-major index on the page after the last fine payload, the
+        // records after it coarsest level first, each level in chunk order, 16-byte aligned.
+        var coarseEntries: [UntoldGSChunkEntry] = []
+        var coarsePayloads: [Data] = []
+        var coarseIndexOffset = 0
+        var coarsePayloadOffset = 0
+        var coarseRecordCount = 0
+        var coarseReport: UntoldGSCoarseLevelReport?
+        if let coarseOptions {
+            let levelCount = coarseOptions.levelCount
+            coarseIndexOffset = alignedToPage(cursor)
+            coarsePayloadOffset = coarseIndexOffset + alignedToPage(levelCount * entries.count * coarseIndexEntrySize)
+            coarseEntries = [UntoldGSChunkEntry](repeating: UntoldGSChunkEntry.emptyCoarse(level: 0, chunk: 0, nodeId: 0), count: levelCount * entries.count)
+            var recordsPerLevel = [Int](repeating: 0, count: levelCount)
+            var chunksWithoutLevels = 0
+            cursor = coarsePayloadOffset
+            for level in stride(from: levelCount, through: 1, by: -1) {
+                for chunk in entries.indices {
+                    let merged = coarseLevels[chunk].level(level)
+                    let slot = (level - 1) * entries.count + chunk
+                    if level == 1, merged.isEmpty {
+                        chunksWithoutLevels += 1
+                    }
+                    guard !merged.isEmpty else {
+                        coarseEntries[slot] = .emptyCoarse(level: UInt16(level), chunk: UInt32(chunk), nodeId: entries[chunk].nodeId)
+                        continue
+                    }
+                    let encoded = encodeChunk(orderedByImportance(merged), shCount: 0, padToPage: false)
+                    var entry = encoded.entry
+                    entry.payloadOffset = UInt64(cursor)
+                    entry.lodLevel = UInt16(level)
+                    entry.nodeId = entries[chunk].nodeId
+                    entry.reserved0 = UInt32(chunk)
+                    coarseEntries[slot] = entry
+                    coarsePayloads.append(encoded.payload)
+                    cursor += encoded.payload.count
+                    recordsPerLevel[level - 1] += merged.count
+                    coarseRecordCount += merged.count
+                }
+            }
+            fileSize = alignedToPage(cursor)
+            flags |= UntoldGSFlags.hasCoarseLevels
+            coarseReport = UntoldGSCoarseLevelReport(
+                levelCount: levelCount,
+                ratioLog2: Array(coarseOptions.ratioLog2.prefix(levelCount)),
+                recordsPerLevel: recordsPerLevel,
+                bytes: fileSize - coarseIndexOffset,
+                chunksWithoutLevels: chunksWithoutLevels
+            )
         }
 
         // Only scanned when the caller did not supply a box (the bake always does).
@@ -142,7 +251,12 @@ public extension UntoldGSFormat {
             nodeTreeOffset: UInt64(nodeTreeOffset),
             paletteOffset: 0,
             payloadOffset: UInt64(payloadOffset),
-            fileSize: UInt64(fileSize)
+            fileSize: UInt64(fileSize),
+            coarseIndexOffset: UInt64(coarseIndexOffset),
+            coarsePayloadOffset: UInt64(coarsePayloadOffset),
+            coarseRecordCount: UInt32(coarseRecordCount),
+            coarseLevelCount: UInt8(coarseOptions?.levelCount ?? 0),
+            coarseRatioLog2: coarseOptions.map { Array($0.ratioLog2.prefix($0.levelCount)) } ?? [0, 0]
         )
 
         let writer = UntoldBinaryWriter()
@@ -161,15 +275,98 @@ public extension UntoldGSFormat {
             writer.writeData(payload)
             writer.align(to: pageAlignment)
         }
+        if coarseOptions != nil {
+            precondition(writer.count == coarseIndexOffset, "coarse index layout mismatch")
+            for entry in coarseEntries {
+                entry.encode(to: writer)
+            }
+            writer.align(to: pageAlignment)
+            precondition(writer.count == coarsePayloadOffset, "coarse payload layout mismatch")
+            for payload in coarsePayloads {
+                writer.writeData(payload)
+            }
+            writer.align(to: pageAlignment)
+        }
         precondition(writer.count == fileSize, "payload layout mismatch")
-        return writer.data
+        return (writer.data, UntoldGSWriteReport(chunkCount: entries.count, coarse: coarseReport))
     }
 
     /// Encodes and writes atomically, creating the parent directory when needed.
     static func write(splats: [UntoldGSSplat], options: UntoldGSWriteOptions = .init(), to url: URL) throws {
-        let data = try write(splats: splats, options: options)
+        _ = try writeReporting(splats: splats, options: options, to: url)
+    }
+
+    /// `write(splats:options:to:)` returning what was baked.
+    static func writeReporting(splats: [UntoldGSSplat], options: UntoldGSWriteOptions = .init(), to url: URL) throws -> UntoldGSWriteReport {
+        let (data, report) = try writeReporting(splats: splats, options: options)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
+        return report
+    }
+
+    // MARK: - Coarse levels
+
+    /// Coarsens every chunk — `ranges[c]` the indices into `splats` of chunk `c`, in Morton
+    /// order — in parallel unless `serial`; the result of chunk `c` lands at index `c` whatever
+    /// the scheduling, and each chunk's arithmetic is sequential in a fixed order, so the bytes
+    /// never depend on the thread count. Each work item gathers its own chunk's splats, so the
+    /// memory in flight is one chunk per thread, not a copy of the tier.
+    internal static func coarsenChunks(_ splats: [UntoldGSSplat], ranges: [[Int]], options: UntoldGSCoarseLevelOptions, serial: Bool) throws -> [UntoldGSCoarseLevels] {
+        let results = CoarsenedChunks(count: ranges.count)
+        let work: @Sendable (Int) -> Void = { chunk in
+            do {
+                let gathered = ranges[chunk].map { splats[$0] }
+                try results.store(UntoldGSCoarsener.coarsen(gathered, options: options), at: chunk)
+            } catch let error as UntoldGSError {
+                results.fail(error, at: chunk)
+            } catch {
+                results.fail(.invalidInput("\(error)"), at: chunk)
+            }
+        }
+        if serial {
+            for chunk in ranges.indices {
+                work(chunk)
+            }
+        } else {
+            DispatchQueue.concurrentPerform(iterations: ranges.count, execute: work)
+        }
+        return try results.take()
+    }
+
+    /// The coarsener's per-chunk results, filled from `concurrentPerform` under one lock (one
+    /// store per chunk, so the lock is never contended for long).
+    private final class CoarsenedChunks: @unchecked Sendable {
+        private let lock = NSLock()
+        private var levels: [UntoldGSCoarseLevels]
+        private var failures: [UntoldGSError?]
+
+        init(count: Int) {
+            levels = [UntoldGSCoarseLevels](repeating: .none, count: count)
+            failures = [UntoldGSError?](repeating: nil, count: count)
+        }
+
+        func store(_ result: UntoldGSCoarseLevels, at chunk: Int) {
+            lock.withLock { levels[chunk] = result }
+        }
+
+        func fail(_ error: UntoldGSError, at chunk: Int) {
+            lock.withLock { failures[chunk] = error }
+        }
+
+        /// The levels by chunk index, or the first chunk's failure.
+        func take() throws -> [UntoldGSCoarseLevels] {
+            try lock.withLock {
+                if let failure = failures.compactMap({ $0 }).first {
+                    throw failure
+                }
+                return levels
+            }
+        }
+    }
+
+    /// The rank order of a coarse level: importance descending, ties by index.
+    internal static func orderedByImportance(_ splats: [UntoldGSSplat]) -> [UntoldGSSplat] {
+        UntoldGSCoarsener.orderedByImportance(splats)
     }
 
     // MARK: - Ordering
@@ -230,7 +427,10 @@ public extension UntoldGSFormat {
         var payload: Data
     }
 
-    internal static func encodeChunk(_ splats: [UntoldGSSplat], shCount: Int) -> EncodedChunk {
+    /// Encodes one chunk (or one coarse level of a chunk) against its own ranges. A fine chunk's
+    /// `payloadBytes` is padded to the page; a coarse level's (`padToPage == false`) is the
+    /// unpadded core size, the levels being packed 16-byte aligned inside their own region.
+    internal static func encodeChunk(_ splats: [UntoldGSSplat], shCount: Int, padToPage: Bool = true) -> EncodedChunk {
         var aabbMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var aabbMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         var logScaleMin = Float.greatestFiniteMagnitude
@@ -269,7 +469,7 @@ public extension UntoldGSFormat {
         let payload = coreWriter.data
         let entry = UntoldGSChunkEntry(
             payloadOffset: 0,
-            payloadBytes: UInt32(alignedToPage(payload.count)),
+            payloadBytes: UInt32(padToPage ? alignedToPage(payload.count) : payload.count),
             coreBytes: UInt32(splats.count * coreRecordSize),
             splatCount: UInt32(splats.count),
             lodLevel: 0,
@@ -319,6 +519,19 @@ public extension UntoldGSFormat {
             throw UntoldGSError.unsupported("tree with \(nodes.count) nodes exceeds \(UInt16.max)")
         }
         return nodes
+    }
+}
+
+extension UntoldGSChunkEntry {
+    /// The coarse index entry of a chunk that has no records at `level`: zero sizes and ranges,
+    /// labelled with its level and chunk so the index stays self-describing.
+    static func emptyCoarse(level: UInt16, chunk: UInt32, nodeId: UInt16) -> UntoldGSChunkEntry {
+        UntoldGSChunkEntry(
+            payloadOffset: 0, payloadBytes: 0, coreBytes: 0, splatCount: 0,
+            lodLevel: level, nodeId: nodeId,
+            aabbMin: .zero, aabbMax: .zero, logScaleMin: 0, logScaleMax: 0,
+            reserved0: chunk, crc32: 0
+        )
     }
 }
 
