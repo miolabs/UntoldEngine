@@ -394,7 +394,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         maxRunningReads = max(1, GaussianPagingPolicy.maxConcurrentReads)
 
         states = Array(repeating: GaussianChunkPageState(), count: chunkCount)
-        masterResidency = Array(repeating: GaussianChunkResidency(residentRanks: 0, fadeFromRank: 0, arrivalFrame: 0, _pad0: 0), count: chunkCount)
+        masterResidency = Array(repeating: GaussianChunkResidency(residentRanks: 0, fadeFromRank: 0, arrivalFrame: 0, coarseAvailable: 0), count: chunkCount)
         masterPageTable = Array(repeating: kGaussianPageSlotInvalid, count: chunkCount * pagesPerChunk)
         slotChunk = Array(repeating: -1, count: slotCount)
         slotTier = Array(repeating: 0, count: slotCount)
@@ -734,7 +734,8 @@ public final class GaussianPageManager: @unchecked Sendable {
             log(.committed, chunk: chunk, tier: firstTier + offset, slot: slot)
         }
         let resident = UInt32(request.firstRank + request.rankCount)
-        masterResidency[chunk] = GaussianChunkResidency(residentRanks: resident, fadeFromRank: UInt32(request.firstRank), arrivalFrame: now, _pad0: 0)
+        // The coarse availability bits (per-chunk-lod-tiers) ride in the same struct and survive the rewrite.
+        masterResidency[chunk] = GaussianChunkResidency(residentRanks: resident, fadeFromRank: UInt32(request.firstRank), arrivalFrame: now, coarseAvailable: masterResidency[chunk].coarseAvailable)
         var state = states[chunk]
         state.residentRanks = UInt16(resident)
         state.fadeFromRank = UInt16(request.firstRank)

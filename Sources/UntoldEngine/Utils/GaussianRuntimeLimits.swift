@@ -77,12 +77,37 @@ public enum GaussianRuntimeLimits {
         set { storage.override = newValue }
     }
 
+    /// The density floor of the per-chunk level rule (per-chunk-lod-tiers): a chunk of a
+    /// `.untoldgs` entity with coarse levels that would draw more than this many fine splats per
+    /// pixel of the viewport draws a coarse level instead even when the frame fits the working
+    /// set, so a far field is never drawn at sub-pixel splats. The quota itself stays on the
+    /// density cap; the floor changes the level only. 0 or a non-finite value switches it off.
+    public static let maxSplatsPerPixelDefault: Float = 1
+
+    /// The floor in effect: the override when set, else the default.
+    public static var maxSplatsPerPixel: Float {
+        storage.maxSplatsPerPixelOverride ?? maxSplatsPerPixelDefault
+    }
+
+    /// Replaces the default floor (`maxSplatsPerPixelDefault`); nil restores it; 0 or a
+    /// non-finite value switches the floor off.
+    public static var maxSplatsPerPixelOverride: Float? {
+        get { storage.maxSplatsPerPixelOverride }
+        set { storage.maxSplatsPerPixelOverride = newValue }
+    }
+
     private final class Storage: @unchecked Sendable {
         private let lock = NSLock()
         private var _override: Int?
+        private var _maxSplatsPerPixelOverride: Float?
         var override: Int? {
             get { lock.lock(); defer { lock.unlock() }; return _override }
             set { lock.lock(); _override = newValue.map { max(1, $0) }; lock.unlock() }
+        }
+
+        var maxSplatsPerPixelOverride: Float? {
+            get { lock.lock(); defer { lock.unlock() }; return _maxSplatsPerPixelOverride }
+            set { lock.lock(); _maxSplatsPerPixelOverride = newValue; lock.unlock() }
         }
     }
 

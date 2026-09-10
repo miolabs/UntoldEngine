@@ -1433,6 +1433,7 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertEqual(MemoryLayout<GaussianChunkResidency>.offset(of: \.residentRanks), 0)
         XCTAssertEqual(MemoryLayout<GaussianChunkResidency>.offset(of: \.fadeFromRank), 4)
         XCTAssertEqual(MemoryLayout<GaussianChunkResidency>.offset(of: \.arrivalFrame), 8)
+        XCTAssertEqual(MemoryLayout<GaussianChunkResidency>.offset(of: \.coarseAvailable), 12)
         XCTAssertEqual(MemoryLayout<GaussianChunkPagingConstants>.stride, 32)
         XCTAssertEqual(MemoryLayout<GaussianChunkPagingConstants>.offset(of: \.pagesPerChunk), 0)
         XCTAssertEqual(MemoryLayout<GaussianChunkPagingConstants>.offset(of: \.ranksPerPageLog2), 4)
@@ -1448,6 +1449,22 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertEqual(gaussianChunkPreprocessPagingConstantsIndex.rawValue, 15)
         XCTAssertEqual(kGaussianPageSlotInvalid, 0xFFFF_FFFF)
         XCTAssertEqual(GaussianPagingPolicy.maxRanksPerPage, 256)
+        // The per-chunk level bindings (per-chunk-lod-tiers).
+        XCTAssertEqual(gaussianChunkCullCoarseTableIndex.rawValue, 10)
+        XCTAssertEqual(gaussianChunkCullLevelStateIndex.rawValue, 11)
+        XCTAssertEqual(gaussianChunkCullLevelConstantsIndex.rawValue, 12)
+        XCTAssertEqual(gaussianBudgetLevelStateIndex.rawValue, 9)
+        XCTAssertEqual(gaussianBudgetResidencyIndex.rawValue, 10)
+        XCTAssertEqual(gaussianBudgetCoarseTableIndex.rawValue, 11)
+        XCTAssertEqual(gaussianBudgetLevelConstantsIndex.rawValue, 12)
+        XCTAssertEqual(gaussianBudgetChunkTableIndex.rawValue, 13)
+        XCTAssertEqual(gaussianBudgetLevelTotalsIndex.rawValue, 14)
+        XCTAssertEqual(gaussianChunkPreprocessCoarseRecordsIndex.rawValue, 16)
+        XCTAssertEqual(gaussianChunkPreprocessCoarseTableIndex.rawValue, 17)
+        XCTAssertEqual(gaussianChunkPreprocessLevelStateIndex.rawValue, 18)
+        XCTAssertEqual(gaussianChunkPreprocessLevelConstantsIndex.rawValue, 19)
+        XCTAssertEqual(MemoryLayout<GaussianChunkLevelConstants>.stride, 48)
+        XCTAssertEqual(MemoryLayout<GaussianChunkLevelState>.stride, 8)
     }
 
     // MARK: - 26: the file itself

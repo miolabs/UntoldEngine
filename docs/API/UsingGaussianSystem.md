@@ -236,7 +236,7 @@ targetScale=… density=… targetDensity=… visibleChunks=… fill=…`, `LogC
 | Chunk table | 48 B per chunk | — |
 
 The shared working set costs 3 × 72 B × budget once, whatever is loaded (216 MB for a million
-splats), plus about 3 KB of fixed state (the budget state and the 528-byte density histogram
+splats), plus about 9 KB of fixed state (the budget state and the 2064-byte density histogram
 with their per-slot readbacks), carried by its own `MemoryBudgetManager` entry
 (`setGaussianWorkingSetBytes`), not by the entities. A million-splat `.untoldgs` at degree 3
 therefore keeps about 61 MB resident (16 B + 45 B per splat, plus about 70 KB of chunk table
