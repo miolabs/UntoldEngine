@@ -569,12 +569,16 @@ the LOD system switches to it, the tier **warms**: the frame culls its demand be
 current tier's and its pager fills it, and the switch waits until 80 % of the ranks the frame
 wants are resident (or 90 ticks have passed) so a paged tier never comes in empty (see [Overdraw-aware LOD selection](#overdraw-aware-lod-selection)
 below for a second, distance-independent signal that can also hold an entity on a coarser
-tier). The switch releases every paged tier the selection just left — its pager shuts down,
+tier). A paged tier is released the moment the selection leaves it — its pager shuts down,
 its pool leaves the page-pool ledger at once and its buffers go with the in-flight frames —
-so an entity holds one pool at a time however often the camera crosses its thresholds; when
-the selection returns to a released tier, the engine loads it again and it warms into a fresh
-pool before the switch, as the first time. A whole-resident tier (below the threshold) stays
-cached after the switch instead, so the switch back is instant and reads nothing. The whole-file tiers and the [per-chunk coarse levels](#per-chunk-coarse-levels) are
+whether the switch to another tier commits or the selection retreats from a tier that was
+still warming (the hysteresis, the overdraw clamp, a camera that stopped short). So an
+entity holds at most two pools, the current tier's and the warming tier's, and one again as
+soon as the warming tier switches in or is abandoned, however often the camera crosses its
+thresholds; when the selection returns to a released tier, the engine loads it again and it
+warms into a fresh pool before the switch, as the first time. A whole-resident tier (below
+the threshold) stays cached after the switch instead, so the switch back is instant and
+reads nothing. The whole-file tiers and the [per-chunk coarse levels](#per-chunk-coarse-levels) are
 different mechanisms that compose: under `--splat-coarse-levels auto` every tier file of at
 least 64 chunks carries its own coarse section, so within the tier the LOD system holds
 resident, far chunks draw merged levels and near chunks their fine ranks.

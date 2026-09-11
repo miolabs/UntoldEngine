@@ -178,15 +178,16 @@ public class GaussianLODSystem: @unchecked Sendable {
               let source = lodComponent.lodLevels[newLOD].buffers
         else { return }
 
-        // Only the tier being switched to warms: a tier the selection targeted earlier and
-        // left (the hysteresis picked the current one again, the overdraw clamp held it back)
-        // stops, or its demand-only cull, its tick and its reads would go on every frame for
-        // the life of the entity.
-        for level in lodComponent.lodLevels {
-            if let pager = level.buffers?.pager, pager !== source.pager, pager.warming {
-                pager.warming = false
-            }
-        }
+        // Only the current tier and the one being switched to hold a pool: a paged tier the
+        // selection targeted earlier and left before it warmed in (the hysteresis picked the
+        // current one again, the overdraw clamp held it back, the camera stopped) is released
+        // here, the moment it stops being the target — its pager shuts down and its buffers go,
+        // as at a switch (below). Left alone it would neither draw nor warm (no frame culls
+        // its demand or ticks its pager) and its pool, a fixed tens to hundreds of MiB, would
+        // stay alive until some later switch commits, one per tier abandoned this way. The
+        // normal request path loads it again, into a fresh pool, if the selection returns.
+        let currentLOD = lodComponent.currentLOD
+        releasePagedTiers(entityId: entityId, lodComponent: lodComponent) { $0 != newLOD && $0 != currentLOD }
 
         if newLOD == lodComponent.currentLOD, scene.get(component: GaussianComponent.self, for: entityId) != nil {
             return
@@ -215,7 +216,7 @@ public class GaussianLODSystem: @unchecked Sendable {
             lodComponent.currentLOD = newLOD
             SystemIntegrationMonitor.shared.recordLODSwitch()
 
-            // The paged tiers the selection just left go with the switch: each holds a fixed
+            // The paged tier the selection just left goes with the switch: it holds a fixed
             // pool (tens to hundreds of MiB) that nothing else would release before the
             // entity's teardown, and a dolly across a threshold or two would leave one pool per
             // tier visited alive. The pager shuts down (its pool leaves the registry at once,
@@ -226,15 +227,25 @@ public class GaussianLODSystem: @unchecked Sendable {
             // `GaussianLODLevel.buffers`. The tier reads `.notResident` after this, so
             // updateEntityLOD requests it again, and the warmth gate above fills its fresh pool
             // before the switch, when the selection returns to it.
-            var released = false
-            for index in lodComponent.lodLevels.indices where index != newLOD {
-                guard lodComponent.lodLevels[index].buffers?.pager != nil else { continue }
+            releasePagedTiers(entityId: entityId, lodComponent: lodComponent) { $0 != newLOD }
+        }
+    }
+
+    /// Releases every paged tier of `lodComponent` whose index `isSuperseded` accepts
+    /// (`GaussianLODComponent.releaseLevelResources(at:)`) and, when any went, rewrites the
+    /// entity's ledger entry from the tiers still resident — under the world mutation gate,
+    /// taken only when there is something to release. A whole-resident tier is never released
+    /// here — it holds no pool and stays cached for the instant switch back.
+    private func releasePagedTiers(entityId: EntityID, lodComponent: GaussianLODComponent, where isSuperseded: (Int) -> Bool) {
+        let superseded = lodComponent.lodLevels.indices.filter {
+            isSuperseded($0) && lodComponent.lodLevels[$0].buffers?.pager != nil
+        }
+        guard !superseded.isEmpty else { return }
+        withWorldMutationGate {
+            for index in superseded {
                 lodComponent.releaseLevelResources(at: index)
-                released = true
             }
-            if released {
-                GeometryStreamingSystem.shared.registerGaussianLODLevelBytes(entityId: entityId, lod: lodComponent)
-            }
+            GeometryStreamingSystem.shared.registerGaussianLODLevelBytes(entityId: entityId, lod: lodComponent)
         }
     }
 }

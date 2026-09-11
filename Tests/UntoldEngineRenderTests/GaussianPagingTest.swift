@@ -1430,25 +1430,100 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertEqual(pager.tick, tickBefore + 1, "a warming tier ticks with the frame")
 
         // The selection goes back to the coarse tier (the hysteresis, the overdraw clamp, a
-        // forced LOD): the fine tier is no longer the target and stops warming, so no frame
-        // culls its demand or ticks its pager again.
+        // forced LOD): the fine tier is no longer the target, so it stops warming and — a paged
+        // tier that neither draws nor warms — is released at once: its pager closes, its pool
+        // leaves the registry, its buffers go, and no frame culls its demand or ticks it again.
         lod.forcedLOD = 1
         GaussianLODSystem.shared.update(deltaTime: 0.1)
         XCTAssertEqual(lod.currentLOD, 1)
-        XCTAssertFalse(pager.warming, "only the tier being switched to warms")
+        XCTAssertEqual(pager.state, .closed, "an abandoned paged tier is released, not parked")
+        XCTAssertNil(lod.lodLevels[0].buffers)
+        XCTAssertEqual(lod.lodLevels[0].residencyState, .notResident)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, 0, "the coarse tier is whole: no pool left")
         let tickAfter = pager.tick
         for _ in 0 ..< 5 {
-            pager.noteGPUIdle()
             runGaussianCullAndPreprocess()
         }
         XCTAssertEqual(pager.tick, tickAfter, "an abandoned tier is neither culled nor ticked")
+        source.deliverAll()
 
-        // Targeted again, it resumes.
+        // Targeted again, it is requested through the normal path and warms into a fresh pool.
         lod.forcedLOD = 0
         GaussianLODSystem.shared.update(deltaTime: 0.1)
-        XCTAssertTrue(pager.warming)
+        XCTAssertEqual(lod.lodLevels[0].residencyState, .loading, "requested again")
+        await lod.lodLevels[0].loadTask?.value
+        let freshPager = try XCTUnwrap(lod.lodLevels[0].buffers?.pager)
+        XCTAssertFalse(freshPager === pager)
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        XCTAssertTrue(freshPager.warming)
         XCTAssertEqual(lod.currentLOD, 1)
-        source.deliverAll()
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, freshPager.poolBytes)
+        (GaussianTestPageSource.created.last { $0.url == tiers.fineURL })?.deliverAll()
+    }
+
+    func testAnAbandonedPagedTierReleasesItsPoolBeforeAnySwitch() async throws {
+        // Both tiers paged, nothing lands: no switch can commit before the warm timeout.
+        let tiers = try await loadTwoTiers(holdEverything: true, coarsePaged: true)
+        let lod = tiers.lod
+        GaussianPagingPolicy.warmTimeoutTicks = 1000
+        let coarsePager = try XCTUnwrap(lod.lodLevels[1].buffers?.pager)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes, "one pool: the coarse tier's")
+        let coarseLedger = try XCTUnwrap(MemoryBudgetManager.shared.getMemorySize(for: tiers.entity))
+
+        // The camera crosses in: the fine tier loads and warms beside the coarse one.
+        lod.forcedLOD = 0
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        await lod.lodLevels[0].loadTask?.value
+        let finePager = try XCTUnwrap(lod.lodLevels[0].buffers?.pager, "the fine tier pages")
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        XCTAssertTrue(finePager.warming)
+        XCTAssertEqual(lod.currentLOD, 1)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes + finePager.poolBytes, "two pools while the fine tier warms")
+        XCTAssertGreaterThan(try XCTUnwrap(MemoryBudgetManager.shared.getMemorySize(for: tiers.entity)), coarseLedger)
+
+        // ...and back out before it warmed: the fine tier's pool goes at once, with no switch
+        // committing, and the ledger follows.
+        lod.forcedLOD = 1
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        XCTAssertEqual(lod.currentLOD, 1, "no switch committed")
+        XCTAssertEqual(finePager.state, .closed)
+        XCTAssertNil(lod.lodLevels[0].buffers)
+        XCTAssertEqual(lod.lodLevels[0].residencyState, .notResident)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes, "one pool: the coarse tier's")
+        XCTAssertEqual(MemoryBudgetManager.shared.getMemorySize(for: tiers.entity), coarseLedger, "the ledger dropped the abandoned tier")
+        XCTAssertEqual(coarsePager.state, .active, "the current tier is untouched")
+        XCTAssertTrue(scene.get(component: GaussianComponent.self, for: tiers.entity)?.pager === coarsePager)
+        (GaussianTestPageSource.created.last { $0.url == tiers.fineURL })?.deliverAll()
+
+        // Frames with the coarse tier drawing alone keep it that way.
+        for _ in 0 ..< 5 {
+            coarsePager.noteGPUIdle()
+            runGaussianCullAndPreprocess()
+            GaussianLODSystem.shared.update(deltaTime: 0.1)
+        }
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes)
+
+        // Crossing in and out twice more never holds more than the two pools at once and
+        // leaves one: each visit gets a fresh pool and gives it back on the retreat.
+        var abandoned: [GaussianPageManager] = [finePager]
+        for _ in 0 ..< 2 {
+            lod.forcedLOD = 0
+            GaussianLODSystem.shared.update(deltaTime: 0.1)
+            await lod.lodLevels[0].loadTask?.value
+            let fresh = try XCTUnwrap(lod.lodLevels[0].buffers?.pager)
+            XCTAssertFalse(abandoned.contains { $0 === fresh }, "a fresh pager per visit")
+            GaussianLODSystem.shared.update(deltaTime: 0.1)
+            XCTAssertTrue(fresh.warming)
+            XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes + fresh.poolBytes)
+            lod.forcedLOD = 1
+            GaussianLODSystem.shared.update(deltaTime: 0.1)
+            XCTAssertEqual(fresh.state, .closed)
+            XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes)
+            abandoned.append(fresh)
+            (GaussianTestPageSource.created.last { $0.url == tiers.fineURL })?.deliverAll()
+        }
+        XCTAssertEqual(lod.currentLOD, 1)
+        XCTAssertEqual(abandoned.filter { $0.state == .closed }.count, 3)
     }
 
     // MARK: - 19: a superseded paged tier releases its pool

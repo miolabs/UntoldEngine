@@ -242,7 +242,7 @@ extension GeometryStreamingSystem {
     }
 
     /// Writes the entity's ledger entry: the bytes of every tier resident right now, summed —
-    /// after a tier loads and after `GaussianLODSystem.applyLOD` releases the paged tiers the
+    /// after a tier loads and after `GaussianLODSystem.applyLOD` releases a paged tier the
     /// selection left, so the ledger drops with the pools rather than at the entity's teardown.
     func registerGaussianLODLevelBytes(entityId: EntityID, lod: GaussianLODComponent) {
         var totalBytes = 0
