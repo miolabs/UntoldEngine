@@ -613,7 +613,7 @@ final class PLYGaussianSource: @unchecked Sendable {
     }
 
     /// Bytes of source a binary window covers, before rounding to whole vertices.
-    static let targetWindowBytes = 16 << 20
+    static let targetWindowBytes = 8 << 20
     /// Bytes of text an ASCII window covers, before cutting at a line boundary.
     static let asciiWindowBytes = 8 << 20
 
@@ -759,28 +759,49 @@ final class PLYGaussianSource: @unchecked Sendable {
         afterBatch: (Double) throws -> Void = { _ in },
         body: (PLYGaussianWindow) throws -> Void
     ) throws {
+        try forEachWindow(parallelism: parallelism, map: { $0 }, afterBatch: afterBatch, body: body)
+    }
+
+    /// `forEachWindow` with a `map` step that runs inside the parallel work item — the place for
+    /// per-splat work that must not serialise on the delivering thread (the cook). For an ASCII
+    /// body, whose windows are cut to the vertex count only once the lines before them are
+    /// counted, `map` runs on the delivering thread instead.
+    func forEachWindow<Mapped>(
+        parallelism: Int = ProcessInfo.processInfo.activeProcessorCount,
+        map: @Sendable @escaping (PLYGaussianWindow) throws -> Mapped,
+        afterBatch: (Double) throws -> Void = { _ in },
+        body: (Mapped) throws -> Void
+    ) throws {
         switch header.format {
         case .ascii:
-            try forEachASCIIWindow(parallelism: parallelism, afterBatch: afterBatch, body: body)
+            try forEachASCIIWindow(parallelism: parallelism, afterBatch: afterBatch) { window in
+                try body(map(window))
+            }
         case .binaryLittleEndian, .binaryBigEndian:
-            try forEachBinaryWindow(parallelism: parallelism, afterBatch: afterBatch, body: body)
+            try forEachBinaryWindow(parallelism: parallelism, map: map, afterBatch: afterBatch, body: body)
         }
     }
 
-    private func forEachBinaryWindow(parallelism: Int, afterBatch: (Double) throws -> Void, body: (PLYGaussianWindow) throws -> Void) throws {
+    private func forEachBinaryWindow<Mapped>(
+        parallelism: Int,
+        map: @Sendable @escaping (PLYGaussianWindow) throws -> Mapped,
+        afterBatch: (Double) throws -> Void,
+        body: (Mapped) throws -> Void
+    ) throws {
         let windows = binaryWindows()
         let batchSize = max(1, parallelism)
         var consumed = 0
         var start = 0
         while start < windows.count {
             let batch = Array(windows[start ..< min(start + batchSize, windows.count)])
-            let results = ParallelResults<PLYGaussianWindow>(count: batch.count)
+            let results = ParallelResults<Mapped>(count: batch.count)
             DispatchQueue.concurrentPerform(iterations: batch.count) { slot in
                 do {
                     let window = batch[slot]
                     var buffer = [UInt8](repeating: 0, count: window.byteCount)
                     try Self.read(descriptor, into: &buffer, count: window.byteCount, at: window.byteOffset)
-                    results.store(parseBinary(buffer, vertexCount: window.vertexCount), at: slot)
+                    let mapped = try map(parseBinary(buffer, vertexCount: window.vertexCount))
+                    results.store(mapped, at: slot)
                 } catch {
                     results.fail(error, at: slot)
                 }
