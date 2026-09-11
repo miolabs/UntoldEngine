@@ -489,10 +489,27 @@ public final class GaussianPageManager: @unchecked Sendable {
     private var wantsInputs = WantInputs()
     private var wantsSumNeeded = 0
     private var wantsSumResidentOfNeeded = 0
-    private var residentChunks = Set<Int>()
-    private var fading: [Int] = []
-    /// Chunks whose `.levelFade` is running (per-chunk-lod-tiers).
-    private var levelFading: [Int] = []
+    /// The chunks with their head resident, dense, in no particular order (`residentPosition`
+    /// is each chunk's index in it, −1 when nothing is resident), and how many of them are
+    /// resident whole — counters kept as tiers map and leave instead of a scan per tick.
+    private var residentList: [Int32] = []
+    private var residentPosition: [Int32]
+    private var wholeChunkCount = 0
+    /// The chunks a tick may request, dense (`candidatePosition` as above): every chunk that
+    /// wants more than it holds, is not loading, faulted or fading in, and is past its
+    /// cooldown, kept up to date at every change of a chunk's state rather than found by a
+    /// scan of the demanded set. A chunk that only waits for its cooldown sits in
+    /// `cooldownHeap` (keyed by the tick it ends) until the tick that reaches it re-examines it.
+    private var candidateChunks: [Int32] = []
+    private var candidatePosition: [Int32]
+    private var cooldownHeap = GaussianTickHeap()
+    private var cooldownQueued: [Bool]
+    /// The fade-ins running, in arrival order (each entry with its arrival tick, so a chunk
+    /// mapped again while an older entry is still queued is expired on its own clock), and the
+    /// level cross-fades likewise, keyed by the switch tick (per-chunk-lod-tiers). Both expire
+    /// from the head.
+    private var fading = GaussianTickQueue()
+    private var levelFading = GaussianTickQueue()
     private var lastReopenTick: UInt32 = 0
 
     // MARK: Coarse levels (per-chunk-lod-tiers; render-thread state)
@@ -683,6 +700,9 @@ public final class GaussianPageManager: @unchecked Sendable {
         demandWords.initialize(repeating: 0, count: max(1, chunkCount))
         demandedPosition = Array(repeating: -1, count: chunkCount)
         wantsDirtyMark = Array(repeating: false, count: chunkCount)
+        residentPosition = Array(repeating: -1, count: chunkCount)
+        candidatePosition = Array(repeating: -1, count: chunkCount)
+        cooldownQueued = Array(repeating: false, count: chunkCount)
         lastConstants = Array(repeating: GaussianChunkPagingConstants(), count: slots)
         for k in 0 ..< slots {
             copyMasterTables(toSlot: k)
@@ -966,8 +986,8 @@ public final class GaussianPageManager: @unchecked Sendable {
         stats.poolBytes = poolBytes
         stats.slotCount = slotCount
         stats.residentSlots = slotCount - freeSlots.count - retiring.total
-        stats.residentChunks = residentChunks.count
-        stats.wholeChunks = residentChunks.reduce(0) { $0 + (Int(states[$1].residentRanks) >= Int(index.chunks[$1].splatCount) ? 1 : 0) }
+        stats.residentChunks = residentList.count
+        stats.wholeChunks = wholeChunkCount
         stats.issuedThisTick = issued
         stats.committedThisTick = committed
         stats.evictedThisTick = evicted
@@ -1054,6 +1074,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         masterResidency[chunk] = GaussianPagingPolicy.mappedResidency(previous: masterResidency[chunk], firstRank: request.firstRank, rankCount: request.rankCount, now: now)
         var state = states[chunk]
         let before = wantContribution(state)
+        let wholeBefore = Int(state.residentRanks) >= Int(index.chunks[chunk].splatCount)
         state.residentRanks = UInt16(resident)
         state.fadeFromRank = UInt16(request.firstRank)
         state.arrivalTick = now
@@ -1061,14 +1082,19 @@ public final class GaussianPageManager: @unchecked Sendable {
         state.flags.remove(.loading)
         if fadeFrames > 0 {
             state.flags.insert(.fadeActive)
-            fading.append(chunk)
+            fading.push(chunk: chunk, tick: now)
         }
         states[chunk] = state
         let after = wantContribution(state)
         wantsSumNeeded += after.needed - before.needed
         wantsSumResidentOfNeeded += after.resident - before.resident
+        if Int(resident) >= Int(index.chunks[chunk].splatCount), !wholeBefore { wholeChunkCount += 1 }
         markWantsDirty(chunk)
-        residentChunks.insert(chunk)
+        if residentPosition[chunk] < 0 {
+            residentPosition[chunk] = Int32(residentList.count)
+            residentList.append(Int32(chunk))
+        }
+        stateChanged(chunk, now: now)
         journal(chunk)
     }
 
@@ -1081,6 +1107,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
         addFreeSlots(request.slots)
         states[chunk].flags.remove(.loading)
+        defer { stateChanged(chunk, now: now) }
 
         switch error {
         case .closed:
@@ -1122,6 +1149,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         guard !states[chunk].flags.contains(.faulted) else { return }
         states[chunk].flags.insert(.faulted)
         faultedChunkCount += 1
+        stateChanged(chunk, now: tick)
         log(.faulted, chunk: chunk, tier: 0, slot: kGaussianPageSlotInvalid)
     }
 
@@ -1141,23 +1169,67 @@ public final class GaussianPageManager: @unchecked Sendable {
     }
 
     private func expireFades(now: UInt32, fadeFrames: UInt32) {
-        guard !fading.isEmpty else { return }
-        fading.removeAll { chunk in
-            // The fade reaches 1 at arrival + fadeFrames - 1 (the kernel counts the arrival frame).
-            let done = fadeFrames == 0 || now &- states[chunk].arrivalTick &+ 1 >= fadeFrames
-            if done { states[chunk].flags.remove(.fadeActive) }
-            return done
+        // The fade reaches 1 at arrival + fadeFrames - 1 (the kernel counts the arrival frame).
+        // The queue is in arrival order, so the head is the first to be done; an entry older
+        // than the chunk's last arrival only leaves the queue.
+        while let head = fading.head, fadeFrames == 0 || now &- head.tick &+ 1 >= fadeFrames {
+            fading.pop()
+            let chunk = Int(head.chunk)
+            guard states[chunk].arrivalTick == head.tick else { continue }
+            states[chunk].flags.remove(.fadeActive)
+            stateChanged(chunk, now: now)
         }
     }
 
     /// The level cross-fades that are done: `.levelFade` held the chunk's tiers for `fadeFrames`
-    /// ticks from its last level change (per-chunk-lod-tiers).
+    /// ticks from its last level change (per-chunk-lod-tiers). The queue is in switch order; an
+    /// entry older than the chunk's last switch only leaves the queue.
     private func expireLevelFades(now: UInt32, fadeFrames: UInt32) {
-        guard !levelFading.isEmpty else { return }
-        levelFading.removeAll { chunk in
-            let done = fadeFrames == 0 || now &- states[chunk].levelSwitchTick >= fadeFrames
-            if done { states[chunk].flags.remove(.levelFade) }
-            return done
+        while let head = levelFading.head, fadeFrames == 0 || now &- head.tick >= fadeFrames {
+            levelFading.pop()
+            let chunk = Int(head.chunk)
+            guard states[chunk].levelSwitchTick == head.tick else { continue }
+            states[chunk].flags.remove(.levelFade)
+        }
+    }
+
+    // MARK: The candidate set
+
+    /// A chunk's state changed: whether it may be requested is re-examined. A chunk that only
+    /// waits for its cooldown is queued for the tick the cooldown ends.
+    private func stateChanged(_ chunk: Int, now: UInt32) {
+        let state = states[chunk]
+        let ready = state.flags.contains(.demanded)
+            && state.neededRanks > state.residentRanks
+            && !state.flags.contains(.loading)
+            && !state.flags.contains(.faulted)
+            && !state.flags.contains(.fadeActive)
+        let member = ready && state.retryAfterTick <= now
+        if ready, !member, !cooldownQueued[chunk] {
+            cooldownQueued[chunk] = true
+            cooldownHeap.push(chunk: chunk, tick: state.retryAfterTick)
+        }
+        let position = Int(candidatePosition[chunk])
+        if member, position < 0 {
+            candidatePosition[chunk] = Int32(candidateChunks.count)
+            candidateChunks.append(Int32(chunk))
+        } else if !member, position >= 0 {
+            let last = candidateChunks.removeLast()
+            if position < candidateChunks.count {
+                candidateChunks[position] = last
+                candidatePosition[Int(last)] = Int32(position)
+            }
+            candidatePosition[chunk] = -1
+        }
+    }
+
+    /// The chunks whose cooldown ended by `now` are re-examined.
+    private func expireCooldowns(now: UInt32) {
+        while let head = cooldownHeap.head, head.tick <= now {
+            cooldownHeap.pop()
+            let chunk = Int(head.chunk)
+            cooldownQueued[chunk] = false
+            stateChanged(chunk, now: now)
         }
     }
 
@@ -1425,6 +1497,7 @@ public final class GaussianPageManager: @unchecked Sendable {
                 demandedPosition[Int(last)] = Int32(position)
             }
             demandedPosition[chunk] = -1
+            stateChanged(chunk, now: tick)
             return
         }
         states[chunk].lastArea = Float(bitPattern: bits)
@@ -1576,9 +1649,9 @@ public final class GaussianPageManager: @unchecked Sendable {
         if drawn != state.drawnLevel {
             state.drawnLevel = drawn
             state.levelSwitchTick = now
-            if inputs.levelFadeFrames > 0, !state.flags.contains(.levelFade) {
+            if inputs.levelFadeFrames > 0 {
                 state.flags.insert(.levelFade)
-                levelFading.append(chunk)
+                levelFading.push(chunk: chunk, tick: now)
             }
             // The rule's hysteresis reads the level drawn last: once more next tick.
             markWantsDirty(chunk)
@@ -1596,6 +1669,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         let after = wantContribution(state)
         wantsSumNeeded += after.needed - before.needed
         wantsSumResidentOfNeeded += after.resident - before.resident
+        stateChanged(chunk, now: now)
     }
 
     /// A demanded chunk's share of the warmth sums: its needed ranks, and the resident ones
@@ -1629,9 +1703,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         // Under pressure: down to the soft target, nothing issued above it, and nothing issued
         // that would carry the pool back above it.
         if let target = pressureTarget, residentSlots > target {
-            let victims = GaussianPagingPolicy.selectVictims(
-                states: states,
-                resident: Array(residentChunks),
+            let victims = selectVictims(
                 count: min(residentSlots - target, GaussianPagingPolicy.maxEvictionsPerTick),
                 inputs: GaussianEvictionInputs(tick: now, ranksPerPage: ranksPerPage, pressure: true)
             )
@@ -1643,24 +1715,11 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
         var issuableSlots = pressureTarget.map { max(0, $0 - residentSlots) } ?? Int.max
 
-        // Candidates by priority, ties on the chunk index.
-        var candidates: [(chunk: Int, priority: Float, tiers: Int)] = []
-        for demandedChunk in demandedChunks {
-            let chunk = Int(demandedChunk)
-            let state = states[chunk]
-            guard GaussianPagingPolicy.isLoadCandidate(state, tick: now) else { continue }
-            let priority = GaussianPagingPolicy.loadPriority(area: state.lastArea, residentRanks: UInt32(state.residentRanks), neededRanks: UInt32(state.neededRanks), ranksPerPage: ranksPerPage)
-            guard priority > 0 else { continue }
-            let missing = GaussianPagingPolicy.tiersNeeded(needed: UInt32(state.neededRanks), ranksPerPage: ranksPerPage) - tiers(state.residentRanks)
-            guard missing > 0 else { continue }
-            candidates.append((chunk, priority, missing))
-        }
-        guard !candidates.isEmpty else { return (coarseIssued, evicted) }
-        candidates.sort { $0.priority > $1.priority || ($0.priority == $1.priority && $0.chunk < $1.chunk) }
+        // The candidates by priority, ties on the chunk index: the best `maxReads` of the set.
+        expireCooldowns(now: now)
         let maxReads = GaussianPagingPolicy.maxPageReadsPerTick
-        if candidates.count > maxReads {
-            candidates.removeLast(candidates.count - maxReads)
-        }
+        let candidates = topCandidates(count: maxReads, now: now)
+        guard !candidates.isEmpty else { return (coarseIssued, evicted) }
 
         // Evict ahead: enough for the candidates beyond what is free or retiring. The free and
         // retiring slots serve the candidates in priority order, so the missing slots are the
@@ -1683,9 +1742,7 @@ public final class GaussianPageManager: @unchecked Sendable {
                 }
                 cumulative = end
             }
-            let victims = GaussianPagingPolicy.selectVictims(
-                states: states,
-                resident: Array(residentChunks),
+            let victims = selectVictims(
                 count: shortfall,
                 inputs: GaussianEvictionInputs(tick: now, ranksPerPage: ranksPerPage, candidatePriority: candidates.first?.priority, slotPriorities: slotPriorities)
             )
@@ -1773,6 +1830,7 @@ public final class GaussianPageManager: @unchecked Sendable {
                 log(.issued, chunk: chunk, tier: firstTier + offset, slot: slot, priority: candidate.priority)
             }
             states[chunk].flags.insert(.loading)
+            stateChanged(chunk, now: now)
             enqueue(.tier(request))
             issued += 1
             issuedBytes += bytes
@@ -1791,6 +1849,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         masterResidency[chunk].residentRanks = resident
         var state = states[chunk]
         let before = wantContribution(state)
+        let wholeBefore = Int(state.residentRanks) >= Int(index.chunks[chunk].splatCount)
         state.residentRanks = UInt16(resident)
         state.retryAfterTick = max(state.retryAfterTick, now &+ GaussianPagingPolicy.reloadCooldownTicks)
         if tiers(state.residentRanks) <= GaussianPagingPolicy.tiersNeeded(needed: UInt32(state.neededRanks), ranksPerPage: ranksPerPage) {
@@ -1803,14 +1862,52 @@ public final class GaussianPageManager: @unchecked Sendable {
         let after = wantContribution(state)
         wantsSumNeeded += after.needed - before.needed
         wantsSumResidentOfNeeded += after.resident - before.resident
+        if wholeBefore { wholeChunkCount -= 1 }
         markWantsDirty(chunk)
         if tier == 0 {
-            residentChunks.remove(chunk)
+            let position = Int(residentPosition[chunk])
+            let last = residentList.removeLast()
+            if position < residentList.count {
+                residentList[position] = last
+                residentPosition[Int(last)] = Int32(position)
+            }
+            residentPosition[chunk] = -1
         }
+        stateChanged(chunk, now: now)
         slotChunk[Int(slot)] = -1
         retiring.retire(slot, atTick: now)
         journal(chunk)
         log(.evicted, chunk: chunk, tier: tier, slot: slot)
+    }
+
+    /// `GaussianPagingPolicy.selectVictims` over the pager's own tables.
+    private func selectVictims(count: Int, inputs: GaussianEvictionInputs) -> [GaussianEvictionVictim] {
+        states.withUnsafeBufferPointer { states in
+            residentList.withUnsafeBufferPointer { resident in
+                GaussianPagingPolicy.selectVictims(states: states, resident: resident, count: count, inputs: inputs)
+            }
+        }
+    }
+
+    /// The best `count` candidates by priority (ties on the chunk index) with the tiers each
+    /// is missing, in that order: a scan of the candidate set, and a bounded heap when the set
+    /// is larger than `count`.
+    private func topCandidates(count: Int, now: UInt32) -> [(chunk: Int, priority: Float, tiers: Int)] {
+        var candidates: [(chunk: Int, priority: Float, tiers: Int)] = []
+        candidates.reserveCapacity(min(count, candidateChunks.count))
+        var selection = GaussianCandidateSelection(capacity: count)
+        for candidateChunk in candidateChunks {
+            let chunk = Int(candidateChunk)
+            let state = states[chunk]
+            guard GaussianPagingPolicy.isLoadCandidate(state, tick: now) else { continue }
+            let priority = GaussianPagingPolicy.loadPriority(area: state.lastArea, residentRanks: UInt32(state.residentRanks), neededRanks: UInt32(state.neededRanks), ranksPerPage: ranksPerPage)
+            guard priority > 0 else { continue }
+            let missing = GaussianPagingPolicy.tiersNeeded(needed: UInt32(state.neededRanks), ranksPerPage: ranksPerPage) - tiers(state.residentRanks)
+            guard missing > 0 else { continue }
+            selection.offer(chunk: chunk, priority: priority, tiers: missing)
+        }
+        selection.drain(into: &candidates)
+        return candidates
     }
 
     private func evictChunk(_ chunk: Int, now: UInt32) {
@@ -2033,5 +2130,159 @@ public final class GaussianPageManager: @unchecked Sendable {
         guard _eventLogEnabled else { return }
         let generation = slot == kGaussianPageSlotInvalid ? 0 : slotGeneration[Int(slot)]
         _eventLog.append(GaussianPagingEvent(tick: tick, kind: kind, chunk: chunk, tier: tier, slot: slot, generation: generation, priority: priority))
+    }
+}
+
+/// A FIFO of (chunk, tick) entries: pushed in tick order, expired from the head.
+struct GaussianTickQueue {
+    struct Entry {
+        let chunk: Int32
+        let tick: UInt32
+    }
+
+    private var entries: [Entry] = []
+    private var first = 0
+
+    var isEmpty: Bool {
+        first >= entries.count
+    }
+
+    var count: Int {
+        entries.count - first
+    }
+
+    var head: Entry? {
+        first < entries.count ? entries[first] : nil
+    }
+
+    mutating func push(chunk: Int, tick: UInt32) {
+        entries.append(Entry(chunk: Int32(chunk), tick: tick))
+    }
+
+    mutating func pop() {
+        first += 1
+        if first == entries.count {
+            entries.removeAll(keepingCapacity: true)
+            first = 0
+        } else if first >= 1024, first * 2 >= entries.count {
+            entries.removeFirst(first)
+            first = 0
+        }
+    }
+}
+
+/// A min-heap of (chunk, tick) entries on the tick, ties on the chunk.
+struct GaussianTickHeap {
+    private var keys: [UInt64] = []
+
+    var head: (chunk: Int32, tick: UInt32)? {
+        guard let key = keys.first else { return nil }
+        return (Int32(truncatingIfNeeded: key), UInt32(truncatingIfNeeded: key >> 32))
+    }
+
+    mutating func push(chunk: Int, tick: UInt32) {
+        keys.append(UInt64(tick) << 32 | UInt64(UInt32(truncatingIfNeeded: chunk)))
+        var index = keys.count - 1
+        while index > 0 {
+            let parent = (index - 1) >> 1
+            guard keys[index] < keys[parent] else { break }
+            keys.swapAt(index, parent)
+            index = parent
+        }
+    }
+
+    mutating func pop() {
+        guard !keys.isEmpty else { return }
+        let last = keys.removeLast()
+        guard !keys.isEmpty else { return }
+        keys[0] = last
+        var index = 0
+        let count = keys.count
+        while true {
+            let left = 2 * index + 1
+            guard left < count else { break }
+            let right = left + 1
+            let child = right < count && keys[right] < keys[left] ? right : left
+            guard keys[child] < keys[index] else { break }
+            keys.swapAt(index, child)
+            index = child
+        }
+    }
+}
+
+/// The best `capacity` candidates offered, by priority descending then chunk ascending: a
+/// min-heap on that order whose root is the weakest kept, replaced by a stronger offer.
+struct GaussianCandidateSelection {
+    private var chunks: [Int32] = []
+    private var priorities: [Float] = []
+    private var tiers: [Int32] = []
+    private let capacity: Int
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+        chunks.reserveCapacity(self.capacity)
+        priorities.reserveCapacity(self.capacity)
+        tiers.reserveCapacity(self.capacity)
+    }
+
+    /// Whether the candidate at `a` is weaker than the one at `b`.
+    private func weaker(_ a: Int, _ b: Int) -> Bool {
+        priorities[a] < priorities[b] || (priorities[a] == priorities[b] && chunks[a] > chunks[b])
+    }
+
+    private mutating func swapAt(_ a: Int, _ b: Int) {
+        chunks.swapAt(a, b)
+        priorities.swapAt(a, b)
+        tiers.swapAt(a, b)
+    }
+
+    private mutating func siftDown(from start: Int) {
+        var index = start
+        let count = chunks.count
+        while true {
+            let left = 2 * index + 1
+            guard left < count else { break }
+            let right = left + 1
+            let child = right < count && weaker(right, left) ? right : left
+            guard weaker(child, index) else { break }
+            swapAt(index, child)
+            index = child
+        }
+    }
+
+    mutating func offer(chunk: Int, priority: Float, tiers missing: Int) {
+        if chunks.count < capacity {
+            chunks.append(Int32(chunk))
+            priorities.append(priority)
+            tiers.append(Int32(missing))
+            var index = chunks.count - 1
+            while index > 0 {
+                let parent = (index - 1) >> 1
+                guard weaker(index, parent) else { break }
+                swapAt(index, parent)
+                index = parent
+            }
+            return
+        }
+        // Weaker than the weakest kept, or equal: not taken.
+        let weakest = priorities[0]
+        guard priority > weakest || (priority == weakest && Int32(chunk) < chunks[0]) else { return }
+        chunks[0] = Int32(chunk)
+        priorities[0] = priority
+        tiers[0] = Int32(missing)
+        siftDown(from: 0)
+    }
+
+    /// The kept candidates, strongest first; the selection is emptied.
+    mutating func drain(into result: inout [(chunk: Int, priority: Float, tiers: Int)]) {
+        result.removeAll(keepingCapacity: true)
+        result.reserveCapacity(chunks.count)
+        for index in chunks.indices {
+            result.append((Int(chunks[index]), priorities[index], Int(tiers[index])))
+        }
+        result.sort { $0.priority > $1.priority || ($0.priority == $1.priority && $0.chunk < $1.chunk) }
+        chunks.removeAll(keepingCapacity: true)
+        priorities.removeAll(keepingCapacity: true)
+        tiers.removeAll(keepingCapacity: true)
     }
 }

@@ -460,6 +460,22 @@ public enum GaussianPagingPolicy {
         count: Int,
         inputs: GaussianEvictionInputs
     ) -> [GaussianEvictionVictim] {
+        let residentChunks = resident.map { Int32($0) }
+        return states.withUnsafeBufferPointer { states in
+            residentChunks.withUnsafeBufferPointer { resident in
+                selectVictims(states: states, resident: resident, count: count, inputs: inputs)
+            }
+        }
+    }
+
+    /// `selectVictims` over the pager's own tables (the states as a buffer, the resident
+    /// chunks as a dense list of indices).
+    static func selectVictims(
+        states: UnsafeBufferPointer<GaussianChunkPageState>,
+        resident: UnsafeBufferPointer<Int32>,
+        count: Int,
+        inputs: GaussianEvictionInputs
+    ) -> [GaussianEvictionVictim] {
         guard count > 0 else { return [] }
         var victims: [GaussianEvictionVictim] = []
         victims.reserveCapacity(count)
@@ -481,7 +497,8 @@ public enum GaussianPagingPolicy {
         // outgoing fine window is still drawn.
         var stale: [(chunk: Int, lastDemand: UInt32)] = []
         var demandedResident: [Int] = []
-        for chunk in resident {
+        for residentChunk in resident {
+            let chunk = Int(residentChunk)
             let state = states[chunk]
             guard state.residentRanks > 0, !state.flags.contains(.loading), !state.flags.contains(.levelFade) else { continue }
             if !state.flags.contains(.demanded), inputs.tick &- state.lastDemandTick > inputs.holdOffTicks {
