@@ -214,6 +214,27 @@ public class GaussianLODSystem: @unchecked Sendable {
             copyGaussianComponentBuffers(from: source, to: destination)
             lodComponent.currentLOD = newLOD
             SystemIntegrationMonitor.shared.recordLODSwitch()
+
+            // The paged tiers the selection just left go with the switch: each holds a fixed
+            // pool (tens to hundreds of MiB) that nothing else would release before the
+            // entity's teardown, and a dolly across a threshold or two would leave one pool per
+            // tier visited alive. The pager shuts down (its pool leaves the registry at once,
+            // the reads in flight are dropped when they land — the generation guard) and the
+            // buffers are let go; the in-flight frames' command buffers retain the pool until
+            // they complete. The live component now references the new tier alone. A
+            // whole-resident tier stays cached for the instant switch back — see
+            // `GaussianLODLevel.buffers`. The tier reads `.notResident` after this, so
+            // updateEntityLOD requests it again, and the warmth gate above fills its fresh pool
+            // before the switch, when the selection returns to it.
+            var released = false
+            for index in lodComponent.lodLevels.indices where index != newLOD {
+                guard lodComponent.lodLevels[index].buffers?.pager != nil else { continue }
+                lodComponent.releaseLevelResources(at: index)
+                released = true
+            }
+            if released {
+                GeometryStreamingSystem.shared.registerGaussianLODLevelBytes(entityId: entityId, lod: lodComponent)
+            }
         }
     }
 }

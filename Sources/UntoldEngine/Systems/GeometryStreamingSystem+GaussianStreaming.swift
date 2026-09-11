@@ -235,14 +235,21 @@ extension GeometryStreamingSystem {
                 }
             }
 
-            var totalBytes = 0
-            for level in lod.lodLevels {
-                guard let buffers = level.buffers else { continue }
-                totalBytes += gaussianComponentEstimatedBytes(buffers)
-            }
-            MemoryBudgetManager.shared.registerMesh(entityId: entityId, meshSizeBytes: totalBytes)
+            registerGaussianLODLevelBytes(entityId: entityId, lod: lod)
             return true
         }
+    }
+
+    /// Writes the entity's ledger entry: the bytes of every tier resident right now, summed —
+    /// after a tier loads and after `GaussianLODSystem.applyLOD` releases the paged tiers the
+    /// selection left, so the ledger drops with the pools rather than at the entity's teardown.
+    func registerGaussianLODLevelBytes(entityId: EntityID, lod: GaussianLODComponent) {
+        var totalBytes = 0
+        for level in lod.lodLevels {
+            guard let buffers = level.buffers else { continue }
+            totalBytes += gaussianComponentEstimatedBytes(buffers)
+        }
+        MemoryBudgetManager.shared.registerMesh(entityId: entityId, meshSizeBytes: totalBytes)
     }
 
     /// Tears down a streamed Gaussian-splat entity's GPU resources and removes it from the

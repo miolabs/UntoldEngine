@@ -1300,13 +1300,18 @@ final class GaussianPagingTest: BaseRenderSetup {
         let entity: EntityID
         let lod: GaussianLODComponent
         let fineURL: URL
+        let coarseURL: URL
         let coarseHeader: UntoldGSHeaderV3
+
+        func url(of lodIndex: Int) -> URL {
+            lodIndex == 0 ? fineURL : coarseURL
+        }
     }
 
     /// Bakes two progressive tiers of the fixture — the coarse one whole (below a per-run
-    /// threshold), the fine one paged with a 13-slot pool — and loads the entity on the coarse
-    /// tier, the fine one not yet requested.
-    private func loadTwoTiers(holdEverything: Bool) async throws -> TwoTierFixture {
+    /// threshold) unless `coarsePaged`, the fine one paged with a 13-slot pool — and loads the
+    /// entity on the coarse tier, the fine one not yet requested.
+    private func loadTwoTiers(holdEverything: Bool, coarsePaged: Bool = false) async throws -> TwoTierFixture {
         let ply = try XCTUnwrap(LoadingSystem.shared.resourceURL(forResource: "test_gaussians", withExtension: "ply", subResource: nil))
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("GaussianPagingTest-tiers-\(UUID().uuidString)")
         var options = UntoldGSCookOptions()
@@ -1318,8 +1323,8 @@ final class GaussianPagingTest: BaseRenderSetup {
         let fineHeader = try UntoldGSFormat.readHeaderV3(from: fineURL)
         let coarseHeader = try UntoldGSFormat.readHeaderV3(from: coarseURL)
         let bytesPerSplat = UntoldGSFormat.coreRecordSize + fineHeader.shBytesPerSplat
-        // The coarse tier whole, the fine one paged.
-        GaussianPagingPolicy.pagingThresholdBytesOverride = (Int(coarseHeader.splatCount) + Int(fineHeader.splatCount)) / 2 * bytesPerSplat
+        // The coarse tier whole, the fine one paged — or both paged.
+        GaussianPagingPolicy.pagingThresholdBytesOverride = coarsePaged ? 0 : (Int(coarseHeader.splatCount) + Int(fineHeader.splatCount)) / 2 * bytesPerSplat
         GaussianPagingPolicy.residencyBudgetBytesOverride = 13 * GaussianPagingPolicy.ranksPerPage(splatsPerChunk: fineHeader.splatsPerChunk) * bytesPerSplat
         GaussianPagingPolicy.warmTimeoutTicks = 10
         if holdEverything {
@@ -1341,8 +1346,12 @@ final class GaussianPagingTest: BaseRenderSetup {
         await lod.lodLevels[1].loadTask?.value
         XCTAssertEqual(lod.currentLOD, 1, "the coarse tier first")
         let coarse = try XCTUnwrap(scene.get(component: GaussianComponent.self, for: entity))
-        XCTAssertNil(coarse.pager, "the coarse tier is below the threshold")
-        return TwoTierFixture(entity: entity, lod: lod, fineURL: fineURL, coarseHeader: coarseHeader)
+        if coarsePaged {
+            XCTAssertNotNil(coarse.pager, "the coarse tier pages")
+        } else {
+            XCTAssertNil(coarse.pager, "the coarse tier is below the threshold")
+        }
+        return TwoTierFixture(entity: entity, lod: lod, fineURL: fineURL, coarseURL: coarseURL, coarseHeader: coarseHeader)
     }
 
     private func runWarmthGate(holdEverything: Bool) async throws {
@@ -1440,6 +1449,162 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertTrue(pager.warming)
         XCTAssertEqual(lod.currentLOD, 1)
         source.deliverAll()
+    }
+
+    // MARK: - 19: a superseded paged tier releases its pool
+
+    /// Forces `lodIndex`, lets its load land if the tier is not resident, and drives frames
+    /// (the live pager and the warming one both idle between frames) until the LOD system
+    /// switches to it. Returns the tier's pager once it is current.
+    @discardableResult
+    private func forceAndSwitch(_ tiers: TwoTierFixture, to lodIndex: Int, maxFrames: Int = 40) async throws -> GaussianPageManager? {
+        let lod = tiers.lod
+        lod.forcedLOD = lodIndex
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        await lod.lodLevels[lodIndex].loadTask?.value
+        XCTAssertEqual(lod.lodLevels[lodIndex].residencyState, .resident, "tier \(lodIndex) loaded")
+        let pager = lod.lodLevels[lodIndex].buffers?.pager
+        let source = GaussianTestPageSource.created.last { $0.url == tiers.url(of: lodIndex) }
+        var frames = 0
+        while lod.currentLOD != lodIndex, frames < maxFrames {
+            scene.get(component: GaussianComponent.self, for: tiers.entity)?.pager?.noteGPUIdle()
+            pager?.noteGPUIdle()
+            runGaussianCullAndPreprocess()
+            if let pager, let source { settle(pager: pager, source: source) }
+            frames += 1
+            GaussianLODSystem.shared.update(deltaTime: 0.1)
+        }
+        XCTAssertEqual(lod.currentLOD, lodIndex, "switched to tier \(lodIndex) within \(maxFrames) frames")
+        return pager
+    }
+
+    func testSwitchingAwayFromAPagedTierReleasesItsPool() async throws {
+        let tiers = try await loadTwoTiers(holdEverything: false, coarsePaged: true)
+        let lod = tiers.lod
+        let coarsePager = try XCTUnwrap(lod.lodLevels[1].buffers?.pager)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes, "one pool: the coarse tier's")
+        let coarseLedger = try XCTUnwrap(MemoryBudgetManager.shared.getMemorySize(for: tiers.entity))
+
+        // The fine tier loads and warms beside the coarse one: two pools while it does.
+        lod.forcedLOD = 0
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        await lod.lodLevels[0].loadTask?.value
+        let finePager = try XCTUnwrap(lod.lodLevels[0].buffers?.pager, "the fine tier pages")
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, coarsePager.poolBytes + finePager.poolBytes, "two pools while the fine tier warms")
+        let bothLedger = try XCTUnwrap(MemoryBudgetManager.shared.getMemorySize(for: tiers.entity))
+        XCTAssertGreaterThan(bothLedger, coarseLedger, "the ledger carries both tiers")
+        XCTAssertEqual(coarsePager.state, .active, "the coarse tier draws until the switch")
+
+        try await forceAndSwitch(tiers, to: 0)
+
+        // The switch released the coarse tier: its pager closed, its buffers gone, its pool
+        // out of the registry and the ledger at once.
+        XCTAssertEqual(coarsePager.state, .closed)
+        XCTAssertNil(lod.lodLevels[1].buffers)
+        XCTAssertEqual(lod.lodLevels[1].residencyState, .notResident)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, finePager.poolBytes, "one pool: the fine tier's")
+        XCTAssertEqual(MemoryBudgetManager.shared.getMemorySize(for: tiers.entity), bothLedger - coarseLedger, "the ledger dropped the released tier")
+
+        // The live component received the fine tier's buffers and holds them untouched.
+        let live = try XCTUnwrap(scene.get(component: GaussianComponent.self, for: tiers.entity))
+        XCTAssertTrue(live.pager === finePager)
+        XCTAssertEqual(finePager.state, .active)
+        XCTAssertNotNil(live.packedSplatData)
+        XCTAssertNotNil(live.chunkTable)
+        XCTAssertEqual(live.splatCount, lod.lodLevels[0].buffers?.splatCount)
+        finePager.noteGPUIdle()
+        runGaussianCullAndPreprocess()
+        XCTAssertGreaterThan(finePager.stats.residentChunks, 0, "the fine tier keeps paging")
+    }
+
+    func testReturningToAReleasedTierLoadsAndWarmsItAgain() async throws {
+        let tiers = try await loadTwoTiers(holdEverything: false, coarsePaged: true)
+        let lod = tiers.lod
+        let coarsePager = try XCTUnwrap(lod.lodLevels[1].buffers?.pager)
+        let switched = try await forceAndSwitch(tiers, to: 0)
+        let finePager = try XCTUnwrap(switched)
+        XCTAssertEqual(coarsePager.state, .closed)
+        XCTAssertNil(lod.lodLevels[1].buffers)
+
+        // Wanted again, the coarse tier is requested through the normal path...
+        lod.forcedLOD = 1
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        XCTAssertEqual(lod.lodLevels[1].residencyState, .loading, "the released tier is requested again")
+        XCTAssertEqual(lod.currentLOD, 0, "the fine tier draws meanwhile")
+        await lod.lodLevels[1].loadTask?.value
+        XCTAssertEqual(lod.lodLevels[1].residencyState, .resident)
+        let freshPager = try XCTUnwrap(lod.lodLevels[1].buffers?.pager, "the reloaded tier pages")
+        XCTAssertFalse(freshPager === coarsePager, "a fresh pager and pool, not the closed one")
+        XCTAssertEqual(freshPager.state, .active)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, finePager.poolBytes + freshPager.poolBytes, "two pools while it warms")
+
+        // ...warms before the switch, as the first time...
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        XCTAssertEqual(lod.currentLOD, 0, "not warm: the fine tier keeps drawing")
+        XCTAssertTrue(freshPager.warming)
+        XCTAssertFalse(freshPager.isWarm)
+        XCTAssertTrue(scene.get(component: GaussianComponent.self, for: tiers.entity)?.pager === finePager)
+
+        // ...and switches in with its own pool, releasing the fine tier's.
+        try await forceAndSwitch(tiers, to: 1)
+        XCTAssertTrue(freshPager.isWarm)
+        XCTAssertFalse(freshPager.warming)
+        XCTAssertGreaterThan(freshPager.stats.residentChunks, 0, "the fresh pool filled while warming")
+        XCTAssertTrue(scene.get(component: GaussianComponent.self, for: tiers.entity)?.pager === freshPager)
+        XCTAssertEqual(finePager.state, .closed)
+        XCTAssertNil(lod.lodLevels[0].buffers)
+        XCTAssertEqual(lod.lodLevels[0].residencyState, .notResident)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, freshPager.poolBytes, "one pool: the reloaded coarse tier's")
+    }
+
+    func testDollyingAcrossTheThresholdHoldsOnePool() async throws {
+        let tiers = try await loadTwoTiers(holdEverything: false, coarsePaged: true)
+        let lod = tiers.lod
+        var pagers: [GaussianPageManager] = []
+        if let pager = lod.lodLevels[1].buffers?.pager { pagers.append(pager) }
+
+        for _ in 0 ..< 3 {
+            if let pager = try await forceAndSwitch(tiers, to: 0) { pagers.append(pager) }
+            if let pager = try await forceAndSwitch(tiers, to: 1) { pagers.append(pager) }
+        }
+        XCTAssertEqual(pagers.count, 7, "the first coarse pager and one per visit")
+        let live = try XCTUnwrap(scene.get(component: GaussianComponent.self, for: tiers.entity)?.pager)
+        XCTAssertTrue(live === pagers.last)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, live.poolBytes, "exactly one pool after three round trips")
+        XCTAssertEqual(pagers.filter { $0.state == .closed }.count, 6, "every superseded pager closed")
+        XCTAssertNil(lod.lodLevels[0].buffers)
+        XCTAssertNotNil(lod.lodLevels[1].buffers)
+
+        // The entity's teardown: the last pool goes, and the released tiers are nil-safe.
+        removeEntityGaussian(entityId: tiers.entity)
+        XCTAssertEqual(live.state, .closed)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, 0)
+        XCTAssertNil(MemoryBudgetManager.shared.getMemorySize(for: tiers.entity))
+    }
+
+    func testAWholeResidentTierStaysCachedAcrossTheSwitch() async throws {
+        // The coarse tier whole, the fine one paged.
+        let tiers = try await loadTwoTiers(holdEverything: false)
+        let lod = tiers.lod
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, 0, "no pool below the threshold")
+        let coarse = try XCTUnwrap(lod.lodLevels[1].buffers)
+
+        let switched = try await forceAndSwitch(tiers, to: 0)
+        let finePager = try XCTUnwrap(switched)
+        XCTAssertTrue(lod.lodLevels[1].buffers === coarse, "a whole-resident tier stays cached for the switch back")
+        XCTAssertEqual(lod.lodLevels[1].residencyState, .resident)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, finePager.poolBytes)
+
+        // Back to the cached tier: no load, an instant switch, and the paged tier goes.
+        lod.forcedLOD = 1
+        GaussianLODSystem.shared.update(deltaTime: 0.1)
+        XCTAssertEqual(lod.currentLOD, 1, "instant: nothing to load or warm")
+        XCTAssertNil(lod.lodLevels[1].loadTask)
+        XCTAssertTrue(lod.lodLevels[1].buffers === coarse)
+        XCTAssertNil(scene.get(component: GaussianComponent.self, for: tiers.entity)?.pager)
+        XCTAssertEqual(finePager.state, .closed)
+        XCTAssertNil(lod.lodLevels[0].buffers)
+        XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, 0, "the released tier's pool went with the switch")
     }
 
     // MARK: - 20: disableChunkCull

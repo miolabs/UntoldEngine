@@ -659,6 +659,13 @@ public class LODComponent: Component {
 /// One pre-baked quality tier for a progressive Gaussian splat asset.
 /// LOD0 is expected to be the full-resolution tier; later indices are progressively coarser.
 public struct GaussianLODLevel {
+    /// The tier's resident buffers, or nil while it is not loaded. A whole-resident tier
+    /// (below the paging threshold) stays here after the LOD system switches away from it, so
+    /// the switch back is instant and reads nothing; a paged tier (`buffers.pager` set) does
+    /// not — `GaussianLODSystem.applyLOD` releases every paged tier the selection just left
+    /// (`GaussianLODComponent.releaseLevelResources(at:)`), since each holds a fixed pool of
+    /// tens to hundreds of MiB, and the normal request path loads it again, with a fresh pool
+    /// that warms before the next switch, when the selection returns to it.
     public var buffers: GaussianComponent?
     public var maxDistance: Float
     public var url: URL?
@@ -742,10 +749,21 @@ public class GaussianLODComponent: Component {
         for index in lodLevels.indices {
             lodLevels[index].loadTask?.cancel()
             lodLevels[index].loadTask = nil
-            lodLevels[index].buffers?.pager?.shutdown()
-            lodLevels[index].buffers = nil
-            lodLevels[index].residencyState = .notResident
+            releaseLevelResources(at: index)
         }
+    }
+
+    /// Drops one tier's residency: its pager is shut down (the pool leaves
+    /// `GaussianPagePoolRegistry` at once, the reads in flight are dropped when they land) and
+    /// its buffers are let go — the Metal buffers themselves go once the in-flight frames that
+    /// reference them complete, since committed command buffers retain them. The tier reads
+    /// `.notResident`, so `GaussianLODSystem` requests it again through the normal path when
+    /// the selection wants it. Safe on a tier already released (nil buffers, a closed pager).
+    /// Does not touch a load in flight; `releaseAllLevelResources` cancels those.
+    func releaseLevelResources(at index: Int) {
+        lodLevels[index].buffers?.pager?.shutdown()
+        lodLevels[index].buffers = nil
+        lodLevels[index].residencyState = .notResident
     }
 }
 
