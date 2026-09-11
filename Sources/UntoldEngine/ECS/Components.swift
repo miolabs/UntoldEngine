@@ -678,6 +678,11 @@ public struct GaussianLODLevel {
     /// i.e. this tier hasn't loaded yet — in which case `clampGaussianLODForOverdraw` falls
     /// back to distance-only LOD selection for it.
     public var meanSquaredSplatExtent: Float?
+    /// This tier's splat count, read from the file the first time the tier loads and kept —
+    /// like `meanSquaredSplatExtent` — when `GaussianLODComponent.releaseLevelResources(at:)`
+    /// lets its buffers go, so `clampGaussianLODForOverdraw` still walks past a released tier
+    /// rather than bailing out at it. `nil` only before the tier has ever loaded.
+    public var splatCount: Int?
 
     public init(maxDistance: Float, url: URL? = nil) {
         self.maxDistance = maxDistance
@@ -759,7 +764,9 @@ public class GaussianLODComponent: Component {
     /// reference them complete, since committed command buffers retain them. The tier reads
     /// `.notResident`, so `GaussianLODSystem` requests it again through the normal path when
     /// the selection wants it. Safe on a tier already released (nil buffers, a closed pager).
-    /// Does not touch a load in flight; `releaseAllLevelResources` cancels those.
+    /// Does not touch a load in flight; `releaseAllLevelResources` cancels those. The tier's
+    /// bake-time stats (`splatCount`, `meanSquaredSplatExtent`) stay known for the overdraw
+    /// clamp.
     func releaseLevelResources(at index: Int) {
         lodLevels[index].buffers?.pager?.shutdown()
         lodLevels[index].buffers = nil

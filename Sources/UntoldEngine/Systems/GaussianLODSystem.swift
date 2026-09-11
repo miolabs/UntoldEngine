@@ -271,11 +271,12 @@ func estimatedGaussianOverdraw(
 /// Walks from `desiredLOD` (the distance/hysteresis-based choice from `selectDesiredLOD`)
 /// toward coarser tiers (higher index, never finer) while `estimatedGaussianOverdraw` for the
 /// candidate exceeds `budget`, using each candidate's bake-time `meanSquaredSplatExtent` and
-/// its currently-known resident `splatCount`. Bails out and returns `desiredLOD` unchanged the
-/// moment a candidate is missing either value — an un-baked `meanSquaredSplatExtent` or a
-/// not-yet-resident tier (unknown splat count) — so entities without bake-time stats, or a
-/// tier this walk reaches before it has ever loaded, fall back to pure distance-based
-/// selection exactly as before this feature existed.
+/// `splatCount` — both kept on the `GaussianLODLevel` from the tier's first load on, so a
+/// paged tier `applyLOD` has since released still takes part in the walk. Bails out and
+/// returns `desiredLOD` unchanged the moment a candidate is missing either value — an
+/// un-baked `meanSquaredSplatExtent` or a tier that has never loaded (unknown splat count) —
+/// so entities without bake-time stats, or a tier this walk reaches before it has ever
+/// loaded, fall back to pure distance-based selection exactly as before this feature existed.
 func clampGaussianLODForOverdraw(
     desiredLOD: Int,
     lodComponent: GaussianLODComponent,
@@ -291,13 +292,13 @@ func clampGaussianLODForOverdraw(
     while candidate < lodComponent.lodLevels.count {
         let level = lodComponent.lodLevels[candidate]
         guard let meanSquaredSplatExtent = level.meanSquaredSplatExtent,
-              let splatCount = level.buffers?.splatCount
+              let splatCount = level.splatCount
         else {
             return desiredLOD
         }
 
         let overdraw = estimatedGaussianOverdraw(
-            splatCount: Int(splatCount),
+            splatCount: splatCount,
             meanSquaredSplatExtent: meanSquaredSplatExtent,
             distance: distance,
             fovY: fovY,

@@ -201,6 +201,7 @@ extension GeometryStreamingSystem {
             // Baked into the .untoldgs file itself (see UntoldGSFormat) — no caller-supplied
             // value needed, and it can't drift out of sync with the tier it describes.
             lod.lodLevels[lodIndex].meanSquaredSplatExtent = built.meanSquaredSplatExtent
+            lod.lodLevels[lodIndex].splatCount = Int(built.component.splatCount)
 
             if makeCurrent {
                 // The entity's very first tier to ever load — if the caller didn't supply a
