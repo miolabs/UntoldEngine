@@ -140,6 +140,28 @@ public extension UntoldGSFormat {
         serialChunks: Bool = false,
         progress: UntoldGSCookProgressSink?
     ) throws -> UntoldGSWriteReport {
+        let staged = try stageStore(view, options: options, to: url, serialChunks: serialChunks, progress: progress)
+        do {
+            try staged.publish()
+        } catch {
+            staged.discard()
+            throw error
+        }
+        return staged.report
+    }
+
+    /// Writes a tier of a store, complete and closed, to a temporary file beside `url` without
+    /// touching `url` itself: what a multi-tier bake does with each tier so it can rename the
+    /// whole set into place only when the last one is written, and a failed or cancelled bake
+    /// leaves the previous bake's tiers exactly as they were. Creates the parent directory when
+    /// needed.
+    internal static func stageStore(
+        _ view: UntoldGSStoreView,
+        options: UntoldGSWriteOptions,
+        to url: URL,
+        serialChunks: Bool = false,
+        progress: UntoldGSCookProgressSink?
+    ) throws -> UntoldGSStagedTier {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let temporary = directory.appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
@@ -147,10 +169,7 @@ public extension UntoldGSFormat {
         do {
             let report = try writeStore(view, options: options, sink: sink, serialChunks: serialChunks, progress: progress)
             try sink.close()
-            guard rename(temporary.path, url.path) == 0 else {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: url.path])
-            }
-            return report
+            return UntoldGSStagedTier(temporaryURL: temporary, url: url, report: report)
         } catch {
             sink.discard()
             throw error
@@ -886,6 +905,26 @@ final class UntoldGSMemorySink: UntoldGSWriteSink, @unchecked Sendable {
 
     var data: Data {
         lock.withLock { Data(bytes) }
+    }
+}
+
+/// A tier written whole to its temporary file and not yet renamed over its destination.
+struct UntoldGSStagedTier {
+    let temporaryURL: URL
+    /// The destination.
+    let url: URL
+    let report: UntoldGSWriteReport
+
+    /// Renames the temporary over `url`, replacing whatever was there.
+    func publish() throws {
+        guard rename(temporaryURL.path, url.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: url.path])
+        }
+    }
+
+    /// Removes the temporary, leaving `url` as it was. Nothing to do once published.
+    func discard() {
+        unlink(temporaryURL.path)
     }
 }
 

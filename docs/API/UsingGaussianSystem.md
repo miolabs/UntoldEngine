@@ -427,12 +427,13 @@ An editor or a tool cooks a capture with
 (see [untoldgsFormat.md](../Architecture/untoldgsFormat.md#cooking-a-capture)). The source is
 streamed in windows and cooked in parallel into one compact store, so a 10 M-splat degree-3
 capture cooks in about two seconds with about 1.4 GB of memory in a release build (and in
-about a minute in a debug build, where it used to take seven), and every tier is written
-through a temporary file renamed into place. `UntoldGSCookControl` takes a progress callback —
+about a minute in a debug build, where it used to take seven), and every tier is written to a
+temporary file, the set renamed into place once the last tier is complete. `UntoldGSCookControl` takes a progress callback —
 `UntoldGSCookProgress` with the phase (`read`, `cook`, `chunk`, `coarsen`, `write`), the
 fraction within it, the overall fraction and the tier — and an `isCancelled` closure polled
-between windows and chunk batches (`Task.isCancelled` is honoured too); cancelling throws
-`UntoldGSCookError.cancelled` and leaves no file, not even a tier already finished. The
+between windows, through the progressive ranking and between chunk batches (`Task.isCancelled`
+is honoured too); cancelling throws `UntoldGSCookError.cancelled` and leaves no file of the
+bake's, not even a tier already finished, while the tiers of a previous bake stay as they were. The
 result's `centerBoundsMin`/`Max` are the bounds of the cooked splats; for the bounds of a source
 before it is cooked, `PLYReader.readGaussianCenterBounds(from:)` makes one streamed pass with
 nothing resident, and `PLYReader.readGaussianSplatCount(from:)` reads the header alone.

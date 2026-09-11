@@ -4970,8 +4970,9 @@ public func bakeGaussianSplatProgressiveTiers(
 
 /// `bakeGaussianSplatProgressiveTiers(plyURL:outputBaseURL:lodFractions:cookOptions:)` with
 /// progress and cancellation (`UntoldGSCookControl`): the source is streamed in windows and
-/// every tier is written through a temporary file, so a cancelled or failed bake leaves no file
-/// behind — not even the tiers it had already finished.
+/// every tier is written to a temporary file, the set renamed into place only once the last
+/// tier is complete, so a cancelled or failed bake leaves no file of its own behind and the
+/// tiers of a previous bake exactly as they were.
 public func bakeGaussianSplatProgressiveTiers(
     plyURL: URL,
     outputBaseURL: URL,
@@ -5025,8 +5026,11 @@ public func bakeGaussianSplatProgressiveTiers(
 
 /// Shared tiering core behind the `.ply` and `.spz` overloads above, over the cooked store: the
 /// finest tier is the store in cooked order; the `_lodN` tiers are prefixes of the progressive
-/// ranking. Each tier is written through a temporary file; on any error (or a cancellation) the
-/// tiers this bake had already written are removed, so nothing partial is left behind.
+/// ranking. Each tier is written to a temporary file beside its destination and the whole set
+/// is renamed into place only after the last tier is complete: a bake that fails or is cancelled
+/// in its third tier discards three temporaries and leaves the `_lod0`/`_lod1` of the previous
+/// bake untouched, where renaming each tier as it finished would have replaced them and then
+/// had to remove them, breaking an asset that loaded before the cook began.
 private func bakeGaussianSplatProgressiveTiers(
     cooked: UntoldGSCookedStore,
     outputBaseURL: URL,
@@ -5088,6 +5092,7 @@ private func bakeGaussianSplatProgressiveTiers(
     let baseName = baseWithoutExtension.lastPathComponent
     let baseDirectory = baseWithoutExtension.deletingLastPathComponent()
 
+    var staged: [UntoldGSStagedTier] = []
     var tiers: [GaussianLODTier] = []
     do {
         for (tierIndex, fraction) in lodFractions.enumerated() {
@@ -5101,17 +5106,23 @@ private func bakeGaussianSplatProgressiveTiers(
                 .appendingPathComponent("\(baseName)_lod\(tierIndex)")
                 .appendingPathExtension("untoldgs")
             let tierExtent = store.meanSquaredSplatExtent(over: keptIndices, count: keptIndices.count)
-            let written = try UntoldGSFormat.writeStore(
+            let written = try UntoldGSFormat.stageStore(
                 UntoldGSStoreView(store: store, indices: keptIndices),
                 options: gaussianTierWriteOptions(shDegree: store.shDegree, boundingBox: assetBoundingBox, meanSquaredSplatExtent: tierExtent, cookOptions: cookOptions),
                 to: tierURL,
                 progress: progress
             )
-            tiers.append(GaussianLODTier(url: tierURL, meanSquaredSplatExtent: tierExtent, coarseReport: written.coarse))
+            staged.append(written)
+            tiers.append(GaussianLODTier(url: tierURL, meanSquaredSplatExtent: tierExtent, coarseReport: written.report.coarse))
+        }
+        // Every tier is complete: the set goes into place finest first, in one tight loop.
+        for tier in staged {
+            try tier.publish()
         }
     } catch {
-        for tier in tiers {
-            try? FileManager.default.removeItem(at: tier.url)
+        // The temporaries of the tiers not yet published; a published tier's is already gone.
+        for tier in staged {
+            tier.discard()
         }
         throw error
     }

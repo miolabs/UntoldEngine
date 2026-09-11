@@ -323,7 +323,7 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
             let control = UntoldGSCookControl(
                 progress: { report in
                     // Cancel the moment the second tier reaches `phase`, so the first tier —
-                    // renamed into place by then — has to go too. `read` and `cook` run once;
+                    // complete in its temporary by then — has to go too. `read` and `cook` run once;
                     // the half tier is below the automatic coarse-level threshold, so
                     // `coarsen` is cancelled in the first tier, with its temporary file open.
                     if report.phase == phase, report.tierIndex == 1 || phase == .read || phase == .cook || phase == .coarsen {
@@ -342,6 +342,63 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
             XCTAssertTrue(seen.isCancelled, "\(phase) was reached")
             let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
             XCTAssertEqual(leftovers, [], "\(phase): no tier and no temporary file remains")
+        }
+    }
+
+    func testCancelledRecookLeavesThePreviousTiersIntact() throws {
+        // A directory already holding a bake's tiers: a re-cook cancelled in its second tier
+        // must leave every one of them as it was — no tier of the new bake in place of an old
+        // one, no mixed set observable while it runs — and a re-cook left to finish replaces
+        // the whole set.
+        let ply = try binaryFixture()
+        let directory = temporaryDirectory.appendingPathComponent("recook", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let output = directory.appendingPathComponent("scene.untoldgs")
+        let previous = ["scene_lod0.untoldgs": "OLD-LOD0", "scene_lod1.untoldgs": "OLD-LOD1"]
+        for (name, marker) in previous {
+            try Data(marker.utf8).write(to: directory.appendingPathComponent(name))
+        }
+        func contents() throws -> [String: String] {
+            var found: [String: String] = [:]
+            for name in try FileManager.default.contentsOfDirectory(atPath: directory.path) where name != ply.lastPathComponent {
+                let data = try Data(contentsOf: directory.appendingPathComponent(name))
+                found[name] = String(data: data, encoding: .utf8) ?? "<\(data.count) bytes>"
+            }
+            return found
+        }
+
+        let seen = ProgressLog()
+        let firstTier = directory.appendingPathComponent("scene_lod0.untoldgs")
+        let control = UntoldGSCookControl(
+            progress: { report in
+                if report.tierIndex == 1 {
+                    // The first tier is complete while the second bakes: it must not have
+                    // replaced the previous bake's yet.
+                    if (try? String(contentsOf: firstTier, encoding: .utf8)) != "OLD-LOD0" {
+                        seen.noteMixedSet()
+                    }
+                    if report.phase == .chunk {
+                        seen.cancel()
+                    }
+                }
+                seen.append(report)
+            },
+            isCancelled: { seen.isCancelled }
+        )
+        XCTAssertThrowsError(
+            try bakeGaussianSplatProgressiveTiers(plyURL: ply, outputBaseURL: output, lodFractions: [1.0, 0.5], cookOptions: transformedOptions, control: control)
+        ) { error in
+            XCTAssertEqual(error as? UntoldGSCookError, .cancelled)
+        }
+        XCTAssertTrue(seen.isCancelled, "the second tier was reached")
+        XCTAssertFalse(seen.sawMixedSet, "the new first tier never stood beside the old second one")
+        XCTAssertEqual(try contents(), previous, "the previous tiers, untouched, and no temporary")
+
+        let result = try bakeGaussianSplatProgressiveTiers(plyURL: ply, outputBaseURL: output, lodFractions: [1.0, 0.5], cookOptions: transformedOptions)
+        XCTAssertEqual(result.tiers.map(\.url.lastPathComponent), ["scene_lod0.untoldgs", "scene_lod1.untoldgs"])
+        XCTAssertEqual(try contents().keys.sorted(), ["scene_lod0.untoldgs", "scene_lod1.untoldgs"])
+        for tier in result.tiers {
+            XCTAssertNoThrow(try UntoldGSFile(url: tier.url), "\(tier.url.lastPathComponent) is the new bake's")
         }
     }
 
@@ -444,6 +501,16 @@ private final class ProgressLog: @unchecked Sendable {
 
     var isCancelled: Bool {
         lock.withLock { cancelled }
+    }
+
+    private var mixedSet = false
+
+    func noteMixedSet() {
+        lock.withLock { mixedSet = true }
+    }
+
+    var sawMixedSet: Bool {
+        lock.withLock { mixedSet }
     }
 }
 

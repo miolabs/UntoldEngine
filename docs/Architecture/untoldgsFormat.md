@@ -227,10 +227,12 @@ verbatim on the test side and compares the two byte for byte.
 `UntoldGSCookProgress` — the phase (`read`, `cook`, then per tier `chunk`, `coarsen` when the
 tier bakes coarse levels, `write`), the fraction within the phase, an overall fraction that
 reaches 1 with the last tier's `write`, and the tier — from the cooking thread, between window
-batches and chunk batches; the same points poll `isCancelled` and `Task.isCancelled`. A
-cancelled bake throws `UntoldGSCookError.cancelled` after discarding its temporary file and
-removing the tiers it had already renamed, as a failed bake removes them, so nothing partial is
-ever left in the output directory. `GaussianProgressiveBakeResult` reports the cook
+batches, across the progressive ranking and between chunk batches; the same points poll
+`isCancelled` and `Task.isCancelled`. Every tier is written to a temporary file beside its
+destination and the set is renamed into place only once the last tier is complete, so a
+cancelled bake (`UntoldGSCookError.cancelled`) or a failed one discards its temporaries and
+leaves the output directory as it found it — a previous bake's tiers included — with nothing
+partial in it. `GaussianProgressiveBakeResult` reports the cook
 (`cookReport`), the asset box and the centre bounds of the cooked splats; an editor that needs
 the bounds of a source before cooking calls `PLYReader.readGaussianCenterBounds(from:)`, one
 streamed pass with nothing resident but the running box, in place of a second full parse.
