@@ -146,7 +146,13 @@ public class PLYReader {
     /// The body is streamed in bounded windows (`PLYGaussianSource`), so only the result is
     /// resident, never a copy of the file.
     public static func readGaussianAsset(from url: URL) throws -> GaussianSplatAsset {
-        let source = try PLYGaussianSource(url: url)
+        try readGaussianAsset(from: url, windowing: .production)
+    }
+
+    /// `readGaussianAsset(from:)` over windows of the given sizes — the seam through which
+    /// tests stream a small fixture in many windows.
+    static func readGaussianAsset(from url: URL, windowing: PLYGaussianSource.Windowing) throws -> GaussianSplatAsset {
+        let source = try PLYGaussianSource(url: url, windowing: windowing)
         var splats: [GaussianSplat] = []
         splats.reserveCapacity(source.vertexCount)
         var coefficients: [Float] = []
@@ -612,13 +618,27 @@ final class PLYGaussianSource: @unchecked Sendable {
         max(0, fileSize - bodyOffset)
     }
 
-    /// Bytes of source a binary window covers, before rounding to whole vertices. Small enough
-    /// that a batch of windows — the raw bytes, the parsed splats and harmonics, the cooked
-    /// store — stays under about 100 MB across every core: malloc keeps what a batch frees
-    /// cached and dirty, so the batch size is footprint for the rest of the bake.
-    static let targetWindowBytes = 2 << 20
-    /// Bytes of text an ASCII window covers, before cutting at a line boundary.
-    static let asciiWindowBytes = 2 << 20
+    /// How the body is cut into windows. Production's sizes unless a test asks for smaller
+    /// ones, to run a fixture of a few hundred vertices through many windows.
+    struct Windowing {
+        /// Bytes of source a binary window covers, before rounding to whole vertices. Small
+        /// enough that a batch of windows — the raw bytes, the parsed splats and harmonics, the
+        /// cooked store — stays under about 100 MB across every core: malloc keeps what a batch
+        /// frees cached and dirty, so the batch size is footprint for the rest of the bake.
+        var targetWindowBytes = 2 << 20
+        /// Bytes of text an ASCII window covers, before cutting at a line boundary.
+        var asciiWindowBytes = 2 << 20
+        /// The fewest vertices a binary window holds, however wide the vertex.
+        var minVerticesPerWindow = 1024
+
+        static let production = Windowing()
+    }
+
+    let windowing: Windowing
+
+    /// Windows read by the last `forEachWindow`, including an ASCII body's past the declared
+    /// count. For tests, which prove a fixture went through more than one.
+    private(set) var windowsRead = 0
 
     /// A read-only descriptor closed exactly once, whenever the source goes away — including
     /// when `init` throws part-way.
@@ -638,8 +658,9 @@ final class PLYGaussianSource: @unchecked Sendable {
         }
     }
 
-    init(url: URL) throws {
+    init(url: URL, windowing: Windowing = .production) throws {
         self.url = url
+        self.windowing = windowing
         let file = try OpenFile(path: url.path)
         self.file = file
         var info = stat()
@@ -706,12 +727,12 @@ final class PLYGaussianSource: @unchecked Sendable {
         var vertexCount: Int
     }
 
-    /// The binary body cut into whole-vertex windows of about `targetWindowBytes`.
+    /// The binary body cut into whole-vertex windows of about `windowing.targetWindowBytes`.
     private func binaryWindows() -> [WindowRange] {
         let count = vertexElement.count
         guard count > 0 else { return [] }
         let stride = layout.stride
-        let perWindow = stride > 0 ? max(1024, min(1 << 20, Self.targetWindowBytes / stride)) : count
+        let perWindow = stride > 0 ? max(windowing.minVerticesPerWindow, min(1 << 20, windowing.targetWindowBytes / stride)) : count
         var windows: [WindowRange] = []
         var first = 0
         while first < count {
@@ -722,14 +743,14 @@ final class PLYGaussianSource: @unchecked Sendable {
         return windows
     }
 
-    /// The ASCII body cut at line boundaries into windows of about `asciiWindowBytes`, found by
-    /// probing for the newline after each boundary rather than scanning the body.
+    /// The ASCII body cut at line boundaries into windows of about `windowing.asciiWindowBytes`,
+    /// found by probing for the newline after each boundary rather than scanning the body.
     private func asciiWindows() throws -> [WindowRange] {
         var windows: [WindowRange] = []
         var start = bodyOffset
         let end = fileSize
         while start < end {
-            var cut = min(start + Self.asciiWindowBytes, end)
+            var cut = min(start + windowing.asciiWindowBytes, end)
             if cut < end {
                 // Extend to just past the first newline at or after the estimate.
                 var probeOffset = cut
@@ -795,6 +816,7 @@ final class PLYGaussianSource: @unchecked Sendable {
         let batchSize = max(1, parallelism)
         var consumed = 0
         var start = 0
+        windowsRead = 0
         while start < windows.count {
             let batch = Array(windows[start ..< min(start + batchSize, windows.count)])
             let results = ParallelResults<Mapped>(count: batch.count)
@@ -812,6 +834,7 @@ final class PLYGaussianSource: @unchecked Sendable {
             for slot in batch.indices {
                 try body(results.take(slot))
                 consumed += batch[slot].byteCount
+                windowsRead += 1
             }
             start += batch.count
             try afterBatch(bodyByteCount > 0 ? Double(consumed) / Double(bodyByteCount) : 1)
@@ -826,6 +849,7 @@ final class PLYGaussianSource: @unchecked Sendable {
         var consumed = 0
         var splatsSoFar = 0
         var start = 0
+        windowsRead = 0
         while start < windows.count {
             let batch = Array(windows[start ..< min(start + batchSize, windows.count)])
             // Once the declared count is met the rest of the body is only checked for UTF-8, as
@@ -869,6 +893,7 @@ final class PLYGaussianSource: @unchecked Sendable {
                 }
                 linesBefore += parsed.lineCount
                 consumed += batch[slot].byteCount
+                windowsRead += 1
             }
             start += batch.count
             try afterBatch(bodyByteCount > 0 ? Double(consumed) / Double(bodyByteCount) : 1)

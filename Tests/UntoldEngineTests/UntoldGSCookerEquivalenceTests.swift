@@ -5,9 +5,11 @@
 //  Pins the streamed cook (windows → store → parallel writer) to the bytes of
 //  the whole-array path it replaced: the same .ply cooked both ways is the
 //  same file, byte for byte, for single- and two-tier bakes, and the outputs
-//  carry SHA-256 pins so both paths cannot drift together. Also the progress
-//  and cancellation contract of UntoldGSCookControl, and the streamed centre
-//  bounds against the loaded splats.
+//  carry SHA-256 pins so both paths cannot drift together — through
+//  production's windows and through windows small enough that the fixtures
+//  span many of them. Also the progress and cancellation contract of
+//  UntoldGSCookControl, and the streamed centre bounds against the loaded
+//  splats.
 //
 //
 // Copyright (C) Untold Engine Studios
@@ -38,11 +40,16 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    /// The cooker test's 300-splat ASCII grid: SH degree 1, `nx ny nz` to skip.
-    private func asciiFixture() throws -> URL {
-        let count = 300
+    /// The cooker test's 300-splat ASCII grid: SH degree 1, `nx ny nz` to skip. `declaredCount`
+    /// is what the header claims when it is not the line count; `unreadableLines` are replaced
+    /// by a face-shaped line no vertex parse accepts.
+    private func asciiFixture(lineCount: Int = 300, declaredCount: Int? = nil, unreadableLines: Set<Int> = []) throws -> URL {
         var body = ""
-        for index in 0 ..< count {
+        for index in 0 ..< lineCount {
+            guard !unreadableLines.contains(index) else {
+                body += "3 \(index) \(index + 1) \(index + 2)\n"
+                continue
+            }
             let x = Float(index % 10) * 0.1
             let y = Float(index / 10 % 10) * 0.1
             let z = Float(index / 100) * 0.1
@@ -52,7 +59,7 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         let header = """
         ply
         format ascii 1.0
-        element vertex \(count)
+        element vertex \(declaredCount ?? lineCount)
         property float x
         property float y
         property float z
@@ -72,10 +79,9 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         property float rot_2
         property float rot_3
         end_header
-
         """
         let url = temporaryDirectory.appendingPathComponent("grid.ply")
-        try Data((header + body).utf8).write(to: url)
+        try Data((header + "\n" + body).utf8).write(to: url)
         return url
     }
 
@@ -235,6 +241,106 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         return url
     }
 
+    /// Vertex bytes of `binaryFixture`: 62 `float` properties and a `uchar`.
+    private let captureStride = 62 * 4 + 1
+
+    /// Windows of `vertices` vertices for a binary body of `stride`-byte vertices, and of about
+    /// `asciiBytes` for an ASCII body.
+    private func smallWindows(vertices: Int = 1024, stride: Int = 1, asciiBytes: Int = 2 << 20) -> PLYGaussianSource.Windowing {
+        PLYGaussianSource.Windowing(targetWindowBytes: vertices * stride, asciiWindowBytes: asciiBytes, minVerticesPerWindow: 1)
+    }
+
+    /// A 1000-splat degree-1 little-endian capture whose dropped vertices sit on either side of
+    /// every 64th index — the windows of `smallWindows(vertices: 64)` — and in runs across some:
+    /// culled by the reader (a −7 logit), under the cook's opacity floor (−5.5), a NaN centre and
+    /// a log scale that overflows `exp` (both degenerate). `nonFiniteColourAt` splats carry a
+    /// NaN DC term instead, which no prune catches and the writer must refuse by index.
+    /// Returns the file and the indices the cook drops.
+    private func boundaryFixture(nonFiniteColourAt: Set<Int> = []) throws -> (url: URL, dropped: Set<Int>) {
+        let count = 1000
+        var rng = SplitMix64(seed: 0xB0BD_0064)
+        var ply = PLYBinaryBuilder(bigEndian: false, comment: "window boundaries")
+        for name in ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2"] {
+            ply.property(name, .float)
+        }
+        for term in 0 ..< 9 {
+            ply.property("f_rest_\(term)", .float)
+        }
+        for name in ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"] {
+            ply.property(name, .float)
+        }
+        ply.beginBody(vertexCount: count, trailingFaceElement: false)
+
+        enum Fate { case kept, culled, underFloor, nanCentre, infiniteScale }
+        var fates = [Fate](repeating: .kept, count: count)
+        for boundary in stride(from: 64, to: count, by: 64) {
+            fates[boundary - 1] = .culled
+            fates[boundary] = .nanCentre
+            fates[boundary + 1] = .underFloor
+            if boundary % 128 == 0 {
+                // A run of drops across the boundary, culls and prunes interleaved.
+                fates[boundary - 3] = .infiniteScale
+                fates[boundary - 2] = .culled
+                fates[boundary + 2] = .culled
+                fates[boundary + 3] = .underFloor
+            }
+        }
+        fates[0] = .culled
+        fates[count - 1] = .infiniteScale
+        var dropped: Set<Int> = []
+        for index in 0 ..< count {
+            let fate = fates[index]
+            if fate != .kept { dropped.insert(index) }
+            ply.append(fate == .nanCentre ? .nan : rng.unit() * 4 - 2)
+            ply.append(rng.unit() * 2 - 1)
+            ply.append(rng.unit() * 4 - 2)
+            for channel in 0 ..< 3 {
+                ply.append(nonFiniteColourAt.contains(index) && channel == 1 ? .nan : rng.unit() * 2 - 1)
+            }
+            for _ in 0 ..< 9 {
+                ply.append(rng.unit() - 0.5)
+            }
+            switch fate {
+            case .culled: ply.append(-7)
+            case .underFloor: ply.append(-5.5)
+            default: ply.append(rng.unit() * 6 - 1)
+            }
+            for axis in 0 ..< 3 {
+                ply.append(fate == .infiniteScale && axis == 2 ? 100 : rng.unit() * 3 - 5)
+            }
+            for _ in 0 ..< 4 {
+                ply.append(rng.unit() * 2 - 1)
+            }
+        }
+        let url = temporaryDirectory.appendingPathComponent("boundaries.ply")
+        try ply.data.write(to: url)
+        return (url, dropped)
+    }
+
+    /// Vertex bytes of `boundaryFixture`: 23 `float` properties.
+    private let boundaryStride = 23 * 4
+
+    /// Where the reader cuts an ASCII body into windows of about `windowBytes`: just past the
+    /// first newline at or after each estimate, the body's end last. Offsets into the body.
+    private func asciiCuts(of ply: URL, windowBytes: Int) throws -> [Int] {
+        let data = try Data(contentsOf: ply)
+        let bodyOffset = try PLYReader.parseHeader(from: data).1
+        let body = [UInt8](data[bodyOffset...])
+        var cuts: [Int] = []
+        var start = 0
+        while start < body.count {
+            var cut = min(start + windowBytes, body.count)
+            if cut < body.count, let newline = body[cut...].firstIndex(of: 0x0A) {
+                cut = newline + 1
+            } else if cut < body.count {
+                cut = body.count
+            }
+            cuts.append(cut)
+            start = cut
+        }
+        return cuts
+    }
+
     /// Every binary fixture: the SH3 capture both ways round, the mixed scalar types both ways
     /// round, the RGB point cloud both ways round.
     private func binaryFixtureVariants() throws -> [URL] {
@@ -270,7 +376,14 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         try SHA256.hash(data: Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func bakeBothWays(ply: URL, name: String, lodFractions: [Float], options: UntoldGSCookOptions) throws -> [(legacy: URL, streamed: URL)] {
+    /// Bakes `ply` through the legacy path and through the streamed one over `windowing` —
+    /// production's, or windows the fixture spans `windows` of — and compares everything the
+    /// bake returns and every tier's bytes.
+    @discardableResult
+    private func bakeBothWays(
+        ply: URL, name: String, lodFractions: [Float], options: UntoldGSCookOptions,
+        windowing: PLYGaussianSource.Windowing = .production, windows: Int? = nil
+    ) throws -> BothWays {
         let legacyBase = temporaryDirectory.appendingPathComponent("legacy-\(name).untoldgs")
         let streamedBase = temporaryDirectory.appendingPathComponent("streamed-\(name).untoldgs")
         let legacy = try LegacyGaussianCookPath.bake(
@@ -278,7 +391,11 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
             emptySourceDescription: "source .ply contains no splats",
             outputBaseURL: legacyBase, lodFractions: lodFractions, cookOptions: options
         )
-        let streamed = try bakeGaussianSplatProgressiveTiers(plyURL: ply, outputBaseURL: streamedBase, lodFractions: lodFractions, cookOptions: options)
+        let source = try PLYGaussianSource(url: ply, windowing: windowing)
+        let streamed = try bakeGaussianSplatProgressiveTiers(source: source, outputBaseURL: streamedBase, lodFractions: lodFractions, cookOptions: options, control: nil)
+        if let windows {
+            XCTAssertEqual(source.windowsRead, windows, "\(name): the body went through \(windows) windows")
+        }
         XCTAssertEqual(legacy.cookReport, streamed.cookReport, name)
         XCTAssertEqual(legacy.boundingBoxMin, streamed.boundingBoxMin, name)
         XCTAssertEqual(legacy.boundingBoxMax, streamed.boundingBoxMax, name)
@@ -288,7 +405,13 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
             XCTAssertEqual(a.coarseReport, b.coarseReport, name)
             XCTAssertEqual(try Data(contentsOf: a.url), try Data(contentsOf: b.url), "\(name): \(a.url.lastPathComponent) is byte-identical either way")
         }
-        return zip(legacy.tiers, streamed.tiers).map { ($0.url, $1.url) }
+        return BothWays(tiers: zip(legacy.tiers, streamed.tiers).map { ($0.url, $1.url) }, report: streamed.cookReport)
+    }
+
+    /// What `bakeBothWays` compared: each tier's file from either path, and the (equal) report.
+    private struct BothWays {
+        var tiers: [(legacy: URL, streamed: URL)]
+        var report: UntoldGSCookReport
     }
 
     // MARK: - Byte identity
@@ -301,13 +424,13 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         options.cropMax = [0.95, 0.95, 0.15]
         options.shDegree = 0
         let single = try bakeBothWays(ply: ply, name: "grid", lodFractions: [1.0], options: options)
-        XCTAssertEqual(try sha256(single[0].streamed), "c27c677da83a97ac272ff3d746f7a5d1e5697e2122ca7d5c53cba28153e583f8")
+        XCTAssertEqual(try sha256(single.tiers[0].streamed), "c27c677da83a97ac272ff3d746f7a5d1e5697e2122ca7d5c53cba28153e583f8")
 
         options.coarseLevels = .levels(count: 1)
-        let tiers = try bakeBothWays(ply: ply, name: "grid-tiers", lodFractions: [1.0, 0.5], options: options)
+        let twoTier = try bakeBothWays(ply: ply, name: "grid-tiers", lodFractions: [1.0, 0.5], options: options)
         // Every splat of the grid has the same importance: the half tier is decided by the
         // ranking's tie order alone, which has to be the same every run.
-        XCTAssertEqual(try sha256(tiers[1].streamed), "62485bd1a68fec31cd42c03e64b0c8b4b8eb46867bdd341b017d40e6cdf4c179")
+        XCTAssertEqual(try sha256(twoTier.tiers[1].streamed), "62485bd1a68fec31cd42c03e64b0c8b4b8eb46867bdd341b017d40e6cdf4c179")
     }
 
     func testBinarySH3FixtureBakesByteIdenticalToTheWholeArrayPath() throws {
@@ -315,20 +438,20 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         XCTAssertEqual(try PLYReader.readGaussianSplatCount(from: ply), 1100)
 
         let transformed = try bakeBothWays(ply: ply, name: "capture", lodFractions: [1.0], options: transformedOptions)
-        let file = try UntoldGSFile(url: transformed[0].streamed)
+        let file = try UntoldGSFile(url: transformed.tiers[0].streamed)
         XCTAssertEqual(file.header.shDegree, 3)
         XCTAssertTrue(file.header.hasCoarseLevels, "69-odd chunks of 16: the automatic section")
         XCTAssertEqual(file.index.coarseRatioLog2, [3, 4])
-        XCTAssertEqual(try sha256(transformed[0].streamed), "e3dc509c394c4428389a6b43dc435489f861d6cb1fc9bbe5948ff21d097776c4")
-        _ = try bakeBothWays(ply: ply, name: "capture-tiers", lodFractions: [1.0, 0.5], options: transformedOptions)
+        XCTAssertEqual(try sha256(transformed.tiers[0].streamed), "e3dc509c394c4428389a6b43dc435489f861d6cb1fc9bbe5948ff21d097776c4")
+        try bakeBothWays(ply: ply, name: "capture-tiers", lodFractions: [1.0, 0.5], options: transformedOptions)
 
         let budgeted = try bakeBothWays(ply: ply, name: "budget", lodFractions: [1.0], options: budgetedOptions)
-        let budgetedFile = try UntoldGSFile(url: budgeted[0].streamed)
+        let budgetedFile = try UntoldGSFile(url: budgeted.tiers[0].streamed)
         XCTAssertEqual(budgetedFile.header.shDegree, 1)
         XCTAssertEqual(budgetedFile.header.splatCount, 700)
         XCTAssertFalse(budgetedFile.header.hasCoarseLevels)
-        XCTAssertEqual(try sha256(budgeted[0].streamed), "a61d665f6ca56d27897f69e974515d00e50cf1f5d364931446be68129ccdf327")
-        _ = try bakeBothWays(ply: ply, name: "budget-tiers", lodFractions: [1.0, 0.5], options: budgetedOptions)
+        XCTAssertEqual(try sha256(budgeted.tiers[0].streamed), "a61d665f6ca56d27897f69e974515d00e50cf1f5d364931446be68129ccdf327")
+        try bakeBothWays(ply: ply, name: "budget-tiers", lodFractions: [1.0, 0.5], options: budgetedOptions)
     }
 
     func testBinaryFixtureReadsIdenticallyThroughBothParsers() throws {
@@ -372,6 +495,190 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         let output = temporaryDirectory.appendingPathComponent("capture-be.untoldgs")
         _ = try bakeGaussianSplatProgressiveTiers(plyURL: ply, outputBaseURL: output, lodFractions: [1.0], cookOptions: transformedOptions)
         XCTAssertEqual(try sha256(output), "e3dc509c394c4428389a6b43dc435489f861d6cb1fc9bbe5948ff21d097776c4")
+    }
+
+    // MARK: - Many windows
+
+    // The fixtures are far below one production window; these run them through windows of a
+    // few dozen vertices, so parallel windows landing in source order, the culled and
+    // non-finite offsets carried across windows, and an ASCII body's line-boundary cuts and
+    // declared-count truncation are all proven against the whole-array path.
+
+    func testBinarySH3FixtureBakesByteIdenticalThroughSixtyFourVertexWindows() throws {
+        // 1100 vertices in 64-vertex windows: 17 full and one of 12, read several per batch.
+        let windowing = smallWindows(vertices: 64, stride: captureStride)
+        for bigEndian in [false, true] {
+            let ply = try binaryFixture(bigEndian: bigEndian)
+            let name = bigEndian ? "capture-be" : "capture-le"
+            XCTAssertEqual(try PLYGaussianSource(url: ply, windowing: windowing).layout.stride, captureStride)
+
+            let transformed = try bakeBothWays(ply: ply, name: "\(name)-w64", lodFractions: [1.0], options: transformedOptions, windowing: windowing, windows: 18)
+            XCTAssertEqual(try sha256(transformed.tiers[0].streamed), "e3dc509c394c4428389a6b43dc435489f861d6cb1fc9bbe5948ff21d097776c4", "the same file as through one window")
+            try bakeBothWays(ply: ply, name: "\(name)-w64-tiers", lodFractions: [1.0, 0.5], options: transformedOptions, windowing: windowing, windows: 18)
+
+            let budgeted = try bakeBothWays(ply: ply, name: "\(name)-w64-budget", lodFractions: [1.0], options: budgetedOptions, windowing: windowing, windows: 18)
+            XCTAssertEqual(try sha256(budgeted.tiers[0].streamed), "a61d665f6ca56d27897f69e974515d00e50cf1f5d364931446be68129ccdf327")
+        }
+    }
+
+    func testBinaryFixturesReadIdenticallyThroughSmallWindows() throws {
+        for ply in try binaryFixtureVariants() {
+            let name = ply.lastPathComponent
+            let whole = try PLYReader.readGaussianAsset(from: ply)
+            let stride = try PLYGaussianSource(url: ply).layout.stride
+            let windowed = try PLYReader.readGaussianAsset(from: ply, windowing: smallWindows(vertices: 37, stride: stride))
+            XCTAssertEqual(whole.splats.count, windowed.splats.count, name)
+            for (a, b) in zip(whole.splats, windowed.splats) {
+                XCTAssertEqual(a.center, b.center, name)
+                XCTAssertEqual(a.scale, b.scale, name)
+                XCTAssertEqual(a.color, b.color, name)
+                XCTAssertEqual(a.quat, b.quat, name)
+                XCTAssertEqual(a.opacity, b.opacity, name)
+            }
+            XCTAssertEqual(whole.sphericalHarmonics?.coefficients, windowed.sphericalHarmonics?.coefficients, name)
+        }
+    }
+
+    func testASCIIFixtureBakesByteIdenticalThroughTwoKilobyteWindows() throws {
+        let ply = try asciiFixture()
+        let cuts = try asciiCuts(of: ply, windowBytes: 2048)
+        XCTAssertGreaterThan(cuts.count, 8, "the 300-line grid spans many 2 KB windows")
+        let windowing = smallWindows(asciiBytes: 2048)
+
+        var options = UntoldGSCookOptions()
+        options.log2ChunkSplats = 7
+        options.cropMin = [0, 0, 0]
+        options.cropMax = [0.95, 0.95, 0.15]
+        options.shDegree = 0
+        let single = try bakeBothWays(ply: ply, name: "grid-w2k", lodFractions: [1.0], options: options, windowing: windowing, windows: cuts.count)
+        XCTAssertEqual(try sha256(single.tiers[0].streamed), "c27c677da83a97ac272ff3d746f7a5d1e5697e2122ca7d5c53cba28153e583f8", "the same file as through one window")
+
+        options.coarseLevels = .levels(count: 1)
+        let twoTier = try bakeBothWays(ply: ply, name: "grid-w2k-tiers", lodFractions: [1.0, 0.5], options: options, windowing: windowing, windows: cuts.count)
+        XCTAssertEqual(try sha256(twoTier.tiers[1].streamed), "62485bd1a68fec31cd42c03e64b0c8b4b8eb46867bdd341b017d40e6cdf4c179")
+    }
+
+    func testASCIIBodyLongerThanItsDeclaredCountIsCutToTheCountAcrossWindows() throws {
+        // 300 lines under a header declaring 250, the first excess line and a later one
+        // unreadable as vertices: the whole-array path took the first 250 lines and never looked
+        // at the rest. The declared count has to run out inside a window, with the excess
+        // spilling over the windows after it — where its lines, readable or not, are counted
+        // but never parsed.
+        let ply = try asciiFixture(lineCount: 300, declaredCount: 250, unreadableLines: [250, 291])
+        let cuts = try asciiCuts(of: ply, windowBytes: 2048)
+        let data = try Data(contentsOf: ply)
+        let bodyOffset = try PLYReader.parseHeader(from: data).1
+        let body = [UInt8](data[bodyOffset...])
+        var endOfDeclared = 0
+        for _ in 0 ..< 250 {
+            endOfDeclared = try XCTUnwrap(body[endOfDeclared...].firstIndex(of: 0x0A)) + 1
+        }
+        XCTAssertFalse(cuts.contains(endOfDeclared), "the count runs out inside a window")
+        XCTAssertGreaterThan(cuts.filter { $0 > endOfDeclared }.count, 1, "the excess spans a window boundary")
+
+        let legacy = try LegacyGaussianCookPath.readGaussianAsset(from: ply)
+        XCTAssertEqual(legacy.splats.count, 250)
+        let windowed = try PLYReader.readGaussianAsset(from: ply, windowing: smallWindows(asciiBytes: 2048))
+        XCTAssertEqual(windowed.splats.count, 250)
+        XCTAssertEqual(legacy.sphericalHarmonics?.coefficients, windowed.sphericalHarmonics?.coefficients)
+        for (a, b) in zip(legacy.splats, windowed.splats) {
+            XCTAssertEqual(a.center, b.center)
+            XCTAssertEqual(a.color, b.color)
+        }
+
+        var options = UntoldGSCookOptions()
+        options.log2ChunkSplats = 5
+        options.shDegree = 1
+        let twoTier = try bakeBothWays(ply: ply, name: "grid-250", lodFractions: [1.0, 0.5], options: options, windowing: smallWindows(asciiBytes: 2048), windows: cuts.count)
+        XCTAssertEqual(twoTier.report.inputSplatCount, 250)
+        XCTAssertEqual(try Int(UntoldGSFile(url: twoTier.tiers[0].streamed).header.splatCount), 250)
+
+        // An unreadable line within the count is still an error, wherever the windows fall.
+        let broken = try asciiFixture(lineCount: 300, declaredCount: 250, unreadableLines: [249])
+        XCTAssertThrowsError(try PLYReader.readGaussianAsset(from: broken, windowing: smallWindows(asciiBytes: 2048))) { error in
+            guard case let PLYError.invalidData(message)? = error as? PLYError else {
+                return XCTFail("\(error)")
+            }
+            XCTAssertTrue(message.hasPrefix("Cannot parse float"), message)
+        }
+    }
+
+    func testCulledAndDegenerateVerticesOnWindowBoundariesBakeByteIdentical() throws {
+        // 15 boundaries, every other one (7) with the longer run; 1000 vertices in 16 windows.
+        let (ply, dropped) = try boundaryFixture()
+        XCTAssertEqual(dropped.count, 75)
+        let windowing = smallWindows(vertices: 64, stride: boundaryStride)
+        XCTAssertEqual(try PLYGaussianSource(url: ply, windowing: windowing).layout.stride, boundaryStride)
+        let culled = 15 + 2 * 7 + 1
+        let read = try PLYReader.readGaussianAsset(from: ply, windowing: windowing)
+        XCTAssertEqual(read.splats.count, 1000 - culled, "culled before every boundary, on both sides of every other, and the first")
+        XCTAssertEqual(read.sphericalHarmonics?.coefficients, try LegacyGaussianCookPath.readGaussianAsset(from: ply).sphericalHarmonics?.coefficients)
+
+        var options = transformedOptions
+        options.log2ChunkSplats = 5
+        let single = try bakeBothWays(ply: ply, name: "boundaries", lodFractions: [1.0], options: options, windowing: windowing, windows: 16)
+        let report = single.report
+        XCTAssertEqual(report.inputSplatCount, 1000 - culled)
+        XCTAssertEqual(report.prunedByOpacity, 15 + 7, "under the floor after every boundary, and after every other")
+        XCTAssertEqual(report.prunedByDegenerateGeometry, 15 + 7 + 1, "a NaN centre on every boundary, an overflowed scale before every other, and the last")
+        XCTAssertEqual(report.prunedByCrop, 0)
+        XCTAssertEqual(report.keptSplatCount, 1000 - dropped.count)
+        XCTAssertEqual(try Int(UntoldGSFile(url: single.tiers[0].streamed).header.splatCount), 1000 - dropped.count)
+        try bakeBothWays(ply: ply, name: "boundaries-tiers", lodFractions: [1.0, 0.5], options: options, windowing: windowing, windows: 16)
+    }
+
+    func testNonFiniteSplatsPastWindowBoundariesAreRefusedByTheirStoreIndex() throws {
+        // A NaN colour survives every prune and reaches the writer, which refuses it by its
+        // index in the cooked store: the first one's index, five windows and their drops in,
+        // has to be the same from the windowed cook as from the whole array.
+        let (ply, dropped) = try boundaryFixture(nonFiniteColourAt: [325, 700])
+        XCTAssertFalse(dropped.contains(325))
+        let expectedIndex = 325 - dropped.filter { $0 < 325 }.count
+        XCTAssertGreaterThan(325 - expectedIndex, 20, "the drops before it shift its index")
+        let expected = UntoldGSError.invalidInput("splat \(expectedIndex) has non-finite data or a non-positive scale")
+
+        var options = transformedOptions
+        options.log2ChunkSplats = 5
+        XCTAssertThrowsError(
+            try LegacyGaussianCookPath.bake(
+                sourceAsset: LegacyGaussianCookPath.readGaussianAsset(from: ply), emptySourceDescription: "",
+                outputBaseURL: temporaryDirectory.appendingPathComponent("legacy-nan.untoldgs"), lodFractions: [1.0], cookOptions: options
+            )
+        ) { error in
+            XCTAssertEqual(error as? UntoldGSError, expected)
+        }
+        let source = try PLYGaussianSource(url: ply, windowing: smallWindows(vertices: 64, stride: boundaryStride))
+        XCTAssertThrowsError(
+            try bakeGaussianSplatProgressiveTiers(
+                source: source, outputBaseURL: temporaryDirectory.appendingPathComponent("streamed-nan.untoldgs"), lodFractions: [1.0], cookOptions: options, control: nil
+            )
+        ) { error in
+            XCTAssertEqual(error as? UntoldGSError, expected)
+        }
+        XCTAssertEqual(source.windowsRead, 16)
+    }
+
+    func testReadProgressClimbsThroughEveryBatchOfWindows() throws {
+        // Four-vertex windows: 275 of them, batched a core's worth at a time, so the read phase
+        // reports many times — from 0, strictly up through (0, 1), to exactly 1.
+        let ply = try binaryFixture()
+        let reports = ProgressLog()
+        let source = try PLYGaussianSource(url: ply, windowing: smallWindows(vertices: 4, stride: captureStride))
+        _ = try bakeGaussianSplatProgressiveTiers(
+            source: source, outputBaseURL: temporaryDirectory.appendingPathComponent("progress-w4.untoldgs"),
+            lodFractions: [1.0], cookOptions: transformedOptions, control: UntoldGSCookControl(progress: { reports.append($0) })
+        )
+        XCTAssertEqual(source.windowsRead, 275)
+        let read = reports.all.filter { $0.phase == .read }.map(\.fraction)
+        XCTAssertEqual(read.first, 0)
+        XCTAssertEqual(read.last, 1)
+        XCTAssertGreaterThanOrEqual(read.count, 4, "at least two batches between the first and the last report")
+        for (previous, next) in zip(read, read.dropFirst()) {
+            XCTAssertGreaterThan(next, previous, "read fractions strictly increase")
+        }
+        for fraction in read.dropFirst().dropLast() {
+            XCTAssertTrue(fraction > 0 && fraction < 1, "\(fraction) is within (0, 1)")
+        }
     }
 
     // MARK: - Centre bounds

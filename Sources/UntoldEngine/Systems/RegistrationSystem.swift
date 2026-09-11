@@ -4986,8 +4986,21 @@ public func bakeGaussianSplatProgressiveTiers(
     cookOptions: UntoldGSCookOptions = UntoldGSCookOptions(),
     control: UntoldGSCookControl?
 ) throws -> GaussianProgressiveBakeResult {
+    try bakeGaussianSplatProgressiveTiers(
+        source: PLYGaussianSource(url: plyURL), outputBaseURL: outputBaseURL, lodFractions: lodFractions, cookOptions: cookOptions, control: control
+    )
+}
+
+/// The `.ply` bake over a source already open — the seam through which tests stream a small
+/// fixture in windows far below production's.
+func bakeGaussianSplatProgressiveTiers(
+    source: PLYGaussianSource,
+    outputBaseURL: URL,
+    lodFractions: [Float],
+    cookOptions: UntoldGSCookOptions,
+    control: UntoldGSCookControl?
+) throws -> GaussianProgressiveBakeResult {
     let progress = UntoldGSCookProgressSink(control: control, tierCount: lodFractions.count)
-    let source = try PLYGaussianSource(url: plyURL)
     guard !lodFractions.isEmpty else {
         throw UntoldGSError.sizeMismatch("lodFractions must contain at least one entry")
     }
