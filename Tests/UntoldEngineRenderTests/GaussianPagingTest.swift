@@ -85,6 +85,8 @@ final class GaussianPagingTest: BaseRenderSetup {
         GaussianPagingPolicy.minPoolSlots = 4
         GaussianPagingPolicy.fadeFrames = 0
         GaussianPagingPolicy.maxConcurrentReads = 64
+        // Count-bounded commits: the tiers a tick maps are a function of the arrivals alone.
+        GaussianPagingPolicy.commitBudget = .infinity
         GaussianTestPageSource.resetCreated()
         GaussianTestPageSource.install()
         GaussianLODSystem.shared.reset()
@@ -967,6 +969,53 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertTrue(sawTwo, "the cap was reached")
     }
 
+    /// The commit budget: a tick over it defers the landed tiers past the first clock stride to
+    /// the next tick, still in priority order, and counts them (`deferredTiers`); under
+    /// `freezePaging` the deferred ones keep mapping (they are landed, not reads).
+    func testTheCommitBudgetDefersLandedTiersInOrder() throws {
+        GaussianRuntimeLimits.workingSetSplatsOverride = 20000
+        let fixture = try loadSlab(poolSlots: 300)
+        placeGaussianTestCamera(eye: slabCamera.eye, target: slabCamera.target)
+        frame(fixture) // tick 1: the first reads issued and landed
+        let issued = fixture.pager.eventLog.filter { $0.kind == .issued && $0.tick == 1 }
+        XCTAssertGreaterThan(issued.count, 32, "enough tiers landed to cross the clock stride")
+        XCTAssertEqual(fixture.pager.stats.pendingReads, 0)
+        // The commit order: priority descending, then the chunk, then the tier.
+        let expected = issued.sorted { $0.priority != $1.priority ? $0.priority > $1.priority : $0.chunk != $1.chunk ? $0.chunk < $1.chunk : $0.tier < $1.tier }
+            .map { (chunk: $0.chunk, tier: $0.tier) }
+
+        // A budget of 0: the first completion, then one clock stride of 16 tiers, per tick. No
+        // new reads (frozen), so the ticks map exactly the tiers that landed at tick 1.
+        GaussianPagingPolicy.commitBudget = 0
+        GaussianDebugOptions.shared.freezePaging = true
+        var committed: [(chunk: Int, tier: Int)] = []
+        var perTick: [Int] = []
+        var deferredAfter: [Int] = []
+        for _ in 0 ..< 64 {
+            frame(fixture)
+            let tick = fixture.pager.tick
+            let events = fixture.pager.eventLog.filter { $0.kind == .committed && $0.tick == tick }
+            committed.append(contentsOf: events.map { (chunk: $0.chunk, tier: $0.tier) })
+            perTick.append(events.count)
+            deferredAfter.append(fixture.pager.stats.deferredTiers)
+            XCTAssertEqual(fixture.pager.stats.pendingReads, 0, "a deferred tier is landed, not pending")
+            XCTAssertEqual(fixture.pager.stats.issuedThisTick, 0, "frozen: nothing issued")
+            if fixture.pager.stats.deferredTiers == 0 { break }
+        }
+        XCTAssertGreaterThan(perTick.count, 1, "the budget deferred some tiers")
+        XCTAssertEqual(deferredAfter.last, 0, "everything landed was mapped in the end")
+        for (index, count) in perTick.enumerated() {
+            XCTAssertGreaterThanOrEqual(count, min(16, expected.count - perTick[..<index].reduce(0, +)), "tick \(index + 2) mapped at least a clock stride")
+            XCTAssertLessThan(count, expected.count, "tick \(index + 2) mapped less than all of it")
+        }
+        for (index, count) in perTick.dropLast().enumerated() {
+            XCTAssertEqual(deferredAfter[index], expected.count - perTick[...index].reduce(0, +), "tick \(index + 2) counted the tiers it left: \(count) mapped")
+        }
+        XCTAssertEqual(committed.map(\.chunk), expected.map(\.chunk), "mapped across the ticks in the commit order")
+        XCTAssertEqual(committed.map(\.tier), expected.map(\.tier))
+        GaussianDebugOptions.shared.freezePaging = false
+    }
+
     // MARK: - 12, 13, 14: failures
 
     func testAReadFailureBacksOffThenFaultsTheChunk() throws {
@@ -1580,15 +1629,21 @@ final class GaussianPagingTest: BaseRenderSetup {
         let camera = placeGaussianTestCamera(eye: simd_float3(orbitRadius, orbitHeight, 0), target: .zero)
 
         var worstTickMs: Double = 0
+        // The time in `renderer.draw` over the run: the wall time also holds each frame's GPU
+        // wait, which grows with the resident set (a faster fill makes the wall time longer).
+        var drawSeconds: Double = 0
         var sawVisible = false
         var fillFrame: Int?
+        var committedSoFar = 0
         let start = CFAbsoluteTimeGetCurrent()
         for frameIndex in 0 ..< frameCount {
             let angle = Float(frameIndex) * 0.05
             cameraLookAt(entityId: camera, eye: simd_float3(orbitRadius * cos(angle), orbitHeight, orbitRadius * sin(angle)), target: .zero, up: simd_float3(0, 1, 0))
             let tickStart = CFAbsoluteTimeGetCurrent()
             renderer.draw(in: renderer.metalView)
-            worstTickMs = max(worstTickMs, (CFAbsoluteTimeGetCurrent() - tickStart) * 1000)
+            let tickSeconds = CFAbsoluteTimeGetCurrent() - tickStart
+            drawSeconds += tickSeconds
+            worstTickMs = max(worstTickMs, tickSeconds * 1000)
             renderInfo.lastCommandBuffer?.waitUntilCompleted()
             XCTAssertEqual(renderInfo.lastCommandBuffer?.status, .completed, "frame \(frameIndex)")
             XCTAssertEqual(sharedVisibleSet().overflowCount, 0, "frame \(frameIndex)")
@@ -1601,7 +1656,8 @@ final class GaussianPagingTest: BaseRenderSetup {
             if frameIndex >= 10 {
                 if sharedVisibleSet().visibleCount > 0 { sawVisible = true }
             }
-            if fillFrame == nil, pager.eventLog.filter({ $0.kind == .committed }).count >= Int(0.8 * Double(stats.slotCount)) { fillFrame = frameIndex }
+            committedSoFar += stats.committedThisTick
+            if fillFrame == nil, committedSoFar >= Int(0.8 * Double(stats.slotCount)) { fillFrame = frameIndex }
             run.saturatedByFrame.append(stats.saturatedCandidates)
             // The levels (per-chunk-lod-tiers): the tick the section landed.
             if run.landedTick == 0, pager.coarseSectionLanded {
@@ -1618,6 +1674,8 @@ final class GaussianPagingTest: BaseRenderSetup {
         run.fineReads = pager.eventLog.filter { $0.kind == .issued }.count
         let committedTiers = pager.eventLog.filter { $0.kind == .committed }.count
         let evictedTiers = pager.eventLog.filter { $0.kind == .evicted }.count
+        XCTAssertEqual(committedSoFar, committedTiers, "the per-tick commit counts sum to the journal's")
+        XCTAssertEqual(stats.deferredTiers, 0, "nothing landed is left unmapped at the end")
         XCTAssertTrue(sawVisible, "something drawn after the fill-in")
         XCTAssertNotNil(fillFrame, "the pool fills: 80 % of its slots were committed within the run")
         if poolHoldsTheAsset {
@@ -1630,9 +1688,9 @@ final class GaussianPagingTest: BaseRenderSetup {
         }
         XCTAssertGreaterThan(stats.residentSlots, 0)
         assertSlotReuseInvariant(pager.eventLog)
-        print(String(format: "[GaussianPagingTest] %d splats in %d chunks (%@), budget %@, pool %@ (%d slots%@): %d frames in %.2f s, resident %@, 80 %% fill at frame %d, worst frame %.2f ms, saturated %d, committed %d tiers, evicted %d (bake+load %.1f s)%@",
+        print(String(format: "[GaussianPagingTest] %d splats in %d chunks (%@), budget %@, pool %@ (%d slots%@): %d frames in %.2f s (%.2f s in draw), resident %@, 80 %% fill at frame %d, worst frame %.2f ms, saturated %d, committed %d tiers, evicted %d (bake+load %.1f s)%@",
                      splatCount, table.chunkCount, gaussianFormatBytes(assetBytes), gaussianFormatBytes(residencyBudgetBytes), gaussianFormatBytes(pager.poolBytes), stats.slotCount,
-                     poolHoldsTheAsset ? ", the whole asset" : "", frameCount, elapsed,
+                     poolHoldsTheAsset ? ", the whole asset" : "", frameCount, elapsed, drawSeconds,
                      gaussianFormatBytes(stats.residentSlots * slotBytes), fillFrame ?? -1, worstTickMs, stats.saturatedCandidates,
                      committedTiers, evictedTiers, start - bakeStart,
                      table.coarse == nil ? "" : String(format: ", coarse levels %d (%@ landed %@, %d pieces, faulted %d)", stats.coarseLevels, gaussianFormatBytes(stats.coarseBytesLanded), gaussianFormatBytes(stats.coarseBytes), stats.coarseReadsIssued, stats.coarseFaulted ? 1 : 0)))

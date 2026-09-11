@@ -148,7 +148,11 @@ public enum GaussianPagingPolicy {
 
     /// The time a tick spends mapping landed tiers before the rest wait for the next tick, in
     /// seconds, past the first completion; the frame's cost of a fill is bounded by this while
-    /// the pool has room and the reads keep up, up to `maxCommitsPerTick` tiers.
+    /// the pool has room and the reads keep up, up to `maxCommitsPerTick` tiers. The clock
+    /// makes the tiers a tick maps a function of the machine's speed, not only of the arrivals:
+    /// `.infinity` turns it off, so the count cap alone bounds a tick and the fill's schedule is
+    /// reproducible run to run (the test fixtures and the benchmarks pin it so). 0 maps the
+    /// first completion and one clock stride (16 tiers) per tick.
     public static var commitBudget: Double {
         get { storage.commitBudget }
         set { storage.commitBudget = max(0, newValue) }

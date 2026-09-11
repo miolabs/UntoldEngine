@@ -64,6 +64,8 @@ final class GaussianChunkLevelTest: BaseRenderSetup {
         GaussianPagingPolicy.resetKnobs()
         GaussianPagingPolicy.minPoolSlots = 4
         GaussianPagingPolicy.maxConcurrentReads = 64
+        // Count-bounded commits: the tiers a tick maps are a function of the arrivals alone.
+        GaussianPagingPolicy.commitBudget = .infinity
         GaussianTestPageSource.resetCreated()
         GaussianTestPageSource.install()
         GaussianLODSystem.shared.reset()

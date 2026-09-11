@@ -48,6 +48,8 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         savedWorkingSetOverride = GaussianRuntimeLimits.workingSetSplatsOverride
         savedLevelMode = GaussianDebugOptions.shared.gaussianLevelMode
         GaussianDebugOptions.shared.gaussianLevelMode = .auto
+        // Count-bounded commits, so framesToWarm and committed/frame compare across machines.
+        GaussianPagingPolicy.commitBudget = .infinity
     }
 
     override func tearDown() async throws {
@@ -202,6 +204,7 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         var issued = 0
         var committed = 0
         var evicted = 0
+        var deferredMax = 0
         let slotBytes = pager.ranksPerPage * (UntoldGSFormat.coreRecordSize + index.header.shBytesPerSplat)
         while quietFrames < 5, framesToWarm < 300 {
             let start = CACurrentMediaTime()
@@ -213,7 +216,9 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
             issued += stats.issuedThisTick
             committed += stats.committedThisTick
             evicted += stats.evictedThisTick
-            quietFrames = stats.pendingReads == 0 && stats.issuedThisTick == 0 ? quietFrames + 1 : 0
+            deferredMax = max(deferredMax, stats.deferredTiers)
+            // Quiet: nothing pending, nothing issued, and no landed tier left for the next tick.
+            quietFrames = stats.pendingReads == 0 && stats.issuedThisTick == 0 && stats.deferredTiers == 0 ? quietFrames + 1 : 0
         }
         let samples = measure(frames: frames + warmup, component: component)
         let cullOnly = measureCullOnly(frames: frames + warmup)
@@ -222,9 +227,11 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         let perFrame = Double(max(1, framesToWarm))
         let coarse = stats.coarseLevels == 0 ? "" : String(format: " coarseLevels=%d coarseBytes=%@ coarsePieces=%d", stats.coarseLevels, gaussianFormatBytes(stats.coarseBytesLanded), stats.coarseReadsIssued)
         let line = report(label, samples, cullOnly: cullOnly, warmup: warmup, component: component)
-            + String(format: " pool=%@ pages=%d/%d framesToWarm=%d issued/frame=%.1f committed/frame=%.1f evicted/frame=%.1f tickMs(max)=%.2f saturated=%d faults=%d%@",
+            + String(format: " pool=%@ pages=%d/%d framesToWarm=%d issued/frame=%.1f committed/frame=%.1f evicted/frame=%.1f commitCap=%d commitBudget=%@ deferred(max)=%d tickMs(max)=%.2f saturated=%d faults=%d%@",
                      gaussianFormatBytes(stats.poolBytes), stats.residentSlots, stats.slotCount, framesToWarm,
-                     Double(issued) / perFrame, Double(committed) / perFrame, Double(evicted) / perFrame, worstTickMs, stats.saturatedCandidates, stats.faultedChunks, coarse)
+                     Double(issued) / perFrame, Double(committed) / perFrame, Double(evicted) / perFrame,
+                     GaussianPagingPolicy.maxCommitsPerTick, GaussianPagingPolicy.commitBudget.isFinite ? String(format: "%.2fms", GaussianPagingPolicy.commitBudget * 1000) : "inf", deferredMax,
+                     worstTickMs, stats.saturatedCandidates, stats.faultedChunks, coarse)
         print("[GaussianChunkCullBenchmark] \(line)")
         return (line, samples.last?.visibleSplats ?? 0, image, issued * slotBytes)
     }

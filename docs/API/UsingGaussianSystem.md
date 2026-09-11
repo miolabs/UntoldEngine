@@ -178,7 +178,9 @@ only the sizes up to `n` (`4000000` for the 4 M run alone). Each run checks the 
 the policy sizes it (the budget, or the whole asset when that is smaller: a 4 M asset without
 harmonics is 64,000,000 B and fits every tier, so nothing saturates and nothing is evicted; a
 20 M asset saturates the pool on purpose) and prints the resident bytes, the frame at which
-80 % of the slots had been committed and the worst frame time.
+80 % of the slots had been committed and the worst frame time, with the run's wall time beside
+the time spent in `renderer.draw` (the rest is each frame's GPU wait, which grows with the
+resident set — a faster fill makes the wall time longer, not shorter).
 
 ### Per-chunk coarse levels
 
@@ -371,7 +373,11 @@ it keeps resident, and every head of the asset fits it.
   minimum-residency and reload-cooldown ticks, the per-tick read and byte caps, the commit
   cap and budget (`maxCommitsPerTick`, 4096 tiers, is the ceiling; `commitBudget`, 0.5 ms,
   is how long a tick keeps mapping landed tiers past the first — a fill is bounded by the
-  clock, thousands of tiers a frame while the pool has room and the reads keep up),
+  clock, thousands of tiers a frame while the pool has room and the reads keep up; the tiers
+  a tick maps therefore depend on the machine and are not reproducible run to run, and
+  `commitBudget = .infinity` restores the count-only bound — the test fixtures and the
+  benchmarks pin it so; `GaussianPagingStats.deferredTiers` counts the landed tiers a tick
+  left for the next one),
   `fadeFrames`, `verifyPagedChunkCRC`. On a paged entity `disableChunkCull` forces only the
   resident ranks (a chunk no view keeps is never demanded, so its ranks never load),
   `disableWorkingSetBudget` wants every rank of every demanded chunk and sizes the set to the

@@ -63,6 +63,9 @@ public struct GaussianPagingStats: Equatable, Sendable {
     public var issuedThisTick = 0
     public var committedThisTick = 0
     public var evictedThisTick = 0
+    /// Landed tiers the tick left unmapped for the next one (its commit cap or budget reached);
+    /// they count in `residentSlots` and no longer in `pendingReads`.
+    public var deferredTiers = 0
     /// Requests that found no slot and nothing worth displacing, over the pager's life.
     public var saturatedCandidates = 0
     public var faultedChunks = 0
@@ -436,6 +439,8 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// The landed reads a tick left unmapped (its commit cap or budget reached), in priority
     /// order; lock-guarded so a shutdown from any thread drops them with the inbox.
     private var _deferred: [GaussianPageCompletion] = []
+    /// Tiers in `_deferred` after the last tick (`GaussianPagingStats.deferredTiers`).
+    private var deferredTiers = 0
     private var coarseInbox: [GaussianCoarseCompletion] = []
     /// The tick's own arrays, swapped with the lock-guarded ones so no tick copies an inbox:
     /// the arrivals taken, the deferred list taken, and the merge of the two.
@@ -1069,6 +1074,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         stats.issuedThisTick = issued
         stats.committedThisTick = committed
         stats.evictedThisTick = evicted
+        stats.deferredTiers = deferredTiers
         stats.saturatedCandidates = saturatedCandidates
         stats.faultedChunks = faultedChunkCount
         stats.corruptChunks = corruptChunkCount
@@ -1095,15 +1101,17 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// Maps the landed reads in priority order — the arrivals since the last tick sorted and
     /// merged with the ones an earlier tick deferred — until `maxCommitsPerTick` tiers are
     /// mapped or `commitBudget` of the tick's time is spent (past the first completion, so a
-    /// slow tick still makes progress); the rest wait, in order, for the next tick. A failed
-    /// read frees its slots at once (never mapped, never referenced by a frame). Ties on the
-    /// priority break on the chunk, then the rank.
+    /// slow tick still makes progress; on the monotonic clock, so a step of the wall clock
+    /// neither stalls nor unbounds a tick); the rest wait, in order, for the next tick. A
+    /// failed read frees its slots at once (never mapped, never referenced by a frame). Ties on
+    /// the priority break on the chunk, then the rank.
     private func drainInbox(now: UInt32, fadeFrames: UInt32) -> Int {
         lock.lock()
         swap(&inbox, &arrivals)
         swap(&_deferred, &deferredTaken)
         let generation = _generation
         lock.unlock()
+        deferredTiers = 0
         guard !arrivals.isEmpty || !deferredTaken.isEmpty else { return 0 }
         arrivals.sort { GaussianPageManager.before($0, $1) }
         merged.removeAll(keepingCapacity: true)
@@ -1126,8 +1134,9 @@ public final class GaussianPageManager: @unchecked Sendable {
 
         var committed = 0
         let commitCap = GaussianPagingPolicy.maxCommitsPerTick
-        let budget = GaussianPagingPolicy.commitBudget
-        let start = CFAbsoluteTimeGetCurrent()
+        // The budget in nanoseconds of the monotonic clock; +inf (no clock) stays +inf.
+        let budgetNanoseconds = GaussianPagingPolicy.commitBudget * 1e9
+        let start = DispatchTime.now().uptimeNanoseconds
         var overBudget = false
         var sinceClock = 0
         for completion in merged {
@@ -1147,7 +1156,7 @@ public final class GaussianPageManager: @unchecked Sendable {
                 if committed > 0 {
                     if !overBudget, sinceClock >= 16 {
                         sinceClock = 0
-                        overBudget = CFAbsoluteTimeGetCurrent() - start >= budget
+                        overBudget = Double(DispatchTime.now().uptimeNanoseconds &- start) >= budgetNanoseconds
                     }
                     if overBudget || committed + tiers > commitCap {
                         deferredTaken.append(completion)
@@ -1163,6 +1172,9 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
         merged.removeAll(keepingCapacity: true)
         if !deferredTaken.isEmpty {
+            for completion in deferredTaken {
+                deferredTiers += completion.request.slots.count
+            }
             // The deferred list was taken whole and nothing else writes it: the ones left are
             // put back, still in order.
             lock.lock()
