@@ -232,8 +232,8 @@ Format](../Architecture/untoldgsFormat.md)); `--lod-levels N` writes progressive
 The `--splat-*` flags cook the capture on the way: register it onto its mesh twin, crop
 away floaters and the captured floor, drop near-transparent splats, and choose the
 spherical-harmonics degree and chunk size. They apply identically regardless of which
-source format was used, since both are read into the same in-memory representation before
-any cooking happens.
+source format was used: a `.ply` is streamed through the cook in windows, a `.spz` is
+decoded whole (its container is not streamable), and both feed the same cook and writer.
 
 ```bash
 untoldengine export --input sofa.ply --output Gaussians/sofa.untoldgs \
@@ -252,6 +252,17 @@ every splat and recorded in the file header.
 sets the chunk size (1024 for objects, 4096 with `--splat-environment` for rooms and
 larger). Values that start with a minus sign must use the `--option=value` form. The
 command prints how many splats were kept and pruned per reason.
+
+The cook streams the `.ply` in bounded windows, parses and cooks them in parallel, and
+writes every tier through a temporary file in the output directory that is renamed into
+place when complete — a 10 M-splat degree-3 capture (2.4 GB) cooks in about two seconds
+with a peak of about 2 GB of memory, where reading the file whole took 35 s and 10 GB. While
+it runs the command reports progress on stderr — one line rewritten in place on a terminal
+(`read      42 %  overall  15 %`, then `cook`, `chunk`, `coarsen`, `write`, with the tier for a
+`--lod-levels` export), a line per phase when stderr is a file — and Ctrl-C cancels it between
+windows or chunk batches: the temporary file and any tier already written are removed, so an
+interrupted export never leaves a partial `.untoldgs` behind (the command exits with
+"Gaussian splat cook cancelled; no file was written").
 
 `--splat-coarse-levels auto|0|1|2` (default `auto`) bakes per-chunk coarse levels into the
 file — one or two importance-sorted merged versions of every chunk (a merged splat per 8 and

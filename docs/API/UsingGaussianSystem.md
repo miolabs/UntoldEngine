@@ -172,8 +172,8 @@ pending=… issued=… committed=… evicted=… saturated=… faults=…`).
 The paging is exercised from the file itself by `GaussianPagingTest.testLargeSyntheticAssetPagesWithinItsPool`
 (`Tests/UntoldEngineRenderTests`): a 300 k-splat synthetic slab against a 1 MiB pool over 120
 real frames. `UNTOLD_PERF_GAUSSIAN_PAGING=1` adds 4 M- and 20 M-splat runs against a 64 MiB
-residency budget — minutes to bake the first time (about 3 GB of memory for the 20 M bake),
-cached in the temporary directory — and `UNTOLD_PERF_GAUSSIAN_PAGING_SPLAT_COUNT=<n>` keeps
+residency budget — a few seconds to bake the first time (the cook streams the source and
+peaks around 2 GB for the 20 M bake), cached in the temporary directory — and `UNTOLD_PERF_GAUSSIAN_PAGING_SPLAT_COUNT=<n>` keeps
 only the sizes up to `n` (`4000000` for the 4 M run alone). Each run checks the pool is what
 the policy sizes it (the budget, or the whole asset when that is smaller: a 4 M asset without
 harmonics is 64,000,000 B and fits every tier, so nothing saturates and nothing is evicted; a
@@ -419,6 +419,23 @@ asset above its path's cap fails to load with an "exceeds maximum" error. Cook l
 with a splat budget (`UntoldGSCookOptions.maxSplatCount`, `untoldengine export
 --splat-max-count`) that fits every platform the asset ships on, or split the scene into
 streamed tiles. What the frame can draw is bounded separately by the working-set budget above.
+
+### Cooking from code
+
+An editor or a tool cooks a capture with
+`bakeGaussianSplatProgressiveTiers(plyURL:outputBaseURL:levelCount:cookOptions:control:)`
+(see [untoldgsFormat.md](../Architecture/untoldgsFormat.md#cooking-a-capture)). The source is
+streamed in windows and cooked in parallel into one compact store, so a 10 M-splat degree-3
+capture cooks in about two seconds with about 2 GB of memory in a release build (and well
+under a minute in a debug build, where it used to take seven), and every tier is written
+through a temporary file renamed into place. `UntoldGSCookControl` takes a progress callback —
+`UntoldGSCookProgress` with the phase (`read`, `cook`, `chunk`, `coarsen`, `write`), the
+fraction within it, the overall fraction and the tier — and an `isCancelled` closure polled
+between windows and chunk batches (`Task.isCancelled` is honoured too); cancelling throws
+`UntoldGSCookError.cancelled` and leaves no file, not even a tier already finished. The
+result's `centerBoundsMin`/`Max` are the bounds of the cooked splats; for the bounds of a source
+before it is cooked, `PLYReader.readGaussianCenterBounds(from:)` makes one streamed pass with
+nothing resident, and `PLYReader.readGaussianSplatCount(from:)` reads the header alone.
 
 ## A splat standing in for a mesh: shells, fades and scene links
 

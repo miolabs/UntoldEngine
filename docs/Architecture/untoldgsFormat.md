@@ -185,6 +185,56 @@ encoding is reserved by the `sphericalHarmonicsPalette` flag and rejected by the
 
 `bakeGaussianSplatProgressiveTiers` writes every progressive tier as a version-3 file.
 
+## Cooking a capture
+
+`bakeGaussianSplatProgressiveTiers(plyURL:outputBaseURL:levelCount:cookOptions:control:)` (and
+the `lodFractions:` and `spzURL:` overloads; the signatures without `control:` are thin
+wrappers) cooks a source into one file or a set of `_lodN` tiers in two passes that never hold
+a copy of the source or of the splat set beyond one compact store:
+
+- **Pass A — read and cook.** `PLYGaussianSource` opens the `.ply` once, parses the header,
+  resolves the vertex properties into a typed layout (byte offset and scalar kind per needed
+  property, defaults for the optional ones), and serves the body as windows of about 8 MB read
+  with `pread` and parsed in parallel — ASCII bodies are cut at line boundaries and parsed per
+  window with the same rules as before. Inside each window's work item `UntoldGSCooker.Kernel`
+  applies the cook (the opacity floor, the degenerate check, the similarity transform, the crop)
+  and the higher-order harmonics are reduced to the target degree and quantised to the file's
+  bytes; the windows are committed in source order into `UntoldGSSplatStore`, a structure of
+  arrays of about 56 bytes per splat plus the SH bytes (about 1 GB for 10 M splats at degree 3).
+  The budget (`maxSplatCount`), the centre bounds, the asset box and the progressive ranking
+  run over the store afterwards. A `.spz` is decoded whole by `SPZReader` and cooked as one
+  window.
+- **Pass B — write.** For each tier (the store, or a ranked prefix of it) the writer computes
+  the Morton keys in parallel and sorts them with a stable radix sort — the same `(key, index)`
+  permutation the closure sort produced, the order being total — fixes the layout (the tree's
+  node count follows from the chunk count, a chunk's padded payload from its splat count) and
+  then, in parallel batches, sorts every chunk by importance, encodes its records and SH bytes
+  into a buffer of its own, checksums them, writes them with `pwrite` at the chunk's offset and
+  coarsens the chunk in Morton order in the same work item. The coarse section, the header, the
+  chunk index and the tree follow at their offsets. Each tier is written to
+  `.<name>.untoldgs.tmp-<uuid>` in the output directory and renamed over the destination when
+  complete.
+
+Every byte is a function of the cooked splats and the options: the window size, the batch size,
+the thread count and the sink (file or memory) never change one, and the output of a given
+source with given options is the file the whole-array cook produced before this pipeline
+existed. `UntoldGSFormat.write(splats:options:)` and `writeReporting` feed an in-memory list
+through the same writer core (a memory sink), so the format tests' CRC pins verify it directly;
+`Tests/UntoldEngineTests/UntoldGSCookerEquivalenceTests.swift` keeps the pre-change path
+verbatim on the test side and compares the two byte for byte.
+
+`UntoldGSCookControl` carries a progress callback and a cancellation hook. Progress arrives as
+`UntoldGSCookProgress` — the phase (`read`, `cook`, then per tier `chunk`, `coarsen` when the
+tier bakes coarse levels, `write`), the fraction within the phase, an overall fraction that
+reaches 1 with the last tier's `write`, and the tier — from the cooking thread, between window
+batches and chunk batches; the same points poll `isCancelled` and `Task.isCancelled`. A
+cancelled bake throws `UntoldGSCookError.cancelled` after discarding its temporary file and
+removing the tiers it had already renamed, as a failed bake removes them, so nothing partial is
+ever left in the output directory. `GaussianProgressiveBakeResult` reports the cook
+(`cookReport`), the asset box and the centre bounds of the cooked splats; an editor that needs
+the bounds of a source before cooking calls `PLYReader.readGaussianCenterBounds(from:)`, one
+streamed pass with nothing resident but the running box, in place of a second full parse.
+
 ## Runtime load
 
 `GaussianChunkLoader.load(url:allowPaging:)` keeps the chunk table resident (the 48-byte
