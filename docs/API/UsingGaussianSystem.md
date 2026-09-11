@@ -139,10 +139,16 @@ entry in place of the file's bytes, so streaming eviction weighs and frees the p
 Every frame the chunk cull writes each chunk's seen screen area into the frame's demand
 table; the pager (`GaussianPageManager`) reads it back three frames later, wants for each
 demanded chunk the ranks the budget would grant it with a 25 % headroom (the density cap
-rule, or a fill density when the frame fits, so an empty pool never asks for the whole
-asset), and reads the missing tiers from disk — near and large chunks first, empty chunks
-before top-ups, the chunk the camera stands in first of all — straight into free pool slots
-on a background queue. A chunk with nothing resident is not listed and asks nothing of the
+rule, or — when the frame fits — the cap the budget solve would settle at with every demanded
+chunk resident whole, solved on the CPU over a histogram of the demanded set, so an empty
+pool never asks for the whole asset and a fresh view fills to the state a whole-resident
+entity settles at), and reads the missing tiers from disk — near and large chunks first,
+empty chunks before top-ups, the chunk the camera stands in first of all — straight into
+free pool slots on a background queue. The tick's work is proportional to what changed, not
+to the chunk count: the demand words are diffed against the last ingest, a chunk's want is
+re-evaluated only when its own inputs (area, residency, landed levels) or the frame-wide ones
+(the cap, the fill) moved, and the candidate, resident and fade sets are kept as chunks
+change state; a still camera over a 10 k-chunk asset costs the tick a few block compares. A chunk with nothing resident is not listed and asks nothing of the
 budget; a partially resident one is listed with its resident ranks, so the budget sees only
 what can be drawn (a file cooked with per-chunk coarse levels changes both — see the next
 section). Arriving tiers fade in over 16 frames. A tier is given up when its chunk
@@ -362,7 +368,10 @@ it keeps resident, and every head of the asset fits it.
   a paged entity by its chunk's resident fraction (green whole, red head-only). The knobs live
   on `GaussianPagingPolicy`: `pagingThresholdBytesOverride` (0 pages every chunked asset — the
   editor's "simulate paging"), `residencyBudgetBytesOverride`, the hold-off, surplus,
-  minimum-residency and reload-cooldown ticks, the per-tick read, byte and commit caps,
+  minimum-residency and reload-cooldown ticks, the per-tick read and byte caps, the commit
+  cap and budget (`maxCommitsPerTick`, 4096 tiers, is the ceiling; `commitBudget`, 0.5 ms,
+  is how long a tick keeps mapping landed tiers past the first — a fill is bounded by the
+  clock, thousands of tiers a frame while the pool has room and the reads keep up),
   `fadeFrames`, `verifyPagedChunkCRC`. On a paged entity `disableChunkCull` forces only the
   resident ranks (a chunk no view keeps is never demanded, so its ranks never load),
   `disableWorkingSetBudget` wants every rank of every demanded chunk and sizes the set to the
