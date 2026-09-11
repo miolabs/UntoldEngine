@@ -60,7 +60,7 @@ enum LegacyGaussianCookPath {
             )
         }
 
-        let rankedIndices = spatiallyInterleavedGaussianRanking(asset.splats)
+        let rankedIndices = try spatiallyInterleavedGaussianRanking(asset.splats)
 
         let baseWithoutExtension = outputBaseURL.deletingPathExtension()
         let baseName = baseWithoutExtension.lastPathComponent

@@ -78,7 +78,7 @@ final class UntoldGSCookerFootprintTests: XCTestCase {
         let control = UntoldGSCookControl(progress: { report in
             if report.phase == .read, report.fraction == 1 {
                 samples.afterRead = Self.physicalFootprint()
-            } else if report.phase == .cook, report.fraction == 0.5 {
+            } else if report.phase == .cook, report.fraction == 0.25 {
                 samples.afterBudget = Self.physicalFootprint()
             }
         })

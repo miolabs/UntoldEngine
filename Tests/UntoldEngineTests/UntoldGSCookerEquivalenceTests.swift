@@ -345,6 +345,62 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         }
     }
 
+    func testRankingPollsAsItRunsWithoutChangingItsResult() throws {
+        var rng = SplitMix64(seed: 0xBA5E)
+        let centers = (0 ..< 5000).map { _ in simd_float3(rng.unit() * 4 - 2, rng.unit(), rng.unit() * 4 - 2) }
+        let importances = (0 ..< 5000).map { _ in rng.unit() }
+        let plain = try spatiallyInterleavedGaussianRanking(count: centers.count, center: { centers[$0] }, importance: { importances[$0] })
+        var fractions: [Double] = []
+        let polled = try spatiallyInterleavedGaussianRanking(
+            count: centers.count, center: { centers[$0] }, importance: { importances[$0] },
+            poll: { fractions.append($0) }
+        )
+        XCTAssertEqual(polled, plain, "the poll never changes the ranking")
+        XCTAssertEqual(Set(plain).count, centers.count)
+        XCTAssertGreaterThan(fractions.count, 5, "every pass of the ranking reports")
+        XCTAssertEqual(fractions.last, 1)
+        for (previous, next) in zip(fractions, fractions.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(next, previous, "the ranking's progress never runs backwards")
+        }
+
+        struct Stop: Error {}
+        XCTAssertThrowsError(
+            try spatiallyInterleavedGaussianRanking(
+                count: centers.count, center: { centers[$0] }, importance: { importances[$0] },
+                poll: { if $0 >= 0.5 { throw Stop() } }
+            )
+        ) { error in
+            XCTAssertTrue(error is Stop)
+        }
+    }
+
+    func testCancellationDuringTheRankingStopsBeforeTheFirstTier() throws {
+        // A multi-tier bake ranks the whole store between the cook's bounds and the first
+        // tier: cancelling in the ranking — a `cook` report past its first half — must land
+        // there, before any tier is ordered, and leave nothing behind.
+        let ply = try binaryFixture()
+        let directory = temporaryDirectory.appendingPathComponent("cancel-ranking", isDirectory: true)
+        let output = directory.appendingPathComponent("cancelled.untoldgs")
+        let seen = ProgressLog()
+        let control = UntoldGSCookControl(
+            progress: { report in
+                if report.phase == .cook, report.fraction > 0.5, report.fraction < 1 {
+                    seen.cancel()
+                }
+                seen.append(report)
+            },
+            isCancelled: { seen.isCancelled }
+        )
+        XCTAssertThrowsError(
+            try bakeGaussianSplatProgressiveTiers(plyURL: ply, outputBaseURL: output, lodFractions: [1.0, 0.5, 0.25], cookOptions: transformedOptions, control: control)
+        ) { error in
+            XCTAssertEqual(error as? UntoldGSCookError, .cancelled)
+        }
+        XCTAssertTrue(seen.isCancelled, "the ranking reported")
+        XCTAssertFalse(seen.all.contains { $0.phase == .chunk }, "no tier was started")
+        XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [], [])
+    }
+
     func testTaskCancellationStopsTheCook() async throws {
         let ply = try binaryFixture()
         let output = temporaryDirectory.appendingPathComponent("task-cancelled.untoldgs")

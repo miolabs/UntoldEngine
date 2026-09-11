@@ -4698,8 +4698,8 @@ private struct GaussianSpatialBucketKey: Hashable {
     let z: Int
 }
 
-func spatiallyInterleavedGaussianRanking(_ splats: [GaussianSplat]) -> [Int] {
-    spatiallyInterleavedGaussianRanking(
+func spatiallyInterleavedGaussianRanking(_ splats: [GaussianSplat]) throws -> [Int] {
+    try spatiallyInterleavedGaussianRanking(
         count: splats.count,
         center: { simd_float3(splats[$0].center.x, splats[$0].center.y, splats[$0].center.z) },
         importance: { gaussianImportanceScore(splats[$0]) }
@@ -4709,13 +4709,35 @@ func spatiallyInterleavedGaussianRanking(_ splats: [GaussianSplat]) -> [Int] {
 /// The progressive ranking over `count` splats given by their centre and importance
 /// (`gaussianImportanceScore`: opacity × major axis²): spatial buckets, each sorted by
 /// importance, visited round-robin from the most important bucket outward.
-func spatiallyInterleavedGaussianRanking(count: Int, center: (Int) -> simd_float3, importance: (Int) -> Float) -> [Int] {
+///
+/// `poll` is called with the ranking's own progress (0…1) between its passes — every so many
+/// splats of the fills and the drain, between the bucket sorts — and may throw to stop it. It
+/// never changes a comparison or a result: the ranking of 10 M splats runs for seconds, and a
+/// bake has to be able to report and cancel across it.
+func spatiallyInterleavedGaussianRanking(
+    count: Int,
+    center: (Int) -> simd_float3,
+    importance: (Int) -> Float,
+    poll: (Double) throws -> Void = { _ in }
+) throws -> [Int] {
     guard count > 1 else { return Array(0 ..< count) }
     let splats = 0 ..< count
+    // Between polls of a pass over every splat: 64 polls of a large ranking, none within a
+    // pass over a small one.
+    let pollStride = max(1 << 16, count / 64)
+    /// Polls at `from` plus the pass's share of `done` out of `count`.
+    func pollPass(_ done: Int, from: Double, to: Double) throws {
+        try poll(from + (to - from) * Double(done) / Double(count))
+    }
+
     var importanceScores = [Float](repeating: 0, count: count)
     for index in splats {
         importanceScores[index] = importance(index)
+        if (index + 1) % pollStride == 0 {
+            try pollPass(index + 1, from: 0, to: 0.1)
+        }
     }
+    try poll(0.1)
     func gaussianImportanceScore(_ index: Int) -> Float {
         importanceScores[index]
     }
@@ -4726,7 +4748,11 @@ func spatiallyInterleavedGaussianRanking(count: Int, center: (Int) -> simd_float
         let center = center(index)
         minBounds = simd_min(minBounds, center)
         maxBounds = simd_max(maxBounds, center)
+        if (index + 1) % pollStride == 0 {
+            try pollPass(index + 1, from: 0.1, to: 0.2)
+        }
     }
+    try poll(0.2)
 
     let extent = maxBounds - minBounds
     let occupiedAxisCount = [extent.x, extent.y, extent.z].filter { $0 > 0.0001 }.count
@@ -4754,13 +4780,23 @@ func spatiallyInterleavedGaussianRanking(count: Int, center: (Int) -> simd_float
         let cellZ = min(maxCellIndex, max(0, Int(normalized.z * Float(cellsPerAxis))))
         let key = GaussianSpatialBucketKey(x: cellX, y: cellY, z: cellZ)
         buckets[key, default: []].append(index)
+        if (index + 1) % pollStride == 0 {
+            try pollPass(index + 1, from: 0.2, to: 0.5)
+        }
     }
+    try poll(0.5)
 
-    let sortedBuckets = buckets.mapValues { indices in
-        indices.sorted {
+    // `mapValues` keeps the dictionary's layout, so the keys come out in the order they always
+    // did; the poll between two buckets' sorts changes nothing about either sort.
+    var sortedBucketCount = 0
+    let sortedBuckets = try buckets.mapValues { indices in
+        try poll(0.5 + 0.15 * Double(sortedBucketCount) / Double(buckets.count))
+        sortedBucketCount += 1
+        return indices.sorted {
             gaussianImportanceScore($0) > gaussianImportanceScore($1)
         }
     }
+    try poll(0.65)
 
     let bucketCenters = sortedBuckets.mapValues { indices in
         var sum = simd_float3.zero
@@ -4795,11 +4831,16 @@ func spatiallyInterleavedGaussianRanking(count: Int, center: (Int) -> simd_float
         }!
         bucketOrder.append(next)
         remainingBuckets.removeAll { $0 == next }
+        if bucketOrder.count % 32 == 0 {
+            try poll(0.65 + 0.05 * Double(bucketOrder.count) / Double(sortedBuckets.count))
+        }
     }
+    try poll(0.7)
 
     var ranking: [Int] = []
     ranking.reserveCapacity(count)
     var depth = 0
+    var nextPoll = pollStride
     while ranking.count < count {
         var appendedThisRound = false
         for key in bucketOrder {
@@ -4809,7 +4850,12 @@ func spatiallyInterleavedGaussianRanking(count: Int, center: (Int) -> simd_float
         }
         guard appendedThisRound else { break }
         depth += 1
+        if ranking.count >= nextPoll {
+            try pollPass(ranking.count, from: 0.7, to: 1)
+            nextPoll += pollStride
+        }
     }
+    try poll(1)
 
     return ranking
 }
@@ -5012,8 +5058,10 @@ private func bakeGaussianSplatProgressiveTiers(
     }
 
     if lodFractions == [1.0] {
+        try progress.report(.cook, fraction: 1)
         progress.beginTier(0)
         try refuseNonFinite(tierIndices: 0 ..< store.count)
+        try progress.checkCancelled()
         let tierExtent = store.meanSquaredSplatExtent(over: 0 ..< store.count, count: store.count)
         let written = try UntoldGSFormat.writeStore(
             UntoldGSStoreView(store: store),
@@ -5024,14 +5072,17 @@ private func bakeGaussianSplatProgressiveTiers(
         return result([GaussianLODTier(url: outputBaseURL, meanSquaredSplatExtent: tierExtent, coarseReport: written.coarse)])
     }
 
-    let rankedIndices = spatiallyInterleavedGaussianRanking(
+    // The ranking is the second half of the cook phase, reported and cancellable as it runs.
+    let rankedIndices = try spatiallyInterleavedGaussianRanking(
         count: store.count,
         center: { store.position($0) },
         importance: { index in
             let majorAxis = store.majorAxis(index)
             return store.opacity(index) * majorAxis * majorAxis
-        }
+        },
+        poll: { fraction in try progress.report(.cook, fraction: 0.5 + 0.5 * fraction) }
     )
+    try progress.report(.cook, fraction: 1)
 
     let baseWithoutExtension = outputBaseURL.deletingPathExtension()
     let baseName = baseWithoutExtension.lastPathComponent
@@ -5045,6 +5096,7 @@ private func bakeGaussianSplatProgressiveTiers(
             let keepCount = max(1, Int((Float(store.count) * clampedFraction).rounded(.up)))
             let keptIndices = Array(rankedIndices.prefix(keepCount))
             try refuseNonFinite(tierIndices: keptIndices)
+            try progress.checkCancelled()
             let tierURL = baseDirectory
                 .appendingPathComponent("\(baseName)_lod\(tierIndex)")
                 .appendingPathExtension("untoldgs")

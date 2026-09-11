@@ -24,7 +24,8 @@ public enum UntoldGSCookPhase: String, Sendable, CaseIterable {
     /// Parsing the source in windows (fraction = source bytes consumed). The per-splat cook —
     /// prune, transform, crop — runs inside the same pass.
     case read
-    /// Budget selection, bounds and the progressive ranking.
+    /// Budget selection and bounds (the first half), then the progressive ranking of a
+    /// multi-tier bake (the second half, polled as it runs).
     case cook
     /// Morton ordering, chunk layout and, without coarse levels, the chunk encode.
     case chunk

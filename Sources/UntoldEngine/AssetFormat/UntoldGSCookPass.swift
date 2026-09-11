@@ -158,7 +158,8 @@ extension UntoldGSCooker {
         culled += cooked.culledCount
     }
 
-    /// The budget, the report and the whole-store facts. The store is taken `inout` so the
+    /// The budget, the report and the whole-store facts: the first half of the `cook` phase; the
+    /// tiering reports the second half over the progressive ranking, or at once. The store is taken `inout` so the
     /// budget's compaction moves the splats within the caller's own arrays: a copy of the
     /// parameter would leave the caller's reference alive and the first write would duplicate
     /// the whole store — a gigabyte for a 10 M-splat degree-3 capture.
@@ -196,7 +197,7 @@ extension UntoldGSCooker {
             }
             store.compact(keeping: survivors)
         }
-        try progress.report(.cook, fraction: 0.5)
+        try progress.report(.cook, fraction: 0.25)
 
         let report = UntoldGSCookReport(
             inputSplatCount: inputCount,
@@ -217,7 +218,7 @@ extension UntoldGSCooker {
             centerBounds: store.centerBounds(),
             boundingBox: store.expandedBoundingBox()
         )
-        try progress.report(.cook, fraction: 1)
+        try progress.report(.cook, fraction: 0.5)
         return cooked
     }
 }
