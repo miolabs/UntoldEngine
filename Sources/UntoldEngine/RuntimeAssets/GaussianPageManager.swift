@@ -479,6 +479,16 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// an ingest changed a word (the sums are the fill rule's inputs, so the order is kept).
     private var demandedArea: Float = 0
     private var demandedSplats = 0
+    /// The chunks whose own want inputs changed since their last evaluation (dense, with a
+    /// mark), the spare list they are swapped into while evaluated, the frame-wide inputs the
+    /// last pass ran with, and the warmth sums over the demanded chunks, maintained as their
+    /// needed and resident ranks change.
+    private var wantsDirty: [Int32] = []
+    private var wantsDirtySpare: [Int32] = []
+    private var wantsDirtyMark: [Bool]
+    private var wantsInputs = WantInputs()
+    private var wantsSumNeeded = 0
+    private var wantsSumResidentOfNeeded = 0
     private var residentChunks = Set<Int>()
     private var fading: [Int] = []
     /// Chunks whose `.levelFade` is running (per-chunk-lod-tiers).
@@ -672,6 +682,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         demandWords = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, chunkCount))
         demandWords.initialize(repeating: 0, count: max(1, chunkCount))
         demandedPosition = Array(repeating: -1, count: chunkCount)
+        wantsDirtyMark = Array(repeating: false, count: chunkCount)
         lastConstants = Array(repeating: GaussianChunkPagingConstants(), count: slots)
         for k in 0 ..< slots {
             copyMasterTables(toSlot: k)
@@ -1042,6 +1053,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         // The coarse availability bits (per-chunk-lod-tiers) ride in the same struct and survive the rewrite.
         masterResidency[chunk] = GaussianPagingPolicy.mappedResidency(previous: masterResidency[chunk], firstRank: request.firstRank, rankCount: request.rankCount, now: now)
         var state = states[chunk]
+        let before = wantContribution(state)
         state.residentRanks = UInt16(resident)
         state.fadeFromRank = UInt16(request.firstRank)
         state.arrivalTick = now
@@ -1052,6 +1064,10 @@ public final class GaussianPageManager: @unchecked Sendable {
             fading.append(chunk)
         }
         states[chunk] = state
+        let after = wantContribution(state)
+        wantsSumNeeded += after.needed - before.needed
+        wantsSumResidentOfNeeded += after.resident - before.resident
+        markWantsDirty(chunk)
         residentChunks.insert(chunk)
         journal(chunk)
     }
@@ -1313,6 +1329,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         guard masterResidency[entry.chunk].coarseAvailable & bit == 0 else { return }
         masterResidency[entry.chunk].coarseAvailable |= bit
         coarseAvailableCount += 1
+        markWantsDirty(entry.chunk)
         journal(entry.chunk)
     }
 
@@ -1396,6 +1413,9 @@ public final class GaussianPageManager: @unchecked Sendable {
         let previous = demandWords[chunk]
         demandWords[chunk] = bits
         if bits == 0 {
+            let before = wantContribution(states[chunk])
+            wantsSumNeeded -= before.needed
+            wantsSumResidentOfNeeded -= before.resident
             states[chunk].lastDemandTick = lastIngestTick
             states[chunk].flags.remove(.demanded)
             let position = Int(demandedPosition[chunk])
@@ -1412,7 +1432,11 @@ public final class GaussianPageManager: @unchecked Sendable {
             states[chunk].flags.insert(.demanded)
             demandedPosition[chunk] = Int32(demandedChunks.count)
             demandedChunks.append(Int32(chunk))
+            let after = wantContribution(states[chunk])
+            wantsSumNeeded += after.needed
+            wantsSumResidentOfNeeded += after.resident
         }
+        markWantsDirty(chunk)
     }
 
     /// The area the cull would write for a chunk it keeps in some view (frustum only), 0 when
@@ -1459,59 +1483,134 @@ public final class GaussianPageManager: @unchecked Sendable {
         // rule draws coarse wants no fine rank (its tiers leave as surplus), and the CPU keeps a
         // mirror of the level drawn to hold the tiers of a chunk mid-fade (`.levelFade`).
         let levelsOn = coarse != nil && !coarseFaulted && !frame.uniformQuotas && !frame.disableWorkingSetBudget && frame.levelMode != .fineOnly
-        let effectiveCap = cap.isFinite ? cap : fill
-        var neededTotal = 0
-        var residentOfNeeded = 0
-        for demandedChunk in demandedChunks {
-            let chunk = Int(demandedChunk)
-            let count = index.chunks[chunk].splatCount
-            var state = states[chunk]
-            var coarseInputs: GaussianCoarseWantInputs?
-            if levelsOn {
-                coarseInputs = GaussianCoarseWantInputs(
-                    tierShifts: coarseTierShifts,
-                    counts: coarseCounts(chunk: chunk),
-                    available: masterResidency[chunk].coarseAvailable,
-                    densityFloor: frame.densityFloor,
-                    levelMode: frame.levelMode
-                )
+        let inputs = WantInputs(
+            cap: cap,
+            fill: fill,
+            fillScale: fillScale,
+            effectiveCap: cap.isFinite ? cap : fill,
+            densityFloor: frame.densityFloor,
+            uniformQuotas: frame.uniformQuotas,
+            disableWorkingSetBudget: frame.disableWorkingSetBudget,
+            levelsOn: levelsOn,
+            levelMode: frame.levelMode,
+            levelFadeFrames: frame.levelFadeFrames
+        )
+        // The rule is a function of the frame-wide inputs, the chunk's own (area, residency,
+        // landed levels) and the level it drew last: a chunk is re-evaluated when one of its own
+        // changed (`wantsDirty`), every demanded chunk when the frame-wide ones did, and one
+        // whose drawn level moved is re-evaluated next tick again until it settles — the same
+        // sequence of evaluations the per-tick pass made, minus the ones that could not change.
+        if inputs != wantsInputs {
+            wantsInputs = inputs
+            for chunk in wantsDirty {
+                wantsDirtyMark[Int(chunk)] = false
             }
-            let want = GaussianPagingPolicy.wantedRanks(
-                splatCount: count,
-                area: state.lastArea,
-                densityCap: cap,
-                fillDensity: fill,
-                fillScale: fillScale,
-                uniformQuotas: frame.uniformQuotas,
-                disableWorkingSetBudget: frame.disableWorkingSetBudget,
-                coarse: coarseInputs
-            )
-            let drawn = coarseInputs.map { UInt8(GaussianPagingPolicy.coarseLevel($0, splatCount: count, area: state.lastArea, cap: effectiveCap, previous: Int(state.drawnLevel), fineAvailable: state.residentRanks > 0)) } ?? 0
-            if drawn != state.drawnLevel {
-                state.drawnLevel = drawn
-                state.levelSwitchTick = now
-                if frame.levelFadeFrames > 0, !state.flags.contains(.levelFade) {
-                    state.flags.insert(.levelFade)
-                    levelFading.append(chunk)
-                }
+            wantsDirty.removeAll(keepingCapacity: true)
+            for demandedChunk in demandedChunks {
+                evaluateWant(chunk: Int(demandedChunk), inputs: inputs, now: now)
             }
-            let needed = GaussianPagingPolicy.neededRanks(want: want, splatCount: count)
-            state.neededRanks = UInt16(needed)
-            let residentTiers = tiers(state.residentRanks)
-            let wantedTiers = GaussianPagingPolicy.tiersNeeded(needed: needed, ranksPerPage: ranksPerPage)
-            if residentTiers > wantedTiers {
-                if state.surplusSinceTick == 0 { state.surplusSinceTick = now }
-            } else {
-                state.surplusSinceTick = 0
+        } else if !wantsDirty.isEmpty {
+            swap(&wantsDirty, &wantsDirtySpare)
+            for dirtyChunk in wantsDirtySpare {
+                let chunk = Int(dirtyChunk)
+                wantsDirtyMark[chunk] = false
+                guard states[chunk].flags.contains(.demanded) else { continue }
+                evaluateWant(chunk: chunk, inputs: inputs, now: now)
             }
-            states[chunk] = state
-            neededTotal += Int(needed)
-            residentOfNeeded += min(Int(needed), Int(state.residentRanks))
+            wantsDirtySpare.removeAll(keepingCapacity: true)
         }
-        let warmth: Float = neededTotal == 0 ? 1 : Float(residentOfNeeded) / Float(neededTotal)
+        let warmth: Float = wantsSumNeeded == 0 ? 1 : Float(wantsSumResidentOfNeeded) / Float(wantsSumNeeded)
         lock.lock()
         _warmth = warmth
         lock.unlock()
+    }
+
+    /// The frame-wide inputs of the wants pass; a change re-evaluates every demanded chunk.
+    private struct WantInputs: Equatable {
+        var cap: Float = .nan
+        var fill: Float = .nan
+        var fillScale: Float = .nan
+        var effectiveCap: Float = .nan
+        var densityFloor: Float = .nan
+        var uniformQuotas = false
+        var disableWorkingSetBudget = false
+        var levelsOn = false
+        var levelMode: GaussianLevelMode = .auto
+        var levelFadeFrames: UInt32 = 0
+
+        static func == (lhs: WantInputs, rhs: WantInputs) -> Bool {
+            lhs.cap.bitPattern == rhs.cap.bitPattern && lhs.fill.bitPattern == rhs.fill.bitPattern
+                && lhs.fillScale.bitPattern == rhs.fillScale.bitPattern && lhs.effectiveCap.bitPattern == rhs.effectiveCap.bitPattern
+                && lhs.densityFloor.bitPattern == rhs.densityFloor.bitPattern && lhs.uniformQuotas == rhs.uniformQuotas
+                && lhs.disableWorkingSetBudget == rhs.disableWorkingSetBudget && lhs.levelsOn == rhs.levelsOn
+                && lhs.levelMode == rhs.levelMode && lhs.levelFadeFrames == rhs.levelFadeFrames
+        }
+    }
+
+    /// One chunk through the want rule, the level mirror and the surplus clock.
+    private func evaluateWant(chunk: Int, inputs: WantInputs, now: UInt32) {
+        let count = index.chunks[chunk].splatCount
+        var state = states[chunk]
+        let before = wantContribution(state)
+        var coarseInputs: GaussianCoarseWantInputs?
+        if inputs.levelsOn {
+            coarseInputs = GaussianCoarseWantInputs(
+                tierShifts: coarseTierShifts,
+                counts: coarseCounts(chunk: chunk),
+                available: masterResidency[chunk].coarseAvailable,
+                densityFloor: inputs.densityFloor,
+                levelMode: inputs.levelMode
+            )
+        }
+        let want = GaussianPagingPolicy.wantedRanks(
+            splatCount: count,
+            area: state.lastArea,
+            densityCap: inputs.cap,
+            fillDensity: inputs.fill,
+            fillScale: inputs.fillScale,
+            uniformQuotas: inputs.uniformQuotas,
+            disableWorkingSetBudget: inputs.disableWorkingSetBudget,
+            coarse: coarseInputs
+        )
+        let drawn = coarseInputs.map { UInt8(GaussianPagingPolicy.coarseLevel($0, splatCount: count, area: state.lastArea, cap: inputs.effectiveCap, previous: Int(state.drawnLevel), fineAvailable: state.residentRanks > 0)) } ?? 0
+        if drawn != state.drawnLevel {
+            state.drawnLevel = drawn
+            state.levelSwitchTick = now
+            if inputs.levelFadeFrames > 0, !state.flags.contains(.levelFade) {
+                state.flags.insert(.levelFade)
+                levelFading.append(chunk)
+            }
+            // The rule's hysteresis reads the level drawn last: once more next tick.
+            markWantsDirty(chunk)
+        }
+        let needed = GaussianPagingPolicy.neededRanks(want: want, splatCount: count)
+        state.neededRanks = UInt16(needed)
+        let residentTiers = tiers(state.residentRanks)
+        let wantedTiers = GaussianPagingPolicy.tiersNeeded(needed: needed, ranksPerPage: ranksPerPage)
+        if residentTiers > wantedTiers {
+            if state.surplusSinceTick == 0 { state.surplusSinceTick = now }
+        } else {
+            state.surplusSinceTick = 0
+        }
+        states[chunk] = state
+        let after = wantContribution(state)
+        wantsSumNeeded += after.needed - before.needed
+        wantsSumResidentOfNeeded += after.resident - before.resident
+    }
+
+    /// A demanded chunk's share of the warmth sums: its needed ranks, and the resident ones
+    /// among them. Nothing for a chunk not demanded.
+    private func wantContribution(_ state: GaussianChunkPageState) -> (needed: Int, resident: Int) {
+        guard state.flags.contains(.demanded) else { return (0, 0) }
+        let needed = Int(state.neededRanks)
+        return (needed, min(needed, Int(state.residentRanks)))
+    }
+
+    /// The chunk's own want inputs changed: its area, its residency or its landed levels.
+    private func markWantsDirty(_ chunk: Int) {
+        guard !wantsDirtyMark[chunk] else { return }
+        wantsDirtyMark[chunk] = true
+        wantsDirty.append(Int32(chunk))
     }
 
     private func tiers(_ ranks: UInt16) -> Int {
@@ -1691,6 +1790,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         let resident = UInt32(tier * ranksPerPage)
         masterResidency[chunk].residentRanks = resident
         var state = states[chunk]
+        let before = wantContribution(state)
         state.residentRanks = UInt16(resident)
         state.retryAfterTick = max(state.retryAfterTick, now &+ GaussianPagingPolicy.reloadCooldownTicks)
         if tiers(state.residentRanks) <= GaussianPagingPolicy.tiersNeeded(needed: UInt32(state.neededRanks), ranksPerPage: ranksPerPage) {
@@ -1700,6 +1800,10 @@ public final class GaussianPageManager: @unchecked Sendable {
             state.flags.remove(.fadeActive)
         }
         states[chunk] = state
+        let after = wantContribution(state)
+        wantsSumNeeded += after.needed - before.needed
+        wantsSumResidentOfNeeded += after.resident - before.resident
+        markWantsDirty(chunk)
         if tier == 0 {
             residentChunks.remove(chunk)
         }
