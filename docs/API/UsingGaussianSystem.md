@@ -428,7 +428,8 @@ An editor or a tool cooks a capture with
 `bakeGaussianSplatProgressiveTiers(plyURL:outputBaseURL:levelCount:cookOptions:control:)`
 (see [untoldgsFormat.md](../Architecture/untoldgsFormat.md#cooking-a-capture)). The source is
 streamed in windows and cooked in parallel into one compact store, so a 10 M-splat degree-3
-capture cooks in about two seconds with about 1.4 GB of memory in a release build (and in
+capture cooks in about two seconds with about 1.4 GB of memory in a release build (1.37 GB with
+a 5 M-splat budget, which compacts the store in place; about seven seconds for three tiers; and in
 about a minute in a debug build, where it used to take seven), and every tier is written to a
 temporary file, the set renamed into place once the last tier is complete. `UntoldGSCookControl` takes a progress callback —
 `UntoldGSCookProgress` with the phase (`read`, `cook`, `chunk`, `coarsen`, `write`), the
