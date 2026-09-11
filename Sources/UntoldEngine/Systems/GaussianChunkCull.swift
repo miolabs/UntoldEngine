@@ -502,12 +502,14 @@ enum GaussianChunkCullMath {
         if want < previous {
             want = min(previous, levelWanted(deltaTier: deltaTier, tierShifts: tierShifts, margin: 1))
         }
-        for level in want ... 2 where (available & (1 << UInt32(level))) != 0 {
-            return level
-        }
-        for level in stride(from: want - 1, through: 0, by: -1) where (available & (1 << UInt32(level))) != 0 {
-            return level
-        }
+        // The wanted level when available, else the next coarser available one, else the next
+        // finer available one (the three levels spelled out: the pager runs this per chunk).
+        let bits = available & 7
+        if bits & (1 << UInt32(want)) != 0 { return want }
+        if want < 2, bits & (1 << UInt32(want + 1)) != 0 { return want + 1 }
+        if want < 1, bits & 4 != 0 { return 2 }
+        if want > 0, bits & (1 << UInt32(want - 1)) != 0 { return want - 1 }
+        if want > 1, bits & 1 != 0 { return 0 }
         return want
     }
 

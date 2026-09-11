@@ -449,7 +449,16 @@ public final class GaussianPageManager: @unchecked Sendable {
     // MARK: Render-thread state
 
     private(set) var tick: UInt32 = 0
-    private var states: [GaussianChunkPageState]
+    /// The per-chunk tables the tick walks, as plain columns (`chunkCount` entries each, owned
+    /// by the pager): the CPU state, the constants of the chunk (its splat count, the counts of
+    /// its runtime levels 1 and 2, per-chunk-lod-tiers), the level rule's availability mask
+    /// (bit 0 fine, bits 1 and 2 the landed levels that have records), the positions in the
+    /// dense sets below and the marks of the dirty list and the journals.
+    private let states: UnsafeMutablePointer<GaussianChunkPageState>
+    private let splatCounts: UnsafeMutablePointer<UInt32>
+    private let coarseCounts1: UnsafeMutablePointer<UInt32>
+    private let coarseCounts2: UnsafeMutablePointer<UInt32>
+    private let availabilityMasks: UnsafeMutablePointer<UInt8>
     private var masterResidency: [GaussianChunkResidency]
     private var masterPageTable: [UInt32]
     private var slotChunk: [Int32]
@@ -460,7 +469,8 @@ public final class GaussianPageManager: @unchecked Sendable {
     private var freeSlots: [UInt32]
     private var retiring = GaussianPageRetireRing()
     private var journals: [[Int]]
-    private var journalMarks: [[Bool]]
+    /// Per slot, per chunk: whether the chunk is in the slot's journal (`slot * chunkCount + chunk`).
+    private let journalMarks: UnsafeMutablePointer<UInt8>
     private var journalFull: [Bool]
     private var demandStampTick: [UInt32?]
     private var demandStampFrame: [UInt64]
@@ -474,7 +484,7 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// The chunks seen by the last ingest, dense, in no particular order; `demandedPosition`
     /// is each chunk's index in it (−1 when not demanded).
     private var demandedChunks: [Int32] = []
-    private var demandedPosition: [Int32]
+    private let demandedPosition: UnsafeMutablePointer<Int32>
     /// Σ area and Σ splatCount over the demanded chunks in chunk order, recomputed only when
     /// an ingest changed a word (the sums are the fill rule's inputs, so the order is kept).
     private var demandedArea: Float = 0
@@ -485,7 +495,7 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// needed and resident ranks change.
     private var wantsDirty: [Int32] = []
     private var wantsDirtySpare: [Int32] = []
-    private var wantsDirtyMark: [Bool]
+    private let wantsDirtyMark: UnsafeMutablePointer<UInt8>
     private var wantsInputs = WantInputs()
     private var wantsSumNeeded = 0
     private var wantsSumResidentOfNeeded = 0
@@ -493,7 +503,7 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// is each chunk's index in it, −1 when nothing is resident), and how many of them are
     /// resident whole — counters kept as tiers map and leave instead of a scan per tick.
     private var residentList: [Int32] = []
-    private var residentPosition: [Int32]
+    private let residentPosition: UnsafeMutablePointer<Int32>
     private var wholeChunkCount = 0
     /// The chunks a tick may request, dense (`candidatePosition` as above): every chunk that
     /// wants more than it holds, is not loading, faulted or fading in, and is past its
@@ -501,9 +511,9 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// scan of the demanded set. A chunk that only waits for its cooldown sits in
     /// `cooldownHeap` (keyed by the tick it ends) until the tick that reaches it re-examines it.
     private var candidateChunks: [Int32] = []
-    private var candidatePosition: [Int32]
+    private let candidatePosition: UnsafeMutablePointer<Int32>
     private var cooldownHeap = GaussianTickHeap()
-    private var cooldownQueued: [Bool]
+    private let cooldownQueued: UnsafeMutablePointer<UInt8>
     /// The fade-ins running, in arrival order (each entry with its arrival tick, so a chunk
     /// mapped again while an older entry is still queued is expired on its own clock), and the
     /// level cross-fades likewise, keyed by the switch tick (per-chunk-lod-tiers). Both expire
@@ -683,7 +693,35 @@ public final class GaussianPageManager: @unchecked Sendable {
         slotBytes = ranksPerPage * (UntoldGSFormat.coreRecordSize + shBytesPerSplat)
         maxRunningReads = max(1, GaussianPagingPolicy.maxConcurrentReads)
 
-        states = Array(repeating: GaussianChunkPageState(), count: chunkCount)
+        let columns = max(1, chunkCount)
+        states = .allocate(capacity: columns)
+        states.initialize(repeating: GaussianChunkPageState(), count: columns)
+        splatCounts = .allocate(capacity: columns)
+        coarseCounts1 = .allocate(capacity: columns)
+        coarseCounts2 = .allocate(capacity: columns)
+        availabilityMasks = .allocate(capacity: columns)
+        for chunk in 0 ..< columns {
+            splatCounts[chunk] = chunk < chunkCount ? index.chunks[chunk].splatCount : 0
+            var m1: UInt32 = 0
+            var m2: UInt32 = 0
+            if let coarse, chunk < chunkCount {
+                m1 = index.coarseEntry(level: coarse.fileLevels[0], chunk: chunk)?.splatCount ?? 0
+                m2 = coarse.fileLevels.count > 1 ? (index.coarseEntry(level: coarse.fileLevels[1], chunk: chunk)?.splatCount ?? 0) : m1
+            }
+            coarseCounts1[chunk] = m1
+            coarseCounts2[chunk] = m2
+            availabilityMasks[chunk] = 1
+        }
+        demandedPosition = .allocate(capacity: columns)
+        demandedPosition.initialize(repeating: -1, count: columns)
+        wantsDirtyMark = .allocate(capacity: columns)
+        wantsDirtyMark.initialize(repeating: 0, count: columns)
+        residentPosition = .allocate(capacity: columns)
+        residentPosition.initialize(repeating: -1, count: columns)
+        candidatePosition = .allocate(capacity: columns)
+        candidatePosition.initialize(repeating: -1, count: columns)
+        cooldownQueued = .allocate(capacity: columns)
+        cooldownQueued.initialize(repeating: 0, count: columns)
         masterResidency = Array(repeating: GaussianChunkResidency(residentRanks: 0, fadeFromRank: 0, arrivalFrame: 0, coarseAvailable: 0), count: chunkCount)
         masterPageTable = Array(repeating: kGaussianPageSlotInvalid, count: chunkCount * pagesPerChunk)
         slotChunk = Array(repeating: -1, count: slotCount)
@@ -692,17 +730,13 @@ public final class GaussianPageManager: @unchecked Sendable {
         freeSlots = (0 ..< slotCount).reversed().map { UInt32($0) }
         let slots = residencyTables.count
         journals = Array(repeating: [], count: slots)
-        journalMarks = Array(repeating: Array(repeating: false, count: chunkCount), count: slots)
+        journalMarks = .allocate(capacity: max(1, slots * chunkCount))
+        journalMarks.initialize(repeating: 0, count: max(1, slots * chunkCount))
         journalFull = Array(repeating: false, count: slots)
         demandStampTick = Array(repeating: nil, count: slots)
         demandStampFrame = Array(repeating: 0, count: slots)
-        demandWords = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, chunkCount))
-        demandWords.initialize(repeating: 0, count: max(1, chunkCount))
-        demandedPosition = Array(repeating: -1, count: chunkCount)
-        wantsDirtyMark = Array(repeating: false, count: chunkCount)
-        residentPosition = Array(repeating: -1, count: chunkCount)
-        candidatePosition = Array(repeating: -1, count: chunkCount)
-        cooldownQueued = Array(repeating: false, count: chunkCount)
+        demandWords = UnsafeMutablePointer<UInt32>.allocate(capacity: columns)
+        demandWords.initialize(repeating: 0, count: columns)
         lastConstants = Array(repeating: GaussianChunkPagingConstants(), count: slots)
         for k in 0 ..< slots {
             copyMasterTables(toSlot: k)
@@ -717,6 +751,17 @@ public final class GaussianPageManager: @unchecked Sendable {
         shutdown()
         source.close()
         demandWords.deallocate()
+        states.deallocate()
+        splatCounts.deallocate()
+        coarseCounts1.deallocate()
+        coarseCounts2.deallocate()
+        availabilityMasks.deallocate()
+        demandedPosition.deallocate()
+        wantsDirtyMark.deallocate()
+        residentPosition.deallocate()
+        candidatePosition.deallocate()
+        cooldownQueued.deallocate()
+        journalMarks.deallocate()
     }
 
     // MARK: Public state
@@ -747,6 +792,15 @@ public final class GaussianPageManager: @unchecked Sendable {
         return state
     }
 
+    /// The raw bits of `GaussianChunkPageState.Flags`, for the tick's own tests.
+    private enum PageFlag {
+        static let loading = GaussianChunkPageState.Flags.loading.rawValue
+        static let faulted = GaussianChunkPageState.Flags.faulted.rawValue
+        static let fadeActive = GaussianChunkPageState.Flags.fadeActive.rawValue
+        static let levelFade = GaussianChunkPageState.Flags.levelFade.rawValue
+        static let demanded = GaussianChunkPageState.Flags.demanded.rawValue
+    }
+
     /// The pool slot of a tier, or nil (tests).
     public func poolSlot(chunk: Int, tier: Int) -> UInt32? {
         let slot = masterPageTable[chunk * pagesPerChunk + tier]
@@ -767,10 +821,8 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// The runtime levels' splat counts of a chunk (the level-2 count is the level-1 count when
     /// one level is resident), 0 without levels.
     func coarseCounts(chunk: Int) -> (UInt32, UInt32) {
-        guard let coarse else { return (0, 0) }
-        let m1 = index.coarseEntry(level: coarse.fileLevels[0], chunk: chunk)?.splatCount ?? 0
-        let m2 = coarse.fileLevels.count > 1 ? (index.coarseEntry(level: coarse.fileLevels[1], chunk: chunk)?.splatCount ?? 0) : m1
-        return (m1, m2)
+        guard coarse != nil else { return (0, 0) }
+        return (coarseCounts1[chunk], coarseCounts2[chunk])
     }
 
     /// Free slots and slots waiting in the retire ring (tests).
@@ -1074,7 +1126,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         masterResidency[chunk] = GaussianPagingPolicy.mappedResidency(previous: masterResidency[chunk], firstRank: request.firstRank, rankCount: request.rankCount, now: now)
         var state = states[chunk]
         let before = wantContribution(state)
-        let wholeBefore = Int(state.residentRanks) >= Int(index.chunks[chunk].splatCount)
+        let wholeBefore = Int(state.residentRanks) >= Int(splatCounts[chunk])
         state.residentRanks = UInt16(resident)
         state.fadeFromRank = UInt16(request.firstRank)
         state.arrivalTick = now
@@ -1088,7 +1140,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         let after = wantContribution(state)
         wantsSumNeeded += after.needed - before.needed
         wantsSumResidentOfNeeded += after.resident - before.resident
-        if Int(resident) >= Int(index.chunks[chunk].splatCount), !wholeBefore { wholeChunkCount += 1 }
+        if Int(resident) >= Int(splatCounts[chunk]), !wholeBefore { wholeChunkCount += 1 }
         markWantsDirty(chunk)
         if residentPosition[chunk] < 0 {
             residentPosition[chunk] = Int32(residentList.count)
@@ -1198,16 +1250,15 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// A chunk's state changed: whether it may be requested is re-examined. A chunk that only
     /// waits for its cooldown is queued for the tick the cooldown ends.
     private func stateChanged(_ chunk: Int, now: UInt32) {
-        let state = states[chunk]
-        let ready = state.flags.contains(.demanded)
-            && state.neededRanks > state.residentRanks
-            && !state.flags.contains(.loading)
-            && !state.flags.contains(.faulted)
-            && !state.flags.contains(.fadeActive)
-        let member = ready && state.retryAfterTick <= now
-        if ready, !member, !cooldownQueued[chunk] {
-            cooldownQueued[chunk] = true
-            cooldownHeap.push(chunk: chunk, tick: state.retryAfterTick)
+        let state = states + chunk
+        let flags = state.pointee.flags.rawValue
+        let ready = flags & PageFlag.demanded != 0
+            && state.pointee.neededRanks > state.pointee.residentRanks
+            && flags & (PageFlag.loading | PageFlag.faulted | PageFlag.fadeActive) == 0
+        let member = ready && state.pointee.retryAfterTick <= now
+        if ready, !member, cooldownQueued[chunk] == 0 {
+            cooldownQueued[chunk] = 1
+            cooldownHeap.push(chunk: chunk, tick: state.pointee.retryAfterTick)
         }
         let position = Int(candidatePosition[chunk])
         if member, position < 0 {
@@ -1228,7 +1279,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         while let head = cooldownHeap.head, head.tick <= now {
             cooldownHeap.pop()
             let chunk = Int(head.chunk)
-            cooldownQueued[chunk] = false
+            cooldownQueued[chunk] = 0
             stateChanged(chunk, now: now)
         }
     }
@@ -1401,6 +1452,10 @@ public final class GaussianPageManager: @unchecked Sendable {
         guard masterResidency[entry.chunk].coarseAvailable & bit == 0 else { return }
         masterResidency[entry.chunk].coarseAvailable |= bit
         coarseAvailableCount += 1
+        let available = masterResidency[entry.chunk].coarseAvailable
+        availabilityMasks[entry.chunk] = 1
+            | ((available & 1) != 0 && coarseCounts1[entry.chunk] > 0 ? 2 : 0)
+            | ((available & 2) != 0 && coarseCounts2[entry.chunk] > 0 ? 4 : 0)
         markWantsDirty(entry.chunk)
         journal(entry.chunk)
     }
@@ -1471,7 +1526,7 @@ public final class GaussianPageManager: @unchecked Sendable {
                 let bits = demandWords[chunk]
                 guard bits != 0 else { continue }
                 totalArea += Float(bitPattern: bits)
-                totalSplats += Int(index.chunks[chunk].splatCount)
+                totalSplats += Int(splatCounts[chunk])
             }
             demandedArea = totalArea
             demandedSplats = totalSplats
@@ -1484,12 +1539,13 @@ public final class GaussianPageManager: @unchecked Sendable {
     private func noteDemand(chunk: Int, bits: UInt32) {
         let previous = demandWords[chunk]
         demandWords[chunk] = bits
+        let state = states + chunk
         if bits == 0 {
-            let before = wantContribution(states[chunk])
-            wantsSumNeeded -= before.needed
-            wantsSumResidentOfNeeded -= before.resident
-            states[chunk].lastDemandTick = lastIngestTick
-            states[chunk].flags.remove(.demanded)
+            let needed = Int(state.pointee.neededRanks)
+            wantsSumNeeded -= needed
+            wantsSumResidentOfNeeded -= min(needed, Int(state.pointee.residentRanks))
+            state.pointee.lastDemandTick = lastIngestTick
+            state.pointee.flags = GaussianChunkPageState.Flags(rawValue: state.pointee.flags.rawValue & ~PageFlag.demanded)
             let position = Int(demandedPosition[chunk])
             let last = demandedChunks.removeLast()
             if position < demandedChunks.count {
@@ -1500,16 +1556,19 @@ public final class GaussianPageManager: @unchecked Sendable {
             stateChanged(chunk, now: tick)
             return
         }
-        states[chunk].lastArea = Float(bitPattern: bits)
+        state.pointee.lastArea = Float(bitPattern: bits)
         if previous == 0 {
-            states[chunk].flags.insert(.demanded)
+            state.pointee.flags = GaussianChunkPageState.Flags(rawValue: state.pointee.flags.rawValue | PageFlag.demanded)
             demandedPosition[chunk] = Int32(demandedChunks.count)
             demandedChunks.append(Int32(chunk))
-            let after = wantContribution(states[chunk])
-            wantsSumNeeded += after.needed
-            wantsSumResidentOfNeeded += after.resident
+            let needed = Int(state.pointee.neededRanks)
+            wantsSumNeeded += needed
+            wantsSumResidentOfNeeded += min(needed, Int(state.pointee.residentRanks))
         }
-        markWantsDirty(chunk)
+        if wantsDirtyMark[chunk] == 0 {
+            wantsDirtyMark[chunk] = 1
+            wantsDirty.append(Int32(chunk))
+        }
     }
 
     /// The area the cull would write for a chunk it keeps in some view (frustum only), 0 when
@@ -1556,12 +1615,18 @@ public final class GaussianPageManager: @unchecked Sendable {
         // rule draws coarse wants no fine rank (its tiers leave as surplus), and the CPU keeps a
         // mirror of the level drawn to hold the tiers of a chunk mid-fade (`.levelFade`).
         let levelsOn = coarse != nil && !coarseFaulted && !frame.uniformQuotas && !frame.disableWorkingSetBudget && frame.levelMode != .fineOnly
+        let effectiveCap = cap.isFinite ? cap : fill
+        // The level rule's cap side, once per pass: the tier of min(cap, floor), or the
+        // stand-in for a zero cap (`GaussianChunkCullMath.level`).
+        let effectiveLevelCap = min(effectiveCap, frame.densityFloor)
         let inputs = WantInputs(
             cap: cap,
             fill: fill,
             fillScale: fillScale,
-            effectiveCap: cap.isFinite ? cap : fill,
+            effectiveCap: effectiveCap,
             densityFloor: frame.densityFloor,
+            capTier: effectiveLevelCap > 0 ? GaussianChunkCullMath.densityTier(density: effectiveLevelCap) : 0,
+            capIsZero: !(effectiveLevelCap > 0),
             uniformQuotas: frame.uniformQuotas,
             disableWorkingSetBudget: frame.disableWorkingSetBudget,
             levelsOn: levelsOn,
@@ -1576,19 +1641,23 @@ public final class GaussianPageManager: @unchecked Sendable {
         if inputs != wantsInputs {
             wantsInputs = inputs
             for chunk in wantsDirty {
-                wantsDirtyMark[Int(chunk)] = false
+                wantsDirtyMark[Int(chunk)] = 0
             }
             wantsDirty.removeAll(keepingCapacity: true)
-            for demandedChunk in demandedChunks {
-                evaluateWant(chunk: Int(demandedChunk), inputs: inputs, now: now)
+            demandedChunks.withUnsafeBufferPointer { demanded in
+                for position in 0 ..< demanded.count {
+                    evaluateWant(chunk: Int(demanded[position]), inputs: inputs, now: now)
+                }
             }
         } else if !wantsDirty.isEmpty {
             swap(&wantsDirty, &wantsDirtySpare)
-            for dirtyChunk in wantsDirtySpare {
-                let chunk = Int(dirtyChunk)
-                wantsDirtyMark[chunk] = false
-                guard states[chunk].flags.contains(.demanded) else { continue }
-                evaluateWant(chunk: chunk, inputs: inputs, now: now)
+            wantsDirtySpare.withUnsafeBufferPointer { dirty in
+                for position in 0 ..< dirty.count {
+                    let chunk = Int(dirty[position])
+                    wantsDirtyMark[chunk] = 0
+                    guard states[chunk].flags.rawValue & PageFlag.demanded != 0 else { continue }
+                    evaluateWant(chunk: chunk, inputs: inputs, now: now)
+                }
             }
             wantsDirtySpare.removeAll(keepingCapacity: true)
         }
@@ -1605,6 +1674,8 @@ public final class GaussianPageManager: @unchecked Sendable {
         var fillScale: Float = .nan
         var effectiveCap: Float = .nan
         var densityFloor: Float = .nan
+        var capTier = 0
+        var capIsZero = false
         var uniformQuotas = false
         var disableWorkingSetBudget = false
         var levelsOn = false
@@ -1620,55 +1691,75 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
     }
 
-    /// One chunk through the want rule, the level mirror and the surplus clock.
+    /// One chunk through the want rule, the level mirror and the surplus clock: the arithmetic
+    /// of `GaussianPagingPolicy.wantedRanks`, `coarseLevel` and `neededRanks` over the pager's
+    /// columns, the level rule's tier distance computed once for both the want (as if the
+    /// chunk drew fine last tick) and the mirror of the level drawn.
     private func evaluateWant(chunk: Int, inputs: WantInputs, now: UInt32) {
-        let count = index.chunks[chunk].splatCount
-        var state = states[chunk]
-        let before = wantContribution(state)
-        var coarseInputs: GaussianCoarseWantInputs?
-        if inputs.levelsOn {
-            coarseInputs = GaussianCoarseWantInputs(
-                tierShifts: coarseTierShifts,
-                counts: coarseCounts(chunk: chunk),
-                available: masterResidency[chunk].coarseAvailable,
-                densityFloor: inputs.densityFloor,
-                levelMode: inputs.levelMode
-            )
+        let count = splatCounts[chunk]
+        let state = states + chunk
+        let area = state.pointee.lastArea
+        let residentRanks = state.pointee.residentRanks
+        var flags = state.pointee.flags.rawValue
+        let neededBefore = Int(state.pointee.neededRanks)
+        let residentBefore = min(neededBefore, Int(residentRanks))
+
+        var want: UInt32
+        var drawn: UInt8 = 0
+        if inputs.disableWorkingSetBudget {
+            want = count
+        } else if inputs.uniformQuotas {
+            want = GaussianChunkCullMath.quota(scale: inputs.fillScale, splatCount: count)
+        } else if inputs.levelsOn, area > 0 {
+            // The rule with fine assumed drawn and available (the want), and with the level
+            // drawn last and fine available only when a rank is resident (the mirror).
+            let mask = UInt32(availabilityMasks[chunk])
+            let mirrorMask = residentRanks > 0 ? mask : mask & ~1
+            let wantLevel: Int
+            let mirrorLevel: Int
+            switch inputs.levelMode {
+            case .fineOnly:
+                wantLevel = 0
+                mirrorLevel = 0
+            case .coarseOnly:
+                wantLevel = (mask & 4) != 0 ? 2 : (mask & 2) != 0 ? 1 : 0
+                mirrorLevel = (mirrorMask & 4) != 0 ? 2 : (mirrorMask & 2) != 0 ? 1 : 0
+            case .auto:
+                let deltaTier = inputs.capIsZero
+                    ? GaussianChunkCullMath.levelRuleMinusInfinity
+                    : inputs.capTier - GaussianChunkCullMath.densityTier(density: Float(count) / area)
+                wantLevel = GaussianChunkCullMath.levelRule(deltaTier: deltaTier, previous: 0, available: mask, tierShifts: coarseTierShifts)
+                mirrorLevel = GaussianChunkCullMath.levelRule(deltaTier: deltaTier, previous: Int(state.pointee.drawnLevel), available: mirrorMask, tierShifts: coarseTierShifts)
+            }
+            want = wantLevel != 0 ? 0 : GaussianChunkCullMath.quota(densityCap: inputs.effectiveCap, splatCount: count, screenArea: area)
+            drawn = UInt8(mirrorLevel)
+        } else {
+            want = GaussianChunkCullMath.quota(densityCap: inputs.effectiveCap, splatCount: count, screenArea: area)
         }
-        let want = GaussianPagingPolicy.wantedRanks(
-            splatCount: count,
-            area: state.lastArea,
-            densityCap: inputs.cap,
-            fillDensity: inputs.fill,
-            fillScale: inputs.fillScale,
-            uniformQuotas: inputs.uniformQuotas,
-            disableWorkingSetBudget: inputs.disableWorkingSetBudget,
-            coarse: coarseInputs
-        )
-        let drawn = coarseInputs.map { UInt8(GaussianPagingPolicy.coarseLevel($0, splatCount: count, area: state.lastArea, cap: inputs.effectiveCap, previous: Int(state.drawnLevel), fineAvailable: state.residentRanks > 0)) } ?? 0
-        if drawn != state.drawnLevel {
-            state.drawnLevel = drawn
-            state.levelSwitchTick = now
+        if drawn != state.pointee.drawnLevel {
+            state.pointee.drawnLevel = drawn
+            state.pointee.levelSwitchTick = now
             if inputs.levelFadeFrames > 0 {
-                state.flags.insert(.levelFade)
+                flags |= PageFlag.levelFade
                 levelFading.push(chunk: chunk, tick: now)
             }
             // The rule's hysteresis reads the level drawn last: once more next tick.
             markWantsDirty(chunk)
         }
         let needed = GaussianPagingPolicy.neededRanks(want: want, splatCount: count)
-        state.neededRanks = UInt16(needed)
-        let residentTiers = tiers(state.residentRanks)
-        let wantedTiers = GaussianPagingPolicy.tiersNeeded(needed: needed, ranksPerPage: ranksPerPage)
+        state.pointee.neededRanks = UInt16(needed)
+        let residentTiers = (Int(residentRanks) + ranksPerPage - 1) / ranksPerPage
+        let wantedTiers = (Int(needed) + ranksPerPage - 1) / ranksPerPage
         if residentTiers > wantedTiers {
-            if state.surplusSinceTick == 0 { state.surplusSinceTick = now }
+            if state.pointee.surplusSinceTick == 0 { state.pointee.surplusSinceTick = now }
         } else {
-            state.surplusSinceTick = 0
+            state.pointee.surplusSinceTick = 0
         }
-        states[chunk] = state
-        let after = wantContribution(state)
-        wantsSumNeeded += after.needed - before.needed
-        wantsSumResidentOfNeeded += after.resident - before.resident
+        state.pointee.flags = GaussianChunkPageState.Flags(rawValue: flags)
+        if flags & PageFlag.demanded != 0 {
+            wantsSumNeeded += Int(needed) - neededBefore
+            wantsSumResidentOfNeeded += min(Int(needed), Int(residentRanks)) - residentBefore
+        }
         stateChanged(chunk, now: now)
     }
 
@@ -1682,8 +1773,8 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     /// The chunk's own want inputs changed: its area, its residency or its landed levels.
     private func markWantsDirty(_ chunk: Int) {
-        guard !wantsDirtyMark[chunk] else { return }
-        wantsDirtyMark[chunk] = true
+        guard wantsDirtyMark[chunk] == 0 else { return }
+        wantsDirtyMark[chunk] = 1
         wantsDirty.append(Int32(chunk))
     }
 
@@ -1849,7 +1940,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         masterResidency[chunk].residentRanks = resident
         var state = states[chunk]
         let before = wantContribution(state)
-        let wholeBefore = Int(state.residentRanks) >= Int(index.chunks[chunk].splatCount)
+        let wholeBefore = Int(state.residentRanks) >= Int(splatCounts[chunk])
         state.residentRanks = UInt16(resident)
         state.retryAfterTick = max(state.retryAfterTick, now &+ GaussianPagingPolicy.reloadCooldownTicks)
         if tiers(state.residentRanks) <= GaussianPagingPolicy.tiersNeeded(needed: UInt32(state.neededRanks), ranksPerPage: ranksPerPage) {
@@ -1882,10 +1973,8 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     /// `GaussianPagingPolicy.selectVictims` over the pager's own tables.
     private func selectVictims(count: Int, inputs: GaussianEvictionInputs) -> [GaussianEvictionVictim] {
-        states.withUnsafeBufferPointer { states in
-            residentList.withUnsafeBufferPointer { resident in
-                GaussianPagingPolicy.selectVictims(states: states, resident: resident, count: count, inputs: inputs)
-            }
+        residentList.withUnsafeBufferPointer { resident in
+            GaussianPagingPolicy.selectVictims(states: UnsafeBufferPointer(start: states, count: chunkCount), resident: resident, count: count, inputs: inputs)
         }
     }
 
@@ -1947,8 +2036,9 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     private func journal(_ chunk: Int) {
         for slot in journals.indices where !journalFull[slot] {
-            guard !journalMarks[slot][chunk] else { continue }
-            journalMarks[slot][chunk] = true
+            let mark = journalMarks + (slot * chunkCount + chunk)
+            guard mark.pointee == 0 else { continue }
+            mark.pointee = 1
             journals[slot].append(chunk)
             if journals[slot].count > chunkCount / 4 {
                 journalFull[slot] = true
@@ -1961,7 +2051,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         if journalFull[slot] {
             copyMasterTables(toSlot: slot)
             journalFull[slot] = false
-            journalMarks[slot] = Array(repeating: false, count: chunkCount)
+            (journalMarks + slot * chunkCount).update(repeating: 0, count: chunkCount)
             journals[slot].removeAll(keepingCapacity: true)
             return
         }
@@ -1974,7 +2064,7 @@ public final class GaussianPageManager: @unchecked Sendable {
             for tier in 0 ..< pagesPerChunk {
                 pages[row + tier] = masterPageTable[row + tier]
             }
-            journalMarks[slot][chunk] = false
+            journalMarks[slot * chunkCount + chunk] = 0
         }
         journals[slot].removeAll(keepingCapacity: true)
     }

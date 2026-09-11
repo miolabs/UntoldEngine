@@ -390,4 +390,40 @@ final class GaussianChunkCullMathTests: XCTestCase {
         XCTAssertEqual(GaussianLevelMode(rawValue: gaussianChunkLevelModeFineOnly.rawValue), .fineOnly)
         XCTAssertEqual(GaussianLevelMode(rawValue: gaussianChunkLevelModeCoarseOnly.rawValue), .coarseOnly)
     }
+
+    /// The spelled-out availability fallbacks of the level rule agree with the loops they
+    /// replaced over every tier distance, previous level, mask and pair of shifts.
+    func testLevelRuleFallbacksMatchTheLoops() {
+        func reference(deltaTier: Int, previous: Int, available: UInt32, tierShifts: (Int, Int)) -> Int {
+            func wanted(margin: Int) -> Int {
+                if deltaTier >= -tierShifts.0 + margin { return 0 }
+                if deltaTier >= -tierShifts.1 + margin { return 1 }
+                return 2
+            }
+            var want = wanted(margin: 0)
+            if want < previous {
+                want = min(previous, wanted(margin: 1))
+            }
+            for level in want ... 2 where (available & (1 << UInt32(level))) != 0 {
+                return level
+            }
+            for level in stride(from: want - 1, through: 0, by: -1) where (available & (1 << UInt32(level))) != 0 {
+                return level
+            }
+            return want
+        }
+        for shifts in [(0, 0), (2, 2), (2, 6), (4, 10), (0, 4)] {
+            for deltaTier in -14 ... 6 {
+                for previous in 0 ... 2 {
+                    for available in UInt32(0) ... 7 {
+                        XCTAssertEqual(
+                            GaussianChunkCullMath.levelRule(deltaTier: deltaTier, previous: previous, available: available, tierShifts: shifts),
+                            reference(deltaTier: deltaTier, previous: previous, available: available, tierShifts: shifts),
+                            "delta \(deltaTier) previous \(previous) available \(available) shifts \(shifts)"
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
