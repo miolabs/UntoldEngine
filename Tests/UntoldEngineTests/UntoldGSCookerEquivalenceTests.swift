@@ -284,11 +284,19 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
             } else {
                 XCTAssertEqual(report.tierIndex, previous.tierIndex + 1)
             }
+            if report.phase != previous.phase || report.tierIndex != previous.tierIndex, previous.fraction == 1, report.fraction == 0 {
+                // A phase that ended at 1 hands over to one starting at 0 at the same overall —
+                // also from `chunk` to `write` in the second tier, which is below the automatic
+                // coarse-level threshold and never reports `coarsen`.
+                XCTAssertEqual(report.overall, previous.overall, accuracy: 1e-5, "\(previous.phase) → \(report.phase) is continuous")
+            }
             previous = report
         }
         for phase in order {
             XCTAssertTrue(all.contains { $0.phase == phase }, "\(phase) is reported")
         }
+        XCTAssertTrue(all.contains { $0.tierIndex == 1 && $0.phase == .chunk }, "the second tier reports chunk")
+        XCTAssertFalse(all.contains { $0.tierIndex == 1 && $0.phase == .coarsen }, "the second tier has no coarse levels")
     }
 
     func testProgressStaysMonotonicWhenTheTierHasNoCoarseLevels() throws {
@@ -312,6 +320,13 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         }
         XCTAssertEqual(chunk.last?.fraction, 1)
         XCTAssertEqual(reports.all.last?.overall, 1)
+
+        // The chunk loop takes the coarsening's share of the tier: `chunk` spans 0.40…0.90 of
+        // the whole and `write` carries on from where it ended, rather than leaping from 0.50.
+        XCTAssertEqual(try XCTUnwrap(chunk.first?.overall), 0.40, accuracy: 1e-5)
+        XCTAssertEqual(try XCTUnwrap(chunk.last?.overall), 0.90, accuracy: 1e-5)
+        let write = reports.all.filter { $0.phase == .write }
+        XCTAssertEqual(try XCTUnwrap(write.first?.overall), try XCTUnwrap(chunk.last?.overall), accuracy: 1e-5, "write starts where chunk ended")
     }
 
     func testCancellationInEveryPhaseLeavesNoFileBehind() throws {

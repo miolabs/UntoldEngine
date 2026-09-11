@@ -226,6 +226,7 @@ public extension UntoldGSFormat {
         // chunk loop reports as `coarsen`; without them the loop is the rest of `chunk`, so the
         // ordering takes the first tenth and the fraction never runs backwards.
         let orderingShare = coarseOptions == nil ? 0.1 : 1.0
+        progress?.setTierHasCoarseLevels(coarseOptions != nil)
         try progress?.report(.chunk, fraction: 0)
         let bounds = bounds(of: view)
         let order = mortonOrder(view, boundsMin: bounds.min, boundsMax: bounds.max)

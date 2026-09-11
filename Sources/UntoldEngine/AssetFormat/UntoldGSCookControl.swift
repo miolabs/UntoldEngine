@@ -85,10 +85,16 @@ final class UntoldGSCookProgressSink: @unchecked Sendable {
     let control: UntoldGSCookControl?
     let tierCount: Int
     private(set) var tierIndex = 0
+    /// Whether the tier being baked reports `coarsen`; the writer says once it knows.
+    private(set) var tierHasCoarseLevels = true
     /// Per-tier weights, by phase; `read` and `cook` come first.
     private static let readWeight: Float = 0.35
     private static let cookWeight: Float = 0.05
     private static let tierWeights: [UntoldGSCookPhase: Float] = [.chunk: 0.10, .coarsen: 0.40, .write: 0.10]
+    /// Without coarse levels the chunk loop — the encode, most of the tier's time — reports as
+    /// `chunk`, which takes the coarsening's share so `overall` keeps moving through it
+    /// instead of leaping when `write` starts.
+    private static let tierWeightsWithoutCoarseLevels: [UntoldGSCookPhase: Float] = [.chunk: 0.50, .coarsen: 0, .write: 0.10]
     private static let tierWeightTotal: Float = 0.60
 
     init(control: UntoldGSCookControl?, tierCount: Int) {
@@ -98,6 +104,13 @@ final class UntoldGSCookProgressSink: @unchecked Sendable {
 
     func beginTier(_ index: Int) {
         tierIndex = index
+        tierHasCoarseLevels = true
+    }
+
+    /// Told by the writer, before its first report of the tier, whether the tier bakes coarse
+    /// levels — and so whether `coarsen` will be reported at all.
+    func setTierHasCoarseLevels(_ hasCoarseLevels: Bool) {
+        tierHasCoarseLevels = hasCoarseLevels
     }
 
     /// Reports `phase` at `fraction`, mapping it onto the whole bake, and polls cancellation.
@@ -112,14 +125,15 @@ final class UntoldGSCookProgressSink: @unchecked Sendable {
         case .cook:
             overall = Self.readWeight + Self.cookWeight * f
         case .chunk, .coarsen, .write:
+            let weights = tierHasCoarseLevels ? Self.tierWeights : Self.tierWeightsWithoutCoarseLevels
             let perTier = Self.tierWeightTotal / Float(tierCount)
             var withinTier: Float = 0
             for earlier in [UntoldGSCookPhase.chunk, .coarsen, .write] {
                 if earlier == phase {
-                    withinTier += (Self.tierWeights[earlier] ?? 0) * f
+                    withinTier += (weights[earlier] ?? 0) * f
                     break
                 }
-                withinTier += Self.tierWeights[earlier] ?? 0
+                withinTier += weights[earlier] ?? 0
             }
             overall = Self.readWeight + Self.cookWeight + perTier * (Float(tierIndex) + withinTier / Self.tierWeightTotal)
         }
