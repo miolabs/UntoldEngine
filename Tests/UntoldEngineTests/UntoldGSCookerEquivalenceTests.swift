@@ -195,7 +195,10 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         XCTAssertEqual(try sha256(single[0].streamed), "c27c677da83a97ac272ff3d746f7a5d1e5697e2122ca7d5c53cba28153e583f8")
 
         options.coarseLevels = .levels(count: 1)
-        _ = try bakeBothWays(ply: ply, name: "grid-tiers", lodFractions: [1.0, 0.5], options: options)
+        let tiers = try bakeBothWays(ply: ply, name: "grid-tiers", lodFractions: [1.0, 0.5], options: options)
+        // Every splat of the grid has the same importance: the half tier is decided by the
+        // ranking's tie order alone, which has to be the same every run.
+        XCTAssertEqual(try sha256(tiers[1].streamed), "62485bd1a68fec31cd42c03e64b0c8b4b8eb46867bdd341b017d40e6cdf4c179")
     }
 
     func testBinarySH3FixtureBakesByteIdenticalToTheWholeArrayPath() throws {

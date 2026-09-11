@@ -4806,7 +4806,13 @@ func spatiallyInterleavedGaussianRanking(
         return sum / Float(max(1, indices.count))
     }
 
-    var remainingBuckets = Array(sortedBuckets.keys)
+    // The bucket order breaks ties — equal importances, equal distances — by the position of
+    // the buckets in this array, and a dictionary's iteration order is seeded from the address
+    // of its storage: without the sort, two rankings of the same splats disagree on their ties,
+    // and a capture whose splats share one importance bakes a different _lod1 every run.
+    var remainingBuckets = Array(sortedBuckets.keys).sorted { lhs, rhs in
+        (lhs.x, lhs.y, lhs.z) < (rhs.x, rhs.y, rhs.z)
+    }
     var bucketOrder: [GaussianSpatialBucketKey] = []
     if let first = remainingBuckets.max(by: { lhs, rhs in
         guard let lhsIndex = sortedBuckets[lhs]?.first,
