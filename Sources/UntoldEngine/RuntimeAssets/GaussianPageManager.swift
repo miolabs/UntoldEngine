@@ -498,9 +498,12 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// ingest changed a word.
     private var demandedSplats = 0
     /// The fill histogram over the demanded chunks (`GaussianPagingPolicy.addFillTerm`), kept
-    /// as terms come and go, and the fill density cap solved over it, cached with the room and
-    /// the level rule's inputs it was solved for.
-    private var fillHistogram = GaussianBudgetDensityHistogram()
+    /// as terms come and go while the fill density is in use (the read-back cap +inf) — built
+    /// from the demanded set when it comes into use, dropped while a finite cap decides the
+    /// wants — and the fill density cap solved over it, cached with the room and the level
+    /// rule's inputs it was solved for.
+    private let fillTiers: UnsafeMutablePointer<GaussianBudgetDensityTier>
+    private var fillHistogramValid = false
     private var fillHistogramVersion: UInt64 = 0
     private var fillCapVersion: UInt64 = .max
     private var fillCapRoom: Float = .nan
@@ -755,6 +758,8 @@ public final class GaussianPageManager: @unchecked Sendable {
         demandStampFrame = Array(repeating: 0, count: slots)
         demandWords = UnsafeMutablePointer<UInt32>.allocate(capacity: columns)
         demandWords.initialize(repeating: 0, count: columns)
+        fillTiers = .allocate(capacity: gaussianDensityTierCount)
+        fillTiers.initialize(repeating: GaussianBudgetDensityTier(), count: gaussianDensityTierCount)
         lastConstants = Array(repeating: GaussianChunkPagingConstants(), count: slots)
         for k in 0 ..< slots {
             copyMasterTables(toSlot: k)
@@ -769,6 +774,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         shutdown()
         source.close()
         demandWords.deallocate()
+        fillTiers.deallocate()
         states.deallocate()
         splatCounts.deallocate()
         coarseCounts1.deallocate()
@@ -1599,14 +1605,16 @@ public final class GaussianPageManager: @unchecked Sendable {
         let previous = demandWords[chunk]
         demandWords[chunk] = bits
         let state = states + chunk
-        let counts = (coarseCounts1[chunk], coarseCounts2[chunk])
-        if previous != 0 {
-            GaussianPagingPolicy.addFillTerm(to: &fillHistogram, splatCount: splatCounts[chunk], area: Float(bitPattern: previous), coarseCounts: counts, sign: -1)
+        if fillHistogramValid {
+            let counts = (coarseCounts1[chunk], coarseCounts2[chunk])
+            if previous != 0 {
+                GaussianPagingPolicy.addFillTerm(to: fillTiers, splatCount: splatCounts[chunk], area: Float(bitPattern: previous), coarseCounts: counts, sign: -1)
+            }
+            if bits != 0 {
+                GaussianPagingPolicy.addFillTerm(to: fillTiers, splatCount: splatCounts[chunk], area: Float(bitPattern: bits), coarseCounts: counts, sign: 1)
+            }
+            fillHistogramVersion &+= 1
         }
-        if bits != 0 {
-            GaussianPagingPolicy.addFillTerm(to: &fillHistogram, splatCount: splatCounts[chunk], area: Float(bitPattern: bits), coarseCounts: counts)
-        }
-        fillHistogramVersion &+= 1
         if bits == 0 {
             let needed = Int(state.pointee.neededRanks)
             wantsSumNeeded -= needed
@@ -1682,17 +1690,38 @@ public final class GaussianPageManager: @unchecked Sendable {
         let levelsOn = coarse != nil && !coarseFaulted && !frame.uniformQuotas && !frame.disableWorkingSetBudget && frame.levelMode != .fineOnly
         // The fill density when the frame fits: the cap the solve would settle at with every
         // demanded chunk resident whole, solved over the fill histogram when it, the room or
-        // the level rule's inputs changed.
-        let room = GaussianPagingPolicy.fillRoom(budget: frame.budget, reservedSplats: reserved)
-        let levelledFill = levelsOn && frame.levelMode == .auto
-        if fillCapVersion != fillHistogramVersion || fillCapRoom.bitPattern != room.bitPattern || fillCapLevelled != levelledFill || fillCapFloor.bitPattern != frame.densityFloor.bitPattern {
-            fillCapVersion = fillHistogramVersion
-            fillCapRoom = room
-            fillCapLevelled = levelledFill
-            fillCapFloor = frame.densityFloor
-            fillCap = GaussianPagingPolicy.fillDensityCap(histogram: fillHistogram, room: room, levels: levelledFill ? (frame.densityFloor, coarseTierShifts) : nil)
+        // the level rule's inputs changed. A finite cap decides the wants instead, and the
+        // histogram is neither kept nor solved while it does.
+        var fill: Float = .nan
+        if cap.isFinite {
+            fillHistogramValid = false
+        } else {
+            if !fillHistogramValid {
+                fillTiers.update(repeating: GaussianBudgetDensityTier(), count: gaussianDensityTierCount)
+                demandedChunks.withUnsafeBufferPointer { demanded in
+                    for position in 0 ..< demanded.count {
+                        let chunk = Int(demanded[position])
+                        GaussianPagingPolicy.addFillTerm(to: fillTiers, splatCount: splatCounts[chunk], area: Float(bitPattern: demandWords[chunk]), coarseCounts: (coarseCounts1[chunk], coarseCounts2[chunk]), sign: 1)
+                    }
+                }
+                fillHistogramValid = true
+                fillHistogramVersion &+= 1
+            }
+            let room = GaussianPagingPolicy.fillRoom(budget: frame.budget, reservedSplats: reserved)
+            let levelledFill = levelsOn && frame.levelMode == .auto
+            if fillCapVersion != fillHistogramVersion || fillCapRoom.bitPattern != room.bitPattern || fillCapLevelled != levelledFill || fillCapFloor.bitPattern != frame.densityFloor.bitPattern {
+                fillCapVersion = fillHistogramVersion
+                fillCapRoom = room
+                fillCapLevelled = levelledFill
+                fillCapFloor = frame.densityFloor
+                var histogram = GaussianBudgetDensityHistogram()
+                withUnsafeMutableBytes(of: &histogram.tiers) { bytes in
+                    bytes.bindMemory(to: GaussianBudgetDensityTier.self).baseAddress!.update(from: fillTiers, count: gaussianDensityTierCount)
+                }
+                fillCap = GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: room, levels: levelledFill ? (frame.densityFloor, coarseTierShifts) : nil)
+            }
+            fill = fillCap
         }
-        let fill = fillCap
         let effectiveCap = cap.isFinite ? cap : fill
         // The level rule's cap side, once per pass: the tier of min(cap, floor), or the
         // stand-in for a zero cap (`GaussianChunkCullMath.level`).

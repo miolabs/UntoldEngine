@@ -352,32 +352,37 @@ public enum GaussianPagingPolicy {
     /// term by term, so the sum over the demanded set is that histogram of a whole-resident
     /// entity. The tier sums wrap, so a removal undoes an addition exactly.
     public static func addFillTerm(to histogram: inout GaussianBudgetDensityHistogram, splatCount: UInt32, area: Float, coarseCounts: (UInt32, UInt32), sign: Int32 = 1) {
+        withUnsafeMutableBytes(of: &histogram.tiers) { bytes in
+            addFillTerm(to: bytes.bindMemory(to: GaussianBudgetDensityTier.self).baseAddress!, splatCount: splatCount, area: area, coarseCounts: coarseCounts, sign: sign)
+        }
+    }
+
+    /// `addFillTerm` over the histogram's tiers as a buffer of `gaussianDensityTierCount`
+    /// entries (the pager keeps them so).
+    static func addFillTerm(to tiers: UnsafeMutablePointer<GaussianBudgetDensityTier>, splatCount: UInt32, area: Float, coarseCounts: (UInt32, UInt32), sign: Int32) {
         guard area > 0, splatCount > 0 else { return }
         let hasLevel = coarseCounts.0 > 0 || coarseCounts.1 > 0
         let finest = coarseCounts.0 > 0 ? coarseCounts.0 : coarseCounts.1
         let listed = max(splatCount, finest)
-        let tier = GaussianChunkCullMath.densityTier(density: Float(splatCount) / area)
-        let scaledArea = UInt32(ceil(area * GaussianChunkCullMath.densityTierFloor(tier)))
-        withUnsafeMutableBytes(of: &histogram.tiers) { bytes in
-            let tiers = bytes.bindMemory(to: GaussianBudgetDensityTier.self)
-            if sign >= 0 {
-                tiers[tier].splats &+= listed
-                tiers[tier].scaledArea &+= scaledArea
-                if hasLevel {
-                    tiers[tier].coarse1 &+= finest
-                    tiers[tier].coarse2 &+= coarseCounts.1 > 0 ? coarseCounts.1 : coarseCounts.0
-                    tiers[tier].levelledSplats &+= listed
-                    tiers[tier].levelledScaledArea &+= scaledArea
-                }
-            } else {
-                tiers[tier].splats &-= listed
-                tiers[tier].scaledArea &-= scaledArea
-                if hasLevel {
-                    tiers[tier].coarse1 &-= finest
-                    tiers[tier].coarse2 &-= coarseCounts.1 > 0 ? coarseCounts.1 : coarseCounts.0
-                    tiers[tier].levelledSplats &-= listed
-                    tiers[tier].levelledScaledArea &-= scaledArea
-                }
+        let tier = tiers + GaussianChunkCullMath.densityTier(density: Float(splatCount) / area)
+        let scaledArea = UInt32(ceil(area * GaussianChunkCullMath.densityTierFloor(tier - tiers)))
+        if sign >= 0 {
+            tier.pointee.splats &+= listed
+            tier.pointee.scaledArea &+= scaledArea
+            if hasLevel {
+                tier.pointee.coarse1 &+= finest
+                tier.pointee.coarse2 &+= coarseCounts.1 > 0 ? coarseCounts.1 : coarseCounts.0
+                tier.pointee.levelledSplats &+= listed
+                tier.pointee.levelledScaledArea &+= scaledArea
+            }
+        } else {
+            tier.pointee.splats &-= listed
+            tier.pointee.scaledArea &-= scaledArea
+            if hasLevel {
+                tier.pointee.coarse1 &-= finest
+                tier.pointee.coarse2 &-= coarseCounts.1 > 0 ? coarseCounts.1 : coarseCounts.0
+                tier.pointee.levelledSplats &-= listed
+                tier.pointee.levelledScaledArea &-= scaledArea
             }
         }
     }
