@@ -183,10 +183,6 @@ public extension UntoldGSFormat {
             )
         }
 
-        try progress?.report(.chunk, fraction: 0)
-        let bounds = bounds(of: view)
-        let order = mortonOrder(view, boundsMin: bounds.min, boundsMax: bounds.max)
-        try progress?.report(.chunk, fraction: 0.5)
         let splatsPerChunk = 1 << Int(options.log2ChunkSplats)
         let chunkCount = (splatCount + splatsPerChunk - 1) / splatsPerChunk
 
@@ -206,6 +202,15 @@ public extension UntoldGSFormat {
             try requested.validate(log2ChunkSplats: options.log2ChunkSplats)
             return requested
         }()
+
+        // Progress: with coarse levels the `chunk` phase is the ordering and the layout and the
+        // chunk loop reports as `coarsen`; without them the loop is the rest of `chunk`, so the
+        // ordering takes the first tenth and the fraction never runs backwards.
+        let orderingShare = coarseOptions == nil ? 0.1 : 1.0
+        try progress?.report(.chunk, fraction: 0)
+        let bounds = bounds(of: view)
+        let order = mortonOrder(view, boundsMin: bounds.min, boundsMax: bounds.max)
+        try progress?.report(.chunk, fraction: 0.5 * orderingShare)
 
         // The layout is fixed before a chunk is encoded: the tree's node count depends on the
         // chunk count alone, a chunk's padded payload on its splat count alone.
@@ -229,13 +234,17 @@ public extension UntoldGSFormat {
         // The writer's importance per splat, so the in-chunk sort compares the same values it
         // always compared without recomputing them per comparison.
         let importance = options.sortByImportanceWithinChunk ? importances(of: view) : []
-        try progress?.report(.chunk, fraction: 1)
+        try progress?.report(.chunk, fraction: orderingShare)
 
         // The chunks: each work item sorts its chunk by importance, encodes the records and the
         // SH bytes into its own buffer, checksums them, writes them at the chunk's offset, and
         // coarsens the chunk in Morton order. Results land by chunk index whatever the
         // scheduling; the chunk's arithmetic is sequential in a fixed order.
         let loopPhase: UntoldGSCookPhase = coarseOptions == nil ? .chunk : .coarsen
+        let loopFraction: (Int) -> Double = { done in
+            let fraction = Double(done) / Double(chunkCount)
+            return loopPhase == .chunk ? orderingShare + (1 - orderingShare) * fraction : fraction
+        }
         let results = ChunkResults(count: chunkCount)
         let work: @Sendable (Int) -> Void = { chunk in
             do {
@@ -275,7 +284,7 @@ public extension UntoldGSFormat {
             for chunk in 0 ..< chunkCount {
                 work(chunk)
                 if let progress, chunk % 64 == 63 {
-                    try progress.report(loopPhase, fraction: Double(chunk + 1) / Double(chunkCount))
+                    try progress.report(loopPhase, fraction: loopFraction(chunk + 1))
                 }
             }
         } else {
@@ -283,12 +292,13 @@ public extension UntoldGSFormat {
             var first = 0
             while first < chunkCount {
                 let count = min(batchSize, chunkCount - first)
-                DispatchQueue.concurrentPerform(iterations: count) { work(first + $0) }
+                let base = first
+                DispatchQueue.concurrentPerform(iterations: count) { work(base + $0) }
                 first += count
                 if let failure = results.firstFailure {
                     throw failure
                 }
-                try progress?.report(loopPhase, fraction: Double(first) / Double(chunkCount))
+                try progress?.report(loopPhase, fraction: loopFraction(first))
             }
         }
         var (entries, coarseLevels) = try results.take()

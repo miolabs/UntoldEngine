@@ -291,6 +291,29 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         }
     }
 
+    func testProgressStaysMonotonicWhenTheTierHasNoCoarseLevels() throws {
+        // Without coarse levels the chunk loop reports as `chunk` after the ordering did; 135
+        // chunks of 8 take several batches, so the fraction must carry on from the ordering's
+        // share rather than start again at zero.
+        let ply = try binaryFixture()
+        var options = transformedOptions
+        options.log2ChunkSplats = 3
+        options.coarseLevels = .off
+        let reports = ProgressLog()
+        let output = temporaryDirectory.appendingPathComponent("flat.untoldgs")
+        _ = try bakeGaussianSplatProgressiveTiers(plyURL: ply, outputBaseURL: output, lodFractions: [1.0], cookOptions: options, control: UntoldGSCookControl(progress: { reports.append($0) }))
+
+        let chunk = reports.all.filter { $0.phase == .chunk }
+        XCTAssertGreaterThan(chunk.count, 4, "the ordering and every chunk batch report")
+        XCTAssertFalse(reports.all.contains { $0.phase == .coarsen })
+        for (previous, next) in zip(chunk, chunk.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(next.fraction, previous.fraction, "chunk fractions never run backwards")
+            XCTAssertGreaterThanOrEqual(next.overall, previous.overall)
+        }
+        XCTAssertEqual(chunk.last?.fraction, 1)
+        XCTAssertEqual(reports.all.last?.overall, 1)
+    }
+
     func testCancellationInEveryPhaseLeavesNoFileBehind() throws {
         let ply = try binaryFixture()
         for phase in UntoldGSCookPhase.allCases {
