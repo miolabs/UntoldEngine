@@ -1108,6 +1108,12 @@ public class StreamingComponent: Component {
     /// Frame when entity was last visible (for LRU eviction)
     public var lastVisibleFrame: Int = 0
 
+    /// How many loads the streaming system has dispatched for this entity. Counted the moment
+    /// a load is dispatched, before its outcome is known, and never reset by the outcome, so a
+    /// caller can tell "the gates let this entity load" from "it loaded" (a load that fails at
+    /// once puts `state` back to `.unloaded` asynchronously).
+    public internal(set) var loadDispatchCount: Int = 0
+
     /// Task handle for cancellation
     var loadTask: Task<Void, Never>?
 

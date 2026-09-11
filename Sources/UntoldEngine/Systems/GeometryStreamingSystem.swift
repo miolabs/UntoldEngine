@@ -2134,6 +2134,7 @@ public class GeometryStreamingSystem: @unchecked Sendable {
         else { return }
 
         streaming.state = .loading
+        streaming.loadDispatchCount += 1
 
         let success = await loadMeshAsync(
             entityId: entityId,
