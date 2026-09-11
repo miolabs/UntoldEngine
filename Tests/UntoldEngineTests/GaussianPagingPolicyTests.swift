@@ -96,6 +96,76 @@ final class GaussianPagingPolicyTests: XCTestCase {
         XCTAssertEqual(GaussianPagingPolicy.fillDensity(budget: 100, reservedSplats: 100, demandedArea: 1), 0)
     }
 
+    /// The fill density cap: the terms added chunk by chunk are the levelled histogram of the
+    /// same chunks resident whole with their levels landed (and removals undo them); the cap
+    /// keeps the bounded request within the room and is the largest such density on the
+    /// bisection's grid; it is at least the plain fill density, which ignores the chunks the
+    /// count caps; it is +inf when everything fits whole and 0 when nothing does.
+    func testFillDensityCapSolvesOverTheDemandedSetAsIfResident() {
+        var generator = SplitMix64(seed: 11)
+        struct Chunk {
+            var n: UInt32
+            var area: Float
+            var m1: UInt32
+            var m2: UInt32
+        }
+        let chunks: [Chunk] = (0 ..< 3000).map { index in
+            let n = UInt32(64 + Int(generator.unit() * 960))
+            let levelled = index % 3 != 0
+            return Chunk(n: n, area: 0.00002 + 0.01 * generator.unit(), m1: levelled ? n / 3 : 0, m2: levelled ? n / 6 : 0)
+        }
+        var histogram = GaussianBudgetDensityHistogram()
+        for chunk in chunks {
+            GaussianPagingPolicy.addFillTerm(to: &histogram, splatCount: chunk.n, area: chunk.area, coarseCounts: (chunk.m1, chunk.m2))
+        }
+        let mirror = GaussianChunkCullMath.densityHistogram(levelledChunks: chunks.map {
+            GaussianChunkCullMath.LevelledChunk(splatCount: $0.n, residentRanks: $0.n, screenArea: $0.area, coarse1: $0.m1, coarse2: $0.m2, availableLevels: ($0.m1 > 0 ? 1 : 0) | ($0.m2 > 0 ? 2 : 0))
+        })
+        for (tier, entry) in histogram.tierArray.enumerated() {
+            let expected = mirror.tier(tier)
+            XCTAssertEqual(entry.splats, expected.splats, "tier \(tier)")
+            XCTAssertEqual(entry.scaledArea, expected.scaledArea, "tier \(tier)")
+            XCTAssertEqual(entry.coarse1, expected.coarse1, "tier \(tier)")
+            XCTAssertEqual(entry.coarse2, expected.coarse2, "tier \(tier)")
+            XCTAssertEqual(entry.levelledSplats, expected.levelledSplats, "tier \(tier)")
+            XCTAssertEqual(entry.levelledScaledArea, expected.levelledScaledArea, "tier \(tier)")
+        }
+        // A removal undoes the term.
+        var reduced = histogram
+        for chunk in chunks.prefix(100) {
+            GaussianPagingPolicy.addFillTerm(to: &reduced, splatCount: chunk.n, area: chunk.area, coarseCounts: (chunk.m1, chunk.m2), sign: -1)
+        }
+        let rest = GaussianChunkCullMath.densityHistogram(levelledChunks: chunks.dropFirst(100).map {
+            GaussianChunkCullMath.LevelledChunk(splatCount: $0.n, residentRanks: $0.n, screenArea: $0.area, coarse1: $0.m1, coarse2: $0.m2, availableLevels: ($0.m1 > 0 ? 1 : 0) | ($0.m2 > 0 ? 2 : 0))
+        })
+        XCTAssertEqual(reduced.tierArray.map(\.splats), rest.tierArray.map(\.splats))
+        XCTAssertEqual(reduced.tierArray.map(\.levelledScaledArea), rest.tierArray.map(\.levelledScaledArea))
+
+        let total = chunks.reduce(0) { $0 + Int($1.n) }
+        let levels = (densityFloor: Float.infinity, tierShifts: (2, 6))
+        // Without levels: the budget solve's own mirror, the grant being the room.
+        let room = Float(total) / 4
+        let plainCap = GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: room, levels: nil)
+        XCTAssertEqual(plainCap, GaussianChunkCullMath.densityCap(histogram: histogram, grant: UInt32(room)), "the fill cap is the budget solve over the fill histogram")
+        XCTAssertTrue(plainCap.isFinite && plainCap > 0)
+        XCTAssertLessThanOrEqual(GaussianChunkCullMath.boundedGrant(histogram: histogram, density: plainCap), room)
+        XCTAssertGreaterThan(GaussianChunkCullMath.boundedGrant(histogram: histogram, density: plainCap * 1.01), room, "the largest such density on the grid")
+        // With levels: the levelled request, which draws the coarse chunks at their counts.
+        let levelledCap = GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: room, levels: levels)
+        XCTAssertTrue(levelledCap.isFinite && levelledCap > 0)
+        XCTAssertLessThanOrEqual(GaussianChunkCullMath.boundedRequest(histogram: histogram, density: levelledCap, tierShifts: levels.tierShifts), room)
+        XCTAssertGreaterThan(GaussianChunkCullMath.boundedRequest(histogram: histogram, density: levelledCap * 1.01, tierShifts: levels.tierShifts), room)
+        XCTAssertNotEqual(levelledCap, plainCap, "the levels change the solve")
+        // A room below what the coarsest levels alone draw: nothing fits.
+        let coarseFloor = GaussianChunkCullMath.boundedRequest(histogram: histogram, density: 0, tierShifts: levels.tierShifts)
+        XCTAssertGreaterThan(coarseFloor, 0)
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: coarseFloor * 0.9, levels: levels), 0)
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: Float(total) * 2, levels: nil), .infinity, "everything fits whole")
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: 0, levels: nil), 0, "nothing fits")
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: GaussianBudgetDensityHistogram(), room: 100, levels: nil), .infinity, "nothing demanded")
+        XCTAssertEqual(GaussianPagingPolicy.fillRoom(budget: 1000, reservedSplats: 100), 0.98 * 1000 - 100)
+    }
+
     func testUniformModeWantsTheScaledCount() {
         let n: UInt32 = 1000
         XCTAssertEqual(GaussianPagingPolicy.wantedRanks(splatCount: n, area: 0.001, densityCap: 0.25, fillDensity: 1, fillScale: 0.5, uniformQuotas: true, disableWorkingSetBudget: false), 500, "the fill scale over the full counts, never the read-back cap: that cap scales the resident ranks the kernel listed and has no fixed point over the full count")

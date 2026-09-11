@@ -494,10 +494,19 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// is each chunk's index in it (−1 when not demanded).
     private var demandedChunks: [Int32] = []
     private let demandedPosition: UnsafeMutablePointer<Int32>
-    /// Σ area and Σ splatCount over the demanded chunks in chunk order, recomputed only when
-    /// an ingest changed a word (the sums are the fill rule's inputs, so the order is kept).
-    private var demandedArea: Float = 0
+    /// Σ splatCount over the demanded chunks (the fill scale's input), recomputed only when an
+    /// ingest changed a word.
     private var demandedSplats = 0
+    /// The fill histogram over the demanded chunks (`GaussianPagingPolicy.addFillTerm`), kept
+    /// as terms come and go, and the fill density cap solved over it, cached with the room and
+    /// the level rule's inputs it was solved for.
+    private var fillHistogram = GaussianBudgetDensityHistogram()
+    private var fillHistogramVersion: UInt64 = 0
+    private var fillCapVersion: UInt64 = .max
+    private var fillCapRoom: Float = .nan
+    private var fillCapLevelled = false
+    private var fillCapFloor: Float = .nan
+    private var fillCap: Float = .infinity
     /// The chunks whose own want inputs changed since their last evaluation (dense, with a
     /// mark), the spare list they are swapped into while evaluated, the frame-wide inputs the
     /// last pass ran with, and the warmth sums over the demanded chunks, maintained as their
@@ -1575,16 +1584,10 @@ public final class GaussianPageManager: @unchecked Sendable {
             }
         }
         if changed {
-            // The sums the fill rule sees, in chunk order as before the diff.
-            var totalArea: Float = 0
             var totalSplats = 0
-            for chunk in 0 ..< chunkCount {
-                let bits = demandWords[chunk]
-                guard bits != 0 else { continue }
-                totalArea += Float(bitPattern: bits)
+            for chunk in 0 ..< chunkCount where demandWords[chunk] != 0 {
                 totalSplats += Int(splatCounts[chunk])
             }
-            demandedArea = totalArea
             demandedSplats = totalSplats
         }
         lastIngestTick = now
@@ -1596,6 +1599,14 @@ public final class GaussianPageManager: @unchecked Sendable {
         let previous = demandWords[chunk]
         demandWords[chunk] = bits
         let state = states + chunk
+        let counts = (coarseCounts1[chunk], coarseCounts2[chunk])
+        if previous != 0 {
+            GaussianPagingPolicy.addFillTerm(to: &fillHistogram, splatCount: splatCounts[chunk], area: Float(bitPattern: previous), coarseCounts: counts, sign: -1)
+        }
+        if bits != 0 {
+            GaussianPagingPolicy.addFillTerm(to: &fillHistogram, splatCount: splatCounts[chunk], area: Float(bitPattern: bits), coarseCounts: counts)
+        }
+        fillHistogramVersion &+= 1
         if bits == 0 {
             let needed = Int(state.pointee.neededRanks)
             wantsSumNeeded -= needed
@@ -1652,7 +1663,6 @@ public final class GaussianPageManager: @unchecked Sendable {
     }
 
     private func computeWants(frame: GaussianPagerFrameInputs, now: UInt32) {
-        let totalArea = demandedArea
         let totalSplats = demandedSplats
         // A readback that predates this entity's frames (the state is zero, or it is another
         // scene's) says nothing about this entity: the frame is taken as fitting until a frame
@@ -1665,12 +1675,24 @@ public final class GaussianPageManager: @unchecked Sendable {
         let stale = state.frameCount == 0 || state.frameCount <= (baselineFrameCount ?? 0)
         let cap = stale ? Float.infinity : state.densityCap
         let reserved = stale ? 0 : Int(state.reservedSplats)
-        let fill = GaussianPagingPolicy.fillDensity(budget: frame.budget, reservedSplats: reserved, demandedArea: totalArea)
         let fillScale = GaussianPagingPolicy.fillScale(budget: frame.budget, reservedSplats: reserved, demandedSplats: totalSplats)
         // The level rule's inputs when the entity draws its coarse levels this frame: a chunk the
         // rule draws coarse wants no fine rank (its tiers leave as surplus), and the CPU keeps a
         // mirror of the level drawn to hold the tiers of a chunk mid-fade (`.levelFade`).
         let levelsOn = coarse != nil && !coarseFaulted && !frame.uniformQuotas && !frame.disableWorkingSetBudget && frame.levelMode != .fineOnly
+        // The fill density when the frame fits: the cap the solve would settle at with every
+        // demanded chunk resident whole, solved over the fill histogram when it, the room or
+        // the level rule's inputs changed.
+        let room = GaussianPagingPolicy.fillRoom(budget: frame.budget, reservedSplats: reserved)
+        let levelledFill = levelsOn && frame.levelMode == .auto
+        if fillCapVersion != fillHistogramVersion || fillCapRoom.bitPattern != room.bitPattern || fillCapLevelled != levelledFill || fillCapFloor.bitPattern != frame.densityFloor.bitPattern {
+            fillCapVersion = fillHistogramVersion
+            fillCapRoom = room
+            fillCapLevelled = levelledFill
+            fillCapFloor = frame.densityFloor
+            fillCap = GaussianPagingPolicy.fillDensityCap(histogram: fillHistogram, room: room, levels: levelledFill ? (frame.densityFloor, coarseTierShifts) : nil)
+        }
+        let fill = fillCap
         let effectiveCap = cap.isFinite ? cap : fill
         // The level rule's cap side, once per pass: the tier of min(cap, floor), or the
         // stand-in for a zero cap (`GaussianChunkCullMath.level`).

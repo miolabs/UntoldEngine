@@ -338,6 +338,117 @@ public enum GaussianPagingPolicy {
         return room / demandedArea
     }
 
+    /// The room the fill aims at: the headroom's share of the budget after the whole-buffer
+    /// entities' reservation.
+    public static func fillRoom(budget: Int, reservedSplats: Int) -> Float {
+        max(0, gaussianBudgetHeadroom * Float(budget) - Float(reservedSplats))
+    }
+
+    /// Adds (or, with `sign` −1, removes) a demanded chunk's term to the fill histogram: the
+    /// chunk as the cull would list it resident whole with every level its file holds landed —
+    /// binned by its full density, its splats, its scaled area, and with levels
+    /// (`coarseCounts`, the runtime level 1 and 2 counts; 0 without) the counts the level rule
+    /// draws in each coarse regime and the levelled shares — `GaussianChunkCullMath.densityHistogram`
+    /// term by term, so the sum over the demanded set is that histogram of a whole-resident
+    /// entity. The tier sums wrap, so a removal undoes an addition exactly.
+    public static func addFillTerm(to histogram: inout GaussianBudgetDensityHistogram, splatCount: UInt32, area: Float, coarseCounts: (UInt32, UInt32), sign: Int32 = 1) {
+        guard area > 0, splatCount > 0 else { return }
+        let hasLevel = coarseCounts.0 > 0 || coarseCounts.1 > 0
+        let finest = coarseCounts.0 > 0 ? coarseCounts.0 : coarseCounts.1
+        let listed = max(splatCount, finest)
+        let tier = GaussianChunkCullMath.densityTier(density: Float(splatCount) / area)
+        let scaledArea = UInt32(ceil(area * GaussianChunkCullMath.densityTierFloor(tier)))
+        withUnsafeMutableBytes(of: &histogram.tiers) { bytes in
+            let tiers = bytes.bindMemory(to: GaussianBudgetDensityTier.self)
+            if sign >= 0 {
+                tiers[tier].splats &+= listed
+                tiers[tier].scaledArea &+= scaledArea
+                if hasLevel {
+                    tiers[tier].coarse1 &+= finest
+                    tiers[tier].coarse2 &+= coarseCounts.1 > 0 ? coarseCounts.1 : coarseCounts.0
+                    tiers[tier].levelledSplats &+= listed
+                    tiers[tier].levelledScaledArea &+= scaledArea
+                }
+            } else {
+                tiers[tier].splats &-= listed
+                tiers[tier].scaledArea &-= scaledArea
+                if hasLevel {
+                    tiers[tier].coarse1 &-= finest
+                    tiers[tier].coarse2 &-= coarseCounts.1 > 0 ? coarseCounts.1 : coarseCounts.0
+                    tiers[tier].levelledSplats &-= listed
+                    tiers[tier].levelledScaledArea &-= scaledArea
+                }
+            }
+        }
+    }
+
+    /// The fill density: the cap the budget solve would settle at with every demanded chunk
+    /// resident whole (and, with `levels`, its levels landed and the level rule in force) — the
+    /// largest density whose bounded request over the fill histogram stays within `room`
+    /// (`GaussianChunkCullMath.boundedRequest` / `boundedGrant`, the same bisection on log2 as
+    /// `densityCap`), +inf when everything fits whole or nothing is demanded, 0 when nothing
+    /// fits. `fillDensity`, the room over the demanded area, is the density at which no chunk
+    /// would be capped by its count; this one accounts for the chunks that are, so the wants of
+    /// a fresh view converge to the state a whole-resident entity settles at rather than short
+    /// of it.
+    public static func fillDensityCap(histogram: GaussianBudgetDensityHistogram, room: Float, levels: (densityFloor: Float, tierShifts: (Int, Int))?) -> Float {
+        var histogram = histogram
+        return withUnsafeMutableBytes(of: &histogram.tiers) { bytes -> Float in
+            let tiers = bytes.bindMemory(to: GaussianBudgetDensityTier.self)
+            var requested: UInt32 = 0
+            var highest = -1
+            for tier in 0 ..< tiers.count where tiers[tier].splats > 0 {
+                requested &+= tiers[tier].splats
+                highest = tier
+            }
+            if requested == 0 { return .infinity }
+            // The grant is a whole number of splats, as the kernel takes it.
+            let room = Float(UInt32(max(0, min(room, Float(UInt32.max)))))
+            if room <= 0 { return 0 }
+            let full = GaussianChunkCullMath.densityTierFloor(highest + 1)
+            func request(_ density: Float) -> Float {
+                let k = levels.map { GaussianChunkCullMath.densityTier(density: min(density, $0.densityFloor)) } ?? 0
+                var total: Float = 0
+                for tier in 0 ... highest where tiers[tier].splats > 0 {
+                    let entry = tiers[tier]
+                    let splats = Float(entry.splats)
+                    let area = Float(entry.scaledArea) / GaussianChunkCullMath.densityTierFloor(tier)
+                    let levelled = levels == nil ? 0 : min(entry.levelledSplats, entry.splats)
+                    if levelled == 0 {
+                        total += min(splats, density * area)
+                        continue
+                    }
+                    let levelledSplats = Float(levelled)
+                    let levelledArea = Float(min(entry.levelledScaledArea, entry.scaledArea)) / GaussianChunkCullMath.densityTierFloor(tier)
+                    let fineOnly = splats - levelledSplats
+                    if fineOnly > 0 {
+                        total += min(fineOnly, density * (area - levelledArea))
+                    }
+                    let delta = k - tier
+                    if let shifts = levels?.tierShifts, delta < -shifts.0 - 1 {
+                        total += delta >= -shifts.1 - 1 ? Float(entry.coarse1) : Float(entry.coarse2)
+                    } else {
+                        total += max(min(levelledSplats, density * levelledArea), Float(entry.coarse1))
+                    }
+                }
+                return total
+            }
+            if request(full) <= room { return .infinity }
+            var lo = gaussianBudgetDensityBisectionLog2Floor
+            var hi = log2(full)
+            if request(exp2(lo)) > room { return 0 }
+            for _ in 0 ..< gaussianBudgetDensityBisectionSteps {
+                let mid = (lo + hi) * 0.5
+                if request(exp2(mid)) <= room {
+                    lo = mid
+                } else {
+                    hi = mid
+                }
+            }
+            return exp2(lo)
+        }
+    }
+
     /// The uniform rule's counterpart of `fillDensity`: the scale at which the demanded chunks
     /// together would consume the room, `min(1, room / Σ n)`; 1 when nothing is demanded.
     public static func fillScale(budget: Int, reservedSplats: Int, demandedSplats: Int) -> Float {
