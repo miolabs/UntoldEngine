@@ -433,7 +433,16 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private var inbox: [GaussianPageCompletion] = []
+    /// The landed reads a tick left unmapped (its commit cap or budget reached), in priority
+    /// order; lock-guarded so a shutdown from any thread drops them with the inbox.
+    private var _deferred: [GaussianPageCompletion] = []
     private var coarseInbox: [GaussianCoarseCompletion] = []
+    /// The tick's own arrays, swapped with the lock-guarded ones so no tick copies an inbox:
+    /// the arrivals taken, the deferred list taken, and the merge of the two.
+    private var arrivals: [GaussianPageCompletion] = []
+    private var deferredTaken: [GaussianPageCompletion] = []
+    private var merged: [GaussianPageCompletion] = []
+    private var coarseArrivals: [GaussianCoarseCompletion] = []
     private var _generation: UInt32 = 0
     private var _state: GaussianPagerState = .active
     private var _pendingReads = 0
@@ -879,7 +888,9 @@ public final class GaussianPageManager: @unchecked Sendable {
         _generation &+= 1
         _state = .closed
         _stats.state = .closed
-        var dropped: [GaussianPageReadRequest] = inbox.map(\.request)
+        var dropped: [GaussianPageReadRequest] = _deferred.map(\.request)
+        dropped.append(contentsOf: inbox.map(\.request))
+        _deferred.removeAll()
         inbox.removeAll()
         coarseInbox.removeAll()
         let pending = _pendingRequests[_pendingHead...]
@@ -1066,20 +1077,45 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     // MARK: Completions
 
-    /// Maps the landed reads in priority order, up to `maxCommitsPerTick` tiers; the rest wait.
-    /// A failed read frees its slots at once (never mapped, never referenced by a frame).
+    /// Maps the landed reads in priority order — the arrivals since the last tick sorted and
+    /// merged with the ones an earlier tick deferred — until `maxCommitsPerTick` tiers are
+    /// mapped or `commitBudget` of the tick's time is spent (past the first completion, so a
+    /// slow tick still makes progress); the rest wait, in order, for the next tick. A failed
+    /// read frees its slots at once (never mapped, never referenced by a frame). Ties on the
+    /// priority break on the chunk, then the rank.
     private func drainInbox(now: UInt32, fadeFrames: UInt32) -> Int {
         lock.lock()
-        var completions = inbox
-        inbox.removeAll(keepingCapacity: true)
+        swap(&inbox, &arrivals)
+        swap(&_deferred, &deferredTaken)
         let generation = _generation
         lock.unlock()
-        guard !completions.isEmpty else { return 0 }
-        completions.sort { $0.request.priority > $1.request.priority }
+        guard !arrivals.isEmpty || !deferredTaken.isEmpty else { return 0 }
+        arrivals.sort { GaussianPageManager.before($0, $1) }
+        merged.removeAll(keepingCapacity: true)
+        merged.reserveCapacity(arrivals.count + deferredTaken.count)
+        var a = 0
+        var d = 0
+        while a < arrivals.count, d < deferredTaken.count {
+            if GaussianPageManager.before(deferredTaken[d], arrivals[a]) {
+                merged.append(deferredTaken[d])
+                d += 1
+            } else {
+                merged.append(arrivals[a])
+                a += 1
+            }
+        }
+        merged.append(contentsOf: arrivals[a...])
+        merged.append(contentsOf: deferredTaken[d...])
+        arrivals.removeAll(keepingCapacity: true)
+        deferredTaken.removeAll(keepingCapacity: true)
 
         var committed = 0
-        var deferred: [GaussianPageCompletion] = []
-        for completion in completions {
+        let commitCap = GaussianPagingPolicy.maxCommitsPerTick
+        let budget = GaussianPagingPolicy.commitBudget
+        let start = CFAbsoluteTimeGetCurrent()
+        var overBudget = false
+        var sinceClock = 0
+        for completion in merged {
             let request = completion.request
             let chunk = request.chunkIndex
             let stale = request.generation != generation
@@ -1093,22 +1129,42 @@ public final class GaussianPageManager: @unchecked Sendable {
             switch completion.result {
             case .success:
                 let tiers = request.slots.count
-                if committed > 0, committed + tiers > GaussianPagingPolicy.maxCommitsPerTick {
-                    deferred.append(completion)
-                    continue
+                if committed > 0 {
+                    if !overBudget, sinceClock >= 16 {
+                        sinceClock = 0
+                        overBudget = CFAbsoluteTimeGetCurrent() - start >= budget
+                    }
+                    if overBudget || committed + tiers > commitCap {
+                        deferredTaken.append(completion)
+                        continue
+                    }
                 }
                 map(request, now: now, fadeFrames: fadeFrames)
                 committed += tiers
+                sinceClock += tiers
             case let .failure(error):
                 fail(request, error: error, now: now)
             }
         }
-        if !deferred.isEmpty {
+        merged.removeAll(keepingCapacity: true)
+        if !deferredTaken.isEmpty {
+            // The deferred list was taken whole and nothing else writes it: the ones left are
+            // put back, still in order.
             lock.lock()
-            inbox.insert(contentsOf: deferred, at: 0)
+            swap(&_deferred, &deferredTaken)
             lock.unlock()
+            deferredTaken.removeAll(keepingCapacity: true)
         }
         return committed
+    }
+
+    /// The commit order: priority descending, then the chunk, then the first rank.
+    private static func before(_ a: GaussianPageCompletion, _ b: GaussianPageCompletion) -> Bool {
+        let x = a.request
+        let y = b.request
+        if x.priority != y.priority { return x.priority > y.priority }
+        if x.chunkIndex != y.chunkIndex { return x.chunkIndex < y.chunkIndex }
+        return x.firstRank < y.firstRank
     }
 
     private func map(_ request: GaussianPageReadRequest, now: UInt32, fadeFrames: UInt32) {
@@ -1386,12 +1442,12 @@ public final class GaussianPageManager: @unchecked Sendable {
     /// corrupt payload faults the levels, a changed file faults the asset as a tier does.
     private func drainCoarseInbox(now: UInt32) {
         lock.lock()
-        let completions = coarseInbox
-        coarseInbox.removeAll(keepingCapacity: true)
+        swap(&coarseInbox, &coarseArrivals)
         let generation = _generation
         lock.unlock()
-        guard !completions.isEmpty else { return }
-        for completion in completions {
+        guard !coarseArrivals.isEmpty else { return }
+        defer { coarseArrivals.removeAll(keepingCapacity: true) }
+        for completion in coarseArrivals {
             let request = completion.request
             guard request.generation == generation else { continue }
             switch completion.result {
@@ -1985,15 +2041,26 @@ public final class GaussianPageManager: @unchecked Sendable {
         var candidates: [(chunk: Int, priority: Float, tiers: Int)] = []
         candidates.reserveCapacity(min(count, candidateChunks.count))
         var selection = GaussianCandidateSelection(capacity: count)
-        for candidateChunk in candidateChunks {
-            let chunk = Int(candidateChunk)
-            let state = states[chunk]
-            guard GaussianPagingPolicy.isLoadCandidate(state, tick: now) else { continue }
-            let priority = GaussianPagingPolicy.loadPriority(area: state.lastArea, residentRanks: UInt32(state.residentRanks), neededRanks: UInt32(state.neededRanks), ranksPerPage: ranksPerPage)
-            guard priority > 0 else { continue }
-            let missing = GaussianPagingPolicy.tiersNeeded(needed: UInt32(state.neededRanks), ranksPerPage: ranksPerPage) - tiers(state.residentRanks)
-            guard missing > 0 else { continue }
-            selection.offer(chunk: chunk, priority: priority, tiers: missing)
+        let ranksPerPage = ranksPerPage
+        candidateChunks.withUnsafeBufferPointer { members in
+            for position in 0 ..< members.count {
+                let chunk = Int(members[position])
+                let state = states + chunk
+                // `GaussianPagingPolicy.isLoadCandidate`, `loadPriority` and the missing tiers
+                // over the columns.
+                let needed = Int(state.pointee.neededRanks)
+                let resident = Int(state.pointee.residentRanks)
+                guard needed > resident,
+                      state.pointee.flags.rawValue & (PageFlag.loading | PageFlag.faulted | PageFlag.fadeActive) == 0,
+                      state.pointee.retryAfterTick <= now
+                else { continue }
+                let deficit = Float(needed - resident) / Float(needed)
+                let priority = state.pointee.lastArea * deficit / Float(resident / ranksPerPage + 1)
+                guard priority > 0 else { continue }
+                let missing = (needed + ranksPerPage - 1) / ranksPerPage - (resident + ranksPerPage - 1) / ranksPerPage
+                guard missing > 0 else { continue }
+                selection.offer(chunk: chunk, priority: priority, tiers: missing)
+            }
         }
         selection.drain(into: &candidates)
         return candidates

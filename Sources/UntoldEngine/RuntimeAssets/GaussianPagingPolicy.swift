@@ -139,10 +139,19 @@ public enum GaussianPagingPolicy {
         set { storage.maxConcurrentReads = max(1, newValue) }
     }
 
-    /// The most tiers mapped per tick (the rest of the completed reads wait in the inbox).
+    /// The most tiers mapped per tick (the rest of the completed reads wait in the inbox), the
+    /// ceiling of the commit budget below.
     public static var maxCommitsPerTick: Int {
         get { storage.maxCommitsPerTick }
         set { storage.maxCommitsPerTick = max(1, newValue) }
+    }
+
+    /// The time a tick spends mapping landed tiers before the rest wait for the next tick, in
+    /// seconds, past the first completion; the frame's cost of a fill is bounded by this while
+    /// the pool has room and the reads keep up, up to `maxCommitsPerTick` tiers.
+    public static var commitBudget: Double {
+        get { storage.commitBudget }
+        set { storage.commitBudget = max(0, newValue) }
     }
 
     /// Executed frames an arriving tier fades in over; 0 shows it at once.
@@ -625,7 +634,8 @@ public enum GaussianPagingPolicy {
         private var _maxPageReadsPerTick = 256
         private var _maxPageBytesInFlight = GaussianPagingPolicy.maxPageBytesInFlightDefault
         private var _maxConcurrentReads = 8
-        private var _maxCommitsPerTick = 256
+        private var _maxCommitsPerTick = 4096
+        private var _commitBudget = 0.0005
         private var _fadeFrames: UInt32 = 16
         private var _verifyPagedChunkCRC = true
         private var _faultReopenTicks: UInt32 = 300
@@ -648,7 +658,8 @@ public enum GaussianPagingPolicy {
             _maxPageReadsPerTick = 256
             _maxPageBytesInFlight = GaussianPagingPolicy.maxPageBytesInFlightDefault
             _maxConcurrentReads = 8
-            _maxCommitsPerTick = 256
+            _maxCommitsPerTick = 4096
+            _commitBudget = 0.0005
             _fadeFrames = 16
             _verifyPagedChunkCRC = true
             _faultReopenTicks = 300
@@ -721,6 +732,11 @@ public enum GaussianPagingPolicy {
         var maxCommitsPerTick: Int {
             get { lock.lock(); defer { lock.unlock() }; return _maxCommitsPerTick }
             set { lock.lock(); _maxCommitsPerTick = newValue; lock.unlock() }
+        }
+
+        var commitBudget: Double {
+            get { lock.lock(); defer { lock.unlock() }; return _commitBudget }
+            set { lock.lock(); _commitBudget = newValue; lock.unlock() }
         }
 
         var fadeFrames: UInt32 {
