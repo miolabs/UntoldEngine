@@ -172,8 +172,10 @@ pending=… issued=… committed=… evicted=… saturated=… faults=…`).
 The paging is exercised from the file itself by `GaussianPagingTest.testLargeSyntheticAssetPagesWithinItsPool`
 (`Tests/UntoldEngineRenderTests`): a 300 k-splat synthetic slab against a 1 MiB pool over 120
 real frames. `UNTOLD_PERF_GAUSSIAN_PAGING=1` adds 4 M- and 20 M-splat runs against a 64 MiB
-residency budget — a few seconds to bake the first time (the cook streams the source and
-peaks under 2 GB for the 20 M bake), cached in the temporary directory — and `UNTOLD_PERF_GAUSSIAN_PAGING_SPLAT_COUNT=<n>` keeps
+residency budget — baked the first time from a synthetic slab built in memory and written
+straight through the writer (no source file, so nothing is streamed: the 20 M bake holds the
+1.6 GB array beside its 1.1 GB store and peaks at 3.3 GB, in about 80 s under `swift test`'s
+debug build and 1.3 s in a release one), cached in the temporary directory — and `UNTOLD_PERF_GAUSSIAN_PAGING_SPLAT_COUNT=<n>` keeps
 only the sizes up to `n` (`4000000` for the 4 M run alone). Each run checks the pool is what
 the policy sizes it (the budget, or the whole asset when that is smaller: a 4 M asset without
 harmonics is 64,000,000 B and fits every tier, so nothing saturates and nothing is evicted; a
