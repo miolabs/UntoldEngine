@@ -1683,7 +1683,12 @@ public final class GaussianPageManager: @unchecked Sendable {
         let stale = state.frameCount == 0 || state.frameCount <= (baselineFrameCount ?? 0)
         let cap = stale ? Float.infinity : state.densityCap
         let reserved = stale ? 0 : Int(state.reservedSplats)
-        let fillScale = GaussianPagingPolicy.fillScale(budget: frame.budget, reservedSplats: reserved, demandedSplats: totalSplats)
+        // The uniform rule's scale is an input of the wants under `uniformQuotas` only: NaN
+        // otherwise, so a change of the demanded set alone (which moves the scale) does not
+        // re-evaluate every demanded chunk when only the changed chunk's own inputs did.
+        let fillScale: Float = frame.uniformQuotas
+            ? GaussianPagingPolicy.fillScale(budget: frame.budget, reservedSplats: reserved, demandedSplats: totalSplats)
+            : .nan
         // The level rule's inputs when the entity draws its coarse levels this frame: a chunk the
         // rule draws coarse wants no fine rank (its tiers leave as surplus), and the CPU keeps a
         // mirror of the level drawn to hold the tiers of a chunk mid-fade (`.levelFade`).
