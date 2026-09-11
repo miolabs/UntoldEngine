@@ -354,8 +354,9 @@ public enum GaussianPagingPolicy {
     /// drew fine last frame, the finer assumption inside the hysteresis band, so a chunk near a
     /// boundary keeps its fine tiers while the GPU still draws it coarse — and the fine ranks
     /// above otherwise. Fine counts as available whatever is resident: the want is what decides
-    /// whether to fetch it. Off under `uniformQuotas` and `disableWorkingSetBudget` (levels are
-    /// off there too).
+    /// whether to fetch it. Off under `uniformQuotas` (the levels are off there too) and under
+    /// `disableWorkingSetBudget` (every rank is wanted; the frame fits, so only the density
+    /// floor can still draw a chunk coarse).
     public static func wantedRanks(
         splatCount: UInt32,
         area: Float,
