@@ -75,7 +75,7 @@ extension UntoldGSCooker {
             throw UntoldGSError.sizeMismatch(emptySourceDescription)
         }
         return try finishCook(
-            store: store, inputCount: source.vertexCount - culled, counts: counts, nonFinite: nonFinite,
+            store: &store, inputCount: source.vertexCount - culled, counts: counts, nonFinite: nonFinite,
             kernel: kernel, options: options, progress: progress
         )
     }
@@ -102,7 +102,7 @@ extension UntoldGSCooker {
         commit(cooked, into: &store, counts: &counts, culled: &culled, nonFinite: &nonFinite)
         try progress.report(.read, fraction: 1)
         return try finishCook(
-            store: store, inputCount: asset.splats.count, counts: counts, nonFinite: nonFinite,
+            store: &store, inputCount: asset.splats.count, counts: counts, nonFinite: nonFinite,
             kernel: kernel, options: options, progress: progress
         )
     }
@@ -158,9 +158,12 @@ extension UntoldGSCooker {
         culled += cooked.culledCount
     }
 
-    /// The budget, the report and the whole-store facts.
+    /// The budget, the report and the whole-store facts. The store is taken `inout` so the
+    /// budget's compaction moves the splats within the caller's own arrays: a copy of the
+    /// parameter would leave the caller's reference alive and the first write would duplicate
+    /// the whole store — a gigabyte for a 10 M-splat degree-3 capture.
     private static func finishCook(
-        store: UntoldGSSplatStore,
+        store: inout UntoldGSSplatStore,
         inputCount: Int,
         counts: PruneCounts,
         nonFinite: [Int],
@@ -168,7 +171,6 @@ extension UntoldGSCooker {
         options: UntoldGSCookOptions,
         progress: UntoldGSCookProgressSink
     ) throws -> UntoldGSCookedStore {
-        var store = store
         var nonFinite = nonFinite
         try progress.report(.cook, fraction: 0)
 
