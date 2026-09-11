@@ -580,14 +580,20 @@ enum ExportError: LocalizedError {
 // MARK: - Gaussian cook progress
 
 /// Prints `UntoldGSCookProgress` on stderr: on a terminal one line rewritten in place
-/// (`read     42 %  overall 15 %`), otherwise a line when a phase or tier starts, so a log
-/// stays readable.
+/// (`read      42 %  overall  15 %  12.3 s`), otherwise a line when a phase or tier starts
+/// with the seconds elapsed since the export began, so a log stays readable and shows where
+/// the time went.
 final class GaussianExportProgressPrinter {
     private let interactive = isatty(STDERR_FILENO) != 0
+    private let start = DispatchTime.now()
     private var lastPhase: UntoldGSCookPhase?
     private var lastTier = -1
     private var lastPercent = -1
     private var lineOpen = false
+
+    private var elapsed: String {
+        String(format: "%.1f s", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e9)
+    }
 
     func report(_ progress: UntoldGSCookProgress) {
         let percent = Int((progress.fraction * 100).rounded(.down))
@@ -599,11 +605,11 @@ final class GaussianExportProgressPrinter {
         let tier = progress.tierCount > 1 ? "  tier \(progress.tierIndex + 1)/\(progress.tierCount)" : ""
         let overall = Int((progress.overall * 100).rounded(.down))
         if interactive {
-            let line = String(format: "\r%-8@ %3d %%  overall %3d %%%@", progress.phase.rawValue as NSString, percent, overall, tier as NSString)
-            write(line.padding(toLength: max(line.count, 48), withPad: " ", startingAt: 0))
+            let line = String(format: "\r%-8@ %3d %%  overall %3d %%%@  %@", progress.phase.rawValue as NSString, percent, overall, tier as NSString, elapsed as NSString)
+            write(line.padding(toLength: max(line.count, 56), withPad: " ", startingAt: 0))
             lineOpen = true
         } else if phaseChanged {
-            write("\(progress.phase.rawValue)\(tier)  overall \(overall) %\n")
+            write("\(progress.phase.rawValue)\(tier)  overall \(overall) %  \(elapsed)\n")
         }
     }
 
