@@ -301,6 +301,18 @@ struct ExportCommand: ParsableCommand {
 
     private func runGaussianSplatExport(inputURL: URL, outputURL: URL, cookOptions: UntoldGSCookOptions) throws {
         printInfo("Exporting Gaussian splats \(inputURL.path)")
+        // Progress on stderr — one updating line on a terminal, a line per phase otherwise — and
+        // Ctrl-C mapped to the cook's cancellation, so an interrupted export leaves no file.
+        let progress = GaussianExportProgressPrinter()
+        GaussianExportCancellation.install()
+        defer {
+            GaussianExportCancellation.uninstall()
+            progress.finish()
+        }
+        let control = UntoldGSCookControl(
+            progress: { progress.report($0) },
+            isCancelled: { GaussianExportCancellation.isRequested }
+        )
         let bakeResult: GaussianProgressiveBakeResult
         do {
             switch inputURL.pathExtension.lowercased() {
@@ -309,16 +321,21 @@ struct ExportCommand: ParsableCommand {
                     spzURL: inputURL,
                     outputBaseURL: outputURL,
                     levelCount: lodLevels,
-                    cookOptions: cookOptions
+                    cookOptions: cookOptions,
+                    control: control
                 )
             default:
                 bakeResult = try bakeGaussianSplatProgressiveTiers(
                     plyURL: inputURL,
                     outputBaseURL: outputURL,
                     levelCount: lodLevels,
-                    cookOptions: cookOptions
+                    cookOptions: cookOptions,
+                    control: control
                 )
             }
+        } catch UntoldGSCookError.cancelled {
+            progress.finish()
+            throw ExportError.splatCookCancelled
         } catch let error as UntoldGSCookError {
             throw ExportError.splatCookFailed(error.description)
         } catch let error as SPZError {
@@ -517,6 +534,7 @@ enum ExportError: LocalizedError {
     case invalidLODLevels(Int)
     case colorGradeLUTNotFound(String)
     case splatCookFailed(String)
+    case splatCookCancelled
     case splatSourceReadFailed(String)
     case invalidSplatUpAxis(String)
     case invalidSplatFlag(String)
@@ -542,6 +560,8 @@ enum ExportError: LocalizedError {
             return "--color-grade-lut path does not exist: \(path)"
         case let .splatCookFailed(reason):
             return "Gaussian splat cook failed: \(reason)"
+        case .splatCookCancelled:
+            return "Gaussian splat cook cancelled; no file was written"
         case let .splatSourceReadFailed(reason):
             return "Failed to read Gaussian source: \(reason)"
         case let .invalidSplatUpAxis(value):
@@ -554,5 +574,69 @@ enum ExportError: LocalizedError {
             let suffix = pathExtension.isEmpty ? "<none>" : ".\(pathExtension)"
             return "--animation export supports only .untoldanim output, got \(suffix)"
         }
+    }
+}
+
+// MARK: - Gaussian cook progress
+
+/// Prints `UntoldGSCookProgress` on stderr: on a terminal one line rewritten in place
+/// (`read     42 %  overall 15 %`), otherwise a line when a phase or tier starts, so a log
+/// stays readable.
+final class GaussianExportProgressPrinter {
+    private let interactive = isatty(STDERR_FILENO) != 0
+    private var lastPhase: UntoldGSCookPhase?
+    private var lastTier = -1
+    private var lastPercent = -1
+    private var lineOpen = false
+
+    func report(_ progress: UntoldGSCookProgress) {
+        let percent = Int((progress.fraction * 100).rounded(.down))
+        let phaseChanged = progress.phase != lastPhase || progress.tierIndex != lastTier
+        guard phaseChanged || percent != lastPercent else { return }
+        lastPhase = progress.phase
+        lastTier = progress.tierIndex
+        lastPercent = percent
+        let tier = progress.tierCount > 1 ? "  tier \(progress.tierIndex + 1)/\(progress.tierCount)" : ""
+        let overall = Int((progress.overall * 100).rounded(.down))
+        if interactive {
+            let line = String(format: "\r%-8@ %3d %%  overall %3d %%%@", progress.phase.rawValue as NSString, percent, overall, tier as NSString)
+            write(line.padding(toLength: max(line.count, 48), withPad: " ", startingAt: 0))
+            lineOpen = true
+        } else if phaseChanged {
+            write("\(progress.phase.rawValue)\(tier)  overall \(overall) %\n")
+        }
+    }
+
+    /// Ends the in-place line, if one is open.
+    func finish() {
+        guard lineOpen else { return }
+        write("\n")
+        lineOpen = false
+    }
+
+    private func write(_ text: String) {
+        FileHandle.standardError.write(Data(text.utf8))
+    }
+}
+
+/// SIGINT → the cook's cancellation flag, for the duration of an export.
+enum GaussianExportCancellation {
+    private nonisolated(unsafe) static var requested: sig_atomic_t = 0
+    private nonisolated(unsafe) static var previousHandler: sig_t?
+
+    static var isRequested: Bool {
+        requested != 0
+    }
+
+    static func install() {
+        requested = 0
+        previousHandler = signal(SIGINT) { _ in
+            GaussianExportCancellation.requested = 1
+        }
+    }
+
+    static func uninstall() {
+        signal(SIGINT, previousHandler ?? SIG_DFL)
+        previousHandler = nil
     }
 }
