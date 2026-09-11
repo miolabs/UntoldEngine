@@ -855,15 +855,34 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertEqual(cornerSet.count, 8)
         frames(fixture, max: 6) { residentChunks(fixture) == cornerSet }
         XCTAssertEqual(residentChunks(fixture), cornerSet)
+        // A demanded chunk's stamp is the last ingest's tick (the flag stands for it).
+        let seenTick = fixture.pager.tick
+        for chunk in cornerSet {
+            let state = fixture.pager.chunkState(Int(chunk))
+            XCTAssertTrue(state.flags.contains(.demanded), "chunk \(chunk) is demanded")
+            XCTAssertEqual(state.lastDemandTick, seenTick, "chunk \(chunk) is stamped with the last ingest")
+        }
 
         // Looking away: nothing is demanded, nothing needs a slot, nothing goes.
         placeGaussianTestCamera(eye: awayCamera.eye, target: awayCamera.target)
         let requestsBefore = fixture.source.requestLog.count
+        // The tick each chunk was last flagged (the ingest sees the previous frame's cull).
+        var lastSeen: [UInt32: UInt32] = [:]
         for _ in 0 ..< 40 {
             frame(fixture)
+            for chunk in cornerSet where fixture.pager.chunkState(Int(chunk)).flags.contains(.demanded) {
+                lastSeen[chunk] = fixture.pager.tick
+            }
             XCTAssertEqual(residentChunks(fixture), cornerSet, "a page seen 40 ticks ago is kept while nothing needs its slot")
         }
         XCTAssertEqual(fixture.source.requestLog.count, requestsBefore)
+        // A chunk that dropped out keeps the tick of the last ingest that saw it.
+        for chunk in cornerSet {
+            let state = fixture.pager.chunkState(Int(chunk))
+            XCTAssertFalse(state.flags.contains(.demanded), "chunk \(chunk) left the demand")
+            XCTAssertEqual(state.lastDemandTick, lastSeen[chunk] ?? seenTick, "chunk \(chunk) keeps the tick it was last seen")
+            XCTAssertGreaterThan(fixture.pager.tick &- state.lastDemandTick, GaussianPagingPolicy.holdOffTicks, "chunk \(chunk) is past the hold-off")
+        }
 
         // The side view demands chunks the pool has no room for: the stale ones make room.
         placeGaussianTestCamera(eye: sideCamera.eye, target: sideCamera.target)

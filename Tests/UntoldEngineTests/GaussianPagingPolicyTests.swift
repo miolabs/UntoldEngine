@@ -344,6 +344,36 @@ final class GaussianPagingPolicyTests: XCTestCase {
         XCTAssertFalse(GaussianPagingPolicy.selectVictims(states: loading, resident: [0, 1, 2], count: 10, inputs: inputs).contains { $0.chunk == 0 })
     }
 
+    /// A chunk flagged `.demanded` is never stale, whatever its stamp: the pager stamps the
+    /// chunks an ingest sees through the flag (not one by one), so a demanded chunk's own
+    /// `lastDemandTick` predates the hold-off after a still camera.
+    func testADemandedChunkIsNeverStaleWhateverItsStamp() {
+        let R = 256
+        var inputs = GaussianEvictionInputs(tick: 30 + 100, ranksPerPage: R)
+        inputs.holdOffTicks = 30
+        inputs.surplusTicks = 0
+        inputs.minResidencyTicks = 0
+        inputs.candidatePriority = .infinity
+        // Two tiers resident, one wanted, surplus since tick 1: stamp 0 either way.
+        var unflagged = resident(512, area: 0.5, lastDemand: 0, needed: 256, surplusSince: 1)
+        var demanded = unflagged
+        demanded.flags.insert(.demanded)
+        let stale = GaussianPagingPolicy.selectVictims(states: [unflagged], resident: [0], count: 10, inputs: inputs)
+        XCTAssertEqual(stale.map(\.kind), [.stale, .stale], "without the flag the stamp makes it stale, and it goes whole")
+        let kept = GaussianPagingPolicy.selectVictims(states: [demanded], resident: [0], count: 10, inputs: inputs)
+        XCTAssertFalse(kept.contains { $0.kind == .stale }, "with the flag it is never stale")
+        XCTAssertEqual(kept, [
+            GaussianEvictionVictim(chunk: 0, tier: 1, kind: .surplus),
+            GaussianEvictionVictim(chunk: 0, tier: 0, kind: .displacement),
+        ], "only its surplus tier and, for a candidate worth it, its tail")
+        // Under pressure the same: the flag keeps it out of the stale class.
+        inputs.pressure = true
+        XCTAssertFalse(GaussianPagingPolicy.selectVictims(states: [demanded], resident: [0], count: 10, inputs: inputs).contains { $0.kind == .stale })
+        // A stamp inside the hold-off keeps an unflagged chunk out of the stale class too.
+        unflagged.lastDemandTick = inputs.tick - inputs.holdOffTicks
+        XCTAssertFalse(GaussianPagingPolicy.selectVictims(states: [unflagged], resident: [0], count: 10, inputs: inputs).contains { $0.kind == .stale })
+    }
+
     func testDisplacementMarginIsAppliedPerCandidateSlot() {
         let R = 256
         let tick: UInt32 = 500
