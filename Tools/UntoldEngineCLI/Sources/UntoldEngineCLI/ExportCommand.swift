@@ -338,6 +338,12 @@ struct ExportCommand: ParsableCommand {
             throw ExportError.splatCookCancelled
         } catch let error as UntoldGSCookError {
             throw ExportError.splatCookFailed(error.description)
+        } catch let error as UntoldGSError {
+            throw ExportError.splatCookFailed(error.description)
+        } catch let error as NSError where error.domain == NSPOSIXErrorDomain || error.domain == NSCocoaErrorDomain {
+            // The writer's file: a full disk, a directory that cannot be created, a rename
+            // refused — the system's own words, with the path it names.
+            throw ExportError.outputWriteFailure(error)
         } catch let error as SPZError {
             // Most commonly a v4/NGSP (ZSTD) file -- a different, unsupported container, not a
             // parse failure -- so this needs to reach the user as a clear message, not a crash.
@@ -536,6 +542,7 @@ enum ExportError: LocalizedError {
     case splatCookFailed(String)
     case splatCookCancelled
     case splatSourceReadFailed(String)
+    case splatOutputWriteFailed(path: String?, reason: String)
     case invalidSplatUpAxis(String)
     case invalidSplatFlag(String)
     case packManifestUnreadable(String)
@@ -564,6 +571,8 @@ enum ExportError: LocalizedError {
             return "Gaussian splat cook cancelled; no file was written"
         case let .splatSourceReadFailed(reason):
             return "Failed to read Gaussian source: \(reason)"
+        case let .splatOutputWriteFailed(path, reason):
+            return "Failed to write Gaussian splat output\(path.map { " \($0)" } ?? ""): \(reason)"
         case let .invalidSplatUpAxis(value):
             return "--splat-up-axis must be y, z or -y, got \(value)"
         case let .invalidSplatFlag(reason):
@@ -574,6 +583,16 @@ enum ExportError: LocalizedError {
             let suffix = pathExtension.isEmpty ? "<none>" : ".\(pathExtension)"
             return "--animation export supports only .untoldanim output, got \(suffix)"
         }
+    }
+
+    /// The write failure for a POSIX or Cocoa file error: the path it names and, for a POSIX
+    /// code, `strerror`'s words (`No space left on device`) rather than the NSError's dump.
+    static func outputWriteFailure(_ error: NSError) -> ExportError {
+        let path = error.userInfo[NSFilePathErrorKey] as? String
+        let reason = error.domain == NSPOSIXErrorDomain
+            ? String(cString: strerror(Int32(error.code)))
+            : error.localizedDescription
+        return .splatOutputWriteFailed(path: path, reason: reason)
     }
 }
 

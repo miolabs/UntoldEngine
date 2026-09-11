@@ -31,6 +31,26 @@ final class UntoldGSFormatTests: XCTestCase {
 
     // MARK: - Record sizes
 
+    func testChunkWriteFailureIsThrownAsTheSinkThrewIt() throws {
+        // A chunk's write failing in the parallel loop — a full disk — must reach the caller as
+        // the sink's own POSIX error, not re-labelled as invalid input.
+        var rng = SplitMix64(seed: 7)
+        let splats = (0 ..< 40).map { _ in rng.nextSplat(boundsMin: [-1, -1, -1], boundsMax: [1, 1, 1], shCount: 0) }
+        var options = UntoldGSWriteOptions()
+        options.log2ChunkSplats = 3
+        options.coarseLevelsAutomatic = false
+        let store = try UntoldGSFormat.makeStore(splats, options: options)
+        let sink = FailingSink(failAtOrAfter: 4096)
+        XCTAssertThrowsError(
+            try UntoldGSFormat.writeStore(UntoldGSStoreView(store: store), options: options, sink: sink, serialChunks: false, progress: nil)
+        ) { error in
+            XCTAssertNil(error as? UntoldGSError, "not re-typed by the chunk loop")
+            let posix = error as NSError
+            XCTAssertEqual(posix.domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(posix.code, Int(ENOSPC))
+        }
+    }
+
     func testHeaderEncodesTwoHundredFiftySixBytes() throws {
         let header = makeHeader()
         let writer = UntoldBinaryWriter()
@@ -1135,4 +1155,22 @@ private struct SplitMix64: RandomNumberGenerator {
             sphericalHarmonics: (0 ..< shCount).map { _ in nextFloat(in: -1 ... 1) }
         )
     }
+}
+
+/// A sink whose writes at or past `failAtOrAfter` — the payload pages, not the header — fail
+/// with `ENOSPC`, as `pwrite` on a full volume does.
+private final class FailingSink: UntoldGSWriteSink, @unchecked Sendable {
+    let failAtOrAfter: Int
+
+    init(failAtOrAfter: Int) {
+        self.failAtOrAfter = failAtOrAfter
+    }
+
+    func write(_: UnsafeRawBufferPointer, at offset: Int) throws {
+        if offset >= failAtOrAfter {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC), userInfo: [NSFilePathErrorKey: "/full/volume/out.untoldgs"])
+        }
+    }
+
+    func finish(fileSize _: Int) throws {}
 }

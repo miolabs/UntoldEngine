@@ -294,10 +294,10 @@ public extension UntoldGSFormat {
                     levels = try UntoldGSCoarsener.coarsen(gathered, options: coarseOptions)
                 }
                 results.store(encoded.entry, levels: levels, at: chunk)
-            } catch let error as UntoldGSError {
-                results.fail(error, at: chunk)
             } catch {
-                results.fail(.invalidInput("\(error)"), at: chunk)
+                // Kept as thrown — the coarsener's UntoldGSError, or the sink's POSIX error
+                // (a full disk) — so the caller sees what happened, not "invalid input".
+                results.fail(error, at: chunk)
             }
         }
         if serialChunks {
@@ -454,17 +454,18 @@ public extension UntoldGSFormat {
     }
 
     /// The per-chunk results of the chunk loop, filled from `concurrentPerform` under one lock
-    /// (one store per chunk, so the lock is never contended for long).
+    /// (one store per chunk, so the lock is never contended for long). A chunk's failure is kept
+    /// as the error it threw.
     private final class ChunkResults: @unchecked Sendable {
         private let lock = NSLock()
         private var entries: [UntoldGSChunkEntry?]
         private var levels: [UntoldGSCoarseLevels]
-        private var failures: [UntoldGSError?]
+        private var failures: [(any Error)?]
 
         init(count: Int) {
             entries = [UntoldGSChunkEntry?](repeating: nil, count: count)
             levels = [UntoldGSCoarseLevels](repeating: .none, count: count)
-            failures = [UntoldGSError?](repeating: nil, count: count)
+            failures = [(any Error)?](repeating: nil, count: count)
         }
 
         func store(_ entry: UntoldGSChunkEntry, levels chunkLevels: UntoldGSCoarseLevels, at chunk: Int) {
@@ -474,12 +475,12 @@ public extension UntoldGSFormat {
             }
         }
 
-        func fail(_ error: UntoldGSError, at chunk: Int) {
+        func fail(_ error: any Error, at chunk: Int) {
             lock.withLock { failures[chunk] = error }
         }
 
         /// The first chunk's failure, in chunk order.
-        var firstFailure: UntoldGSError? {
+        var firstFailure: (any Error)? {
             lock.withLock { failures.compactMap { $0 }.first }
         }
 
