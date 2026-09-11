@@ -357,6 +357,8 @@ public class AnimationComponent: Component {
     var rootMotion = RootMotionState()
     var footIK = FootIKState()
     var motionMatching = MotionMatchingState()
+    var poseLayer = PoseLayerState()
+    var reachIK = ReachIKState()
 
     public required init() {}
 
@@ -375,6 +377,8 @@ public class AnimationComponent: Component {
         rootMotion = RootMotionState()
         footIK = FootIKState()
         motionMatching = MotionMatchingState()
+        poseLayer = PoseLayerState()
+        reachIK = ReachIKState()
     }
 
     func getAllAnimationClips() -> [String] {
