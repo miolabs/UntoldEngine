@@ -240,4 +240,95 @@ struct UntoldGSStoreView {
     func splat(_ index: Int) -> UntoldGSSplat {
         store.splat(storeIndex(index))
     }
+
+    /// Runs `body` with raw pointers into the view's arrays — what a hot loop that several
+    /// threads run at once must use: an array subscript in an unoptimised build retains and
+    /// releases the shared buffer, and sixteen cores contending on one reference count turn a
+    /// two-second cook into minutes. The pointers are valid inside `body` only.
+    func withUnsafePointers<Result>(_ body: (UntoldGSStorePointers) throws -> Result) rethrows -> Result {
+        try store.positions.withUnsafeBufferPointer { positions in
+            try store.scales.withUnsafeBufferPointer { scales in
+                try store.rotations.withUnsafeBufferPointer { rotations in
+                    try store.colors.withUnsafeBufferPointer { colors in
+                        try store.opacities.withUnsafeBufferPointer { opacities in
+                            try store.sh.withUnsafeBufferPointer { sh in
+                                try withOptionalIndices { indices in
+                                    try body(UntoldGSStorePointers(
+                                        positions: positions, scales: scales, rotations: rotations, colors: colors,
+                                        opacities: opacities, sh: sh, shBytesPerSplat: store.shBytesPerSplat, indices: indices
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func withOptionalIndices<Result>(_ body: (UnsafeBufferPointer<Int>?) throws -> Result) rethrows -> Result {
+        if let indices {
+            return try indices.withUnsafeBufferPointer { try body($0) }
+        }
+        return try body(nil)
+    }
+}
+
+/// Raw pointers into a `UntoldGSStoreView`, from `withUnsafePointers`. `storeIndex(_:)` maps a
+/// view position to the store; the accessors take store indices.
+struct UntoldGSStorePointers {
+    let positions: UnsafeBufferPointer<Float>
+    let scales: UnsafeBufferPointer<Float>
+    let rotations: UnsafeBufferPointer<Float>
+    let colors: UnsafeBufferPointer<Float>
+    let opacities: UnsafeBufferPointer<Float>
+    let sh: UnsafeBufferPointer<UInt8>
+    let shBytesPerSplat: Int
+    let indices: UnsafeBufferPointer<Int>?
+
+    @inline(__always)
+    func storeIndex(_ position: Int) -> Int {
+        if let indices {
+            return indices[position]
+        }
+        return position
+    }
+
+    @inline(__always)
+    func position(_ index: Int) -> SIMD3<Float> {
+        SIMD3<Float>(positions[3 * index], positions[3 * index + 1], positions[3 * index + 2])
+    }
+
+    @inline(__always)
+    func scale(_ index: Int) -> SIMD3<Float> {
+        SIMD3<Float>(scales[3 * index], scales[3 * index + 1], scales[3 * index + 2])
+    }
+
+    @inline(__always)
+    func rotation(_ index: Int) -> simd_quatf {
+        simd_quatf(vector: SIMD4<Float>(rotations[4 * index], rotations[4 * index + 1], rotations[4 * index + 2], rotations[4 * index + 3]))
+    }
+
+    @inline(__always)
+    func color(_ index: Int) -> SIMD3<Float> {
+        SIMD3<Float>(colors[3 * index], colors[3 * index + 1], colors[3 * index + 2])
+    }
+
+    @inline(__always)
+    func opacity(_ index: Int) -> Float {
+        opacities[index]
+    }
+
+    /// `UntoldGSSplatStore.splat(_:)`.
+    @inline(__always)
+    func splat(_ index: Int) -> UntoldGSSplat {
+        UntoldGSSplat(position: position(index), scale: scale(index), rotation: rotation(index), color: color(index), opacity: opacity(index))
+    }
+
+    /// `UntoldGSSplatStore.writerImportance(_:)`.
+    @inline(__always)
+    func writerImportance(_ index: Int) -> Float {
+        let sx = scales[3 * index], sy = scales[3 * index + 1], sz = scales[3 * index + 2]
+        return opacities[index] * (sx * sy + sy * sz + sz * sx)
+    }
 }

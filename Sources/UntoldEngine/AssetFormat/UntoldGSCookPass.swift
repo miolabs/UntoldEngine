@@ -118,26 +118,29 @@ extension UntoldGSCooker {
         let sourcePerSplat = sourcePerChannel * 3
         var shBytes = [UInt8](repeating: 0, count: higherOrder * 3)
 
-        for (index, splat) in window.splats.enumerated() {
-            guard let transformed = kernel.process(splat, counts: &cooked.counts) else { continue }
-            let writerSplat = UntoldGSSplat(transformed)
-            var finite = writerSplat.isFinite
-            if higherOrder > 0 {
-                let base = index * sourcePerSplat
-                var slot = 0
-                for channel in 0 ..< 3 {
-                    let start = base + channel * sourcePerChannel + 1
-                    for coefficient in window.shCoefficients[start ..< start + higherOrder] {
-                        finite = finite && coefficient.isFinite
-                        shBytes[slot] = quantizeGaussianSHCoefficient(coefficient)
-                        slot += 1
+        window.shCoefficients.withUnsafeBufferPointer { coefficients in
+            for (index, splat) in window.splats.enumerated() {
+                guard let transformed = kernel.process(splat, counts: &cooked.counts) else { continue }
+                let writerSplat = UntoldGSSplat(transformed)
+                var finite = writerSplat.isFinite
+                if higherOrder > 0 {
+                    let base = index * sourcePerSplat
+                    var slot = 0
+                    for channel in 0 ..< 3 {
+                        let start = base + channel * sourcePerChannel + 1
+                        for offset in start ..< start + higherOrder {
+                            let coefficient = coefficients[offset]
+                            finite = finite && coefficient.isFinite
+                            shBytes[slot] = quantizeGaussianSHCoefficient(coefficient)
+                            slot += 1
+                        }
                     }
                 }
+                if !finite {
+                    cooked.nonFiniteLocal.append(cooked.store.count)
+                }
+                cooked.store.append(writerSplat, shBytes: shBytes)
             }
-            if !finite {
-                cooked.nonFiniteLocal.append(cooked.store.count)
-            }
-            cooked.store.append(writerSplat, shBytes: shBytes)
         }
         return cooked
     }

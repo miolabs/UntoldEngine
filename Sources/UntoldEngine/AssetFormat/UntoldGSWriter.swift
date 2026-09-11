@@ -244,7 +244,11 @@ public extension UntoldGSFormat {
                 let mortonOrdered = order[start ..< end].map { Int($0) }
                 var ordered = mortonOrdered
                 if options.sortByImportanceWithinChunk {
-                    ordered.sort { importance[$0] > importance[$1] }
+                    // The same `sort` call on the same sequence with the same comparisons as
+                    // ever; the pointer only spares the shared array's reference count.
+                    importance.withUnsafeBufferPointer { importance in
+                        ordered.sort { importance[$0] > importance[$1] }
+                    }
                 }
                 var encoded = encodeFineChunk(view, ordered: ordered, shCount: shCount)
                 encoded.entry.payloadOffset = UInt64(payloadOffsets[chunk])
@@ -255,7 +259,10 @@ public extension UntoldGSFormat {
                 if let coarseOptions {
                     // The merge seeds on the Morton order of the chunk, not the importance
                     // order the fine payload took.
-                    levels = try UntoldGSCoarsener.coarsen(mortonOrdered.map { view.splat($0) }, options: coarseOptions)
+                    let gathered = view.withUnsafePointers { pointers in
+                        mortonOrdered.map { pointers.splat(pointers.storeIndex($0)) }
+                    }
+                    levels = try UntoldGSCoarsener.coarsen(gathered, options: coarseOptions)
                 }
                 results.store(encoded.entry, levels: levels, at: chunk)
             } catch let error as UntoldGSError {
@@ -493,8 +500,11 @@ public extension UntoldGSFormat {
         let slice = 1 << 16
         DispatchQueue.concurrentPerform(iterations: (count + slice - 1) / slice) { part in
             let start = part * slice
-            for index in start ..< min(start + slice, count) {
-                keys[index] = UntoldGSPacking.mortonKey(view.position(index), boundsMin: boundsMin, boundsMax: boundsMax)
+            view.withUnsafePointers { pointers in
+                for index in start ..< min(start + slice, count) {
+                    let position = pointers.position(pointers.storeIndex(index))
+                    keys[index] = UntoldGSPacking.mortonKey(position, boundsMin: boundsMin, boundsMax: boundsMax)
+                }
             }
         }
         return sortedByKeyThenIndex(keys)
@@ -554,12 +564,13 @@ public extension UntoldGSFormat {
     /// `importance` of every position of `view`.
     private static func importances(of view: UntoldGSStoreView) -> [Float] {
         let count = view.count
-        let store = view.store
-        return [Float](unsafeUninitializedCapacity: count) { buffer, initialized in
-            for index in 0 ..< count {
-                buffer[index] = store.writerImportance(view.storeIndex(index))
+        return view.withUnsafePointers { pointers in
+            [Float](unsafeUninitializedCapacity: count) { buffer, initialized in
+                for index in 0 ..< count {
+                    buffer[index] = pointers.writerImportance(pointers.storeIndex(index))
+                }
+                initialized = count
             }
-            initialized = count
         }
     }
 
@@ -567,10 +578,12 @@ public extension UntoldGSFormat {
     internal static func bounds(of view: UntoldGSStoreView) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
         var minimum = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var maximum = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-        for index in 0 ..< view.count {
-            let position = view.position(index)
-            minimum = simd_min(minimum, position)
-            maximum = simd_max(maximum, position)
+        view.withUnsafePointers { pointers in
+            for index in 0 ..< view.count {
+                let position = pointers.position(pointers.storeIndex(index))
+                minimum = simd_min(minimum, position)
+                maximum = simd_max(maximum, position)
+            }
         }
         return (minimum, maximum)
     }
@@ -634,51 +647,50 @@ public extension UntoldGSFormat {
     /// `encodeChunk` produces for the same splats, written into one buffer with no per-word
     /// appends. `payloadBytes` is padded to the page, as for every fine chunk.
     internal static func encodeFineChunk(_ view: UntoldGSStoreView, ordered: [Int], shCount: Int) -> (entry: UntoldGSChunkEntry, payload: [UInt8]) {
-        let store = view.store
         var aabbMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var aabbMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         var logScaleMin = Float.greatestFiniteMagnitude
         var logScaleMax = -Float.greatestFiniteMagnitude
-
-        for position in ordered {
-            let index = view.storeIndex(position)
-            aabbMin = simd_min(aabbMin, store.position(index))
-            aabbMax = simd_max(aabbMax, store.position(index))
-            let scale = store.scale(index)
-            for axis in 0 ..< 3 {
-                let logScale = log(max(scale[axis], Float.leastNormalMagnitude))
-                logScaleMin = min(logScaleMin, logScale)
-                logScaleMax = max(logScaleMax, logScale)
-            }
-        }
-
-        let ranges = UntoldGSPacking.ChunkRanges(
-            aabbMin: aabbMin, aabbMax: aabbMax, logScaleMin: logScaleMin, logScaleMax: logScaleMax
-        )
         let count = ordered.count
         let coreBytes = count * coreRecordSize
         var payload = [UInt8](repeating: 0, count: coreBytes + count * shCount)
         var crc = UntoldGSCRC32.initialValue
-        payload.withUnsafeMutableBytes { raw in
-            var offset = 0
+
+        view.withUnsafePointers { pointers in
             for position in ordered {
-                let record = UntoldGSPacking.encode(store.splat(view.storeIndex(position)), ranges: ranges)
-                raw.storeBytes(of: record.position.littleEndian, toByteOffset: offset, as: UInt32.self)
-                raw.storeBytes(of: record.rotation.littleEndian, toByteOffset: offset + 4, as: UInt32.self)
-                raw.storeBytes(of: record.scale.littleEndian, toByteOffset: offset + 8, as: UInt32.self)
-                raw.storeBytes(of: record.rgba.littleEndian, toByteOffset: offset + 12, as: UInt32.self)
-                offset += coreRecordSize
+                let index = pointers.storeIndex(position)
+                aabbMin = simd_min(aabbMin, pointers.position(index))
+                aabbMax = simd_max(aabbMax, pointers.position(index))
+                let scale = pointers.scale(index)
+                for axis in 0 ..< 3 {
+                    let logScale = log(max(scale[axis], Float.leastNormalMagnitude))
+                    logScaleMin = min(logScaleMin, logScale)
+                    logScaleMax = max(logScaleMax, logScale)
+                }
             }
-            if shCount > 0 {
-                store.sh.withUnsafeBytes { sh in
+
+            let ranges = UntoldGSPacking.ChunkRanges(
+                aabbMin: aabbMin, aabbMax: aabbMax, logScaleMin: logScaleMin, logScaleMax: logScaleMax
+            )
+            payload.withUnsafeMutableBytes { raw in
+                var offset = 0
+                for position in ordered {
+                    let record = UntoldGSPacking.encode(pointers.splat(pointers.storeIndex(position)), ranges: ranges)
+                    raw.storeBytes(of: record.position.littleEndian, toByteOffset: offset, as: UInt32.self)
+                    raw.storeBytes(of: record.rotation.littleEndian, toByteOffset: offset + 4, as: UInt32.self)
+                    raw.storeBytes(of: record.scale.littleEndian, toByteOffset: offset + 8, as: UInt32.self)
+                    raw.storeBytes(of: record.rgba.littleEndian, toByteOffset: offset + 12, as: UInt32.self)
+                    offset += coreRecordSize
+                }
+                if shCount > 0, let sh = pointers.sh.baseAddress {
                     for position in ordered {
-                        let range = store.shRange(view.storeIndex(position))
-                        raw.baseAddress!.advanced(by: offset).copyMemory(from: sh.baseAddress!.advanced(by: range.lowerBound), byteCount: shCount)
+                        let start = pointers.storeIndex(position) * shCount
+                        raw.baseAddress!.advanced(by: offset).copyMemory(from: sh.advanced(by: start), byteCount: shCount)
                         offset += shCount
                     }
                 }
+                UntoldGSCRC32.update(&crc, UnsafeRawBufferPointer(raw))
             }
-            UntoldGSCRC32.update(&crc, UnsafeRawBufferPointer(raw))
         }
         let entry = UntoldGSChunkEntry(
             payloadOffset: 0,

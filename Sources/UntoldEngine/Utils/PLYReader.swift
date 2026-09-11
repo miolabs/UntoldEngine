@@ -890,39 +890,47 @@ final class PLYGaussianSource: @unchecked Sendable {
             window.shCoefficients.reserveCapacity(vertexCount * shSchema.coefficientsPerSplat)
         }
 
-        buffer.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            var restValues = [Float](repeating: 0, count: restCount)
-            for vertex in 0 ..< vertexCount {
-                let p = base + vertex * stride
-                var fields = PLYVertexFields()
-                fields.hasSphericalHarmonics = layout.hasSphericalHarmonics
-                fields.x = Self.load(p, layout.x, bigEndian)
-                fields.y = Self.load(p, layout.y, bigEndian)
-                fields.z = Self.load(p, layout.z, bigEndian)
-                fields.scale0 = Self.load(p, layout.scale0, bigEndian)
-                fields.scale1 = Self.load(p, layout.scale1, bigEndian)
-                fields.scale2 = Self.load(p, layout.scale2, bigEndian)
-                fields.color0 = Self.load(p, layout.color0, bigEndian)
-                fields.color1 = Self.load(p, layout.color1, bigEndian)
-                fields.color2 = Self.load(p, layout.color2, bigEndian)
-                for index in 0 ..< restCount {
-                    restValues[index] = Self.load(p, layout.rest[index], bigEndian)
-                }
-                fields.opacity = Self.load(p, layout.opacity, bigEndian)
-                fields.rot0 = Self.load(p, layout.rot0, bigEndian)
-                fields.rot1 = Self.load(p, layout.rot1, bigEndian)
-                fields.rot2 = Self.load(p, layout.rot2, bigEndian)
-                fields.rot3 = Self.load(p, layout.rot3, bigEndian)
+        // The layout's sources are read through pointers: the `rest` array is shared by every
+        // window in flight, and an array subscript in an unoptimised build would retain and
+        // release that shared buffer from sixteen threads at once, per field.
+        let restSources = layout.rest
+        restSources.withUnsafeBufferPointer { rest in
+            buffer.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                var restValues = [Float](repeating: 0, count: restCount)
+                for vertex in 0 ..< vertexCount {
+                    let p = base + vertex * stride
+                    var fields = PLYVertexFields()
+                    fields.hasSphericalHarmonics = layout.hasSphericalHarmonics
+                    fields.x = Self.load(p, layout.x, bigEndian)
+                    fields.y = Self.load(p, layout.y, bigEndian)
+                    fields.z = Self.load(p, layout.z, bigEndian)
+                    fields.scale0 = Self.load(p, layout.scale0, bigEndian)
+                    fields.scale1 = Self.load(p, layout.scale1, bigEndian)
+                    fields.scale2 = Self.load(p, layout.scale2, bigEndian)
+                    fields.color0 = Self.load(p, layout.color0, bigEndian)
+                    fields.color1 = Self.load(p, layout.color1, bigEndian)
+                    fields.color2 = Self.load(p, layout.color2, bigEndian)
+                    restValues.withUnsafeMutableBufferPointer { restValues in
+                        for index in 0 ..< restCount {
+                            restValues[index] = Self.load(p, rest[index], bigEndian)
+                        }
+                    }
+                    fields.opacity = Self.load(p, layout.opacity, bigEndian)
+                    fields.rot0 = Self.load(p, layout.rot0, bigEndian)
+                    fields.rot1 = Self.load(p, layout.rot1, bigEndian)
+                    fields.rot2 = Self.load(p, layout.rot2, bigEndian)
+                    fields.rot3 = Self.load(p, layout.rot3, bigEndian)
 
-                let splat = PLYReader.makeSplat(fields)
-                guard splat.opacity >= minRetainedGaussianOpacity else {
-                    window.culledCount += 1
-                    continue
-                }
-                window.splats.append(splat)
-                if perChannel > 0 {
-                    Self.appendSphericalHarmonics(&window.shCoefficients, dc: (fields.color0, fields.color1, fields.color2), rest: restValues, restPerChannel: restPerChannel)
+                    let splat = PLYReader.makeSplat(fields)
+                    guard splat.opacity >= minRetainedGaussianOpacity else {
+                        window.culledCount += 1
+                        continue
+                    }
+                    window.splats.append(splat)
+                    if perChannel > 0 {
+                        Self.appendSphericalHarmonics(&window.shCoefficients, dc: (fields.color0, fields.color1, fields.color2), rest: restValues, restPerChannel: restPerChannel)
+                    }
                 }
             }
         }
