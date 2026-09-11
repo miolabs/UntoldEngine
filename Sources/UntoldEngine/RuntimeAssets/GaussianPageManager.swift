@@ -1172,13 +1172,25 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
         merged.removeAll(keepingCapacity: true)
         if !deferredTaken.isEmpty {
-            for completion in deferredTaken {
-                deferredTiers += completion.request.slots.count
-            }
             // The deferred list was taken whole and nothing else writes it: the ones left are
-            // put back, still in order.
+            // put back, still in order — unless a shutdown ran meanwhile (its generation bump
+            // and `.closed` show under the lock), which dropped the list it found empty: they
+            // are dropped here as it would have, since no tick drains a closed pager and each
+            // completion holds the manager.
             lock.lock()
-            swap(&_deferred, &deferredTaken)
+            if _state != .closed, _generation == generation {
+                for completion in deferredTaken {
+                    deferredTiers += completion.request.slots.count
+                }
+                swap(&_deferred, &deferredTaken)
+            } else if _eventLogEnabled {
+                for completion in deferredTaken {
+                    let request = completion.request
+                    for slot in request.slots {
+                        _eventLog.append(GaussianPagingEvent(tick: tick, kind: .dropped, chunk: request.chunkIndex, tier: request.firstRank / ranksPerPage, slot: slot, generation: 0, priority: 0))
+                    }
+                }
+            }
             lock.unlock()
             deferredTaken.removeAll(keepingCapacity: true)
         }
