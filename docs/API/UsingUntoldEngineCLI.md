@@ -256,7 +256,7 @@ command prints how many splats were kept and pruned per reason.
 The cook streams the `.ply` in bounded windows, parses and cooks them in parallel, and
 writes every tier through a temporary file in the output directory that is renamed into
 place when complete — a 10 M-splat degree-3 capture (2.4 GB) cooks in about two seconds
-with a peak of about 2 GB of memory, where reading the file whole took 35 s and 10 GB. While
+with a peak of about 1.4 GB of memory, where reading the file whole took 35 s and 10 GB. While
 it runs the command reports progress on stderr — one line rewritten in place on a terminal
 (`read      42 %  overall  15 %`, then `cook`, `chunk`, `coarsen`, `write`, with the tier for a
 `--lod-levels` export), a line per phase when stderr is a file — and Ctrl-C cancels it between

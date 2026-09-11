@@ -173,7 +173,7 @@ The paging is exercised from the file itself by `GaussianPagingTest.testLargeSyn
 (`Tests/UntoldEngineRenderTests`): a 300 k-splat synthetic slab against a 1 MiB pool over 120
 real frames. `UNTOLD_PERF_GAUSSIAN_PAGING=1` adds 4 M- and 20 M-splat runs against a 64 MiB
 residency budget — a few seconds to bake the first time (the cook streams the source and
-peaks around 2 GB for the 20 M bake), cached in the temporary directory — and `UNTOLD_PERF_GAUSSIAN_PAGING_SPLAT_COUNT=<n>` keeps
+peaks under 2 GB for the 20 M bake), cached in the temporary directory — and `UNTOLD_PERF_GAUSSIAN_PAGING_SPLAT_COUNT=<n>` keeps
 only the sizes up to `n` (`4000000` for the 4 M run alone). Each run checks the pool is what
 the policy sizes it (the budget, or the whole asset when that is smaller: a 4 M asset without
 harmonics is 64,000,000 B and fits every tier, so nothing saturates and nothing is evicted; a
@@ -426,8 +426,8 @@ An editor or a tool cooks a capture with
 `bakeGaussianSplatProgressiveTiers(plyURL:outputBaseURL:levelCount:cookOptions:control:)`
 (see [untoldgsFormat.md](../Architecture/untoldgsFormat.md#cooking-a-capture)). The source is
 streamed in windows and cooked in parallel into one compact store, so a 10 M-splat degree-3
-capture cooks in about two seconds with about 2 GB of memory in a release build (and well
-under a minute in a debug build, where it used to take seven), and every tier is written
+capture cooks in about two seconds with about 1.4 GB of memory in a release build (and in
+about a minute in a debug build, where it used to take seven), and every tier is written
 through a temporary file renamed into place. `UntoldGSCookControl` takes a progress callback —
 `UntoldGSCookProgress` with the phase (`read`, `cook`, `chunk`, `coarsen`, `write`), the
 fraction within it, the overall fraction and the tier — and an `isCancelled` closure polled
