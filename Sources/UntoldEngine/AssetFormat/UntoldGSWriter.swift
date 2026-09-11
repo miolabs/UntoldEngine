@@ -948,19 +948,25 @@ final class UntoldGSFileSink: UntoldGSWriteSink, @unchecked Sendable {
     }
 }
 
-/// A fixed-size buffer several threads fill at disjoint indices, owned for the writer's pass.
+/// A fixed-size zeroed buffer several threads fill at disjoint indices, owned for the writer's
+/// pass. Mapped straight from the kernel rather than malloc'd: the sort's scratch is a quarter
+/// of a gigabyte for a 10 M-splat tier, and malloc would keep that much freed memory cached —
+/// dirty, in the footprint — for the rest of the bake, where `munmap` gives it back at once.
 final class UnsafeSharedBuffer<Element: FixedWidthInteger>: @unchecked Sendable {
     let count: Int
     private let base: UnsafeMutablePointer<Element>
+    private let byteCount: Int
 
     init(count: Int) {
         self.count = count
-        base = UnsafeMutablePointer<Element>.allocate(capacity: max(1, count))
-        base.initialize(repeating: 0, count: max(1, count))
+        byteCount = max(1, count) * MemoryLayout<Element>.stride
+        let mapped = mmap(nil, byteCount, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
+        precondition(mapped != nil && mapped != MAP_FAILED, "cannot map \(byteCount) bytes for the writer")
+        base = mapped!.bindMemory(to: Element.self, capacity: max(1, count))
     }
 
     deinit {
-        base.deallocate()
+        munmap(UnsafeMutableRawPointer(base), byteCount)
     }
 
     @inline(__always)

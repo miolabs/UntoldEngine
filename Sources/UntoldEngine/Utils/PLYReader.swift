@@ -612,10 +612,13 @@ final class PLYGaussianSource: @unchecked Sendable {
         max(0, fileSize - bodyOffset)
     }
 
-    /// Bytes of source a binary window covers, before rounding to whole vertices.
-    static let targetWindowBytes = 8 << 20
+    /// Bytes of source a binary window covers, before rounding to whole vertices. Small enough
+    /// that a batch of windows — the raw bytes, the parsed splats and harmonics, the cooked
+    /// store — stays under about 100 MB across every core: malloc keeps what a batch frees
+    /// cached and dirty, so the batch size is footprint for the rest of the bake.
+    static let targetWindowBytes = 2 << 20
     /// Bytes of text an ASCII window covers, before cutting at a line boundary.
-    static let asciiWindowBytes = 8 << 20
+    static let asciiWindowBytes = 2 << 20
 
     /// A read-only descriptor closed exactly once, whenever the source goes away — including
     /// when `init` throws part-way.

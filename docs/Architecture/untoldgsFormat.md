@@ -194,7 +194,7 @@ a copy of the source or of the splat set beyond one compact store:
 
 - **Pass A — read and cook.** `PLYGaussianSource` opens the `.ply` once, parses the header,
   resolves the vertex properties into a typed layout (byte offset and scalar kind per needed
-  property, defaults for the optional ones), and serves the body as windows of about 8 MB read
+  property, defaults for the optional ones), and serves the body as windows of about 2 MB read
   with `pread` and parsed in parallel — ASCII bodies are cut at line boundaries and parsed per
   window with the same rules as before. Inside each window's work item `UntoldGSCooker.Kernel`
   applies the cook (the opacity floor, the degenerate check, the similarity transform, the crop)
