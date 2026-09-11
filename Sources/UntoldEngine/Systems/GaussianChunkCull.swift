@@ -513,6 +513,44 @@ enum GaussianChunkCullMath {
         return want
     }
 
+    /// The cap side of the level rule, computed once per frame or pass: the tier of the
+    /// effective cap min(cap, floor), or the stand-in for a cap that is not above zero.
+    struct LevelCap: Equatable {
+        var tier = 0
+        var isZero = false
+    }
+
+    /// `LevelCap` of `densityCap` under the density floor (+inf when off).
+    @inline(__always)
+    static func levelCap(densityCap: Float, densityFloor: Float) -> LevelCap {
+        let effective = min(densityCap, densityFloor)
+        return effective > 0 ? LevelCap(tier: densityTier(density: effective), isZero: false) : LevelCap(tier: 0, isZero: true)
+    }
+
+    /// The level rule's tier distance, tier(effective cap) − tier(n / A), for a chunk of
+    /// `splatCount` splats covering `screenArea`; `levelRuleMinusInfinity` at a zero cap.
+    @inline(__always)
+    static func levelDeltaTier(cap: LevelCap, splatCount: UInt32, screenArea: Float) -> Int {
+        cap.isZero ? levelRuleMinusInfinity : cap.tier - densityTier(density: Float(splatCount) / screenArea)
+    }
+
+    /// The level at `deltaTier` under `mode`: `levelRule` under `.auto`, fine under
+    /// `.fineOnly`, the coarsest available level under `.coarseOnly`. The one rule the pager's
+    /// wants, its mirror of the level drawn and `level(densityCap:…)` run.
+    @inline(__always)
+    static func level(mode: GaussianLevelMode, deltaTier: Int, previous: Int, available: UInt32, tierShifts: (Int, Int)) -> Int {
+        switch mode {
+        case .fineOnly:
+            return 0
+        case .coarseOnly:
+            if (available & 4) != 0 { return 2 }
+            if (available & 2) != 0 { return 1 }
+            return 0
+        case .auto:
+            return levelRule(deltaTier: deltaTier, previous: previous, available: available, tierShifts: tierShifts)
+        }
+    }
+
     /// Mirror of `gaussianChunkLevel`: the level a chunk of `splatCount` splats covering
     /// `screenArea` takes at `densityCap` and the density floor (+inf when off), given the level
     /// it drew last frame, its availability mask and the entity's tier shifts; the debug modes
@@ -527,20 +565,8 @@ enum GaussianChunkCullMath {
         tierShifts: (Int, Int),
         levelMode: GaussianLevelMode = .auto
     ) -> Int {
-        switch levelMode {
-        case .fineOnly:
-            return 0
-        case .coarseOnly:
-            if (available & 4) != 0 { return 2 }
-            if (available & 2) != 0 { return 1 }
-            return 0
-        case .auto:
-            let effective = min(densityCap, densityFloor)
-            let deltaTier = effective > 0
-                ? densityTier(density: effective) - densityTier(density: Float(splatCount) / screenArea)
-                : levelRuleMinusInfinity
-            return levelRule(deltaTier: deltaTier, previous: previous, available: available, tierShifts: tierShifts)
-        }
+        let deltaTier = levelDeltaTier(cap: levelCap(densityCap: densityCap, densityFloor: densityFloor), splatCount: splatCount, screenArea: screenArea)
+        return level(mode: levelMode, deltaTier: deltaTier, previous: previous, available: available, tierShifts: tierShifts)
     }
 
     /// The quota of a chunk drawn at `level`: fine on its resident ranks, min(resident,

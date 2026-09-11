@@ -502,10 +502,16 @@ public enum GaussianPagingPolicy {
             return GaussianChunkCullMath.quota(scale: fillScale, splatCount: splatCount)
         }
         let cap = densityCap.isFinite ? densityCap : fillDensity
-        if let coarse, coarseLevel(coarse, splatCount: splatCount, area: area, cap: cap, previous: 0) != 0 {
-            return 0
-        }
-        return GaussianChunkCullMath.quota(densityCap: cap, splatCount: splatCount, screenArea: area)
+        let level = coarse.map { coarseLevel($0, splatCount: splatCount, area: area, cap: cap, previous: 0) } ?? 0
+        return fineWant(level: level, cap: cap, splatCount: splatCount, area: area)
+    }
+
+    /// The fine ranks a chunk of `splatCount` seen with `area` wants at `cap` when the level
+    /// rule picks `level` for it: none drawn coarse, the quota otherwise. The one rule
+    /// `wantedRanks` and the pager's pass run.
+    @inline(__always)
+    static func fineWant(level: Int, cap: Float, splatCount: UInt32, area: Float) -> UInt32 {
+        level != 0 ? 0 : GaussianChunkCullMath.quota(densityCap: cap, splatCount: splatCount, screenArea: area)
     }
 
     /// The level the rule picks for a chunk of `splatCount` seen with `area` at `cap` (finite: the
@@ -550,6 +556,7 @@ public enum GaussianPagingPolicy {
     /// The load priority of a chunk seen with `area` holding `residentRanks` of the `neededRanks`
     /// it wants: near and large first, empty chunks before top-ups, the chunk the camera stands
     /// in (the guard area) first of all. 0 when nothing is missing.
+    @inline(__always)
     public static func loadPriority(area: Float, residentRanks: UInt32, neededRanks: UInt32, ranksPerPage: Int) -> Float {
         guard neededRanks > residentRanks else { return 0 }
         let firstMissingTier = Int(residentRanks) / ranksPerPage
@@ -565,6 +572,7 @@ public enum GaussianPagingPolicy {
 
     /// Whether `state` may be requested at `tick`: something missing, not loading, not
     /// faulted, past its cooldown or backoff, not fading in.
+    @inline(__always)
     public static func isLoadCandidate(_ state: GaussianChunkPageState, tick: UInt32) -> Bool {
         state.neededRanks > state.residentRanks
             && !state.flags.contains(.loading)

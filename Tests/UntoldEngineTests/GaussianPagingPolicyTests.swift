@@ -247,6 +247,45 @@ final class GaussianPagingPolicyTests: XCTestCase {
         XCTAssertEqual(GaussianPagingPolicy.keepScore(area: 0.4, tier: 3), 0.1)
     }
 
+    /// The pager evaluates the wants over its columns with the level rule's cap side computed
+    /// once per pass (`GaussianChunkCullMath.levelCap`, `levelDeltaTier`, `level(mode:…)`) and
+    /// the want through `fineWant`: over random inputs that path is `wantedRanks` /
+    /// `coarseLevel` / `GaussianChunkCullMath.level(densityCap:…)` exactly.
+    func testTheColumnRulesThePagerRunsAreTheDocumentedRules() {
+        var rng = SplitMix64(seed: 0x5EED_C0DE)
+        let modes: [GaussianLevelMode] = [.auto, .fineOnly, .coarseOnly]
+        var coarseWants = 0
+        var fineWants = 0
+        for _ in 0 ..< 4000 {
+            let n = UInt32(1 + rng.next() % 1024)
+            let area = exp2(rng.unit() * 24 - 12)
+            let cap: Float = rng.unit() < 0.15 ? .infinity : rng.unit() < 0.1 ? 0 : exp2(rng.unit() * 30 - 8)
+            let fill: Float = rng.unit() < 0.3 ? .infinity : exp2(rng.unit() * 30 - 8)
+            let floor: Float = rng.unit() < 0.5 ? .infinity : exp2(rng.unit() * 30 - 8)
+            let mask = UInt32(rng.next() % 8)
+            let previous = Int(rng.next() % 3)
+            let shifts = (Int(rng.next() % 6), Int(rng.next() % 6) + 6)
+            let mode = modes[Int(rng.next() % 3)]
+            let counts = (UInt32(rng.next() % 300), UInt32(rng.next() % 100))
+            let effective = cap.isFinite ? cap : fill
+            let levelCap = GaussianChunkCullMath.levelCap(densityCap: effective, densityFloor: floor)
+            let deltaTier = GaussianChunkCullMath.levelDeltaTier(cap: levelCap, splatCount: n, screenArea: area)
+            let columnLevel = GaussianChunkCullMath.level(mode: mode, deltaTier: deltaTier, previous: previous, available: mask, tierShifts: shifts)
+            XCTAssertEqual(columnLevel, GaussianChunkCullMath.level(densityCap: effective, densityFloor: floor, splatCount: n, screenArea: area, previous: previous, available: mask, tierShifts: shifts, levelMode: mode))
+            // The wants: fine assumed drawn, the availability from the coarse inputs.
+            let coarse = GaussianCoarseWantInputs(tierShifts: shifts, counts: counts, available: mask >> 1, densityFloor: floor, levelMode: mode)
+            let wantMask = coarse.availabilityMask
+            let wantLevel = GaussianChunkCullMath.level(mode: mode, deltaTier: deltaTier, previous: 0, available: wantMask, tierShifts: shifts)
+            XCTAssertEqual(wantLevel, GaussianPagingPolicy.coarseLevel(coarse, splatCount: n, area: area, cap: effective, previous: 0))
+            let columnWant = GaussianPagingPolicy.fineWant(level: wantLevel, cap: effective, splatCount: n, area: area)
+            XCTAssertEqual(columnWant, GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: fill, uniformQuotas: false, disableWorkingSetBudget: false, coarse: coarse))
+            XCTAssertEqual(GaussianPagingPolicy.fineWant(level: 0, cap: effective, splatCount: n, area: area), GaussianPagingPolicy.wantedRanks(splatCount: n, area: area, densityCap: cap, fillDensity: fill, uniformQuotas: false, disableWorkingSetBudget: false), "without levels")
+            if wantLevel != 0 { coarseWants += 1 } else { fineWants += 1 }
+        }
+        XCTAssertGreaterThan(coarseWants, 200, "the draw covered coarse wants")
+        XCTAssertGreaterThan(fineWants, 200, "and fine ones")
+    }
+
     // MARK: - Eviction
 
     private func resident(_ ranks: UInt16, area: Float, lastDemand: UInt32, needed: UInt16, mappedAt: UInt32 = 0, surplusSince: UInt32 = 0) -> GaussianChunkPageState {

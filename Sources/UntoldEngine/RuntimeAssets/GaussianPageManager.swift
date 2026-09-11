@@ -1723,17 +1723,14 @@ public final class GaussianPageManager: @unchecked Sendable {
             fill = fillCap
         }
         let effectiveCap = cap.isFinite ? cap : fill
-        // The level rule's cap side, once per pass: the tier of min(cap, floor), or the
-        // stand-in for a zero cap (`GaussianChunkCullMath.level`).
-        let effectiveLevelCap = min(effectiveCap, frame.densityFloor)
         let inputs = WantInputs(
             cap: cap,
             fill: fill,
             fillScale: fillScale,
             effectiveCap: effectiveCap,
             densityFloor: frame.densityFloor,
-            capTier: effectiveLevelCap > 0 ? GaussianChunkCullMath.densityTier(density: effectiveLevelCap) : 0,
-            capIsZero: !(effectiveLevelCap > 0),
+            // The level rule's cap side, once per pass.
+            levelCap: GaussianChunkCullMath.levelCap(densityCap: effectiveCap, densityFloor: frame.densityFloor),
             uniformQuotas: frame.uniformQuotas,
             disableWorkingSetBudget: frame.disableWorkingSetBudget,
             levelsOn: levelsOn,
@@ -1781,8 +1778,7 @@ public final class GaussianPageManager: @unchecked Sendable {
         var fillScale: Float = .nan
         var effectiveCap: Float = .nan
         var densityFloor: Float = .nan
-        var capTier = 0
-        var capIsZero = false
+        var levelCap = GaussianChunkCullMath.LevelCap()
         var uniformQuotas = false
         var disableWorkingSetBudget = false
         var levelsOn = false
@@ -1798,10 +1794,11 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
     }
 
-    /// One chunk through the want rule, the level mirror and the surplus clock: the arithmetic
-    /// of `GaussianPagingPolicy.wantedRanks`, `coarseLevel` and `neededRanks` over the pager's
-    /// columns, the level rule's tier distance computed once for both the want (as if the
-    /// chunk drew fine last tick) and the mirror of the level drawn.
+    /// One chunk through the want rule, the level mirror and the surplus clock:
+    /// `GaussianPagingPolicy.wantedRanks`, `coarseLevel` and `neededRanks` over the pager's
+    /// columns through the rules they share (`GaussianChunkCullMath.level(mode:deltaTier:…)`,
+    /// `GaussianPagingPolicy.fineWant`), the level rule's tier distance computed once for both
+    /// the want (as if the chunk drew fine last tick) and the mirror of the level drawn.
     private func evaluateWant(chunk: Int, inputs: WantInputs, now: UInt32) {
         let count = splatCounts[chunk]
         let state = states + chunk
@@ -1822,23 +1819,10 @@ public final class GaussianPageManager: @unchecked Sendable {
             // drawn last and fine available only when a rank is resident (the mirror).
             let mask = UInt32(availabilityMasks[chunk])
             let mirrorMask = residentRanks > 0 ? mask : mask & ~1
-            let wantLevel: Int
-            let mirrorLevel: Int
-            switch inputs.levelMode {
-            case .fineOnly:
-                wantLevel = 0
-                mirrorLevel = 0
-            case .coarseOnly:
-                wantLevel = (mask & 4) != 0 ? 2 : (mask & 2) != 0 ? 1 : 0
-                mirrorLevel = (mirrorMask & 4) != 0 ? 2 : (mirrorMask & 2) != 0 ? 1 : 0
-            case .auto:
-                let deltaTier = inputs.capIsZero
-                    ? GaussianChunkCullMath.levelRuleMinusInfinity
-                    : inputs.capTier - GaussianChunkCullMath.densityTier(density: Float(count) / area)
-                wantLevel = GaussianChunkCullMath.levelRule(deltaTier: deltaTier, previous: 0, available: mask, tierShifts: coarseTierShifts)
-                mirrorLevel = GaussianChunkCullMath.levelRule(deltaTier: deltaTier, previous: Int(state.pointee.drawnLevel), available: mirrorMask, tierShifts: coarseTierShifts)
-            }
-            want = wantLevel != 0 ? 0 : GaussianChunkCullMath.quota(densityCap: inputs.effectiveCap, splatCount: count, screenArea: area)
+            let deltaTier = GaussianChunkCullMath.levelDeltaTier(cap: inputs.levelCap, splatCount: count, screenArea: area)
+            let wantLevel = GaussianChunkCullMath.level(mode: inputs.levelMode, deltaTier: deltaTier, previous: 0, available: mask, tierShifts: coarseTierShifts)
+            let mirrorLevel = GaussianChunkCullMath.level(mode: inputs.levelMode, deltaTier: deltaTier, previous: Int(state.pointee.drawnLevel), available: mirrorMask, tierShifts: coarseTierShifts)
+            want = GaussianPagingPolicy.fineWant(level: wantLevel, cap: inputs.effectiveCap, splatCount: count, area: area)
             drawn = UInt8(mirrorLevel)
         } else {
             want = GaussianChunkCullMath.quota(densityCap: inputs.effectiveCap, splatCount: count, screenArea: area)
@@ -2096,17 +2080,11 @@ public final class GaussianPageManager: @unchecked Sendable {
         candidateChunks.withUnsafeBufferPointer { members in
             for position in 0 ..< members.count {
                 let chunk = Int(members[position])
-                let state = states + chunk
-                // `GaussianPagingPolicy.isLoadCandidate`, `loadPriority` and the missing tiers
-                // over the columns.
-                let needed = Int(state.pointee.neededRanks)
-                let resident = Int(state.pointee.residentRanks)
-                guard needed > resident,
-                      state.pointee.flags.rawValue & (PageFlag.loading | PageFlag.faulted | PageFlag.fadeActive) == 0,
-                      state.pointee.retryAfterTick <= now
-                else { continue }
-                let deficit = Float(needed - resident) / Float(needed)
-                let priority = state.pointee.lastArea * deficit / Float(resident / ranksPerPage + 1)
+                let state = states[chunk]
+                guard GaussianPagingPolicy.isLoadCandidate(state, tick: now) else { continue }
+                let needed = Int(state.neededRanks)
+                let resident = Int(state.residentRanks)
+                let priority = GaussianPagingPolicy.loadPriority(area: state.lastArea, residentRanks: UInt32(resident), neededRanks: UInt32(needed), ranksPerPage: ranksPerPage)
                 guard priority > 0 else { continue }
                 let missing = (needed + ranksPerPage - 1) / ranksPerPage - (resident + ranksPerPage - 1) / ranksPerPage
                 guard missing > 0 else { continue }
