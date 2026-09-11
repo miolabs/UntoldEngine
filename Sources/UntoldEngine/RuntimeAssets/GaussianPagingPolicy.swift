@@ -451,9 +451,9 @@ public enum GaussianPagingPolicy {
     /// only when the priority of the candidate its slot serves (`inputs.slotPriorities[i]` for
     /// the i-th victim, else `inputs.candidatePriority`) beats it by the swap margin and the tier
     /// is not pinned. Under pressure the third class ignores margin and pin. A loading chunk is
-    /// never a victim (its read must land on a prefix). Fewer than `count` victims means the
-    /// pool is saturated. Ties are broken on the chunk index, so the choice does not depend on
-    /// the order of `resident`.
+    /// never a victim (its read must land on a prefix); a chunk flagged `.demanded` is never
+    /// stale, whatever its stamp. Fewer than `count` victims means the pool is saturated. Ties
+    /// are broken on the chunk index, so the choice does not depend on the order of `resident`.
     public static func selectVictims(
         states: [GaussianChunkPageState],
         resident: [Int],
@@ -484,7 +484,7 @@ public enum GaussianPagingPolicy {
         for chunk in resident {
             let state = states[chunk]
             guard state.residentRanks > 0, !state.flags.contains(.loading), !state.flags.contains(.levelFade) else { continue }
-            if inputs.tick &- state.lastDemandTick > inputs.holdOffTicks {
+            if !state.flags.contains(.demanded), inputs.tick &- state.lastDemandTick > inputs.holdOffTicks {
                 stale.append((chunk, state.lastDemandTick))
             } else {
                 demandedResident.append(chunk)
@@ -757,13 +757,17 @@ public struct GaussianChunkPageState: Equatable, Sendable {
         /// The chunk's level changed within the last `fadeFrames` ticks (per-chunk-lod-tiers):
         /// its fine tiers may be the outgoing window of the cross-fade and are no victim.
         public static let levelFade = Flags(rawValue: 1 << 3)
+        /// Seen by the last ingest (its demand word non-zero): its demand stamp is the ingest's
+        /// tick, and it is never stale.
+        public static let demanded = Flags(rawValue: 1 << 4)
     }
 
     /// 0, R, 2R, …, n: the resident prefix.
     public var residentRanks: UInt16 = 0
     /// The ranks to keep resident this tick (§ wanted ranks with headroom).
     public var neededRanks: UInt16 = 0
-    /// The tick the chunk was last seen (its demand word non-zero).
+    /// The tick the chunk was last seen (its demand word non-zero); while `.demanded` is set
+    /// the pager's last ingest tick stands for it (`GaussianPageManager.chunkState` fills it in).
     public var lastDemandTick: UInt32 = 0
     /// Its last seen screen area.
     public var lastArea: Float = 0

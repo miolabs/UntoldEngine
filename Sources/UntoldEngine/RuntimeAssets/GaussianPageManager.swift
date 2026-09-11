@@ -464,6 +464,21 @@ public final class GaussianPageManager: @unchecked Sendable {
     private var journalFull: [Bool]
     private var demandStampTick: [UInt32?]
     private var demandStampFrame: [UInt64]
+    /// The demand as the last ingest left it: per chunk the bits of its seen area, 0 when no
+    /// view kept it. The next ingest diffs the slot's words (or the seed) against it, so only
+    /// the chunks whose word changed are touched — none at a still camera.
+    private let demandWords: UnsafeMutablePointer<UInt32>
+    /// The tick of the last ingest: the demand stamp of every chunk seen by it (`.demanded`),
+    /// and what a chunk that drops out keeps as its `lastDemandTick`.
+    private var lastIngestTick: UInt32 = 0
+    /// The chunks seen by the last ingest, dense, in no particular order; `demandedPosition`
+    /// is each chunk's index in it (−1 when not demanded).
+    private var demandedChunks: [Int32] = []
+    private var demandedPosition: [Int32]
+    /// Σ area and Σ splatCount over the demanded chunks in chunk order, recomputed only when
+    /// an ingest changed a word (the sums are the fill rule's inputs, so the order is kept).
+    private var demandedArea: Float = 0
+    private var demandedSplats = 0
     private var residentChunks = Set<Int>()
     private var fading: [Int] = []
     /// Chunks whose `.levelFade` is running (per-chunk-lod-tiers).
@@ -654,6 +669,9 @@ public final class GaussianPageManager: @unchecked Sendable {
         journalFull = Array(repeating: false, count: slots)
         demandStampTick = Array(repeating: nil, count: slots)
         demandStampFrame = Array(repeating: 0, count: slots)
+        demandWords = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, chunkCount))
+        demandWords.initialize(repeating: 0, count: max(1, chunkCount))
+        demandedPosition = Array(repeating: -1, count: chunkCount)
         lastConstants = Array(repeating: GaussianChunkPagingConstants(), count: slots)
         for k in 0 ..< slots {
             copyMasterTables(toSlot: k)
@@ -667,6 +685,7 @@ public final class GaussianPageManager: @unchecked Sendable {
     deinit {
         shutdown()
         source.close()
+        demandWords.deallocate()
     }
 
     // MARK: Public state
@@ -688,8 +707,13 @@ public final class GaussianPageManager: @unchecked Sendable {
         masterResidency[chunk].residentRanks
     }
 
+    /// The pager's CPU state of a chunk (tests, the inspector). A demanded chunk's
+    /// `lastDemandTick` is the tick of the last ingest, which stamps the chunks it sees through
+    /// `.demanded` rather than one by one.
     public func chunkState(_ chunk: Int) -> GaussianChunkPageState {
-        states[chunk]
+        var state = states[chunk]
+        if state.flags.contains(.demanded) { state.lastDemandTick = lastIngestTick }
+        return state
     }
 
     /// The pool slot of a tier, or nil (tests).
@@ -872,12 +896,12 @@ public final class GaussianPageManager: @unchecked Sendable {
         if active {
             let pressure = takePressureRequest(now: now)
             // 5. Demand.
-            let demand = ingestDemand(slot: slot, frame: frame, now: now)
+            ingestDemand(slot: slot, frame: frame, now: now)
             // 6. Wanted ranks.
-            computeWants(demanded: demand.chunks, totalArea: demand.totalArea, totalSplats: demand.totalSplats, frame: frame, now: now)
+            computeWants(frame: frame, now: now)
             // 7 and 8. Eviction and reads.
             if !frame.freeze {
-                let result = issueReads(demanded: demand.chunks, now: now, pressureTarget: pressure)
+                let result = issueReads(now: now, pressureTarget: pressure)
                 issued = result.issued
                 evicted = result.evicted
             }
@@ -1308,39 +1332,87 @@ public final class GaussianPageManager: @unchecked Sendable {
     // MARK: Demand and wants
 
     /// This slot's demand words when they are this entity's and recent, else the CPU seed
-    /// (frustum and area for every chunk, no HZB).
-    private func ingestDemand(slot: Int, frame: GaussianPagerFrameInputs, now: UInt32) -> (chunks: [Int], totalArea: Float, totalSplats: Int) {
-        var demanded: [Int] = []
-        var totalArea: Float = 0
-        var totalSplats = 0
+    /// (frustum and area for every chunk, no HZB), diffed against the last ingest: a chunk whose
+    /// word changed is (re)stamped, enters or leaves the demanded set; the others are not
+    /// touched. The slot's words are compared a block at a time (`memcmp`), so a still camera
+    /// costs a scan of the table and nothing per chunk.
+    private func ingestDemand(slot: Int, frame: GaussianPagerFrameInputs, now: UInt32) {
+        var changed = false
         let fresh = demandStampTick[slot] != nil && frame.frameIndex &- demandStampFrame[slot] <= GaussianPagingPolicy.seedGapFrames
         if fresh {
             let words = demandTables[slot].contents().bindMemory(to: UInt32.self, capacity: chunkCount)
-            for chunk in 0 ..< chunkCount {
-                let bits = words[chunk]
-                guard bits != 0 else { continue }
-                let area = Float(bitPattern: bits)
-                guard area > 0, area.isFinite else { continue }
-                states[chunk].lastDemandTick = now
-                states[chunk].lastArea = area
-                demanded.append(chunk)
-                totalArea += area
-                totalSplats += Int(index.chunks[chunk].splatCount)
+            let block = 256
+            var chunk = 0
+            while chunk < chunkCount {
+                let end = min(chunk + block, chunkCount)
+                if memcmp(words + chunk, demandWords + chunk, (end - chunk) * MemoryLayout<UInt32>.size) == 0 {
+                    chunk = end
+                    continue
+                }
+                while chunk < end {
+                    var bits = words[chunk]
+                    if bits != 0 {
+                        let area = Float(bitPattern: bits)
+                        if !(area > 0 && area.isFinite) { bits = 0 }
+                    }
+                    if bits != demandWords[chunk] {
+                        noteDemand(chunk: chunk, bits: bits)
+                        changed = true
+                    }
+                    chunk += 1
+                }
             }
         } else {
             var constants = frame.cullConstants
             constants.uniformQuotas = 0
             for chunk in 0 ..< chunkCount {
                 let area = GaussianPageManager.seedArea(entry: index.chunks[chunk], constants: constants)
-                guard area > 0 else { continue }
-                states[chunk].lastDemandTick = now
-                states[chunk].lastArea = area
-                demanded.append(chunk)
-                totalArea += area
-                totalSplats += Int(index.chunks[chunk].splatCount)
+                let bits = area > 0 ? area.bitPattern : 0
+                if bits != demandWords[chunk] {
+                    noteDemand(chunk: chunk, bits: bits)
+                    changed = true
+                }
             }
         }
-        return (demanded, totalArea, totalSplats)
+        if changed {
+            // The sums the fill rule sees, in chunk order as before the diff.
+            var totalArea: Float = 0
+            var totalSplats = 0
+            for chunk in 0 ..< chunkCount {
+                let bits = demandWords[chunk]
+                guard bits != 0 else { continue }
+                totalArea += Float(bitPattern: bits)
+                totalSplats += Int(index.chunks[chunk].splatCount)
+            }
+            demandedArea = totalArea
+            demandedSplats = totalSplats
+        }
+        lastIngestTick = now
+    }
+
+    /// A chunk's demand word changed: its area, and its membership of the demanded set. A chunk
+    /// that drops out keeps the tick of the last ingest that saw it as its `lastDemandTick`.
+    private func noteDemand(chunk: Int, bits: UInt32) {
+        let previous = demandWords[chunk]
+        demandWords[chunk] = bits
+        if bits == 0 {
+            states[chunk].lastDemandTick = lastIngestTick
+            states[chunk].flags.remove(.demanded)
+            let position = Int(demandedPosition[chunk])
+            let last = demandedChunks.removeLast()
+            if position < demandedChunks.count {
+                demandedChunks[position] = last
+                demandedPosition[Int(last)] = Int32(position)
+            }
+            demandedPosition[chunk] = -1
+            return
+        }
+        states[chunk].lastArea = Float(bitPattern: bits)
+        if previous == 0 {
+            states[chunk].flags.insert(.demanded)
+            demandedPosition[chunk] = Int32(demandedChunks.count)
+            demandedChunks.append(Int32(chunk))
+        }
     }
 
     /// The area the cull would write for a chunk it keeps in some view (frustum only), 0 when
@@ -1367,7 +1439,9 @@ public final class GaussianPageManager: @unchecked Sendable {
         return min(max(area, gaussianScreenAreaMin), limit * limit)
     }
 
-    private func computeWants(demanded: [Int], totalArea: Float, totalSplats: Int, frame: GaussianPagerFrameInputs, now: UInt32) {
+    private func computeWants(frame: GaussianPagerFrameInputs, now: UInt32) {
+        let totalArea = demandedArea
+        let totalSplats = demandedSplats
         // A readback that predates this entity's frames (the state is zero, or it is another
         // scene's) says nothing about this entity: the frame is taken as fitting until a frame
         // that saw the entity has been read back.
@@ -1388,7 +1462,8 @@ public final class GaussianPageManager: @unchecked Sendable {
         let effectiveCap = cap.isFinite ? cap : fill
         var neededTotal = 0
         var residentOfNeeded = 0
-        for chunk in demanded {
+        for demandedChunk in demandedChunks {
+            let chunk = Int(demandedChunk)
             let count = index.chunks[chunk].splatCount
             var state = states[chunk]
             var coarseInputs: GaussianCoarseWantInputs?
@@ -1445,7 +1520,7 @@ public final class GaussianPageManager: @unchecked Sendable {
 
     // MARK: Eviction and reads
 
-    private func issueReads(demanded: [Int], now: UInt32, pressureTarget: Int?) -> (issued: Int, evicted: Int) {
+    private func issueReads(now: UInt32, pressureTarget: Int?) -> (issued: Int, evicted: Int) {
         var evicted = 0
         // The coarse section's pieces first: outside the pool, counted in the bytes in flight the
         // tier requests below respect.
@@ -1469,9 +1544,10 @@ public final class GaussianPageManager: @unchecked Sendable {
         }
         var issuableSlots = pressureTarget.map { max(0, $0 - residentSlots) } ?? Int.max
 
-        // Candidates by priority.
+        // Candidates by priority, ties on the chunk index.
         var candidates: [(chunk: Int, priority: Float, tiers: Int)] = []
-        for chunk in demanded {
+        for demandedChunk in demandedChunks {
+            let chunk = Int(demandedChunk)
             let state = states[chunk]
             guard GaussianPagingPolicy.isLoadCandidate(state, tick: now) else { continue }
             let priority = GaussianPagingPolicy.loadPriority(area: state.lastArea, residentRanks: UInt32(state.residentRanks), neededRanks: UInt32(state.neededRanks), ranksPerPage: ranksPerPage)
@@ -1481,7 +1557,7 @@ public final class GaussianPageManager: @unchecked Sendable {
             candidates.append((chunk, priority, missing))
         }
         guard !candidates.isEmpty else { return (coarseIssued, evicted) }
-        candidates.sort { $0.priority > $1.priority }
+        candidates.sort { $0.priority > $1.priority || ($0.priority == $1.priority && $0.chunk < $1.chunk) }
         let maxReads = GaussianPagingPolicy.maxPageReadsPerTick
         if candidates.count > maxReads {
             candidates.removeLast(candidates.count - maxReads)
