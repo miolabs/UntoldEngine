@@ -344,6 +344,10 @@ public enum GaussianPagingPolicy {
         max(0, gaussianBudgetHeadroom * Float(budget) - Float(reservedSplats))
     }
 
+    /// The largest room `fillDensityCap` takes as a whole number of splats: the largest `Float`
+    /// below 2^32 (4,294,967,040; `Float(UInt32.max)` itself rounds up to 2^32).
+    static let fillRoomMax = Float(UInt32.max).nextDown
+
     /// Adds (or, with `sign` −1, removes) a demanded chunk's term to the fill histogram: the
     /// chunk as the cull would list it resident whole with every level its file holds landed —
     /// binned by its full density, its splats, its scaled area, and with levels
@@ -407,8 +411,9 @@ public enum GaussianPagingPolicy {
                 highest = tier
             }
             if requested == 0 { return .infinity }
-            // The grant is a whole number of splats, as the kernel takes it.
-            let room = Float(UInt32(max(0, min(room, Float(UInt32.max)))))
+            // The grant is a whole number of splats, as the kernel takes it. `Float(UInt32.max)`
+            // rounds up to 2^32, which `UInt32(_:)` rejects: the clamp is the float just below.
+            let room = Float(UInt32(max(0, min(room, fillRoomMax))))
             if room <= 0 { return 0 }
             let full = GaussianChunkCullMath.densityTierFloor(highest + 1)
             func request(_ density: Float) -> Float {

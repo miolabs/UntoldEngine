@@ -164,6 +164,15 @@ final class GaussianPagingPolicyTests: XCTestCase {
         XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: 0, levels: nil), 0, "nothing fits")
         XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: GaussianBudgetDensityHistogram(), room: 100, levels: nil), .infinity, "nothing demanded")
         XCTAssertEqual(GaussianPagingPolicy.fillRoom(budget: 1000, reservedSplats: 100), 0.98 * 1000 - 100)
+        // A room beyond what a whole number of 32-bit splats can hold is taken as that number,
+        // never converted as is (`Float(UInt32.max)` rounds up to 2^32, which `UInt32(_:)`
+        // rejects): an "unlimited" working set override reaches this on the render thread.
+        XCTAssertEqual(GaussianPagingPolicy.fillRoomMax, 4_294_967_040)
+        XCTAssertNotNil(UInt32(exactly: GaussianPagingPolicy.fillRoomMax))
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: 5e9, levels: nil), .infinity, "a room of 5e9 splats fits everything")
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: Float(UInt32.max), levels: levels), .infinity)
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: .infinity, levels: nil), .infinity)
+        XCTAssertEqual(GaussianPagingPolicy.fillDensityCap(histogram: histogram, room: GaussianPagingPolicy.fillRoom(budget: Int.max, reservedSplats: 0), levels: levels), .infinity, "an unlimited budget")
     }
 
     func testUniformModeWantsTheScaledCount() {
