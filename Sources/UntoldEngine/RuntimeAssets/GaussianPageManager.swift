@@ -583,20 +583,24 @@ public final class GaussianPageManager: @unchecked Sendable {
             var straddlers: [Int] = []
             var cursor = 0
             for piece in coarsePieces.indices {
-                while cursor < entries.count, entries[cursor].lastPiece < piece {
+                // The payloads are sorted and disjoint, so their first pieces never decrease:
+                // past everything that began in an earlier piece (ended there, or a straddler
+                // listed with its first piece), the payloads wholly inside this piece follow,
+                // and at most one more begins here and ends later — the piece's straddler.
+                while cursor < entries.count, entries[cursor].firstPiece < piece {
                     cursor += 1
                 }
-                var start = cursor
-                while start < entries.count, entries[start].firstPiece == piece, entries[start].lastPiece != piece {
-                    straddlers.append(start)
-                    start += 1
-                }
+                let start = cursor
                 var end = start
                 while end < entries.count, entries[end].firstPiece == piece, entries[end].lastPiece == piece {
                     end += 1
                 }
                 pieceEntries[piece] = start ..< end
                 cursor = end
+                if cursor < entries.count, entries[cursor].firstPiece == piece {
+                    straddlers.append(cursor)
+                    cursor += 1
+                }
             }
             coarsePieceEntries = pieceEntries
             coarseStraddlers = straddlers

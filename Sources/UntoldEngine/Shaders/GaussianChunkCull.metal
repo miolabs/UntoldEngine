@@ -262,10 +262,14 @@ kernel void gaussianChunkCull(
 
     // The outgoing window, listed and reserved one frame before the quota pass commits the
     // switch and on every frame of the fade; the quota pass grants it (or zeroes it when the
-    // switch does not commit) from the same state.
+    // switch does not commit) from the same state. With the cross-fade off (fadeFrames 0) a
+    // switch draws the new level alone from its commit frame: no outgoing window is listed.
     uint out = 0u;
     uint outLevel = 0u;
     const uint level = gaussianLevelStateLevel(state.word0);
+    if (lvl.fadeFrames == 0u) {
+        return;
+    }
     if (gaussianLevelStatePendingValid(state.word0)) {
         out = gaussianLevelStateOutCount(state.word0);
         outLevel = level;

@@ -13,7 +13,10 @@
 //  the image — and paged from the file into a pool a quarter of the asset's size with the
 //  budget unlimited (frames to warm, pages, reads and evictions per frame, the pager's worst
 //  tick), plus a pool that holds the whole asset whose near half must match the unlimited
-//  frame — at a camera that sees about 30 % of the asset. Skipped unless
+//  frame — at a camera that sees about 30 % of the asset; and, with the slab's per-chunk coarse
+//  levels baked, the quarter budget with the levels on and off (the far half of the image is
+//  where the levels replace the fine prefix) and the quarter pool in both modes (the fine bytes
+//  the pager reads to warm). Skipped unless
 //  UNTOLD_PERF_GAUSSIAN_CHUNK_CULL=1: the bakes take tens of seconds and the numbers are
 //  machine-specific, so this is a tool, not a gate.
 //
@@ -35,6 +38,7 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
     private var savedDisableHZBOcclusionCull = false
     private var savedDisableScreenWeightedQuotas = false
     private var savedWorkingSetOverride: Int?
+    private var savedLevelMode = GaussianLevelMode.auto
 
     override func setUp() async throws {
         try await super.setUp()
@@ -42,6 +46,8 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         savedDisableHZBOcclusionCull = GaussianDebugOptions.shared.disableHZBOcclusionCull
         savedDisableScreenWeightedQuotas = GaussianDebugOptions.shared.disableScreenWeightedQuotas
         savedWorkingSetOverride = GaussianRuntimeLimits.workingSetSplatsOverride
+        savedLevelMode = GaussianDebugOptions.shared.gaussianLevelMode
+        GaussianDebugOptions.shared.gaussianLevelMode = .auto
     }
 
     override func tearDown() async throws {
@@ -49,6 +55,7 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         GaussianDebugOptions.shared.disableChunkCull = savedDisableChunkCull
         GaussianDebugOptions.shared.disableHZBOcclusionCull = savedDisableHZBOcclusionCull
         GaussianDebugOptions.shared.disableScreenWeightedQuotas = savedDisableScreenWeightedQuotas
+        GaussianDebugOptions.shared.gaussianLevelMode = savedLevelMode
         GaussianRuntimeLimits.workingSetSplatsOverride = savedWorkingSetOverride
         GaussianSharedWorkingSet.shared.resetBudgetHysteresis()
         destroyAllEntities()
@@ -64,13 +71,13 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
 
     // MARK: - Synthetic asset
 
-    private func syntheticAssetURL(splatCount: Int) throws -> URL {
-        try GaussianSyntheticAsset.url(splatCount: splatCount)
+    private func syntheticAssetURL(splatCount: Int, coarseLevels: UntoldGSCoarseLevelOptions? = nil) throws -> URL {
+        try GaussianSyntheticAsset.url(splatCount: splatCount, coarseLevels: coarseLevels)
     }
 
     // MARK: - Scene
 
-    private func addEntity(_ result: GaussianLoadResult) -> GaussianComponent? {
+    private func addEntity(_ result: GaussianLoadResult) -> (entity: EntityID, component: GaussianComponent)? {
         let entity = createEntity()
         registerComponent(entityId: entity, componentType: GaussianComponent.self)
         registerComponent(entityId: entity, componentType: WorldTransformComponent.self)
@@ -78,7 +85,15 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         scene.get(component: WorldTransformComponent.self, for: entity)?.space = matrix_identity_float4x4
         guard let component = scene.get(component: GaussianComponent.self, for: entity) else { return nil }
         copyGaussianLoadResult(result, to: component)
-        return component
+        return (entity, component)
+    }
+
+    /// Removes the entity's splat data at once — `destroyAllEntities` alone leaves a paged
+    /// entity's pool in the registry until a frame finalizes, and the next paged load would be
+    /// sized against what that pool left of the budget.
+    private func removeEntity(_ entity: EntityID) {
+        removeEntityGaussian(entityId: entity)
+        destroyAllEntities()
     }
 
     /// The oblique view the budget test's partial-view case uses too (GaussianRenderTestSupport).
@@ -142,22 +157,23 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
 
     /// One configuration on one asset: add the entity, converge the budget scale, measure, and
     /// keep one rendered splat layer for the quality comparison.
-    private func bench(_ label: String, result: GaussianLoadResult, index: UntoldGSIndex, frames: Int, warmup: Int) -> (line: String, visibleSplats: Int, image: [Float16])? {
+    private func bench(_ label: String, result: GaussianLoadResult, index: UntoldGSIndex, frames: Int, warmup: Int) -> (line: String, visibleSplats: Int, image: [Float16], gpuMs: Double)? {
         GaussianSharedWorkingSet.shared.resetBudgetHysteresis()
         _ = placeCameraSeeing(target: 0.30, index: index)
-        guard let component = addEntity(result) else { return nil }
-        defer { destroyAllEntities() }
+        guard let (entity, component) = addEntity(result) else { return nil }
+        defer { removeEntity(entity) }
         let samples = measure(frames: frames + warmup, component: component)
         let cullOnly = measureCullOnly(frames: frames + warmup)
         let image = renderGaussianSplatLayer()
-        return (report(label, samples, cullOnly: cullOnly, warmup: warmup, component: component), samples.last?.visibleSplats ?? 0, image)
+        let measured = samples.dropFirst(warmup).map(\.gpuMs).sorted()
+        return (report(label, samples, cullOnly: cullOnly, warmup: warmup, component: component), samples.last?.visibleSplats ?? 0, image, measured.isEmpty ? 0 : measured[measured.count / 2])
     }
 
     /// The paged configuration: the asset loaded from the file into a pool of `poolBytes`,
     /// warmed until no read is pending for five frames (at most 300), then measured like the
     /// others; the line carries the pool, the pages, the reads and evictions per frame and the
     /// pager's worst tick.
-    private func benchPaged(_ label: String, url: URL, index: UntoldGSIndex, poolBytes: Int, frames: Int, warmup: Int) throws -> (line: String, visibleSplats: Int, image: [Float16])? {
+    private func benchPaged(_ label: String, url: URL, index: UntoldGSIndex, poolBytes: Int, frames: Int, warmup: Int) throws -> (line: String, visibleSplats: Int, image: [Float16], fineBytes: Int)? {
         GaussianPagingPolicy.pagingThresholdBytesOverride = 0
         GaussianPagingPolicy.residencyBudgetBytesOverride = poolBytes
         defer {
@@ -177,8 +193,8 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
             chunkTable: loaded.chunkTable,
             pager: pager
         ))
-        guard let component = addEntity(result) else { return nil }
-        defer { destroyAllEntities() }
+        guard let (entity, component) = addEntity(result) else { return nil }
+        defer { removeEntity(entity) }
 
         var framesToWarm = 0
         var quietFrames = 0
@@ -186,6 +202,7 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         var issued = 0
         var committed = 0
         var evicted = 0
+        let slotBytes = pager.ranksPerPage * (UntoldGSFormat.coreRecordSize + index.header.shBytesPerSplat)
         while quietFrames < 5, framesToWarm < 300 {
             let start = CACurrentMediaTime()
             renderer.draw(in: renderer.metalView)
@@ -203,12 +220,13 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
         let image = renderGaussianSplatLayer()
         let stats = pager.stats
         let perFrame = Double(max(1, framesToWarm))
+        let coarse = stats.coarseLevels == 0 ? "" : String(format: " coarseLevels=%d coarseBytes=%@ coarsePieces=%d", stats.coarseLevels, gaussianFormatBytes(stats.coarseBytesLanded), stats.coarseReadsIssued)
         let line = report(label, samples, cullOnly: cullOnly, warmup: warmup, component: component)
-            + String(format: " pool=%@ pages=%d/%d framesToWarm=%d issued/frame=%.1f committed/frame=%.1f evicted/frame=%.1f tickMs(max)=%.2f saturated=%d faults=%d",
+            + String(format: " pool=%@ pages=%d/%d framesToWarm=%d issued/frame=%.1f committed/frame=%.1f evicted/frame=%.1f tickMs(max)=%.2f saturated=%d faults=%d%@",
                      gaussianFormatBytes(stats.poolBytes), stats.residentSlots, stats.slotCount, framesToWarm,
-                     Double(issued) / perFrame, Double(committed) / perFrame, Double(evicted) / perFrame, worstTickMs, stats.saturatedCandidates, stats.faultedChunks)
+                     Double(issued) / perFrame, Double(committed) / perFrame, Double(evicted) / perFrame, worstTickMs, stats.saturatedCandidates, stats.faultedChunks, coarse)
         print("[GaussianChunkCullBenchmark] \(line)")
-        return (line, samples.last?.visibleSplats ?? 0, image)
+        return (line, samples.last?.visibleSplats ?? 0, image, issued * slotBytes)
     }
 
     /// The two halves of a splat layer: the bottom half (the near content of the oblique view,
@@ -324,9 +342,67 @@ final class GaussianChunkCullBenchmark: BaseRenderSetup {
                 // spends less; logged, not asserted.
                 XCTAssertGreaterThanOrEqual(weightedQuality.near, uniformQuality.near - 0.25, "the weighted quotas keep the near half at least as well as the uniform rule")
             }
+
+            // Per-chunk LOD (per-chunk-lod-tiers): the same slab with its coarse levels baked, at
+            // the quarter budget with the levels on (.auto) and off (.fineOnly, the fine prefix),
+            // each against the unlimited fine reference over the two halves — the far half is
+            // where the levels replace the prefix — and their whole-frame GPU time; then paged
+            // into a quarter of the asset in both modes with the pool's residency and the reads.
+            let levelledURL = try syntheticAssetURL(splatCount: splatCount, coarseLevels: .default)
+            let levelledLoaded = try GaussianChunkLoader.load(url: levelledURL)
+            let levelledCoarse = try XCTUnwrap(levelledLoaded.chunkTable.coarse, "the levelled bake carries both levels beside a whole load")
+            let levelledChunked = try XCTUnwrap(buildGaussianLoadResult(
+                packedSplatBuffer: levelledLoaded.packedSplatBuffer,
+                splatCount: UInt(levelledLoaded.splatCount),
+                sphericalHarmonicsBuffer: levelledLoaded.sphericalHarmonicsBuffer,
+                sphericalHarmonicsMetadata: levelledLoaded.sphericalHarmonicsMetadata,
+                boundingBox: levelledLoaded.boundingBox,
+                chunkTable: levelledLoaded.chunkTable
+            ))
+            print(String(format: "[GaussianChunkCullBenchmark] %@ coarse levels: %d resident (%@ of records), ratios %@",
+                         prefix, levelledCoarse.levelCount, gaussianFormatBytes(levelledCoarse.recordBytes), levelledCoarse.ratioLog2.map(String.init).joined(separator: ",")))
+            GaussianRuntimeLimits.workingSetSplatsOverride = quarter
+            var levelsQuality: (near: Float, far: Float)?
+            var levelsGPU: Double?
+            GaussianDebugOptions.shared.gaussianLevelMode = .auto
+            if let levels = bench("\(prefix) per-chunk LOD, budget \(quarter) (25 %% of the visible count), levels on", result: levelledChunked, index: levelledLoaded.index, frames: frames + 20, warmup: warmup + 20) {
+                lines.append(levels.line)
+                levelsQuality = psnrByHalf(levels.image, reference: reference)
+                levelsGPU = levels.gpuMs
+            }
+            GaussianDebugOptions.shared.gaussianLevelMode = .fineOnly
+            var prefixQuality: (near: Float, far: Float)?
+            var prefixGPU: Double?
+            if let fine = bench("\(prefix) per-chunk LOD, budget \(quarter) (25 %% of the visible count), fine only", result: levelledChunked, index: levelledLoaded.index, frames: frames, warmup: warmup) {
+                lines.append(fine.line)
+                prefixQuality = psnrByHalf(fine.image, reference: reference)
+                prefixGPU = fine.gpuMs
+            }
+            if let levelsQuality, let prefixQuality, let levelsGPU, let prefixGPU {
+                print(String(format: "[GaussianChunkCullBenchmark] %@ PSNR vs unlimited at a quarter budget — near half: levels %.2f dB, fine only %.2f dB; far half: levels %.2f dB, fine only %.2f dB; frame gpu median levels %.3f ms, fine only %.3f ms",
+                             prefix, levelsQuality.near, prefixQuality.near, levelsQuality.far, prefixQuality.far, levelsGPU, prefixGPU))
+                XCTAssertGreaterThanOrEqual(levelsQuality.far, prefixQuality.far - 0.25, "the levels draw the far half at least as well as the fine prefix")
+            }
+            GaussianRuntimeLimits.workingSetSplatsOverride = splatCount
+            var pagedFineBytes: (levels: Int, fine: Int) = (0, 0)
+            GaussianDebugOptions.shared.gaussianLevelMode = .auto
+            if let paged = try benchPaged("\(prefix) per-chunk LOD, paged (pool = 25 %% of the asset), budget unlimited, levels on", url: levelledURL, index: levelledLoaded.index, poolBytes: assetBytes / 4, frames: frames, warmup: warmup) {
+                lines.append(paged.line)
+                pagedFineBytes.levels = paged.fineBytes
+                let quality = psnrByHalf(paged.image, reference: reference)
+                print(String(format: "[GaussianChunkCullBenchmark] %@ PSNR vs unlimited, paged at a quarter pool with levels — near half %.2f dB, far half %.2f dB", prefix, quality.near, quality.far))
+            }
+            GaussianDebugOptions.shared.gaussianLevelMode = .fineOnly
+            if let paged = try benchPaged("\(prefix) per-chunk LOD, paged (pool = 25 %% of the asset), budget unlimited, fine only", url: levelledURL, index: levelledLoaded.index, poolBytes: assetBytes / 4, frames: frames, warmup: warmup) {
+                lines.append(paged.line)
+                pagedFineBytes.fine = paged.fineBytes
+            }
+            GaussianDebugOptions.shared.gaussianLevelMode = .auto
+            print(String(format: "[GaussianChunkCullBenchmark] %@ paged fine bytes read to warm — levels %@, fine only %@", prefix, gaussianFormatBytes(pagedFineBytes.levels), gaussianFormatBytes(pagedFineBytes.fine)))
+            XCTAssertLessThanOrEqual(pagedFineBytes.levels, pagedFineBytes.fine, "with the levels on the pager reads no more fine bytes than without")
             GaussianRuntimeLimits.workingSetSplatsOverride = nil
         }
 
-        XCTAssertEqual(lines.count, splatCounts.count * 6)
+        XCTAssertEqual(lines.count, splatCounts.count * 10)
     }
 }

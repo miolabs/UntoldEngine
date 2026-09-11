@@ -17,7 +17,8 @@
 //  nothing; the layouts are pinned; disablePaging loads whole; an unload with landed reads
 //  frees the pager; waiting reads hold no thread; a tier the selection leaves stops warming;
 //  and a 300 k asset pages within a 1 MiB pool over 120 real frames from the file itself (4 M
-//  and 20 M against a 64 MiB budget on opt-in).
+//  and 20 M against a 64 MiB budget on opt-in); with its per-chunk coarse levels it stops
+//  wanting fine tiers from afar once they have landed.
 //
 // Copyright (C) Untold Engine Studios
 //
@@ -1488,6 +1489,48 @@ final class GaussianPagingTest: BaseRenderSetup {
         }
     }
 
+    /// The same slab with its per-chunk coarse levels (per-chunk-lod-tiers) from the file
+    /// itself, against a 2 MiB budget (a pool of half the asset; the levels allowed the whole
+    /// budget beside it, so both stay resident), at an orbit far enough that a chunk is a few
+    /// pixels. The first tick wants every chunk it sees, so both runs saturate the pool before
+    /// the section has landed (one 660 KiB piece, CRC-checked in a debug build over a few
+    /// frames); from then on the section-free run keeps wanting fine tiers it cannot fit on every
+    /// frame of the orbit, while the levelled run draws the chunks coarse and wants nothing more
+    /// — the pool's saturation stops growing.
+    func testLargeSyntheticAssetWithLevelsStopsWantingFineTiersFromAfar() throws {
+        GaussianPageSourceFactory.override = nil
+        GaussianPagingPolicy.fadeFrames = 16
+        GaussianPagingPolicy.coarseBudgetFractionOverride = 1
+        let plain = try runLargeAsset(splatCount: 300_000, residencyBudgetBytes: 2 << 20, frames: 60, orbitRadius: 200, orbitHeight: 132)
+        XCTAssertNil(plain.coarseLevels)
+        XCTAssertGreaterThanOrEqual(plain.residentSlots, plain.slotCount - 4, "the section-free run fills its pool")
+        let levelled = try runLargeAsset(splatCount: 300_000, residencyBudgetBytes: 2 << 20, frames: 60, orbitRadius: 200, orbitHeight: 132, coarseLevels: .default)
+        XCTAssertEqual(levelled.coarseLevels, 2, "both levels resident beside the pool")
+        XCTAssertTrue(levelled.coarseLanded, "the section landed from the file source")
+        XCTAssertGreaterThan(levelled.coarseChunksDrawn, levelled.chunkCount / 2, "most chunks draw a coarse level")
+        let landed = levelled.landedFrame
+        XCTAssertLessThan(landed, 40, "the section landed well inside the run")
+        let plainGrowth = plain.saturatedByFrame[59] - plain.saturatedByFrame[landed]
+        let levelledGrowth = levelled.saturatedByFrame[59] - levelled.saturatedByFrame[landed]
+        XCTAssertGreaterThan(plainGrowth, 10 * (59 - landed), "the section-free run keeps wanting tiers it cannot fit")
+        XCTAssertLessThan(levelledGrowth, plainGrowth / 4, "once the levels landed the levelled run wants little more")
+        print("[GaussianPagingTest] far orbit at 2 MiB: section-free \(plain.fineReads) fine reads, saturation +\(plainGrowth) after frame \(landed); levelled \(levelled.fineReads) fine reads, saturation +\(levelledGrowth) after the section landed at frame \(landed) (tick \(levelled.landedTick)), \(levelled.coarseChunksDrawn) of \(levelled.chunkCount) chunks coarse on the last frame")
+    }
+
+    private struct LargeAssetRun {
+        var chunkCount = 0
+        var slotCount = 0
+        var residentSlots = 0
+        var coarseLevels: Int?
+        var coarseLanded = false
+        var landedTick: UInt32 = 0
+        var landedFrame = 0
+        var fineReads = 0
+        var coarseChunksDrawn = 0
+        /// `saturatedCandidates` after each frame.
+        var saturatedByFrame: [Int] = []
+    }
+
     /// Unloads the previous run's entity before the next load: `destroyAllEntities` alone
     /// defers the component cleanup to a frame's finalize, and a pool still in the registry
     /// leaves the next one only what the budget has left (64 MiB less a 4 M asset's
@@ -1502,12 +1545,13 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, 0, "every pool left the registry before the next load sizes against the budget")
     }
 
-    private func runLargeAsset(splatCount: Int, residencyBudgetBytes: Int, frames frameCount: Int) throws {
+    @discardableResult
+    private func runLargeAsset(splatCount: Int, residencyBudgetBytes: Int, frames frameCount: Int, orbitRadius: Float = 6, orbitHeight: Float = 4, coarseLevels: UntoldGSCoarseLevelOptions? = nil) throws -> LargeAssetRun {
         releaseLargeAssets()
         GaussianPagingPolicy.residencyBudgetBytesOverride = residencyBudgetBytes
         GaussianPagingPolicy.minPoolSlots = 4
         let bakeStart = CFAbsoluteTimeGetCurrent()
-        let url = try GaussianSyntheticAsset.url(splatCount: splatCount)
+        let url = try GaussianSyntheticAsset.url(splatCount: splatCount, coarseLevels: coarseLevels)
         // The pool the policy gives this asset: what the budget leaves (nothing is allocated),
         // capped at the asset in whole slots and at the platform maximum.
         let header = try UntoldGSFormat.readHeaderV3(from: url)
@@ -1526,7 +1570,11 @@ final class GaussianPagingTest: BaseRenderSetup {
         XCTAssertEqual(pager.poolBytes, expectedSlots * slotBytes)
         XCTAssertEqual(GaussianPagePoolRegistry.shared.allocatedBytes, pager.poolBytes, "the pool is in the registry")
         pager.eventLogEnabled = true
-        let camera = placeGaussianTestCamera(eye: simd_float3(6, 4, 0), target: .zero)
+        var run = LargeAssetRun()
+        run.chunkCount = table.chunkCount
+        run.coarseLevels = table.coarse?.levelCount
+        XCTAssertEqual(table.coarse != nil, coarseLevels != nil, "the levelled bake carries a section that fits at least its coarsest level")
+        let camera = placeGaussianTestCamera(eye: simd_float3(orbitRadius, orbitHeight, 0), target: .zero)
 
         var worstTickMs: Double = 0
         var sawVisible = false
@@ -1534,7 +1582,7 @@ final class GaussianPagingTest: BaseRenderSetup {
         let start = CFAbsoluteTimeGetCurrent()
         for frameIndex in 0 ..< frameCount {
             let angle = Float(frameIndex) * 0.05
-            cameraLookAt(entityId: camera, eye: simd_float3(6 * cos(angle), 4, 6 * sin(angle)), target: .zero, up: simd_float3(0, 1, 0))
+            cameraLookAt(entityId: camera, eye: simd_float3(orbitRadius * cos(angle), orbitHeight, orbitRadius * sin(angle)), target: .zero, up: simd_float3(0, 1, 0))
             let tickStart = CFAbsoluteTimeGetCurrent()
             renderer.draw(in: renderer.metalView)
             worstTickMs = max(worstTickMs, (CFAbsoluteTimeGetCurrent() - tickStart) * 1000)
@@ -1546,13 +1594,25 @@ final class GaussianPagingTest: BaseRenderSetup {
             XCTAssertLessThanOrEqual(stats.residentSlots, stats.slotCount)
             XCTAssertEqual(stats.state, .active)
             XCTAssertEqual(stats.faultedChunks, 0)
+            XCTAssertFalse(stats.coarseFaulted)
             if frameIndex >= 10 {
                 if sharedVisibleSet().visibleCount > 0 { sawVisible = true }
             }
             if fillFrame == nil, pager.eventLog.filter({ $0.kind == .committed }).count >= Int(0.8 * Double(stats.slotCount)) { fillFrame = frameIndex }
+            run.saturatedByFrame.append(stats.saturatedCandidates)
+            // The levels (per-chunk-lod-tiers): the tick the section landed.
+            if run.landedTick == 0, pager.coarseSectionLanded {
+                run.landedTick = pager.tick
+                run.landedFrame = frameIndex
+                run.coarseLanded = true
+            }
         }
         let elapsed = CFAbsoluteTimeGetCurrent() - start
         let stats = pager.stats
+        run.residentSlots = stats.residentSlots
+        run.slotCount = stats.slotCount
+        run.coarseChunksDrawn = try Int(budgetState().coarseChunks)
+        run.fineReads = pager.eventLog.filter { $0.kind == .issued }.count
         let committedTiers = pager.eventLog.filter { $0.kind == .committed }.count
         let evictedTiers = pager.eventLog.filter { $0.kind == .evicted }.count
         XCTAssertTrue(sawVisible, "something drawn after the fill-in")
@@ -1567,10 +1627,12 @@ final class GaussianPagingTest: BaseRenderSetup {
         }
         XCTAssertGreaterThan(stats.residentSlots, 0)
         assertSlotReuseInvariant(pager.eventLog)
-        print(String(format: "[GaussianPagingTest] %d splats in %d chunks (%@), budget %@, pool %@ (%d slots%@): %d frames in %.2f s, resident %@, 80 %% fill at frame %d, worst frame %.2f ms, saturated %d, committed %d tiers, evicted %d (bake+load %.1f s)",
+        print(String(format: "[GaussianPagingTest] %d splats in %d chunks (%@), budget %@, pool %@ (%d slots%@): %d frames in %.2f s, resident %@, 80 %% fill at frame %d, worst frame %.2f ms, saturated %d, committed %d tiers, evicted %d (bake+load %.1f s)%@",
                      splatCount, table.chunkCount, gaussianFormatBytes(assetBytes), gaussianFormatBytes(residencyBudgetBytes), gaussianFormatBytes(pager.poolBytes), stats.slotCount,
                      poolHoldsTheAsset ? ", the whole asset" : "", frameCount, elapsed,
                      gaussianFormatBytes(stats.residentSlots * slotBytes), fillFrame ?? -1, worstTickMs, stats.saturatedCandidates,
-                     committedTiers, evictedTiers, start - bakeStart))
+                     committedTiers, evictedTiers, start - bakeStart,
+                     table.coarse == nil ? "" : String(format: ", coarse levels %d (%@ landed %@, %d pieces, faulted %d)", stats.coarseLevels, gaussianFormatBytes(stats.coarseBytesLanded), gaussianFormatBytes(stats.coarseBytes), stats.coarseReadsIssued, stats.coarseFaulted ? 1 : 0)))
+        return run
     }
 }
