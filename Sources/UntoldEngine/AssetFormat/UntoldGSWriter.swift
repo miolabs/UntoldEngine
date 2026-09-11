@@ -666,40 +666,52 @@ public extension UntoldGSFormat {
         var payload = [UInt8](repeating: 0, count: coreBytes + count * shCount)
         var crc = UntoldGSCRC32.initialValue
 
+        // Counted loops over raw pointers: this runs once per splat on every thread, and a debug
+        // build's generic array iteration would cost more than the encoding itself.
         view.withUnsafePointers { pointers in
-            for position in ordered {
-                let index = pointers.storeIndex(position)
-                aabbMin = simd_min(aabbMin, pointers.position(index))
-                aabbMax = simd_max(aabbMax, pointers.position(index))
-                let scale = pointers.scale(index)
-                for axis in 0 ..< 3 {
-                    let logScale = log(max(scale[axis], Float.leastNormalMagnitude))
-                    logScaleMin = min(logScaleMin, logScale)
-                    logScaleMax = max(logScaleMax, logScale)
-                }
-            }
-
-            let ranges = UntoldGSPacking.ChunkRanges(
-                aabbMin: aabbMin, aabbMax: aabbMax, logScaleMin: logScaleMin, logScaleMax: logScaleMax
-            )
-            payload.withUnsafeMutableBytes { raw in
-                var offset = 0
-                for position in ordered {
-                    let record = UntoldGSPacking.encode(pointers.splat(pointers.storeIndex(position)), ranges: ranges)
-                    raw.storeBytes(of: record.position.littleEndian, toByteOffset: offset, as: UInt32.self)
-                    raw.storeBytes(of: record.rotation.littleEndian, toByteOffset: offset + 4, as: UInt32.self)
-                    raw.storeBytes(of: record.scale.littleEndian, toByteOffset: offset + 8, as: UInt32.self)
-                    raw.storeBytes(of: record.rgba.littleEndian, toByteOffset: offset + 12, as: UInt32.self)
-                    offset += coreRecordSize
-                }
-                if shCount > 0, let sh = pointers.sh.baseAddress {
-                    for position in ordered {
-                        let start = pointers.storeIndex(position) * shCount
-                        raw.baseAddress!.advanced(by: offset).copyMemory(from: sh.advanced(by: start), byteCount: shCount)
-                        offset += shCount
+            ordered.withUnsafeBufferPointer { ordered in
+                var slot = 0
+                while slot < count {
+                    let index = pointers.storeIndex(ordered[slot])
+                    aabbMin = simd_min(aabbMin, pointers.position(index))
+                    aabbMax = simd_max(aabbMax, pointers.position(index))
+                    let scale = pointers.scale(index)
+                    var axis = 0
+                    while axis < 3 {
+                        let logScale = log(max(scale[axis], Float.leastNormalMagnitude))
+                        logScaleMin = min(logScaleMin, logScale)
+                        logScaleMax = max(logScaleMax, logScale)
+                        axis += 1
                     }
+                    slot += 1
                 }
-                UntoldGSCRC32.update(&crc, UnsafeRawBufferPointer(raw))
+
+                let ranges = UntoldGSPacking.ChunkRanges(
+                    aabbMin: aabbMin, aabbMax: aabbMax, logScaleMin: logScaleMin, logScaleMax: logScaleMax
+                )
+                payload.withUnsafeMutableBytes { raw in
+                    var offset = 0
+                    slot = 0
+                    while slot < count {
+                        let record = UntoldGSPacking.encode(pointers.splat(pointers.storeIndex(ordered[slot])), ranges: ranges)
+                        raw.storeBytes(of: record.position.littleEndian, toByteOffset: offset, as: UInt32.self)
+                        raw.storeBytes(of: record.rotation.littleEndian, toByteOffset: offset + 4, as: UInt32.self)
+                        raw.storeBytes(of: record.scale.littleEndian, toByteOffset: offset + 8, as: UInt32.self)
+                        raw.storeBytes(of: record.rgba.littleEndian, toByteOffset: offset + 12, as: UInt32.self)
+                        offset += coreRecordSize
+                        slot += 1
+                    }
+                    if shCount > 0, let sh = pointers.sh.baseAddress {
+                        slot = 0
+                        while slot < count {
+                            let start = pointers.storeIndex(ordered[slot]) * shCount
+                            raw.baseAddress!.advanced(by: offset).copyMemory(from: sh.advanced(by: start), byteCount: shCount)
+                            offset += shCount
+                            slot += 1
+                        }
+                    }
+                    UntoldGSCRC32.update(&crc, UnsafeRawBufferPointer(raw))
+                }
             }
         }
         let entry = UntoldGSChunkEntry(

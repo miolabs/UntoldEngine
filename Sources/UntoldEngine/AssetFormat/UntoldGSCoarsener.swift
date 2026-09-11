@@ -204,9 +204,10 @@ public enum UntoldGSCoarsener {
     /// Distance is `|μ_i − μ_k|² + colourWeight² |c_i − c_k|²`; assignment goes to the nearest
     /// centre, ties to the lower index; an emptied cluster is re-seeded with the member of the
     /// largest cluster farthest from its centre. Fixed iteration order, `Float` accumulation in
-    /// member order: bit-reproducible. The inner loop runs on scalar arrays through unsafe
-    /// buffers — it is the bake's hot spot (`n × k × passes` distances per chunk) and a debug
-    /// build pays for every bounds check and generic SIMD call otherwise.
+    /// member order: bit-reproducible. The inner loops run on scalar arrays through unsafe
+    /// buffers and count with `while` — this is the bake's hot spot (`n × k × passes` distances
+    /// per chunk), and a debug build pays for every bounds check, every generic `Range`
+    /// iterator and every retain of a shared array otherwise.
     static func cluster(
         positions: [SIMD3<Float>],
         colours: [SIMD3<Float>],
@@ -217,123 +218,50 @@ public enum UntoldGSCoarsener {
     ) -> [Int] {
         let n = positions.count
         let k = max(1, min(clusterCount, n))
-        var assignment = (0 ..< n).map { index in min(k - 1, index * k / n) }
+        var assignment = [Int](repeating: 0, count: n)
+        var seed = 0
+        while seed < n {
+            assignment[seed] = min(k - 1, seed * k / n)
+            seed += 1
+        }
         guard k > 1, passes > 0 else { return assignment }
 
         let colourWeightSquared = colourWeight * colourWeight
         // Structure of arrays: member coordinates and colours, then the centres.
         var member = [Float](repeating: 0, count: 6 * n)
-        for index in 0 ..< n {
-            member[6 * index] = positions[index].x
-            member[6 * index + 1] = positions[index].y
-            member[6 * index + 2] = positions[index].z
-            member[6 * index + 3] = colours[index].x
-            member[6 * index + 4] = colours[index].y
-            member[6 * index + 5] = colours[index].z
+        var fill = 0
+        while fill < n {
+            let position = positions[fill]
+            let colour = colours[fill]
+            member[6 * fill] = position.x
+            member[6 * fill + 1] = position.y
+            member[6 * fill + 2] = position.z
+            member[6 * fill + 3] = colour.x
+            member[6 * fill + 4] = colour.y
+            member[6 * fill + 5] = colour.z
+            fill += 1
         }
         var centre = [Float](repeating: 0, count: 6 * k)
         var counts = [Int](repeating: 0, count: k)
+        var weightSums = [Float](repeating: 0, count: k)
+        var plainSums = [Float](repeating: 0, count: 6 * k)
 
         member.withUnsafeBufferPointer { memberBuffer in
-            centre.withUnsafeMutableBufferPointer { centreBuffer in
-                assignment.withUnsafeMutableBufferPointer { assignmentBuffer in
-                    counts.withUnsafeMutableBufferPointer { countBuffer in
-                        guard let m = memberBuffer.baseAddress, let c = centreBuffer.baseAddress,
-                              let a = assignmentBuffer.baseAddress, let count = countBuffer.baseAddress
-                        else { return }
-                        var weightSums = [Float](repeating: 0, count: k)
-                        var plainSums = [Float](repeating: 0, count: 6 * k)
-
-                        @inline(__always) func distance(_ index: Int, _ cluster: Int) -> Float {
-                            let mi = m + 6 * index
-                            let ci = c + 6 * cluster
-                            let dx = mi[0] - ci[0]
-                            let dy = mi[1] - ci[1]
-                            let dz = mi[2] - ci[2]
-                            let dr = mi[3] - ci[3]
-                            let dg = mi[4] - ci[4]
-                            let db = mi[5] - ci[5]
-                            return dx * dx + dy * dy + dz * dz + colourWeightSquared * (dr * dr + dg * dg + db * db)
-                        }
-
-                        for _ in 0 ..< passes {
-                            // Centres: weighted means in member order (plain means where the weights vanish).
-                            for value in 0 ..< 6 * k {
-                                c[value] = 0
-                                plainSums[value] = 0
-                            }
-                            for cluster in 0 ..< k {
-                                weightSums[cluster] = 0
-                                count[cluster] = 0
-                            }
-                            for index in 0 ..< n {
-                                let cluster = a[index]
-                                let w = weights[index]
-                                let mi = 6 * index
-                                let ci = 6 * cluster
-                                for component in 0 ..< 6 {
-                                    c[ci + component] += w * m[mi + component]
-                                    plainSums[ci + component] += m[mi + component]
-                                }
-                                weightSums[cluster] += w
-                                count[cluster] += 1
-                            }
-                            for cluster in 0 ..< k where count[cluster] > 0 {
-                                let ci = 6 * cluster
-                                if weightSums[cluster] > 0 {
-                                    for component in 0 ..< 6 {
-                                        c[ci + component] /= weightSums[cluster]
-                                    }
-                                } else {
-                                    for component in 0 ..< 6 {
-                                        c[ci + component] = plainSums[ci + component] / Float(count[cluster])
-                                    }
-                                }
-                            }
-
-                            // Assignment: the nearest centre, ties to the lower index.
-                            for index in 0 ..< n {
-                                var best = 0
-                                var bestDistance = distance(index, 0)
-                                for cluster in 1 ..< k {
-                                    let d = distance(index, cluster)
-                                    if d < bestDistance {
-                                        bestDistance = d
-                                        best = cluster
-                                    }
-                                }
-                                a[index] = best
-                            }
-
-                            // Re-seed emptied clusters from the largest one (ties to the lower index)
-                            // with its member farthest from the centre (ties to the lower member index).
-                            for cluster in 0 ..< k {
-                                count[cluster] = 0
-                            }
-                            for index in 0 ..< n {
-                                count[a[index]] += 1
-                            }
-                            for empty in 0 ..< k where count[empty] == 0 {
-                                var largest = 0
-                                for cluster in 1 ..< k where count[cluster] > count[largest] {
-                                    largest = cluster
-                                }
-                                guard count[largest] > 1 else { continue }
-                                var farthest = -1
-                                var farthestDistance: Float = -1
-                                for index in 0 ..< n where a[index] == largest {
-                                    let d = distance(index, largest)
-                                    if d > farthestDistance {
-                                        farthestDistance = d
-                                        farthest = index
-                                    }
-                                }
-                                guard farthest >= 0 else { continue }
-                                a[farthest] = empty
-                                count[largest] -= 1
-                                count[empty] += 1
-                                for component in 0 ..< 6 {
-                                    c[6 * empty + component] = m[6 * farthest + component]
+            weights.withUnsafeBufferPointer { weightBuffer in
+                centre.withUnsafeMutableBufferPointer { centreBuffer in
+                    assignment.withUnsafeMutableBufferPointer { assignmentBuffer in
+                        counts.withUnsafeMutableBufferPointer { countBuffer in
+                            weightSums.withUnsafeMutableBufferPointer { weightSumBuffer in
+                                plainSums.withUnsafeMutableBufferPointer { plainSumBuffer in
+                                    guard let m = memberBuffer.baseAddress, let weights = weightBuffer.baseAddress,
+                                          let c = centreBuffer.baseAddress, let a = assignmentBuffer.baseAddress,
+                                          let count = countBuffer.baseAddress, let weightSums = weightSumBuffer.baseAddress,
+                                          let plainSums = plainSumBuffer.baseAddress
+                                    else { return }
+                                    refine(
+                                        n: n, k: k, passes: passes, colourWeightSquared: colourWeightSquared,
+                                        m: m, weights: weights, c: c, a: a, count: count, weightSums: weightSums, plainSums: plainSums
+                                    )
                                 }
                             }
                         }
@@ -342,6 +270,151 @@ public enum UntoldGSCoarsener {
             }
         }
         return assignment
+    }
+
+    /// The Lloyd passes of `cluster` over raw buffers: `m` the 6-wide members, `c` the 6-wide
+    /// centres, `a` the assignment, `count`, `weightSums` (k) and `plainSums` (6 k) scratch.
+    private static func refine(
+        n: Int, k: Int, passes: Int, colourWeightSquared: Float,
+        m: UnsafePointer<Float>, weights: UnsafePointer<Float>,
+        c: UnsafeMutablePointer<Float>, a: UnsafeMutablePointer<Int>, count: UnsafeMutablePointer<Int>,
+        weightSums: UnsafeMutablePointer<Float>, plainSums: UnsafeMutablePointer<Float>
+    ) {
+        @inline(__always) func distance(_ index: Int, _ cluster: Int) -> Float {
+            let mi = m + 6 * index
+            let ci = c + 6 * cluster
+            let dx = mi[0] - ci[0]
+            let dy = mi[1] - ci[1]
+            let dz = mi[2] - ci[2]
+            let dr = mi[3] - ci[3]
+            let dg = mi[4] - ci[4]
+            let db = mi[5] - ci[5]
+            return dx * dx + dy * dy + dz * dz + colourWeightSquared * (dr * dr + dg * dg + db * db)
+        }
+
+        var pass = 0
+        while pass < passes {
+            pass += 1
+            // Centres: weighted means in member order (plain means where the weights vanish).
+            var value = 0
+            while value < 6 * k {
+                c[value] = 0
+                plainSums[value] = 0
+                value += 1
+            }
+            var cluster = 0
+            while cluster < k {
+                weightSums[cluster] = 0
+                count[cluster] = 0
+                cluster += 1
+            }
+            var index = 0
+            while index < n {
+                let cluster = a[index]
+                let w = weights[index]
+                let mi = 6 * index
+                let ci = 6 * cluster
+                var component = 0
+                while component < 6 {
+                    c[ci + component] += w * m[mi + component]
+                    plainSums[ci + component] += m[mi + component]
+                    component += 1
+                }
+                weightSums[cluster] += w
+                count[cluster] += 1
+                index += 1
+            }
+            cluster = 0
+            while cluster < k {
+                if count[cluster] > 0 {
+                    let ci = 6 * cluster
+                    if weightSums[cluster] > 0 {
+                        var component = 0
+                        while component < 6 {
+                            c[ci + component] /= weightSums[cluster]
+                            component += 1
+                        }
+                    } else {
+                        var component = 0
+                        while component < 6 {
+                            c[ci + component] = plainSums[ci + component] / Float(count[cluster])
+                            component += 1
+                        }
+                    }
+                }
+                cluster += 1
+            }
+
+            // Assignment: the nearest centre, ties to the lower index.
+            index = 0
+            while index < n {
+                var best = 0
+                var bestDistance = distance(index, 0)
+                var candidate = 1
+                while candidate < k {
+                    let d = distance(index, candidate)
+                    if d < bestDistance {
+                        bestDistance = d
+                        best = candidate
+                    }
+                    candidate += 1
+                }
+                a[index] = best
+                index += 1
+            }
+
+            // Re-seed emptied clusters from the largest one (ties to the lower index)
+            // with its member farthest from the centre (ties to the lower member index).
+            cluster = 0
+            while cluster < k {
+                count[cluster] = 0
+                cluster += 1
+            }
+            index = 0
+            while index < n {
+                count[a[index]] += 1
+                index += 1
+            }
+            var empty = 0
+            while empty < k {
+                if count[empty] == 0 {
+                    var largest = 0
+                    var candidate = 1
+                    while candidate < k {
+                        if count[candidate] > count[largest] {
+                            largest = candidate
+                        }
+                        candidate += 1
+                    }
+                    if count[largest] > 1 {
+                        var farthest = -1
+                        var farthestDistance: Float = -1
+                        var member = 0
+                        while member < n {
+                            if a[member] == largest {
+                                let d = distance(member, largest)
+                                if d > farthestDistance {
+                                    farthestDistance = d
+                                    farthest = member
+                                }
+                            }
+                            member += 1
+                        }
+                        if farthest >= 0 {
+                            a[farthest] = empty
+                            count[largest] -= 1
+                            count[empty] += 1
+                            var component = 0
+                            while component < 6 {
+                                c[6 * empty + component] = m[6 * farthest + component]
+                                component += 1
+                            }
+                        }
+                    }
+                }
+                empty += 1
+            }
+        }
     }
 
     // MARK: - Merge
