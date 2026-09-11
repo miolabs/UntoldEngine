@@ -79,61 +79,170 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
         return url
     }
 
-    /// A deterministic 1100-splat binary little-endian SH3 capture in the 3DGS property order
-    /// plus a `uchar` property to skip: opacities across the visibility cull (1/255) and the
-    /// cook floor (0.005), one degenerate splat (a −∞ log scale), higher-order terms past the
-    /// ±1 quantisation range, and a trailing `face` element.
-    private func binaryFixture() throws -> URL {
+    /// A deterministic 1100-splat binary SH3 capture in the 3DGS property order plus a `uchar`
+    /// property to skip: opacities across the visibility cull (1/255) and the cook floor (0.005),
+    /// one degenerate splat (a −∞ log scale), higher-order terms past the ±1 quantisation range,
+    /// and a trailing `face` element. Little-endian unless asked otherwise; the same values
+    /// either way.
+    private func binaryFixture(bigEndian: Bool = false) throws -> URL {
         let count = 1100
         var rng = SplitMix64(seed: 0x5EED_5EED_1100)
-        var header = ["ply", "format binary_little_endian 1.0", "comment synthetic SH3 capture", "element vertex \(count)"]
-        header += ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"].map { "property float \($0)" }
-        header += (0 ..< 45).map { "property float f_rest_\($0)" }
-        header += ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"].map { "property float \($0)" }
-        header += ["property uchar tag", "element face 0", "property list uchar int vertex_indices", "end_header"]
-        var data = Data((header.joined(separator: "\n") + "\n").utf8)
-
-        func append(_ value: Float) {
-            var bits = value.bitPattern.littleEndian
-            withUnsafeBytes(of: &bits) { data.append(contentsOf: $0) }
+        var ply = PLYBinaryBuilder(bigEndian: bigEndian, comment: "synthetic SH3 capture")
+        for name in ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"] {
+            ply.property(name, .float)
         }
+        for term in 0 ..< 45 {
+            ply.property("f_rest_\(term)", .float)
+        }
+        for name in ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"] {
+            ply.property(name, .float)
+        }
+        ply.property("tag", .uchar)
+        ply.beginBody(vertexCount: count, trailingFaceElement: true)
+
         for index in 0 ..< count {
             // A disc-ish cloud with a few outliers, so the crop and the Morton order both bite.
             let radius = rng.unit() * (index % 97 == 0 ? 6 : 2)
             let angle = rng.unit() * 2 * .pi
-            append(radius * cos(angle))
-            append(rng.unit() * 0.3 - 0.15)
-            append(radius * sin(angle))
-            append(0)
-            append(0)
-            append(1)
+            ply.append(radius * cos(angle))
+            ply.append(rng.unit() * 0.3 - 0.15)
+            ply.append(radius * sin(angle))
+            ply.append(0)
+            ply.append(0)
+            ply.append(1)
             for _ in 0 ..< 3 {
-                append(rng.unit() * 2 - 1)
+                ply.append(rng.unit() * 2 - 1)
             }
             for term in 0 ..< 45 {
                 let value = rng.unit() - 0.5
-                append(index % 131 == 7 && term % 11 == 0 ? value * 4 : value)
+                ply.append(index % 131 == 7 && term % 11 == 0 ? value * 4 : value)
             }
             // Opacity logits: most visible, some between the cull and the cook floor, some below.
             switch index % 53 {
-            case 0: append(-7) // sigmoid ≈ 0.0009 < 1/255: culled by the reader
-            case 1: append(-5.5) // sigmoid ≈ 0.0041: past the cull, under the 0.005 floor
-            default: append(rng.unit() * 8 - 2)
+            case 0: ply.append(-7) // sigmoid ≈ 0.0009 < 1/255: culled by the reader
+            case 1: ply.append(-5.5) // sigmoid ≈ 0.0041: past the cull, under the 0.005 floor
+            default: ply.append(rng.unit() * 8 - 2)
             }
             for axis in 0 ..< 3 {
-                append(index == 500 && axis == 1 ? -.infinity : rng.unit() * 4 - 6)
+                ply.append(index == 500 && axis == 1 ? -.infinity : rng.unit() * 4 - 6)
             }
             var q = SIMD4<Float>(rng.unit() * 2 - 1, rng.unit() * 2 - 1, rng.unit() * 2 - 1, rng.unit() * 2 - 1)
             if simd_length_squared(q) == 0 { q = SIMD4<Float>(1, 0, 0, 0) }
-            append(q.x)
-            append(q.y)
-            append(q.z)
-            append(q.w)
-            data.append(UInt8(index & 0xFF))
+            ply.append(q.x)
+            ply.append(q.y)
+            ply.append(q.z)
+            ply.append(q.w)
+            ply.append(Float(index & 0xFF))
         }
-        let url = temporaryDirectory.appendingPathComponent("capture.ply")
-        try data.write(to: url)
+        let url = temporaryDirectory.appendingPathComponent(bigEndian ? "capture-be.ply" : "capture.ply")
+        try ply.data.write(to: url)
         return url
+    }
+
+    /// A 600-splat degree-1 capture whose properties take every scalar type the reader decodes:
+    /// `double` positions and harmonics beside `float` ones, `short` normals, integer rotations
+    /// of every width, and `uchar`/`char` properties to skip — so a missed byte swap or a wrong
+    /// integer load shows against the legacy decoder.
+    private func mixedScalarFixture(bigEndian: Bool) throws -> URL {
+        let count = 600
+        var rng = SplitMix64(seed: 0x3A1E_D000 + (bigEndian ? 1 : 0))
+        var ply = PLYBinaryBuilder(bigEndian: bigEndian, comment: "mixed scalar types")
+        ply.property("x", .double)
+        ply.property("y", .float)
+        ply.property("z", .double)
+        ply.property("nx", .short)
+        ply.property("tag", .uchar)
+        ply.property("f_dc_0", .float)
+        ply.property("f_dc_1", .double)
+        ply.property("f_dc_2", .float)
+        for term in 0 ..< 9 {
+            ply.property("f_rest_\(term)", term % 2 == 0 ? .float : .double)
+        }
+        ply.property("opacity", .float)
+        ply.property("flag", .char)
+        ply.property("scale_0", .float)
+        ply.property("scale_1", .double)
+        ply.property("scale_2", .float)
+        ply.property("rot_0", .int)
+        ply.property("rot_1", .uint)
+        ply.property("rot_2", .ushort)
+        ply.property("rot_3", .char)
+        ply.beginBody(vertexCount: count, trailingFaceElement: false)
+        for index in 0 ..< count {
+            ply.append(rng.unit() * 4 - 2)
+            ply.append(rng.unit() * 2 - 1)
+            ply.append(rng.unit() * 4 - 2)
+            ply.append(Float(Int(rng.unit() * 2000) - 1000))
+            ply.append(Float(index & 0xFF))
+            for _ in 0 ..< 3 {
+                ply.append(rng.unit() * 2 - 1)
+            }
+            for _ in 0 ..< 9 {
+                ply.append(rng.unit() - 0.5)
+            }
+            ply.append(index % 41 == 0 ? -7 : rng.unit() * 6 - 1)
+            ply.append(Float(Int(rng.unit() * 200) - 100))
+            for _ in 0 ..< 3 {
+                ply.append(rng.unit() * 3 - 5)
+            }
+            ply.append(Float(Int(rng.unit() * 7) - 3))
+            ply.append(Float(Int(rng.unit() * 5) + 1))
+            ply.append(Float(Int(rng.unit() * 9)))
+            ply.append(Float(Int(rng.unit() * 7) - 3))
+        }
+        let url = temporaryDirectory.appendingPathComponent(bigEndian ? "mixed-be.ply" : "mixed-le.ply")
+        try ply.data.write(to: url)
+        return url
+    }
+
+    /// A 300-point cloud without harmonics: `uchar red/green/blue` for the colour, `double`
+    /// scales, `short` rotations and a `char` opacity — the plain point-cloud path of the reader.
+    private func rgbFixture(bigEndian: Bool) throws -> URL {
+        let count = 300
+        var rng = SplitMix64(seed: 0x0C01_0000 + (bigEndian ? 1 : 0))
+        var ply = PLYBinaryBuilder(bigEndian: bigEndian, comment: "rgb point cloud")
+        for name in ["x", "y", "z"] {
+            ply.property(name, .float)
+        }
+        for name in ["red", "green", "blue"] {
+            ply.property(name, .uchar)
+        }
+        ply.property("opacity", .char)
+        for name in ["scale_0", "scale_1", "scale_2"] {
+            ply.property(name, .double)
+        }
+        for name in ["rot_0", "rot_1", "rot_2", "rot_3"] {
+            ply.property(name, .short)
+        }
+        ply.beginBody(vertexCount: count, trailingFaceElement: false)
+        for _ in 0 ..< count {
+            for _ in 0 ..< 3 {
+                ply.append(rng.unit() * 2 - 1)
+            }
+            for _ in 0 ..< 3 {
+                ply.append(Float(Int(rng.unit() * 256)))
+            }
+            ply.append(Float(Int(rng.unit() * 9) - 3))
+            for _ in 0 ..< 3 {
+                ply.append(rng.unit() * 3 - 5)
+            }
+            for _ in 0 ..< 4 {
+                ply.append(Float(Int(rng.unit() * 7) - 3))
+            }
+        }
+        let url = temporaryDirectory.appendingPathComponent(bigEndian ? "rgb-be.ply" : "rgb-le.ply")
+        try ply.data.write(to: url)
+        return url
+    }
+
+    /// Every binary fixture: the SH3 capture both ways round, the mixed scalar types both ways
+    /// round, the RGB point cloud both ways round.
+    private func binaryFixtureVariants() throws -> [URL] {
+        try [
+            binaryFixture(), binaryFixture(bigEndian: true),
+            mixedScalarFixture(bigEndian: false), mixedScalarFixture(bigEndian: true),
+            rgbFixture(bigEndian: false), rgbFixture(bigEndian: true),
+        ]
     }
 
     /// Options A: the source degree, a non-identity similarity, 16-splat chunks → automatic levels.
@@ -223,26 +332,52 @@ final class UntoldGSCookerEquivalenceTests: XCTestCase {
     }
 
     func testBinaryFixtureReadsIdenticallyThroughBothParsers() throws {
-        let ply = try binaryFixture()
-        let legacy = try LegacyGaussianCookPath.readGaussianAsset(from: ply)
-        let streamed = try PLYReader.readGaussianAsset(from: ply)
-        XCTAssertEqual(legacy.splats.count, streamed.splats.count)
-        XCTAssertEqual(legacy.splats.count, 1100 - 21, "every 53rd splat is culled by the reader")
-        for (a, b) in zip(legacy.splats, streamed.splats) {
-            XCTAssertEqual(a.center, b.center)
-            XCTAssertEqual(a.scale, b.scale)
-            XCTAssertEqual(a.color, b.color)
-            XCTAssertEqual(a.quat, b.quat)
-            XCTAssertEqual(a.opacity, b.opacity)
+        for ply in try binaryFixtureVariants() {
+            let name = ply.lastPathComponent
+            let legacy = try LegacyGaussianCookPath.readGaussianAsset(from: ply)
+            let streamed = try PLYReader.readGaussianAsset(from: ply)
+            XCTAssertEqual(legacy.splats.count, streamed.splats.count, name)
+            XCTAssertGreaterThan(streamed.splats.count, 0, name)
+            for (a, b) in zip(legacy.splats, streamed.splats) {
+                XCTAssertEqual(a.center, b.center, name)
+                XCTAssertEqual(a.scale, b.scale, name)
+                XCTAssertEqual(a.color, b.color, name)
+                XCTAssertEqual(a.quat, b.quat, name)
+                XCTAssertEqual(a.opacity, b.opacity, name)
+            }
+            XCTAssertEqual(legacy.sphericalHarmonics?.degree, streamed.sphericalHarmonics?.degree, name)
+            XCTAssertEqual(legacy.sphericalHarmonics?.coefficients, streamed.sphericalHarmonics?.coefficients, name)
         }
-        XCTAssertEqual(legacy.sphericalHarmonics?.coefficients, streamed.sphericalHarmonics?.coefficients)
-        XCTAssertEqual(streamed.sphericalHarmonics?.degree, 3)
+
+        let capture = try PLYReader.readGaussianAsset(from: binaryFixture())
+        XCTAssertEqual(capture.splats.count, 1100 - 21, "every 53rd splat is culled by the reader")
+        XCTAssertEqual(capture.sphericalHarmonics?.degree, 3)
+        let mixedPLY = try mixedScalarFixture(bigEndian: true)
+        XCTAssertEqual(try PLYReader.readGaussianSplatCount(from: mixedPLY), 600)
+        let mixed = try PLYReader.readGaussianAsset(from: mixedPLY)
+        XCTAssertEqual(mixed.sphericalHarmonics?.degree, 1)
+        XCTAssertEqual(mixed.splats.count, 600 - 15, "every 41st point is culled")
+        let rgbPLY = try rgbFixture(bigEndian: true)
+        XCTAssertEqual(try PLYReader.readGaussianSplatCount(from: rgbPLY), 300)
+        let rgb = try PLYReader.readGaussianAsset(from: rgbPLY)
+        XCTAssertNil(rgb.sphericalHarmonics)
+        XCTAssertEqual(rgb.splats.count, 300)
+    }
+
+    func testBigEndianCaptureBakesTheSameBytesAsTheLittleEndianOne() throws {
+        // The same values in the other byte order: the decoded splats, and so the file, are the
+        // same as the little-endian capture's — the SHA pinned above.
+        let ply = try binaryFixture(bigEndian: true)
+        XCTAssertEqual(try PLYReader.readGaussianSplatCount(from: ply), 1100)
+        let output = temporaryDirectory.appendingPathComponent("capture-be.untoldgs")
+        _ = try bakeGaussianSplatProgressiveTiers(plyURL: ply, outputBaseURL: output, lodFractions: [1.0], cookOptions: transformedOptions)
+        XCTAssertEqual(try sha256(output), "e3dc509c394c4428389a6b43dc435489f861d6cb1fc9bbe5948ff21d097776c4")
     }
 
     // MARK: - Centre bounds
 
     func testStreamedCenterBoundsMatchTheLoadedSplats() throws {
-        for ply in try [asciiFixture(), binaryFixture()] {
+        for ply in try [asciiFixture()] + binaryFixtureVariants() {
             let splats = try PLYReader.readGaussianSplats(from: ply)
             var minimum = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
             var maximum = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
@@ -529,6 +664,60 @@ private final class ProgressLog: @unchecked Sendable {
 
     var sawMixedSet: Bool {
         lock.withLock { mixedSet }
+    }
+}
+
+/// Writes a binary PLY: the header from the properties declared, then each vertex's values
+/// encoded in the property's scalar type and the file's byte order.
+private struct PLYBinaryBuilder {
+    enum Scalar: String {
+        case float, double, uchar, char, ushort, short, uint, int
+    }
+
+    let bigEndian: Bool
+    private var header: [String]
+    private var types: [Scalar] = []
+    private var slot = 0
+    private(set) var data = Data()
+
+    init(bigEndian: Bool, comment: String) {
+        self.bigEndian = bigEndian
+        header = ["ply", "format \(bigEndian ? "binary_big_endian" : "binary_little_endian") 1.0", "comment \(comment)"]
+    }
+
+    mutating func property(_ name: String, _ type: Scalar) {
+        header.append("property \(type.rawValue) \(name)")
+        types.append(type)
+    }
+
+    mutating func beginBody(vertexCount: Int, trailingFaceElement: Bool) {
+        var lines = Array(header.prefix(3)) + ["element vertex \(vertexCount)"] + header.dropFirst(3)
+        if trailingFaceElement {
+            lines += ["element face 0", "property list uchar int vertex_indices"]
+        }
+        lines.append("end_header")
+        data = Data((lines.joined(separator: "\n") + "\n").utf8)
+    }
+
+    /// The next property's value of the vertex, encoded in its declared type.
+    mutating func append(_ value: Float) {
+        let type = types[slot % types.count]
+        slot += 1
+        switch type {
+        case .float: appendBits(value.bitPattern)
+        case .double: appendBits(Double(value).bitPattern)
+        case .uchar: data.append(UInt8(value))
+        case .char: data.append(UInt8(bitPattern: Int8(value)))
+        case .ushort: appendBits(UInt16(value))
+        case .short: appendBits(UInt16(bitPattern: Int16(value)))
+        case .uint: appendBits(UInt32(value))
+        case .int: appendBits(UInt32(bitPattern: Int32(value)))
+        }
+    }
+
+    private mutating func appendBits(_ bits: some FixedWidthInteger) {
+        var ordered = bigEndian ? bits.bigEndian : bits.littleEndian
+        withUnsafeBytes(of: &ordered) { data.append(contentsOf: $0) }
     }
 }
 
