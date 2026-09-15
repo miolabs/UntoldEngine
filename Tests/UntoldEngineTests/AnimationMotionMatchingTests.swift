@@ -114,6 +114,40 @@ final class AnimationMotionMatchingTests: XCTestCase {
         scene.get(component: AnimationComponent.self, for: entityId)!
     }
 
+    /// Stop clip: the root travels +z at 1 m/s through the first second of
+    /// the 2 s clip and stands through the second.
+    private func makeStopClip() -> AnimationClip {
+        let rootChannel = RuntimeAnimationChannel(
+            jointPath: "root",
+            translations: [
+                .init(time: 0.0, value: simd_float3(0, 0.9, 0)),
+                .init(time: 1.0, value: simd_float3(0, 0.9, 1)),
+                .init(time: 2.0, value: simd_float3(0, 0.9, 1)),
+            ],
+            rotations: [
+                .init(time: 0.0, value: SIMD4<Float>(0, 0, 0, 1)),
+                .init(time: 2.0, value: SIMD4<Float>(0, 0, 0, 1)),
+            ]
+        )
+        return AnimationClip(runtimeClip: RuntimeAnimationClip(name: "stop", duration: 2.0, channels: [rootChannel]))
+    }
+
+    private func buildDatabase(clips: [AnimationClip], oneShot: Set<String>, tail: Float) -> MotionDatabase? {
+        let skeleton = scene.get(component: SkeletonComponent.self, for: entityId)!.skeleton!
+        let compiled = clips.map { animationComponent.compiledClip(for: $0, skeleton: skeleton) }
+        return MotionDatabase(
+            clips: clips,
+            compiledClips: compiled,
+            skeleton: skeleton,
+            leftFootPath: "root/foot_l",
+            rightFootPath: "root/foot_r",
+            sampleRate: 30,
+            weights: MotionMatchingWeights(),
+            oneShotClipNames: oneShot,
+            oneShotTail: tail
+        )
+    }
+
     private func buildDatabase() -> MotionDatabase? {
         let skeleton = scene.get(component: SkeletonComponent.self, for: entityId)!.skeleton!
         let clips = [animationComponent.animationClips["walk"]!, animationComponent.animationClips["idle"]!]
@@ -392,5 +426,137 @@ extension AnimationMotionMatchingTests {
             simd_length(getLocalPosition(entityId: entityId)), 0, accuracy: 1e-4,
             "The component's child entity must not drift inside the asset"
         )
+    }
+
+    // MARK: - Hands and runway
+
+    func testHandFeaturesExtendTheLayout() throws {
+        let skeleton = try XCTUnwrap(scene.get(component: SkeletonComponent.self, for: entityId)?.skeleton)
+        let walk = try XCTUnwrap(animationComponent.animationClips["walk"])
+        let clips = [walk]
+        let compiled = clips.map { animationComponent.compiledClip(for: $0, skeleton: skeleton) }
+        // The feet stand in for hands on this skeleton: the six extra
+        // dimensions must mirror the foot positions.
+        let database = try XCTUnwrap(MotionDatabase(
+            clips: clips, compiledClips: compiled, skeleton: skeleton,
+            leftFootPath: "root/foot_l", rightFootPath: "root/foot_r",
+            leftHandPath: "root/foot_l", rightHandPath: "root/foot_r",
+            sampleRate: 30, weights: MotionMatchingWeights()
+        ))
+        XCTAssertTrue(database.hasHands)
+        XCTAssertEqual(database.dimensions, 33)
+        let raw = database.rawFeatures(at: 10)
+        for d in 0 ..< 6 {
+            XCTAssertEqual(raw[15 + d], raw[d], accuracy: 1e-5)
+        }
+        // Without hand paths the layout is unchanged.
+        let plain = try XCTUnwrap(buildDatabase())
+        XCTAssertFalse(plain.hasHands)
+        XCTAssertEqual(plain.dimensions, 27)
+    }
+
+    func testRunwayPenaltyMovesAStandingMatchOffAOneShotTail() throws {
+        let stop = makeStopClip()
+        let skeleton = try XCTUnwrap(scene.get(component: SkeletonComponent.self, for: entityId)?.skeleton)
+        let compiled = [animationComponent.compiledClip(for: stop, skeleton: skeleton)]
+        func database(penalty: Float) throws -> MotionDatabase {
+            try XCTUnwrap(MotionDatabase(
+                clips: [stop], compiledClips: compiled, skeleton: skeleton,
+                leftFootPath: "root/foot_l", rightFootPath: "root/foot_r",
+                sampleRate: 30, weights: MotionMatchingWeights(),
+                oneShotClipNames: ["stop"], oneShotTail: 0, oneShotRunwayPenalty: penalty
+            ))
+        }
+        // Standing near the end: without a penalty the incumbent holds
+        // (every standing frame costs the same); with one, an equal frame
+        // a second earlier wins.
+        let free = try database(penalty: 0)
+        let taxed = try database(penalty: 1)
+        let tail = try XCTUnwrap(free.frameIndex(ofClip: stop, time: 1.9))
+        let query = free.rawFeatures(at: tail)
+        let held = try XCTUnwrap(free.search(query: query, preferredIndex: tail, minimumGain: 0.05))
+        XCTAssertEqual(held, tail)
+        let moved = try XCTUnwrap(taxed.search(query: query, preferredIndex: tail, minimumGain: 0.05))
+        XCTAssertNotEqual(moved, tail)
+        XCTAssertLessThanOrEqual(taxed.frames[moved].time, 1.0 + 1e-4)
+        XCTAssertEqual(taxed.runwayPenalties[tail], 0.81, accuracy: 0.02)
+        XCTAssertEqual(taxed.runwayPenalties[moved], 0, accuracy: 1e-6)
+    }
+
+    // MARK: - One-shot clips
+
+    func testOneShotTrajectoryExtrapolatesInsteadOfWrapping() throws {
+        let stop = makeStopClip()
+        let looping = try XCTUnwrap(buildDatabase(clips: [stop], oneShot: [], tail: 0))
+        let oneShot = try XCTUnwrap(buildDatabase(clips: [stop], oneShot: ["stop"], tail: 0))
+
+        // Standing at 1.5 s, one second ahead: the looping database wraps
+        // into the clip's travel, the one-shot database keeps standing.
+        let zAtOneSecond = MotionFeatureLayout.poseDimensions + 2 * 4 + 1
+        let loopingFrame = try XCTUnwrap(looping.frameIndex(ofClip: stop, time: 1.5))
+        let oneShotFrame = try XCTUnwrap(oneShot.frameIndex(ofClip: stop, time: 1.5))
+        XCTAssertGreaterThan(looping.rawFeatures(at: loopingFrame)[zAtOneSecond], 0.4)
+        XCTAssertEqual(oneShot.rawFeatures(at: oneShotFrame)[zAtOneSecond], 0, accuracy: 1e-3)
+
+        // A one-shot clip drops its last sample so no velocity wraps either.
+        XCTAssertEqual(looping.frames.count, 60)
+        XCTAssertEqual(oneShot.frames.count, 59)
+        XCTAssertTrue(oneShot.isOneShot(clip: stop))
+        XCTAssertFalse(looping.isOneShot(clip: stop))
+    }
+
+    func testOneShotTailIsNotSearchable() throws {
+        let stop = makeStopClip()
+        let database = try XCTUnwrap(buildDatabase(clips: [stop], oneShot: ["stop"], tail: 0.5))
+
+        // Frames past 1.5 s are never returned, even for their own features.
+        let tailFrame = try XCTUnwrap(database.frameIndex(ofClip: stop, time: 1.8))
+        XCTAssertFalse(database.searchable[tailFrame])
+        let best = try XCTUnwrap(database.search(query: database.rawFeatures(at: tailFrame)))
+        XCTAssertTrue(database.searchable[best])
+        XCTAssertLessThanOrEqual(database.frames[best].time, 1.5 + 1e-4)
+        XCTAssertEqual(database.searchable.filter { $0 == false }.count, 14)
+    }
+
+    func testOneShotPlaybackLeavesThroughAJumpBeforeTheEnd() throws {
+        animationComponent.animationClips["stop"] = makeStopClip()
+        setMotionMatching(entityId: entityId, descriptor: MotionMatchingDescriptor(
+            leftFootPath: "root/foot_l",
+            rightFootPath: "root/foot_r",
+            clipNames: ["stop", "idle"],
+            oneShotClipNames: ["stop"],
+            weights: MotionMatchingWeights(footVelocity: 0.5)
+        ))
+        setMotionMatchingEnabled(entityId: entityId, enabled: true)
+        setMotionMatchingGoal(entityId: entityId, desiredVelocity: .zero)
+        prepareMotionMatching(entityId: entityId)
+        AnimationSystem.shared.update(deltaTime) // hard start on the first database frame
+
+        // Standing in the stop clip's second half with a standing goal:
+        // nothing beats the incumbent, so only the end guard can move it.
+        let stop = try XCTUnwrap(animationComponent.animationClips["stop"])
+        animationComponent.currentAnimation = stop
+        animationComponent.currentTime = 1.2
+
+        var time: Float = 0
+        var maxTime: Float = 0
+        var sawJump = false
+        var wrapped = false
+        while time < 1.5, sawJump == false {
+            let before = animationComponent.currentTime
+            AnimationSystem.shared.update(deltaTime)
+            time += deltaTime
+            if animationComponent.motionMatching.timeSinceJump == 0 {
+                sawJump = true
+            } else if animationComponent.currentAnimation === stop {
+                maxTime = max(maxTime, animationComponent.currentTime)
+                if animationComponent.currentTime < before {
+                    wrapped = true
+                }
+            }
+        }
+        XCTAssertFalse(wrapped, "a one-shot clip must never wrap")
+        XCTAssertLessThan(maxTime, 2.0)
+        XCTAssertTrue(sawJump, "playback should leave a one-shot clip through a search before its end")
     }
 }

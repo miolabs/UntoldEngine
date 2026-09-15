@@ -30,6 +30,13 @@ public struct MotionMatchingDescriptor {
     public var leftFootPath: String
     public var rightFootPath: String
 
+    /// Hand joints, optional: when both are given their positions join the
+    /// pose features (weighted by `weights.handPosition`), so a jump
+    /// prefers a clip whose arms are near where they already are instead
+    /// of flapping the upper body between clips the feet call equal.
+    public var leftHandPath: String?
+    public var rightHandPath: String?
+
     /// Database resample rate in frames per second.
     public var sampleRate: Float
 
@@ -63,6 +70,14 @@ public struct MotionMatchingDescriptor {
     /// default) disables it; a few radians per second is typical.
     public var headingCorrectionRate: Float
 
+    /// Travel speed at which the orientation warp reaches its full rate;
+    /// below it the rate scales down linearly, to nothing when standing.
+    /// The default 0.5 m/s lets a shamble bend its path at nearly the full
+    /// rate, which on a character taking slow steps reads as a rigid turn
+    /// with no footwork. Raise it so slow motion turns through pivot and
+    /// arc clips and only a moving character's path is bent.
+    public var headingCorrectionSpeed: Float
+
     /// Absolute floor on the cost improvement a candidate frame needs over
     /// the incumbent before a jump fires (scaled feature-space units). The
     /// relative switch margin is meaningless when both costs are tiny — a
@@ -78,11 +93,35 @@ public struct MotionMatchingDescriptor {
     /// pose that never advances through the cycle.
     public var minPlayTime: Float
 
+    /// Clips that must never wrap: starts, stops, pivots, or a long
+    /// capture. The database assumes every other clip loops — a frame near
+    /// the end predicts its trajectory into the clip's own beginning and
+    /// playback runs straight through the wrap, which for a stop clip is a
+    /// hard cut from standing back into the run. A one-shot clip instead
+    /// extrapolates its trajectory past the end at its terminal velocity and
+    /// yaw rate, forces a search — with no incumbent bias — as playback
+    /// comes within a search interval of the end, and keeps the frames that
+    /// could not play for `minPlayTime` before that out of the candidate
+    /// set, so it always leaves through an inertialized jump and never
+    /// bounces straight back out. Should the search find nothing, playback
+    /// holds the last frame rather than wrapping.
+    public var oneShotClipNames: Set<String>
+
+    /// Cost added to a one-shot clip's frame as its playable time runs out
+    /// (nothing with a second or more left, all of it at the end), so an
+    /// equally good frame with runway wins: without it a standing goal
+    /// settles on the still tail of a stop clip, is forced out at its end,
+    /// and lands straight back on it — a half-second loop of jumps where a
+    /// looping idle was available.
+    public var oneShotRunwayPenalty: Float
+
     public var weights: MotionMatchingWeights
 
     public init(
         leftFootPath: String,
         rightFootPath: String,
+        leftHandPath: String? = nil,
+        rightHandPath: String? = nil,
         clipNames: [String] = [],
         sampleRate: Float = 30,
         searchInterval: Float = 0.1,
@@ -90,12 +129,17 @@ public struct MotionMatchingDescriptor {
         predictionHalflife: Float = 0.25,
         maxTurnRate: Float = 2.0,
         headingCorrectionRate: Float = 0,
+        headingCorrectionSpeed: Float = 0.5,
         switchMinimumGain: Float = 0.05,
         minPlayTime: Float = 0.3,
+        oneShotClipNames: Set<String> = [],
+        oneShotRunwayPenalty: Float = 1,
         weights: MotionMatchingWeights = MotionMatchingWeights()
     ) {
         self.leftFootPath = leftFootPath
         self.rightFootPath = rightFootPath
+        self.leftHandPath = leftHandPath
+        self.rightHandPath = rightHandPath
         self.clipNames = clipNames
         self.sampleRate = sampleRate
         self.searchInterval = searchInterval
@@ -103,8 +147,11 @@ public struct MotionMatchingDescriptor {
         self.predictionHalflife = predictionHalflife
         self.maxTurnRate = maxTurnRate
         self.headingCorrectionRate = headingCorrectionRate
+        self.headingCorrectionSpeed = headingCorrectionSpeed
         self.switchMinimumGain = switchMinimumGain
         self.minPlayTime = minPlayTime
+        self.oneShotClipNames = oneShotClipNames
+        self.oneShotRunwayPenalty = oneShotRunwayPenalty
         self.weights = weights
     }
 }
@@ -162,6 +209,12 @@ struct MotionMatchingState {
     var fkPositions: [simd_float3] = []
     var fkRotations: [simd_quatf] = []
     var query: [Float] = []
+
+    /// Scratch for the playing clip's raw pose (hand features).
+    var rawSampler = ClipSampler()
+    var rawPose = PoseBuffer()
+    var rawPositions: [simd_float3] = []
+    var rawRotations: [simd_quatf] = []
 
     mutating func reset() {
         database = nil
@@ -238,7 +291,7 @@ func updateMotionMatching(
         let travel = animationComponent.rootMotion.isEnabled
             ? simd_length(animationComponent.rootMotion.lastWorldVelocity)
             : simd_length(animationComponent.motionMatching.simulatedVelocity)
-        let movementScale = min(1, travel / 0.5)
+        let movementScale = min(1, travel / max(descriptor.headingCorrectionSpeed, 1e-3))
         let maxStep = descriptor.headingCorrectionRate * deltaTime * movementScale
         let step = max(-maxStep, min(maxStep, goalYawDelta))
         if abs(step) > 1e-6 {
@@ -253,6 +306,25 @@ func updateMotionMatching(
     animationComponent.motionMatching.searchClock += deltaTime
     animationComponent.motionMatching.historyElapsed += deltaTime
     animationComponent.motionMatching.timeSinceJump += deltaTime
+
+    // A one-shot clip leaves through a search, never through the wrap:
+    // within the last search interval (plus two samples of slack) every
+    // update searches with no incumbent bias, and playback is held short of
+    // the end in case nothing is found, so the pose freezes on the last
+    // frame instead of cutting to the first.
+    var forced = false
+    if let current = animationComponent.currentAnimation, database.isOneShot(clip: current) {
+        let duration = max(current.duration, 1e-4)
+        let step = deltaTime * animationComponent.playbackSpeed
+        if duration - animationComponent.currentTime <= descriptor.searchInterval + 2 * database.sampleInterval {
+            forced = true
+            animationComponent.motionMatching.searchClock = descriptor.searchInterval
+        }
+        if animationComponent.currentTime + step >= duration - 1e-3 {
+            animationComponent.currentTime = max(0, duration - 1e-3 - step)
+        }
+    }
+
     guard animationComponent.motionMatching.searchClock >= descriptor.searchInterval else { return }
     animationComponent.motionMatching.searchClock = 0
 
@@ -273,9 +345,9 @@ func updateMotionMatching(
     }
 
     // Seed the search with where playback currently is, so equal-cost
-    // frames never cause a jump.
+    // frames never cause a jump (not when forced out of a one-shot clip).
     var preferredIndex: Int?
-    if let current = animationComponent.currentAnimation {
+    if !forced, let current = animationComponent.currentAnimation {
         let wrapped = fmod(animationComponent.currentTime, max(current.duration, 1e-4))
         preferredIndex = database.frameIndex(ofClip: current, time: wrapped)
     }
@@ -295,7 +367,7 @@ func updateMotionMatching(
 
     // Continuity: when the winner is (near) where playback would naturally
     // be anyway, keep playing instead of re-transitioning every search.
-    if let current = animationComponent.currentAnimation, current === clip {
+    if !forced, let current = animationComponent.currentAnimation, current === clip {
         let duration = max(clip.duration, 1e-4)
         let wrapped = fmod(animationComponent.currentTime, duration)
         var difference = abs(wrapped - frame.time)
@@ -305,7 +377,7 @@ func updateMotionMatching(
         }
     }
 
-    guard animationComponent.motionMatching.timeSinceJump >= descriptor.minPlayTime else { return }
+    guard forced || animationComponent.motionMatching.timeSinceJump >= descriptor.minPlayTime else { return }
 
     motionMatchingJump(
         entityId: entityId,
@@ -387,6 +459,39 @@ private func buildMotionMatchingQuery(
         query.append(value.y)
         query.append(value.z)
     }
+    if let leftHand = database.leftHandIndex, let rightHand = database.rightHandIndex {
+        // The hands come from the playing clip's own pose, not the displayed
+        // one: right after a jump the displayed arms still carry the decaying
+        // transition offset, and matching against that had the search chase
+        // its own blend from frame to frame. The clip's hands say where the
+        // arms are headed; a candidate is judged against that.
+        var handPositions = positions
+        var handRootHorizontal = rootHorizontal
+        var handInverseYaw = inverseRootYaw
+        if let current = animationComponent.currentAnimation {
+            let compiled = animationComponent.compiledClip(for: current, skeleton: skeleton)
+            animationComponent.motionMatching.refreshRawPose(
+                compiled: compiled, clip: current,
+                time: fmod(animationComponent.currentTime, max(current.duration, 1e-4)),
+                parentIndices: skeleton.parentIndices
+            )
+            handPositions = animationComponent.motionMatching.rawPositions
+            let rawRoot = handPositions[root]
+            handRootHorizontal = simd_float3(rawRoot.x, 0, rawRoot.z)
+            handInverseYaw = simd_quatf(
+                angle: -yawTwist(animationComponent.motionMatching.rawRotations[root]).yaw,
+                axis: simd_float3(0, 1, 0)
+            )
+        }
+        for value in [
+            handInverseYaw.act(handPositions[leftHand] - handRootHorizontal),
+            handInverseYaw.act(handPositions[rightHand] - handRootHorizontal),
+        ] {
+            query.append(value.x)
+            query.append(value.y)
+            query.append(value.z)
+        }
+    }
 
     // Predicted trajectory: a turn-rate-limited arc toward the goal.
     // Heading rotates at most `maxTurnRate` toward the goal direction, and
@@ -452,8 +557,15 @@ func buildMotionDatabase(
         skeleton: skeleton,
         leftFootPath: descriptor.leftFootPath,
         rightFootPath: descriptor.rightFootPath,
+        leftHandPath: descriptor.leftHandPath,
+        rightHandPath: descriptor.rightHandPath,
         sampleRate: descriptor.sampleRate,
-        weights: descriptor.weights
+        weights: descriptor.weights,
+        oneShotClipNames: descriptor.oneShotClipNames,
+        // A target must be playable for minPlayTime before the end guard
+        // (a search interval plus two samples from the end) forces it out.
+        oneShotTail: descriptor.minPlayTime + descriptor.searchInterval + 2 / max(descriptor.sampleRate, 1),
+        oneShotRunwayPenalty: descriptor.oneShotRunwayPenalty
     )
 }
 
@@ -493,6 +605,17 @@ extension MotionMatchingState {
             parentIndices: parentIndices,
             positions: &fkPositions,
             rotations: &fkRotations
+        )
+    }
+
+    /// Samples the playing clip's raw pose at `time` and runs FK on it.
+    mutating func refreshRawPose(compiled: CompiledAnimationClip, clip: AnimationClip, time: Float, parentIndices: [Int?]) {
+        rawSampler.sample(compiled, time: time, duration: clip.duration, speed: clip.speed, into: &rawPose)
+        computeForwardKinematics(
+            pose: rawPose,
+            parentIndices: parentIndices,
+            positions: &rawPositions,
+            rotations: &rawRotations
         )
     }
 }
