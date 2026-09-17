@@ -417,14 +417,19 @@ engine-repo maintenance tool, not something a game project needs to run.
 
 ## Generated Project Structure
 
+A single-platform project, shown for the default `--platform macos`:
+
 ```
 MyGame/
+├── MyGame.xcodeproj
+├── project.yml
 ├── Package.swift
 ├── README.md
 └── Sources/
     └── MyGame/
         ├── AppDelegate.swift
         ├── GameScene.swift
+        ├── GameSceneUtils.swift
         ├── GameViewController.swift
         ├── Base.lproj/
         │   └── Main.storyboard
@@ -433,9 +438,35 @@ MyGame/
             ├── Scenes/
             ├── Scripts/
             ├── Models/
+            ├── StreamModels/
+            ├── Animations/
+            ├── Gaussians/
             ├── Textures/
-            └── Shaders/
+            ├── Shaders/
+            └── LUT/
 ```
+
+`Package.swift` is only generated for `macos`. Apart from that, `ios` and `ios-ar` projects have the same files, and a `visionos` project has a SwiftUI entry point, `MyGameApp.swift`, in place of `AppDelegate.swift`, `GameViewController.swift` and the storyboard.
+
+A `multi` project is laid out differently. Each of its four targets has its own folder with the platform-specific files, and the shared code and assets stay in `Sources/MyGame/`:
+
+```
+MyGame/
+├── MyGame.xcodeproj
+├── project.yml
+├── README.md
+├── MyGame macOS/          # AppDelegate.swift, GameViewController.swift, Base.lproj/Main.storyboard, Info.plist
+├── MyGame iOS/            # The same four files, UIKit versions
+├── MyGame iOS AR/         # The same four files, with the ARKit view controller and camera permission
+├── MyGame visionOS/       # MyGameApp.swift (SwiftUI), Info.plist
+└── Sources/
+    └── MyGame/            # Shared by all four targets
+        ├── GameScene.swift
+        ├── GameSceneUtils.swift
+        └── GameData/
+```
+
+Xcode shows one scheme per target, named like the folders: `MyGame macOS`, `MyGame iOS`, `MyGame iOS AR` and `MyGame visionOS`. See [Multi-Platform CLI Usage](https://github.com/untoldengine/UntoldEngine/blob/develop/Tools/UntoldEngineCLI/MULTI_PLATFORM_USAGE.md) for details.
 
 The starter `GameScene.swift` shows how to load `.untold` runtime assets, use `setEntityStreamScene(...)` for streamed scenes, and enable static batching.
 
@@ -445,14 +476,14 @@ The starter `GameScene.swift` shows how to load `.untold` runtime assets, use `s
 
 ## Engine Dependencies by Platform
 
-The generated `Package.swift` pulls in only the engine modules needed for your platform:
+The generated Xcode project links only the engine modules needed for your platform:
 
 | Platform | Engine modules |
 |---|---|
 | `macos` / `ios` | `UntoldEngine` |
 | `ios-ar` | `UntoldEngineAR` |
 | `visionos` | `UntoldEngineXR` + `UntoldEngineAR` |
-| `multi` | `UntoldEngine` + `UntoldEngineXR` + `UntoldEngineAR` |
+| `multi` | Per target: `UntoldEngine` (macOS, iOS), `UntoldEngineAR` (iOS AR), `UntoldEngineXR` + `UntoldEngineAR` (visionOS) |
 
 ---
 

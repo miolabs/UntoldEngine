@@ -11,7 +11,7 @@ mkdir MyGame && cd MyGame
 untoldengine create MyGame --platform multi --team-id YOUR_TEAM_ID
 ```
 
-This creates a single Xcode project that can be built for macOS, iOS, and visionOS.
+This creates a single Xcode project with four app targets: macOS, iOS, iOS with ARKit, and visionOS.
 
 ## Command Options
 
@@ -120,14 +120,20 @@ open MyGame/MyGame.xcodeproj
 
 ### Select Platform
 
-In Xcode, use the scheme selector at the top to choose your target platform:
-- **My Mac** - Build and run on macOS
-- **iPhone/iPad** - Build and run on iOS device/simulator
-- **Apple Vision Pro** - Build and run on visionOS device/simulator
+The project has one target per platform, and Xcode shows one scheme for each. Use the scheme selector at the top to choose a scheme, then a run destination for it:
+
+| Scheme | Run destination |
+|---|---|
+| **MyGame macOS** | My Mac |
+| **MyGame iOS** | iPhone/iPad device or simulator |
+| **MyGame iOS AR** | iPhone/iPad device (ARKit does not run in the simulator) |
+| **MyGame visionOS** | Apple Vision Pro device or simulator |
+
+The schemes are named after your project: `<project-name> macOS`, `<project-name> iOS`, `<project-name> iOS AR` and `<project-name> visionOS`.
 
 ### Build and Run
 
-Press `Cmd+R` or click the Play button to build and run for the selected platform.
+Press `Cmd+R` or click the Play button to build and run the selected scheme.
 
 ## Comparison: Single vs Multi-Platform
 
@@ -155,30 +161,55 @@ untoldengine create MyGame --platform multi --team-id YOUR_TEAM_ID
 
 ```
 MyGame/
-├── MyGame.xcodeproj          # Multi-platform Xcode project
-├── project.yml               # XcodeGen configuration
+├── MyGame.xcodeproj              # Xcode project with one target per platform
+├── project.yml                   # XcodeGen configuration
 ├── README.md
+├── MyGame macOS/                 # macOS target only
+│   ├── AppDelegate.swift         # NSApplicationDelegate
+│   ├── GameViewController.swift  # NSViewController: Metal view and renderer setup
+│   ├── Base.lproj/
+│   │   └── Main.storyboard
+│   └── Info.plist
+├── MyGame iOS/                   # iOS target only
+│   ├── AppDelegate.swift         # UIApplicationDelegate
+│   ├── GameViewController.swift  # UIViewController: Metal view and renderer setup
+│   ├── Base.lproj/
+│   │   └── Main.storyboard
+│   └── Info.plist
+├── MyGame iOS AR/                # iOS AR target only
+│   ├── AppDelegate.swift         # UIApplicationDelegate
+│   ├── GameViewController.swift  # UIViewController: ARKit session and AR renderer
+│   ├── Base.lproj/
+│   │   └── Main.storyboard
+│   └── Info.plist                # Adds the camera usage description and the ARKit requirement
+├── MyGame visionOS/              # visionOS target only
+│   ├── MyGameApp.swift           # SwiftUI App with the immersive space
+│   └── Info.plist
 └── Sources/
-    └── MyGame/
-        ├── AppDelegate.swift         # Platform-specific (with #if os(...))
-        ├── GameScene.swift           # Shared across all platforms
-        ├── GameViewController.swift  # Platform-specific (with #if os(...))
-        ├── Base.lproj/
-        │   └── Main.storyboard      # For macOS/iOS
-        ├── Info.plist               # Multi-platform compatible
-        └── GameData/                # Shared game assets
+    └── MyGame/                   # Shared by all four targets
+        ├── GameScene.swift       # Game setup, update loop and input
+        ├── GameSceneUtils.swift  # Points the engine at the bundled GameData
+        └── GameData/             # Shared game assets
             ├── Scenes/
             ├── Scripts/
             ├── Models/
+            ├── StreamModels/
             ├── Animations/
             ├── Gaussians/
             ├── Textures/
-            └── Shaders/
+            ├── Shaders/
+            └── LUT/
 ```
+
+**Platform-specific files** live in the four `MyGame <platform>/` folders. Each folder belongs to exactly one target and holds what differs between platforms: the app entry point, the view controller, the storyboard and `Info.plist`. The macOS, iOS and iOS AR targets each have their own `AppDelegate.swift` and `GameViewController.swift`; the visionOS target uses a SwiftUI `App` (`MyGameApp.swift`) instead and has no storyboard.
+
+**Shared files** live in `Sources/MyGame/`. All four targets compile `GameScene.swift` and `GameSceneUtils.swift`, and each app bundles the same `GameData/` folder.
 
 ## Platform-Specific Code
 
-The generated templates use conditional compilation. You can add platform-specific logic:
+Code that only one platform needs belongs in that target's folder. Those files are compiled for a single platform, so they need no conditional compilation. When you add a file in Xcode, set its target membership to match: one target for platform code, all four for shared code.
+
+Files in `Sources/MyGame/` are compiled into every target. When shared code has to differ per platform, use conditional compilation there (`os(iOS)` is true for both the iOS and the iOS AR target):
 
 ```swift
 class GameScene {
@@ -220,10 +251,10 @@ Your Team ID is required for iOS and visionOS code signing. Find it:
 ## Tips
 
 ✅ **Always specify `--team-id`** for multi-platform projects (required for iOS/visionOS)  
-✅ **One GameData folder** - assets are shared across all platforms  
-✅ **One GameScene** - game logic is identical across platforms  
+✅ **One GameData folder** - `Sources/MyGame/GameData` is bundled into every target  
+✅ **One GameScene** - `Sources/MyGame/GameScene.swift` is compiled into every target; only the files in the per-target folders differ  
 ✅ **Version control friendly** - one project instead of three  
-✅ **Switch platforms** easily in Xcode without changing projects  
+✅ **Switch platforms** by picking another scheme in Xcode, without changing projects  
 
 ## Examples
 
@@ -280,10 +311,10 @@ brew install xcodegen
 
 **Platform switch not working in Xcode:**
 - Make sure you've opened the `.xcodeproj` file
-- Check that all platforms appear in the scheme selector
+- Check that all four schemes (`MyGame macOS`, `MyGame iOS`, `MyGame iOS AR`, `MyGame visionOS`) appear in the scheme selector
 - Try cleaning the build folder (`Cmd+Shift+K`)
 
 ## See Also
 
-- [Multi-Platform Build System Documentation](../../Documentation/MultiPlatformBuildExample.md)
+- [Using the UntoldEngine CLI](../../docs/API/UsingUntoldEngineCLI.md)
 - [UntoldEngine Documentation](https://github.com/untoldengine/UntoldEngine)
