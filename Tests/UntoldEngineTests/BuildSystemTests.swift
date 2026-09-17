@@ -1062,6 +1062,242 @@ final class BuildSystemTests: XCTestCase {
                        "visionOS single-platform should not add shader support unless it depends on the base UntoldEngine product")
     }
 
+    // MARK: - README Template Tests
+
+    // These tests run the template step of the build (copyTemplateProject) rather than
+    // build(settings:), which also needs the xcodegen tool to be installed.
+
+    // BuildSettings is not Sendable, so the build system, which does not run on the main actor,
+    // only takes settings that nothing on the main actor can reach. The helpers that make them
+    // are nonisolated and static for that reason.
+
+    /// Every kind of project the build system can generate
+    private nonisolated static func readmeProjectKinds(
+        macOS: MacOSVersion = .v14,
+        iOS: IOSVersion = .v17,
+        visionOS: VisionOSVersion = .v2
+    ) -> [(label: String, target: BuildTarget, isIOSAR: Bool)] {
+        [
+            ("macOS", .macOS(deployment: macOS), false),
+            ("iOS", .iOS(deployment: iOS), false),
+            ("iOS AR", .iOS(deployment: iOS), true),
+            ("visionOS", .visionOS(deployment: visionOS), false),
+            ("Multi-Platform", .multi(macOS: macOS, iOS: iOS, visionOS: visionOS), false),
+        ]
+    }
+
+    /// Build settings for a project of one of the kinds above, with an output folder of its own
+    private nonisolated static func readmeTestSettings(
+        projectName: String,
+        label: String,
+        target: BuildTarget,
+        isIOSAR: Bool,
+        outputRoot: URL
+    ) -> BuildSettings {
+        BuildSettings(
+            projectName: projectName,
+            bundleIdentifier: "com.test.game",
+            outputPath: outputRoot.appendingPathComponent(label),
+            target: target,
+            isIOSAR: isIOSAR
+        )
+    }
+
+    /// Runs the template step of the build for a project of one of the kinds above. Returns the
+    /// folder of the project and the README.md generated in it.
+    private nonisolated static func generateReadme(
+        with buildSystem: BuildSystem,
+        in outputRoot: URL,
+        projectName: String,
+        label: String,
+        target: BuildTarget,
+        isIOSAR: Bool
+    ) async throws -> (projectDir: URL, readme: String) {
+        let settings = readmeTestSettings(projectName: projectName, label: label, target: target, isIOSAR: isIOSAR, outputRoot: outputRoot)
+        let projectDir = settings.outputPath.appendingPathComponent(projectName)
+
+        try await buildSystem.copyTemplateProject(to: projectDir, settings: settings)
+
+        let readme = try String(contentsOf: projectDir.appendingPathComponent("README.md"), encoding: .utf8)
+        return (projectDir, readme)
+    }
+
+    /// The paths, relative to the project folder, that the "Project Structure" tree of a README lists
+    private func pathsListedInProjectStructure(of readme: String) throws -> Set<String> {
+        // The tree is the first fenced block under the "Project Structure" heading
+        let sections = readme.components(separatedBy: "Project Structure\n")
+        XCTAssertEqual(sections.count, 2, "README should have one Project Structure section")
+        let tree = try XCTUnwrap(sections.last?.components(separatedBy: "```").dropFirst().first,
+                                 "The Project Structure section should show the tree in a fenced block")
+
+        var paths: Set<String> = []
+        var ancestors: [String] = []
+        for line in tree.components(separatedBy: "\n") {
+            // "│   ├── Info.plist    # Comment": the entry marker sits 4 columns further right per
+            // level of depth. The line of the project folder itself has no marker.
+            guard let marker = line.range(of: "├── ") ?? line.range(of: "└── ") else {
+                continue
+            }
+            let depth = line.distance(from: line.startIndex, to: marker.lowerBound) / 4
+
+            var name = String(line[marker.upperBound...])
+            if let comment = name.range(of: "  #") {
+                name = String(name[..<comment.lowerBound])
+            }
+            name = name.trimmingCharacters(in: .whitespaces)
+            if name.hasSuffix("/") {
+                name.removeLast()
+            }
+
+            ancestors = Array(ancestors.prefix(depth)) + [name]
+            paths.insert(ancestors.joined(separator: "/"))
+        }
+
+        return paths
+    }
+
+    func testGeneratedReadmeDescribesItsOwnKindOfProject() async throws {
+        // Given: Build settings for every kind of project the build system can generate
+        let expectedAbout = [
+            "macOS": "This is a macOS game project",
+            "iOS": "This is an iOS game project",
+            "iOS AR": "This is an iOS augmented reality (ARKit) game project",
+            "visionOS": "This is a visionOS game project",
+            "Multi-Platform": "This is a multi-platform game project",
+        ]
+
+        for (label, target, isIOSAR) in Self.readmeProjectKinds() {
+            // When: Running the template step of the build
+            let (_, readme) = try await Self.generateReadme(
+                with: buildSystem, in: tempDirectory, projectName: "My Game", label: label, target: target, isIOSAR: isIOSAR
+            )
+
+            // Then: The README should present the project as what it is, and as nothing else
+            for (kind, about) in expectedAbout {
+                XCTAssertEqual(readme.contains(about), kind == label,
+                               "\(label): README should\(kind == label ? "" : " not") say \"\(about)\"")
+            }
+
+            // It should be titled after the project and send the user to the Xcode project,
+            // which is how every kind of project is built and run
+            XCTAssertTrue(readme.hasPrefix("# My Game\n"), "\(label): README should be titled after the project")
+            XCTAssertTrue(readme.contains("open \"My Game.xcodeproj\""),
+                          "\(label): README should tell how to open the Xcode project")
+
+            // It should not carry instructions or files of the SwiftPM-only layout of older versions
+            for stale in ["swift build", "swift run", "open Package.swift", "main.swift", "GameRuntime.swift", ".json"] {
+                XCTAssertFalse(readme.contains(stale), "\(label): README should not mention \"\(stale)\"")
+            }
+
+            // No placeholder should be left unexpanded
+            XCTAssertFalse(readme.contains("{{"), "\(label): README should not contain unexpanded {{...}} placeholders")
+        }
+    }
+
+    func testGeneratedReadmeProjectStructureMatchesGeneratedProject() async throws {
+        // Given: Build settings for every kind of project the build system can generate.
+        // The project name has a space, as the names typed in the editor can have.
+        let projectName = "My Game"
+
+        for (label, target, isIOSAR) in Self.readmeProjectKinds() {
+            // When: Running the template step of the build
+            let (projectDir, readme) = try await Self.generateReadme(
+                with: buildSystem, in: tempDirectory, projectName: projectName, label: label, target: target, isIOSAR: isIOSAR
+            )
+
+            // Then: The Project Structure tree of the README should list the files and folders
+            // of the project, no more and no less. project.yml and the Xcode project are written
+            // by the XcodeGen step of the build, which these tests do not run.
+            let generatedPaths = try Set(FileManager.default.subpathsOfDirectory(atPath: projectDir.path))
+                .union(["project.yml", "\(projectName).xcodeproj"])
+            let listedPaths = try pathsListedInProjectStructure(of: readme)
+
+            XCTAssertFalse(listedPaths.isEmpty, "\(label): README should list the project structure")
+            XCTAssertEqual(listedPaths.subtracting(generatedPaths).sorted(), [],
+                           "\(label): README should not list files or folders the project does not have")
+            XCTAssertEqual(generatedPaths.subtracting(listedPaths).sorted(), [],
+                           "\(label): README should list every file and folder of the project")
+        }
+    }
+
+    func testGeneratedReadmeNamesTheSchemesOfTheXcodeProject() async throws {
+        // Given: Build settings for every kind of project the build system can generate
+        for (label, target, isIOSAR) in Self.readmeProjectKinds() {
+            // When: Running the template step of the build and generating the XcodeGen spec
+            let (_, readme) = try await Self.generateReadme(
+                with: buildSystem, in: tempDirectory, projectName: "MyGame", label: label, target: target, isIOSAR: isIOSAR
+            )
+            let yamlContent = try XcodeGenProjectSpec.generateYAML(
+                settings: Self.readmeTestSettings(projectName: "MyGame", label: label, target: target, isIOSAR: isIOSAR, outputRoot: tempDirectory)
+            )
+
+            // Then: The README should name, as the scheme to select, every target of the spec.
+            // Targets are the keys nested one level under "targets:".
+            let targetLines = yamlContent.components(separatedBy: "targets:\n").last?
+                .components(separatedBy: "\n")
+                .filter { $0.hasPrefix("  ") && !$0.hasPrefix("   ") && $0.hasSuffix(":") } ?? []
+            let targetNames = targetLines.map { String($0.dropFirst(2).dropLast()) }
+
+            XCTAssertEqual(targetNames.count, label == "Multi-Platform" ? 4 : 1,
+                           "\(label): unexpected targets in the XcodeGen spec: \(targetNames)")
+            for targetName in targetNames {
+                XCTAssertTrue(readme.contains("**\(targetName)**"),
+                              "\(label): README should name the \"\(targetName)\" scheme")
+            }
+        }
+    }
+
+    func testGeneratedReadmeRequirementsNameTheDeploymentTargetsOfTheProject() async throws {
+        // Given: Projects whose deployment targets are not the lowest ones the build system supports
+        let kinds = Self.readmeProjectKinds(macOS: .v15, iOS: .v18, visionOS: .v26)
+        let expectedRequirements = [
+            "macOS": ["- macOS 15 or later"],
+            "iOS": ["- iOS 18 or later"],
+            "iOS AR": ["- iOS 18 or later"],
+            "visionOS": ["- visionOS 26 or later"],
+            "Multi-Platform": ["- macOS 15 or later", "- iOS 18 or later", "- visionOS 26 or later"],
+        ]
+
+        for (label, target, isIOSAR) in kinds {
+            // When: Running the template step of the build
+            let (_, readme) = try await Self.generateReadme(
+                with: buildSystem, in: tempDirectory, projectName: "MyGame", label: label, target: target, isIOSAR: isIOSAR
+            )
+
+            // Then: The README should require the deployment target of each platform of the
+            // project, and of no other platform
+            let platformRequirements = readme.components(separatedBy: "\n").filter { line in
+                ["- macOS ", "- iOS ", "- visionOS "].contains { line.hasPrefix($0) }
+            }
+            XCTAssertEqual(platformRequirements, expectedRequirements[label],
+                           "\(label): README should name the deployment targets of the project")
+        }
+    }
+
+    func testPlatformRequirementsStringListsEveryPlatformOfTheTarget() {
+        // Given/When/Then: Single-platform targets should get one requirement line
+        XCTAssertEqual(buildSystem.getPlatformRequirementsString(.macOS(deployment: .v13)), "- macOS 13 or later")
+        XCTAssertEqual(buildSystem.getPlatformRequirementsString(.iOS(deployment: .v16)), "- iOS 16 or later")
+        XCTAssertEqual(buildSystem.getPlatformRequirementsString(.visionOS(deployment: .v26)), "- visionOS 26 or later")
+
+        // Multi-platform targets should get one line per platform, each with its own version
+        XCTAssertEqual(buildSystem.getPlatformRequirementsString(.multi(macOS: .v15, iOS: .v18, visionOS: .v1)),
+                       "- macOS 15 or later\n- iOS 18 or later\n- visionOS 1 or later")
+    }
+
+    func testMacOSVersionStringUsesTheMacOSDeploymentTargetOfTheTarget() {
+        // Given/When/Then: A macOS target should give the major version of its deployment target
+        XCTAssertEqual(buildSystem.getMacOSVersionString(.macOS(deployment: .v15)), "15")
+
+        // So should a multi-platform target, rather than a default version
+        XCTAssertEqual(buildSystem.getMacOSVersionString(.multi(macOS: .v14, iOS: .v17, visionOS: .v2)), "14")
+        XCTAssertEqual(buildSystem.getMacOSVersionString(.multi(macOS: .v15, iOS: .v17, visionOS: .v2)), "15")
+
+        // Targets without macOS fall back to the lowest supported version
+        XCTAssertEqual(buildSystem.getMacOSVersionString(.iOS(deployment: .v17)), "13")
+        XCTAssertEqual(buildSystem.getMacOSVersionString(.visionOS(deployment: .v2)), "13")
+    }
+
     // MARK: - Multi-Platform Tests
 
     func testMultiPlatformTargetProperties() {

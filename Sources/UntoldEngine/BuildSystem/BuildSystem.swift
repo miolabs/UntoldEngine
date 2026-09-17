@@ -333,7 +333,10 @@ import Foundation
             return projectDir
         }
 
-        private func copyTemplateProject(to projectDir: URL, settings: BuildSettings) async throws {
+        /// Internal — exposed for testing via @testable import. The template step of `build`:
+        /// writes the embedded templates for `settings.target` into `projectDir` with their
+        /// `{{...}}` placeholders expanded. Unlike the full build, it does not need `xcodegen`.
+        func copyTemplateProject(to projectDir: URL, settings: BuildSettings) async throws {
             // Use embedded templates
             Logger.log(message: "📦 Creating project from embedded templates")
             try createProjectFromEmbeddedTemplates(at: projectDir, settings: settings)
@@ -513,6 +516,7 @@ import Foundation
                 "{{PROJECT_NAME}}": settings.projectName,
                 "{{BUNDLE_IDENTIFIER}}": settings.bundleIdentifier,
                 "{{MACOS_VERSION}}": getMacOSVersionString(settings.target),
+                "{{PLATFORM_REQUIREMENTS}}": getPlatformRequirementsString(settings.target),
             ]
 
             let fileManager = FileManager.default
@@ -547,14 +551,32 @@ import Foundation
             }
         }
 
-        private func getMacOSVersionString(_ target: BuildTarget) -> String {
-            switch target {
-            case let .macOS(version):
-                // Convert "13.0" to "13" for Package.swift
-                return version.rawValue.components(separatedBy: ".").first ?? "13"
-            default:
-                return "13"
+        /// Internal — exposed for testing via @testable import. The value of `{{MACOS_VERSION}}`:
+        /// the major version of the macOS deployment target of `target`.
+        func getMacOSVersionString(_ target: BuildTarget) -> String {
+            // iOS-only and visionOS-only targets have no macOS deployment target. None of their
+            // templates use {{MACOS_VERSION}}; the lowest supported version keeps it expandable.
+            let deploymentTarget = target.deploymentTarget(for: "macOS") ?? MacOSVersion.v13.rawValue
+
+            // Convert "13.0" to "13" for Package.swift
+            return deploymentTarget.components(separatedBy: ".").first ?? deploymentTarget
+        }
+
+        /// Internal — exposed for testing via @testable import. The value of
+        /// `{{PLATFORM_REQUIREMENTS}}`: one Markdown list item per platform of `target` with its
+        /// deployment target, such as "- macOS 14 or later".
+        func getPlatformRequirementsString(_ target: BuildTarget) -> String {
+            let requirements: [String] = target.platforms.compactMap { platform in
+                guard let deploymentTarget = target.deploymentTarget(for: platform) else {
+                    return nil
+                }
+
+                // "14.0" reads better as "14"
+                let version = deploymentTarget.hasSuffix(".0") ? String(deploymentTarget.dropLast(2)) : deploymentTarget
+                return "- \(platform) \(version) or later"
             }
+
+            return requirements.joined(separator: "\n")
         }
 
         // MARK: - Asset Bundling Helpers
