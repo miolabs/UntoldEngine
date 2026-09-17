@@ -164,6 +164,11 @@ import Foundation
                     teamIDLine = ""
                 }
 
+                // Every target compiles its own folder and the shared Sources folder. GameData is
+                // excluded from the latter because it is added as a folder: left in, each of its
+                // files would also be copied to the top of the app's resources, where files of the
+                // same name in different GameData folders collide ("Multiple commands produce").
+
                 // Build packages section for multi-platform (always include AR for iOS AR target)
                 yaml = """
                 name: \(settings.projectName)
@@ -181,6 +186,8 @@ import Foundation
                     sources:
                       - path: \(settings.projectName) macOS
                       - path: Sources/\(settings.projectName)
+                        excludes:
+                          - "GameData"
                       - path: Sources/\(settings.projectName)/GameData
                         type: folder
                         buildPhase: resources
@@ -210,6 +217,8 @@ import Foundation
                     sources:
                       - path: \(settings.projectName) iOS
                       - path: Sources/\(settings.projectName)
+                        excludes:
+                          - "GameData"
                       - path: Sources/\(settings.projectName)/GameData
                         type: folder
                         buildPhase: resources
@@ -244,6 +253,8 @@ import Foundation
                     sources:
                       - path: \(settings.projectName) iOS AR
                       - path: Sources/\(settings.projectName)
+                        excludes:
+                          - "GameData"
                       - path: Sources/\(settings.projectName)/GameData
                         type: folder
                         buildPhase: resources
@@ -274,6 +285,8 @@ import Foundation
                     sources:
                       - path: \(settings.projectName) visionOS
                       - path: Sources/\(settings.projectName)
+                        excludes:
+                          - "GameData"
                       - path: Sources/\(settings.projectName)/GameData
                         type: folder
                         buildPhase: resources

@@ -1450,6 +1450,35 @@ final class BuildSystemTests: XCTestCase {
                        "All 4 targets should reference shared Sources folder (2 refs per target)")
     }
 
+    func testMultiPlatformXcodeGenSpecExcludesGameDataFromSharedSources() throws {
+        // Given: Build settings for a multi-platform project
+        let settings = BuildSettings(
+            projectName: "MyGame",
+            bundleIdentifier: "com.test.game",
+            outputPath: tempDirectory,
+            target: .multi(macOS: .v14, iOS: .v17, visionOS: .v2)
+        )
+
+        // When: Generating XcodeGen YAML spec
+        let yamlContent = try XcodeGenProjectSpec.generateYAML(settings: settings)
+
+        // Then: Every target should take the shared Sources folder without GameData, which it
+        // adds as a folder. Left in, each GameData file is also copied to the top of the app's
+        // resources, and two files of the same name in different GameData folders stop the
+        // build ("Multiple commands produce"), as the textures of two models easily do.
+        let sharedSources = """
+              - path: Sources/MyGame
+                excludes:
+                  - "GameData"
+              - path: Sources/MyGame/GameData
+                type: folder
+                buildPhase: resources
+        """
+        let occurrences = yamlContent.components(separatedBy: sharedSources).count - 1
+        XCTAssertEqual(occurrences, 4,
+                       "All 4 targets should exclude GameData from the shared Sources folder and add it as a folder")
+    }
+
     func testMultiPlatformWithTeamID() throws {
         // Given: Multi-platform settings with team ID
         let settings = BuildSettings(
