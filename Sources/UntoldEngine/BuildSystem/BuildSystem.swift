@@ -333,13 +333,13 @@ import Foundation
             return projectDir
         }
 
-        private func copyTemplateProject(to projectDir: URL, settings: BuildSettings) async throws {
+        /// Internal — exposed for testing via @testable import. The template step of `build`:
+        /// writes the embedded templates for `settings.target` into `projectDir` with their
+        /// `{{...}}` placeholders expanded. Unlike the full build, it does not need `xcodegen`.
+        func copyTemplateProject(to projectDir: URL, settings: BuildSettings) async throws {
             // Use embedded templates
             Logger.log(message: "📦 Creating project from embedded templates")
             try createProjectFromEmbeddedTemplates(at: projectDir, settings: settings)
-
-            // Process template variables
-            try processTemplateVariables(in: projectDir, settings: settings)
 
             Logger.log(message: "📋 Template project created successfully")
         }
@@ -358,16 +358,22 @@ import Foundation
             }
 
             for (relativePath, content) in templateFiles {
-                // Replace {{PROJECT_NAME}} in paths
-                let processedPath = relativePath.replacingOccurrences(of: "{{PROJECT_NAME}}", with: settings.projectName)
+                // Replace template variables in paths
+                let processedPath = expandTemplateVariables(in: relativePath, settings: settings)
                 let fileURL = projectDir.appendingPathComponent(processedPath)
 
                 // Create intermediate directories
                 let dirURL = fileURL.deletingLastPathComponent()
                 try fileManager.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
+                // Replace template variables in the content. Every template goes through here,
+                // whatever its file type. XML templates (storyboards, plists), recognized by their
+                // XML declaration, need the values escaped.
+                let isXML = content.hasPrefix("<?xml")
+                let processedContent = expandTemplateVariables(in: content, settings: settings, escapingForXML: isXML)
+
                 // Write file content
-                try content.write(to: fileURL, atomically: true, encoding: .utf8)
+                try processedContent.write(to: fileURL, atomically: true, encoding: .utf8)
             }
 
             // Create GameData directory structure
@@ -508,43 +514,32 @@ import Foundation
             }
         }
 
-        private func processTemplateVariables(in projectDir: URL, settings: BuildSettings) throws {
+        /// Replaces the `{{...}}` template variables in `text` with their values from `settings`.
+        /// Pass `escapingForXML` when `text` is an XML document: a project name such as
+        /// "Rock & Roll" would otherwise produce a storyboard or plist that fails to parse.
+        private func expandTemplateVariables(in text: String, settings: BuildSettings, escapingForXML: Bool = false) -> String {
             let replacements: [String: String] = [
                 "{{PROJECT_NAME}}": settings.projectName,
                 "{{BUNDLE_IDENTIFIER}}": settings.bundleIdentifier,
                 "{{MACOS_VERSION}}": getMacOSVersionString(settings.target),
             ]
 
-            let fileManager = FileManager.default
-            guard let enumerator = fileManager.enumerator(
-                at: projectDir,
-                includingPropertiesForKeys: [.isRegularFileKey]
-            ) else {
-                return
+            var expanded = text
+            for (placeholder, value) in replacements {
+                expanded = expanded.replacingOccurrences(of: placeholder, with: escapingForXML ? xmlEscaped(value) : value)
             }
 
-            for case let fileURL as URL in enumerator {
-                // Process text files only
-                guard ["swift", "md", "txt"].contains(fileURL.pathExtension) || fileURL.lastPathComponent == "Package.swift" else {
-                    continue
-                }
+            return expanded
+        }
 
-                guard var content = try? String(contentsOf: fileURL, encoding: .utf8) else {
-                    continue
-                }
-
-                var modified = false
-                for (placeholder, value) in replacements {
-                    if content.contains(placeholder) {
-                        content = content.replacingOccurrences(of: placeholder, with: value)
-                        modified = true
-                    }
-                }
-
-                if modified {
-                    try content.write(to: fileURL, atomically: true, encoding: .utf8)
-                }
-            }
+        private func xmlEscaped(_ value: String) -> String {
+            // "&" goes first so that the entities added by the other replacements are not escaped again
+            value
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+                .replacingOccurrences(of: "\"", with: "&quot;")
+                .replacingOccurrences(of: "'", with: "&apos;")
         }
 
         private func getMacOSVersionString(_ target: BuildTarget) -> String {

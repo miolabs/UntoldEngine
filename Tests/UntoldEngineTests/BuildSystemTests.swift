@@ -1442,4 +1442,196 @@ final class BuildSystemTests: XCTestCase {
                          "Single-platform should not have multi-platform folder structure")
         }
     }
+
+    // MARK: - Template Placeholder Expansion Tests
+
+    // These tests run the template step of the build (copyTemplateProject) rather than
+    // build(settings:), which also needs the xcodegen tool to be installed.
+
+    /// Every path and every line of text under `directory` that still carries a `{{` placeholder marker.
+    private func unexpandedPlaceholders(in directory: URL) throws -> [String] {
+        var findings: [String] = []
+
+        for subpath in try FileManager.default.subpathsOfDirectory(atPath: directory.path).sorted() {
+            if subpath.contains("{{") {
+                findings.append("path: \(subpath)")
+            }
+
+            var isDirectory: ObjCBool = false
+            let fileURL = directory.appendingPathComponent(subpath)
+            guard FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue
+            else {
+                continue
+            }
+
+            let content = try String(contentsOf: fileURL, encoding: .utf8)
+            for line in content.components(separatedBy: .newlines) where line.contains("{{") {
+                findings.append("\(subpath): \(line.trimmingCharacters(in: .whitespaces))")
+            }
+        }
+
+        return findings
+    }
+
+    func testGeneratedProjectTreeHasNoUnexpandedPlaceholders() async throws {
+        // Given: Build settings for every kind of project the build system can generate
+        let configurations: [(label: String, target: BuildTarget, isIOSAR: Bool)] = [
+            ("macOS", .macOS(deployment: .v14), false),
+            ("iOS", .iOS(deployment: .v17), false),
+            ("iOS AR", .iOS(deployment: .v17), true),
+            ("visionOS", .visionOS(deployment: .v2), false),
+            ("Multi-Platform", .multi(macOS: .v14, iOS: .v17, visionOS: .v2), false),
+        ]
+
+        for (label, target, isIOSAR) in configurations {
+            let projectName = "MyGameProject"
+            let outputPath = tempDirectory.appendingPathComponent(label)
+            let projectDir = outputPath.appendingPathComponent(projectName)
+            let settings = BuildSettings(
+                projectName: projectName,
+                bundleIdentifier: "com.mycompany.mygame",
+                outputPath: outputPath,
+                target: target,
+                isIOSAR: isIOSAR
+            )
+
+            // When: Running the template step of the build
+            try await buildSystem.copyTemplateProject(to: projectDir, settings: settings)
+
+            // Then: Every template should have been written to the project tree...
+            let templateFiles = isIOSAR
+                ? BuildTemplates.getTemplateFilesForIOSAR()
+                : BuildTemplates.getTemplateFiles(for: target)
+            let generatedPaths = try Set(FileManager.default.subpathsOfDirectory(atPath: projectDir.path))
+            let expectedPaths = Set(templateFiles.keys.map {
+                $0.replacingOccurrences(of: "{{PROJECT_NAME}}", with: projectName)
+            })
+            XCTAssertFalse(expectedPaths.isEmpty, "\(label): there should be templates to generate")
+            XCTAssertEqual(expectedPaths.subtracting(generatedPaths), [],
+                           "\(label): every template file should be written to the project tree")
+
+            // ...and no file of the tree, whatever its type, should be left with a placeholder
+            XCTAssertEqual(try unexpandedPlaceholders(in: projectDir), [],
+                           "\(label): generated project should not contain unexpanded {{...}} placeholders")
+        }
+    }
+
+    func testGeneratedMacOSProjectExpandsPlaceholdersWithSettingsValues() async throws {
+        // Given: Build settings for a macOS project
+        let projectName = "MyGameProject"
+        let bundleID = "com.mycompany.mygame"
+        let projectDir = tempDirectory.appendingPathComponent(projectName)
+        let settings = BuildSettings(
+            projectName: projectName,
+            bundleIdentifier: bundleID,
+            outputPath: tempDirectory,
+            target: .macOS(deployment: .v14)
+        )
+
+        // When: Running the template step of the build
+        try await buildSystem.copyTemplateProject(to: projectDir, settings: settings)
+
+        // Then: The storyboard should name the app menu, its Quit item and the window after the project
+        let sourcesDir = projectDir.appendingPathComponent("Sources").appendingPathComponent(projectName)
+        let storyboardContent = try String(
+            contentsOf: sourcesDir.appendingPathComponent("Base.lproj/Main.storyboard"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(storyboardContent.contains("<menuItem title=\"\(projectName)\""),
+                      "Main.storyboard should title the app menu with the project name")
+        XCTAssertTrue(storyboardContent.contains("<menuItem title=\"Quit \(projectName)\""),
+                      "Main.storyboard should title the Quit menu item with the project name")
+        XCTAssertTrue(storyboardContent.contains("<window key=\"window\" title=\"\(projectName)\""),
+                      "Main.storyboard should title the window with the project name")
+        XCTAssertTrue(storyboardContent.contains("customModule=\"\(projectName)\""),
+                      "Main.storyboard should reference the project module")
+
+        // The Info.plist should carry the bundle identifier
+        let infoPlistContent = try String(contentsOf: sourcesDir.appendingPathComponent("Info.plist"), encoding: .utf8)
+        XCTAssertTrue(infoPlistContent.contains("<string>\(bundleID)</string>"),
+                      "Info.plist should contain the bundle identifier")
+
+        // Package.swift and README.md should carry the macOS deployment version
+        let packageContent = try String(contentsOf: projectDir.appendingPathComponent("Package.swift"), encoding: .utf8)
+        XCTAssertTrue(packageContent.contains(".macOS(.v14)"),
+                      "Package.swift should contain the macOS deployment version")
+        XCTAssertTrue(packageContent.contains("name: \"\(projectName)\""),
+                      "Package.swift should contain the project name")
+        let readmeContent = try String(contentsOf: projectDir.appendingPathComponent("README.md"), encoding: .utf8)
+        XCTAssertTrue(readmeContent.contains("macOS 14 or later"),
+                      "README.md should contain the macOS deployment version")
+    }
+
+    func testGeneratedVisionOSInfoPlistExpandsProjectName() async throws {
+        // Given: Build settings for a visionOS project
+        let projectName = "MyVisionGame"
+        let projectDir = tempDirectory.appendingPathComponent(projectName)
+        let settings = BuildSettings(
+            projectName: projectName,
+            bundleIdentifier: "com.test.vision",
+            outputPath: tempDirectory,
+            target: .visionOS(deployment: .v2)
+        )
+
+        // When: Running the template step of the build
+        try await buildSystem.copyTemplateProject(to: projectDir, settings: settings)
+
+        // Then: The usage descriptions shown in the system permission prompts should name the project
+        let infoPlistData = try Data(contentsOf: projectDir.appendingPathComponent("Sources/\(projectName)/Info.plist"))
+        let infoPlist = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: infoPlistData, options: [], format: nil) as? [String: Any],
+            "Info.plist should be a valid property list"
+        )
+        for key in ["NSWorldSensingUsageDescription", "NSAccessoryTrackingUsageDescription"] {
+            let usageDescription = try XCTUnwrap(infoPlist[key] as? String, "Info.plist should contain \(key)")
+            XCTAssertTrue(usageDescription.hasPrefix("\(projectName) "),
+                          "\(key) should start with the project name, got: \(usageDescription)")
+        }
+    }
+
+    func testGeneratedXMLFilesEscapeSpecialCharactersInProjectName() async throws {
+        // Given: A project name carrying all five XML special characters. The editor takes the
+        // name from a free-form text field, and a raw "&" or "<" would make a storyboard or a
+        // plist unparseable, which breaks the build of the generated project.
+        let projectName = "Tom & Jerry's <\"Big\"> Chase"
+        let projectDir = tempDirectory.appendingPathComponent(projectName)
+        let settings = BuildSettings(
+            projectName: projectName,
+            bundleIdentifier: "com.test.game",
+            outputPath: tempDirectory,
+            target: .multi(macOS: .v14, iOS: .v17, visionOS: .v2)
+        )
+
+        // When: Running the template step of the build
+        try await buildSystem.copyTemplateProject(to: projectDir, settings: settings)
+
+        // Then: The storyboard should be well-formed XML whose titles decode to the project name
+        let storyboard = try XMLDocument(
+            contentsOf: projectDir.appendingPathComponent("\(projectName) macOS/Base.lproj/Main.storyboard"),
+            options: []
+        )
+        let menuItemTitles = try storyboard.nodes(forXPath: "//menuItem/@title").compactMap(\.stringValue)
+        XCTAssertEqual(menuItemTitles, [projectName, "Quit \(projectName)"],
+                       "Main.storyboard menu titles should decode to the project name")
+        let windowTitles = try storyboard.nodes(forXPath: "//window/@title").compactMap(\.stringValue)
+        XCTAssertEqual(windowTitles, [projectName],
+                       "Main.storyboard window title should decode to the project name")
+
+        // The plist should be a valid property list whose strings decode to the project name
+        let infoPlistData = try Data(contentsOf: projectDir.appendingPathComponent("\(projectName) visionOS/Info.plist"))
+        let infoPlist = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: infoPlistData, options: [], format: nil) as? [String: Any],
+            "Info.plist should be a valid property list"
+        )
+        let usageDescription = try XCTUnwrap(infoPlist["NSWorldSensingUsageDescription"] as? String,
+                                             "Info.plist should contain NSWorldSensingUsageDescription")
+        XCTAssertTrue(usageDescription.hasPrefix("\(projectName) "),
+                      "NSWorldSensingUsageDescription should start with the project name, got: \(usageDescription)")
+
+        // Files that are not XML should get the project name as is
+        let readmeContent = try String(contentsOf: projectDir.appendingPathComponent("README.md"), encoding: .utf8)
+        XCTAssertTrue(readmeContent.contains("# \(projectName)\n"),
+                      "README.md should contain the unescaped project name")
+    }
 }
