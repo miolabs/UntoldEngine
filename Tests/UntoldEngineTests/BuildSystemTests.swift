@@ -1139,6 +1139,8 @@ final class BuildSystemTests: XCTestCase {
         // Should contain platform-specific folders for visionOS
         XCTAssertNotNil(templateFiles["{{PROJECT_NAME}} visionOS/{{PROJECT_NAME}}App.swift"],
                         "Should have visionOS-specific App file")
+        XCTAssertNotNil(templateFiles["{{PROJECT_NAME}} visionOS/EngineStatsWindowStore.swift"],
+                        "Should have the engine stats store the visionOS App file uses")
         XCTAssertNotNil(templateFiles["{{PROJECT_NAME}} visionOS/Info.plist"],
                         "Should have visionOS-specific Info.plist")
 
@@ -1153,6 +1155,11 @@ final class BuildSystemTests: XCTestCase {
                      "Multi-platform template should not include Package.swift")
     }
 
+    // The tests below check that the targets of a generated project can compile. They cannot
+    // build one, which takes xcodebuild and a checkout of the engine from GitHub, so they check
+    // the templates against each other instead: whatever a template uses has to come from a file
+    // that the same target compiles, on the platform of that target.
+
     /// Every file map the build system generates a project from
     private func templateFileMaps() -> [(kind: String, files: [String: String])] {
         [
@@ -1162,6 +1169,199 @@ final class BuildSystemTests: XCTestCase {
             ("visionOS", BuildTemplates.getTemplateFiles(for: .visionOS(deployment: .v2))),
             ("Multi-Platform", BuildTemplates.getTemplateFilesForMultiPlatform()),
         ]
+    }
+
+    /// The Swift code each target of a file map compiles, as its platform sees it: with the
+    /// `#if os(...)` blocks resolved, the comments removed and {{PROJECT_NAME}} expanded.
+    /// A multi-platform map has one target per "{{PROJECT_NAME}} <platform>" folder, which
+    /// compiles that folder and the shared Sources folder (see XcodeGenProjectSpec). Any other
+    /// map has a single target, which compiles every Swift file of the map.
+    private func compiledSources(of files: [String: String], kind: String) throws -> [(target: String, sources: [String: String])] {
+        // Package.swift is the manifest of the macOS project, not a file of its target
+        let swiftFiles = files.filter { $0.key.hasSuffix(".swift") && $0.key != "Package.swift" }
+        let sharedFiles = swiftFiles.filter { $0.key.hasPrefix("Sources/") }
+        let targetFolders = Set(swiftFiles.keys.filter { !$0.hasPrefix("Sources/") }.map { $0.components(separatedBy: "/")[0] })
+
+        let targets = targetFolders.isEmpty
+            ? [(target: kind, files: sharedFiles)]
+            : targetFolders.sorted().map { folder in
+                (target: folder.replacingOccurrences(of: "{{PROJECT_NAME}} ", with: ""),
+                 files: sharedFiles.merging(swiftFiles.filter { $0.key.hasPrefix(folder + "/") }) { shared, _ in shared })
+            }
+
+        return try targets.map { target, files in
+            // "iOS AR" is an iOS target
+            let os = ["macOS", "visionOS"].first { target.hasPrefix($0) } ?? "iOS"
+            let sources = try files.mapValues { template in
+                try activeLines(of: template, os: os)
+                    .map { $0.components(separatedBy: "//")[0] }
+                    .joined(separator: "\n")
+                    .replacingOccurrences(of: "{{PROJECT_NAME}}", with: "MyGame")
+            }
+            return (target, sources)
+        }
+    }
+
+    /// The lines of a Swift template that its `#if os(...)` blocks leave in on one platform.
+    /// Understands the one kind of condition the templates use: `os(<platform>)`, on its own.
+    private func activeLines(of template: String, os: String) throws -> [String] {
+        // One entry per open #if: whether its current branch is compiled, and whether that
+        // branch or an earlier one of the same #if matched the platform
+        var openBlocks: [(isActive: Bool, hasMatched: Bool)] = []
+        var lines: [String] = []
+
+        for line in template.components(separatedBy: "\n") {
+            let words = line.trimmingCharacters(in: .whitespaces).components(separatedBy: " ")
+
+            switch words[0] {
+            case "#if", "#elseif":
+                let condition = words.dropFirst().joined(separator: " ")
+                let platform = try XCTUnwrap(
+                    condition.hasPrefix("os(") && condition.hasSuffix(")") ? condition.dropFirst(3).dropLast() : nil,
+                    "Unsupported condition in a template: \(line)"
+                )
+                if words[0] == "#if" {
+                    openBlocks.append((isActive: platform == os, hasMatched: platform == os))
+                } else {
+                    let block = try XCTUnwrap(openBlocks.popLast(), "#elseif without #if in a template")
+                    let isActive = !block.hasMatched && platform == os
+                    openBlocks.append((isActive: isActive, hasMatched: block.hasMatched || isActive))
+                }
+            case "#else":
+                let block = try XCTUnwrap(openBlocks.popLast(), "#else without #if in a template")
+                openBlocks.append((isActive: !block.hasMatched, hasMatched: true))
+            case "#endif":
+                _ = try XCTUnwrap(openBlocks.popLast(), "#endif without #if in a template")
+            default:
+                // A line is compiled when every #if around it is
+                if openBlocks.allSatisfy(\.isActive) {
+                    lines.append(line)
+                }
+            }
+        }
+
+        XCTAssertTrue(openBlocks.isEmpty, "#if without #endif in a template")
+        return lines
+    }
+
+    /// The names of the types a Swift source declares: "GameScene" for `class GameScene {`
+    private func declaredTypeNames(in source: String) throws -> [String] {
+        let declaration = try NSRegularExpression(pattern: "\\b(?:class|struct|enum|actor|protocol)\\s+(\\w+)")
+        let matches = declaration.matches(in: source, range: NSRange(source.startIndex..., in: source))
+        return matches.compactMap { Range($0.range(at: 1), in: source) }.map { String(source[$0]) }
+    }
+
+    func testEveryTargetDeclaresTheTemplateTypesItsFilesUse() throws {
+        // Given: The Swift code of every target of every kind of project, and the types that
+        // the templates declare, whichever the project they go to
+        var projects: [(kind: String, targets: [(target: String, sources: [String: String])])] = []
+        for (kind, files) in templateFileMaps() {
+            try projects.append((kind, compiledSources(of: files, kind: kind)))
+        }
+        let templateTypes = try Set(projects.flatMap(\.targets).flatMap(\.sources.values).flatMap(declaredTypeNames))
+        XCTAssertTrue(templateTypes.isSuperset(of: ["GameScene", "GameViewController", "MyGameApp", "EngineStatsWindowStore"]),
+                      "Should find the types the templates declare, found \(templateTypes.sorted())")
+
+        for (kind, targets) in projects {
+            for (target, sources) in targets {
+                // When: Looking for the template types each file of the target names
+                let declaredTypes = try Set(sources.values.flatMap(declaredTypeNames))
+
+                for (path, source) in sources {
+                    let usedTypes = templateTypes.filter { typeName in
+                        source.range(of: "\\b\(typeName)\\b", options: .regularExpression) != nil
+                    }
+
+                    // Then: A file of the same target should declare each of them. The visionOS app
+                    // of a multi-platform project could not find EngineStatsWindowStore, which only
+                    // the GameScene.swift of a single-platform visionOS project declared.
+                    XCTAssertEqual(usedTypes.subtracting(declaredTypes).sorted(), [],
+                                   "\(kind) project, \(target) target: \(path) uses types that no file of the target declares")
+                }
+            }
+        }
+    }
+
+    func testEveryTargetDeclaresEachTemplateTypeOnce() throws {
+        // Given: The Swift code of every target of every kind of project
+        for (kind, files) in templateFileMaps() {
+            for (target, sources) in try compiledSources(of: files, kind: kind) {
+                // When: Counting the declarations of each type across the files of the target
+                let declarations = try sources.values.flatMap(declaredTypeNames)
+                let redeclaredTypes = Dictionary(grouping: declarations) { $0 }.filter { $0.value.count > 1 }.keys
+
+                // Then: No type should be declared twice, as a GameScene.swift in both the shared
+                // Sources folder and the folder of a target would do
+                XCTAssertEqual(redeclaredTypes.sorted(), [],
+                               "\(kind) project, \(target) target: types declared by more than one file")
+                XCTAssertTrue(declarations.contains("GameScene"),
+                              "\(kind) project, \(target) target: should declare GameScene")
+            }
+        }
+    }
+
+    func testMultiPlatformGameSceneKeepsPlatformCodeInsideOSBlocks() throws {
+        // Given: The GameScene.swift of a multi-platform project, which every target compiles
+        let templateFiles = BuildTemplates.getTemplateFilesForMultiPlatform()
+        let gameScene = try XCTUnwrap(templateFiles["Sources/{{PROJECT_NAME}}/GameScene.swift"],
+                                      "Should have shared GameScene in Sources folder")
+
+        // When: Resolving its #if os(...) blocks for each platform
+        let macOSCode = try activeLines(of: gameScene, os: "macOS").joined(separator: "\n")
+        let iOSCode = try activeLines(of: gameScene, os: "iOS").joined(separator: "\n")
+        let visionOSCode = try activeLines(of: gameScene, os: "visionOS").joined(separator: "\n")
+
+        // Then: Every platform should get the GameScene the app files of its target expect
+        for (platform, code) in [("macOS", macOSCode), ("iOS", iOSCode), ("visionOS", visionOSCode)] {
+            for expected in ["import UntoldEngine\n", "class GameScene {", "setupAssetPaths()", "func update(deltaTime", "func handleInput()"] {
+                XCTAssertTrue(code.contains(expected), "Shared GameScene should contain \"\(expected)\" on \(platform)")
+            }
+        }
+
+        // macOS should handle the keyboard and the mouse, as its single-platform GameScene does
+        for expected in ["InputSystem.shared.registerKeyboardEvents()", "InputSystem.shared.registerMouseEvents()", "moveCameraWithInput(", "orbitCameraAround("] {
+            XCTAssertTrue(macOSCode.contains(expected), "Shared GameScene should contain \"\(expected)\" on macOS")
+            XCTAssertFalse(iOSCode.contains(expected), "Shared GameScene should not contain \"\(expected)\" on iOS")
+            XCTAssertFalse(visionOSCode.contains(expected), "Shared GameScene should not contain \"\(expected)\" on visionOS")
+        }
+
+        // visionOS should handle spatial input, as its single-platform GameScene does. The
+        // engine only declares SpatialManipulationSystem on visionOS: no other platform compiles
+        // code that names it.
+        for expected in ["InputSystem.shared.registerXREvents()", "xrSpatialInputState", "SpatialManipulationSystem"] {
+            XCTAssertTrue(visionOSCode.contains(expected), "Shared GameScene should contain \"\(expected)\" on visionOS")
+            XCTAssertFalse(macOSCode.contains(expected), "Shared GameScene should not contain \"\(expected)\" on macOS")
+            XCTAssertFalse(iOSCode.contains(expected), "Shared GameScene should not contain \"\(expected)\" on iOS")
+        }
+    }
+
+    func testMultiPlatformVisionOSTargetShipsEngineStatsWindowStore() throws {
+        // Given: The file maps of a multi-platform project and of a single-platform visionOS one
+        let multiPlatformFiles = BuildTemplates.getTemplateFilesForMultiPlatform()
+        let visionOSFiles = BuildTemplates.getTemplateFiles(for: .visionOS(deployment: .v2))
+
+        // When: Looking for the store of the Engine Stats window that the visionOS app opens
+        let storeFile = try XCTUnwrap(multiPlatformFiles["{{PROJECT_NAME}} visionOS/EngineStatsWindowStore.swift"],
+                                      "Multi-platform visionOS target should have the engine stats store")
+        let sharedGameScene = try XCTUnwrap(multiPlatformFiles["Sources/{{PROJECT_NAME}}/GameScene.swift"])
+        let visionOSGameScene = try XCTUnwrap(visionOSFiles["Sources/{{PROJECT_NAME}}/GameScene.swift"])
+
+        // Then: The multi-platform project should have it in a file of the visionOS target,
+        // with the imports the class needs, and keep it out of the shared GameScene
+        let storeClassStart = try XCTUnwrap(storeFile.range(of: "@MainActor\nfinal class EngineStatsWindowStore: ObservableObject {"),
+                                            "EngineStatsWindowStore.swift should declare the store")
+        for module in ["Combine", "Foundation", "UntoldEngine"] {
+            XCTAssertTrue(storeFile.contains("import \(module)\n"), "EngineStatsWindowStore.swift should import \(module)")
+        }
+        XCTAssertFalse(sharedGameScene.contains("EngineStatsWindowStore"),
+                       "Shared GameScene should leave the visionOS-only store to the visionOS target")
+
+        // The single-platform visionOS project should still end its GameScene.swift with the
+        // same class, and should not get the separate file
+        XCTAssertTrue(visionOSGameScene.hasSuffix(storeFile[storeClassStart.lowerBound...] + "\n"),
+                      "visionOS GameScene.swift should end with the engine stats store")
+        XCTAssertNil(visionOSFiles["Sources/{{PROJECT_NAME}}/EngineStatsWindowStore.swift"],
+                     "Single-platform visionOS project keeps the store in GameScene.swift")
     }
 
     func testTemplatesThatUseTheEngineLoggerImportUntoldEngine() {
