@@ -16,22 +16,49 @@ import Foundation
 
     // MARK: - Build Target
 
+    // A generated project links the UntoldEngine package, so its deployment targets cannot be
+    // lower than the `platforms` minimums in the engine's Package.swift. The cases below those
+    // minimums are deprecated and rejected by `BuildSystem.build(settings:)`; they are kept so
+    // that existing code still compiles and stored settings still decode. `supportedCases`
+    // lists the rest and is what a UI should offer.
+
     public enum MacOSVersion: String, Codable {
+        @available(*, deprecated, message: "UntoldEngine requires macOS 14 or later, so BuildSystem.build(settings:) rejects this deployment target")
         case v13 = "13.0"
         case v14 = "14.0"
         case v15 = "15.0"
+
+        /// The deployment targets a generated project can use, lowest first. The lowest one is
+        /// the macOS minimum of the UntoldEngine package.
+        public static var supportedCases: [MacOSVersion] {
+            [.v14, .v15]
+        }
     }
 
     public enum IOSVersion: String, Codable {
+        @available(*, deprecated, message: "UntoldEngine requires iOS 17 or later, so BuildSystem.build(settings:) rejects this deployment target")
         case v16 = "16.0"
         case v17 = "17.0"
         case v18 = "18.0"
+
+        /// The deployment targets a generated project can use, lowest first. The lowest one is
+        /// the iOS minimum of the UntoldEngine package.
+        public static var supportedCases: [IOSVersion] {
+            [.v17, .v18]
+        }
     }
 
     public enum VisionOSVersion: String, Codable {
+        @available(*, deprecated, message: "UntoldEngine requires visionOS 2 or later, so BuildSystem.build(settings:) rejects this deployment target")
         case v1 = "1.0"
         case v2 = "2.0"
         case v26 = "26.0"
+
+        /// The deployment targets a generated project can use, lowest first. The lowest one is
+        /// the visionOS minimum of the UntoldEngine package.
+        public static var supportedCases: [VisionOSVersion] {
+            [.v2, .v26]
+        }
     }
 
     public enum BuildTarget: Codable {
@@ -302,7 +329,9 @@ import Foundation
 
         // MARK: - Private Helpers
 
-        private func validateSettings(_ settings: BuildSettings) throws {
+        /// Internal — exposed for testing via @testable import. The first step of `build`: it
+        /// throws before anything is written to (or removed from) the output path.
+        func validateSettings(_ settings: BuildSettings) throws {
             guard !settings.projectName.isEmpty else {
                 throw BuildError.invalidSettings("Project name cannot be empty")
             }
@@ -317,6 +346,39 @@ import Foundation
             let range = NSRange(settings.bundleIdentifier.startIndex..., in: settings.bundleIdentifier)
             guard regex?.firstMatch(in: settings.bundleIdentifier, range: range) != nil else {
                 throw BuildError.invalidSettings("Invalid bundle identifier format")
+            }
+
+            try validateDeploymentTargets(of: settings.target)
+        }
+
+        /// The generated project links the UntoldEngine package. With a deployment target below
+        /// the package's own minimum it cannot compile ("compiling for macOS 13.0, but module
+        /// 'UntoldEngine' has a minimum deployment target of macOS 14.0"), so fail here instead.
+        private func validateDeploymentTargets(of target: BuildTarget) throws {
+            var unsupported: [String] = []
+
+            func check<Version: RawRepresentable & Equatable>(_ version: Version, platform: String, supported: [Version]) where Version.RawValue == String {
+                guard !supported.contains(version) else { return }
+
+                let requirement = supported.first.map { " (UntoldEngine requires \(platform) \($0.rawValue) or later)" } ?? ""
+                unsupported.append("\(platform) \(version.rawValue) is not a supported deployment target\(requirement)")
+            }
+
+            switch target {
+            case let .macOS(version):
+                check(version, platform: "macOS", supported: MacOSVersion.supportedCases)
+            case let .iOS(version):
+                check(version, platform: "iOS", supported: IOSVersion.supportedCases)
+            case let .visionOS(version):
+                check(version, platform: "visionOS", supported: VisionOSVersion.supportedCases)
+            case let .multi(macOS, iOS, visionOS):
+                check(macOS, platform: "macOS", supported: MacOSVersion.supportedCases)
+                check(iOS, platform: "iOS", supported: IOSVersion.supportedCases)
+                check(visionOS, platform: "visionOS", supported: VisionOSVersion.supportedCases)
+            }
+
+            guard unsupported.isEmpty else {
+                throw BuildError.invalidSettings(unsupported.joined(separator: "; "))
             }
         }
 

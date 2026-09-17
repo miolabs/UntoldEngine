@@ -151,6 +151,202 @@ final class BuildSystemTests: XCTestCase {
         }
     }
 
+    // MARK: - Deployment Target Tests
+
+    /// The `platforms` minimums that the engine's own Package.swift declares, in the raw value
+    /// format of the version enums: `["macOS": "14.0", "iOS": "17.0", "visionOS": "2.0"]`.
+    private static func enginePackageMinimums() throws -> [String: String] {
+        // Tests/UntoldEngineTests/BuildSystemTests.swift -> the package root
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let manifest = try String(contentsOf: packageRoot.appendingPathComponent("Package.swift"), encoding: .utf8)
+
+        // `.macOS(.v14)`, `.iOS(.v17)`, `.visionOS(.v2)`; a minor version is spelled `.v10_15`
+        let regex = try NSRegularExpression(pattern: #"\.(macOS|iOS|visionOS)\(\.v(\d+)(?:_(\d+))?\)"#)
+        var minimums: [String: String] = [:]
+        for match in regex.matches(in: manifest, range: NSRange(manifest.startIndex..., in: manifest)) {
+            guard let platform = Range(match.range(at: 1), in: manifest),
+                  let major = Range(match.range(at: 2), in: manifest)
+            else {
+                continue
+            }
+
+            let minor = Range(match.range(at: 3), in: manifest).map { String(manifest[$0]) } ?? "0"
+            minimums[String(manifest[platform])] = "\(manifest[major]).\(minor)"
+        }
+
+        return minimums
+    }
+
+    /// The message of the `BuildError.invalidSettings` that `validateSettings` throws for a
+    /// project with `target`, or nil when the settings are valid.
+    private func invalidSettingsMessage(for target: BuildTarget) throws -> String? {
+        let settings = BuildSettings(
+            projectName: "DeploymentTargetProject",
+            bundleIdentifier: "com.test.deploymenttarget",
+            outputPath: tempDirectory,
+            target: target
+        )
+
+        do {
+            try buildSystem.validateSettings(settings)
+            return nil
+        } catch let BuildError.invalidSettings(message) {
+            return message
+        }
+    }
+
+    /// Settings for a macOS 13 project. `nonisolated`: `BuildSettings` is not Sendable, so the
+    /// settings sent to the async `build` must not belong to the main actor.
+    private nonisolated static func macOS13Settings(projectName: String, outputPath: URL) throws -> BuildSettings {
+        try BuildSettings(
+            projectName: projectName,
+            bundleIdentifier: "com.test.macos13",
+            outputPath: outputPath,
+            target: .macOS(deployment: XCTUnwrap(MacOSVersion(rawValue: "13.0")))
+        )
+    }
+
+    func testSupportedDeploymentTargetsStartAtTheEnginePackageMinimums() throws {
+        // Given: The platform minimums that the engine's Package.swift declares
+        let minimums = try Self.enginePackageMinimums()
+
+        // When: Reading the deployment targets that the version enums offer
+        let offered = [
+            "macOS": MacOSVersion.supportedCases.map(\.rawValue),
+            "iOS": IOSVersion.supportedCases.map(\.rawValue),
+            "visionOS": VisionOSVersion.supportedCases.map(\.rawValue),
+        ]
+
+        // Then: The lowest offered version should be the package minimum. A generated project
+        // links the engine package, so it cannot target less than the package does. When
+        // Package.swift raises a minimum, `supportedCases` has to follow (and the case that
+        // drops out gets deprecated like the ones before it).
+        for (platform, versions) in offered {
+            let minimum = try XCTUnwrap(minimums[platform], "Package.swift should declare a \(platform) minimum as .\(platform)(.vN)")
+            XCTAssertEqual(versions.first, minimum,
+                           "The lowest offered \(platform) deployment target should be the \(platform) minimum of the UntoldEngine package")
+
+            let ascending = versions.sorted { $0.compare($1, options: .numeric) == .orderedAscending }
+            XCTAssertEqual(versions, ascending, "\(platform) supportedCases should list the lowest version first")
+        }
+    }
+
+    func testValidateSettingsAcceptsEverySupportedDeploymentTarget() throws {
+        // Given/When/Then: Every offered version should pass validation in a single-platform target
+        for version in MacOSVersion.supportedCases {
+            XCTAssertNil(try invalidSettingsMessage(for: .macOS(deployment: version)),
+                         "macOS \(version.rawValue) should be accepted")
+        }
+        for version in IOSVersion.supportedCases {
+            XCTAssertNil(try invalidSettingsMessage(for: .iOS(deployment: version)),
+                         "iOS \(version.rawValue) should be accepted")
+        }
+        for version in VisionOSVersion.supportedCases {
+            XCTAssertNil(try invalidSettingsMessage(for: .visionOS(deployment: version)),
+                         "visionOS \(version.rawValue) should be accepted")
+        }
+
+        // And the lowest ones, which sit right at the engine minimums, in a multi-platform target
+        let macOS = try XCTUnwrap(MacOSVersion.supportedCases.first)
+        let iOS = try XCTUnwrap(IOSVersion.supportedCases.first)
+        let visionOS = try XCTUnwrap(VisionOSVersion.supportedCases.first)
+        XCTAssertNil(try invalidSettingsMessage(for: .multi(macOS: macOS, iOS: iOS, visionOS: visionOS)),
+                     "A multi-platform target at the engine minimums should be accepted")
+    }
+
+    func testValidateSettingsRejectsDeploymentTargetsBelowTheEngineMinimum() throws {
+        // Given: The deployment targets below the UntoldEngine package minimums. They are built
+        // from their raw values, the way stored settings decode them: naming the deprecated
+        // cases would only add deprecation warnings to the tests.
+        let macOS13 = try XCTUnwrap(MacOSVersion(rawValue: "13.0"))
+        let iOS16 = try XCTUnwrap(IOSVersion(rawValue: "16.0"))
+        let visionOS1 = try XCTUnwrap(VisionOSVersion(rawValue: "1.0"))
+
+        // When/Then: Validation should fail, naming the platform, the version and the minimum
+        XCTAssertEqual(try invalidSettingsMessage(for: .macOS(deployment: macOS13)),
+                       "macOS 13.0 is not a supported deployment target (UntoldEngine requires macOS 14.0 or later)")
+        XCTAssertEqual(try invalidSettingsMessage(for: .iOS(deployment: iOS16)),
+                       "iOS 16.0 is not a supported deployment target (UntoldEngine requires iOS 17.0 or later)")
+        XCTAssertEqual(try invalidSettingsMessage(for: .visionOS(deployment: visionOS1)),
+                       "visionOS 1.0 is not a supported deployment target (UntoldEngine requires visionOS 2.0 or later)")
+    }
+
+    func testValidateSettingsReportsEveryUnsupportedDeploymentTargetOfAMultiPlatformTarget() throws {
+        // Given: A multi-platform target with two deployment targets below the engine minimums
+        let macOS13 = try XCTUnwrap(MacOSVersion(rawValue: "13.0"))
+        let visionOS1 = try XCTUnwrap(VisionOSVersion(rawValue: "1.0"))
+
+        // When: Validating it
+        let message = try invalidSettingsMessage(for: .multi(macOS: macOS13, iOS: .v17, visionOS: visionOS1))
+
+        // Then: One failure should report both of them, and not the supported iOS version
+        XCTAssertEqual(message,
+                       "macOS 13.0 is not a supported deployment target (UntoldEngine requires macOS 14.0 or later); "
+                           + "visionOS 1.0 is not a supported deployment target (UntoldEngine requires visionOS 2.0 or later)")
+    }
+
+    func testBuildWithUnsupportedDeploymentTargetFailsBeforeTouchingTheOutputPath() async throws {
+        // Given: An existing project folder, and settings for that project with a deployment
+        // target below the engine minimum
+        let projectName = "ExistingProject"
+        let existingFile = tempDirectory
+            .appendingPathComponent(projectName)
+            .appendingPathComponent("GameScene.swift")
+        try FileManager.default.createDirectory(at: existingFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "// custom game code".write(to: existingFile, atomically: true, encoding: .utf8)
+
+        let settings = try Self.macOS13Settings(projectName: projectName, outputPath: tempDirectory)
+
+        // When/Then: build should throw invalidSettings instead of generating a project that
+        // cannot compile
+        do {
+            _ = try await buildSystem.build(settings: settings)
+            XCTFail("build should reject a deployment target below the engine minimum")
+        } catch let error as BuildError {
+            if case let .invalidSettings(message) = error {
+                XCTAssertTrue(message.contains("macOS 13.0"), "Error message should name the rejected deployment target")
+            } else {
+                XCTFail("Expected invalidSettings error, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected BuildError.invalidSettings, got \(error)")
+        }
+
+        // And it should leave the existing project alone: a build replaces the project folder
+        XCTAssertTrue(FileManager.default.fileExists(atPath: existingFile.path),
+                      "A rejected build should not remove the existing project")
+    }
+
+    func testStoredSettingsWithAnUnsupportedDeploymentTargetStillDecode() throws {
+        // Given: Build settings that were stored while macOS 13 was still offered
+        let settings = BuildSettings(
+            projectName: "StoredProject",
+            bundleIdentifier: "com.test.stored",
+            outputPath: tempDirectory,
+            target: .macOS(deployment: .v14)
+        )
+        let currentJSON = try XCTUnwrap(String(data: JSONEncoder().encode(settings), encoding: .utf8))
+        let storedJSON = currentJSON.replacingOccurrences(of: "\"14.0\"", with: "\"13.0\"")
+        XCTAssertNotEqual(storedJSON, currentJSON, "The encoded settings should contain the deployment target")
+
+        // When: Decoding them
+        let decoded = try JSONDecoder().decode(BuildSettings.self, from: Data(storedJSON.utf8))
+
+        // Then: They should still load, which is why the unsupported cases are deprecated rather
+        // than removed, and fail validation with the clear message instead
+        XCTAssertEqual(decoded.target.deploymentTarget, "13.0")
+        XCTAssertThrowsError(try buildSystem.validateSettings(decoded)) { error in
+            guard case let BuildError.invalidSettings(message) = error else {
+                XCTFail("Expected invalidSettings error, got \(error)")
+                return
+            }
+            XCTAssertTrue(message.contains("macOS 13.0"), "Error message should name the stored deployment target")
+        }
+    }
+
     // MARK: - Template Generation Tests
 
     func testAppDelegateSwiftGeneratedWithExpectedContent() {
