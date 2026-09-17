@@ -612,8 +612,10 @@ final class BuildSystemTests: XCTestCase {
                       "iOS AR GameViewController should implement ARSessionDelegate")
         XCTAssertTrue(gameViewControllerContent.contains("import UntoldEngineAR"),
                       "iOS AR GameViewController should import UntoldEngineAR")
-        XCTAssertFalse(gameViewControllerContent.contains("import UntoldEngine\n"),
-                       "iOS AR GameViewController should NOT import UntoldEngine standalone (it's in GameScene)")
+        // Logger is declared by UntoldEngine, which UntoldEngineAR does not re-export, and an
+        // import only counts for its own file: the one in GameScene.swift does not help here
+        XCTAssertTrue(gameViewControllerContent.contains("import UntoldEngine\n"),
+                      "iOS AR GameViewController should import UntoldEngine for the Logger it uses")
         XCTAssertTrue(gameViewControllerContent.contains("UntoldEngineAR"),
                       "iOS AR GameViewController should use UntoldEngineAR class")
         XCTAssertTrue(gameViewControllerContent.contains("var arSession: ARSession!"),
@@ -1149,6 +1151,35 @@ final class BuildSystemTests: XCTestCase {
         // Should NOT contain Package.swift (uses XcodeGen)
         XCTAssertNil(templateFiles["Package.swift"],
                      "Multi-platform template should not include Package.swift")
+    }
+
+    /// Every file map the build system generates a project from
+    private func templateFileMaps() -> [(kind: String, files: [String: String])] {
+        [
+            ("macOS", BuildTemplates.getTemplateFiles(for: .macOS(deployment: .v14))),
+            ("iOS", BuildTemplates.getTemplateFiles(for: .iOS(deployment: .v17))),
+            ("iOS AR", BuildTemplates.getTemplateFilesForIOSAR()),
+            ("visionOS", BuildTemplates.getTemplateFiles(for: .visionOS(deployment: .v2))),
+            ("Multi-Platform", BuildTemplates.getTemplateFilesForMultiPlatform()),
+        ]
+    }
+
+    func testTemplatesThatUseTheEngineLoggerImportUntoldEngine() {
+        // Given: Every Swift file of every kind of project
+        for (kind, files) in templateFileMaps() {
+            for (path, template) in files where path.hasSuffix(".swift") {
+                // When: The file logs through the Logger of the engine
+                guard template.contains("Logger.log(") else {
+                    continue
+                }
+
+                // Then: It should import UntoldEngine itself. An import only counts for the file
+                // it is in, and UntoldEngineAR does not re-export UntoldEngine: the iOS AR
+                // GameViewController, which only imported UntoldEngineAR, could not find Logger.
+                XCTAssertTrue(template.components(separatedBy: "\n").contains("import UntoldEngine"),
+                              "\(kind) project: \(path) uses Logger, so it should import UntoldEngine")
+            }
+        }
     }
 
     func testMultiPlatformXcodeGenSpec() throws {

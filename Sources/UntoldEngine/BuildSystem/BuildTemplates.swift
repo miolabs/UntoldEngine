@@ -785,6 +785,7 @@ import Foundation
         import UIKit
         import MetalKit
         import ARKit
+        import UntoldEngine
         import UntoldEngineAR
 
         // GameViewController: Manages the MTKView and AR renderer
