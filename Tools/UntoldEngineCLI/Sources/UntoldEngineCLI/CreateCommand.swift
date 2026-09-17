@@ -58,13 +58,13 @@ struct CreateCommand: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Output directory (default: current directory)")
     var output: String?
 
-    @Option(name: .long, help: "macOS deployment version (13, 14, 15)")
+    @Option(name: .long, help: "macOS deployment version (\(CreateCommand.versionNames(MacOSVersion.supportedCases)))")
     var macosVersion: String = "15"
 
-    @Option(name: .long, help: "iOS deployment version (16, 17, 18)")
+    @Option(name: .long, help: "iOS deployment version (\(CreateCommand.versionNames(IOSVersion.supportedCases)))")
     var iosVersion: String = "17"
 
-    @Option(name: .long, help: "visionOS deployment version (1, 2)")
+    @Option(name: .long, help: "visionOS deployment version (\(CreateCommand.versionNames(VisionOSVersion.supportedCases)))")
     var visionosVersion: String = "2"
 
     @Option(name: .long, help: "Apple Developer Team ID for code signing")
@@ -128,26 +128,26 @@ struct CreateCommand: AsyncParsableCommand {
 
         switch platform.lowercased() {
         case "macos":
-            let version = parseMacOSVersion(macosVersion)
+            let version = try Self.parseMacOSVersion(macosVersion)
             buildTarget = .macOS(deployment: version)
 
         case "ios":
-            let version = parseIOSVersion(iosVersion)
+            let version = try Self.parseIOSVersion(iosVersion)
             buildTarget = .iOS(deployment: version)
 
         case "ios-ar":
-            let version = parseIOSVersion(iosVersion)
+            let version = try Self.parseIOSVersion(iosVersion)
             buildTarget = .iOS(deployment: version)
             isIOSAR = true
 
         case "visionos":
-            let version = parseVisionOSVersion(visionosVersion)
+            let version = try Self.parseVisionOSVersion(visionosVersion)
             buildTarget = .visionOS(deployment: version)
 
         case "multi":
-            let macOS = parseMacOSVersion(macosVersion)
-            let iOS = parseIOSVersion(iosVersion)
-            let visionOS = parseVisionOSVersion(visionosVersion)
+            let macOS = try Self.parseMacOSVersion(macosVersion)
+            let iOS = try Self.parseIOSVersion(iosVersion)
+            let visionOS = try Self.parseVisionOSVersion(visionosVersion)
             buildTarget = .multi(macOS: macOS, iOS: iOS, visionOS: visionOS)
 
         default:
@@ -179,31 +179,36 @@ struct CreateCommand: AsyncParsableCommand {
         )
     }
 
-    private func parseMacOSVersion(_ version: String) -> MacOSVersion {
-        switch version {
-        case "13", "13.0": return .v13
-        case "14", "14.0": return .v14
-        case "15", "15.0": return .v15
-        default: return .v15
-        }
+    // The version options accept what the engine's `supportedCases` list and nothing else, so the
+    // CLI cannot offer a deployment target that `BuildSystem.build` rejects. "14" and "14.0" both
+    // name `.v14`.
+
+    static func parseMacOSVersion(_ version: String) throws -> MacOSVersion {
+        try parseDeploymentVersion(version, platform: "macOS", supported: MacOSVersion.supportedCases)
     }
 
-    private func parseIOSVersion(_ version: String) -> IOSVersion {
-        switch version {
-        case "16", "16.0": return .v16
-        case "17", "17.0": return .v17
-        case "18", "18.0": return .v18
-        default: return .v17
-        }
+    static func parseIOSVersion(_ version: String) throws -> IOSVersion {
+        try parseDeploymentVersion(version, platform: "iOS", supported: IOSVersion.supportedCases)
     }
 
-    private func parseVisionOSVersion(_ version: String) -> VisionOSVersion {
-        switch version {
-        case "1", "1.0": return .v1
-        case "2", "2.0": return .v2
-        case "26", "26.0": return .v26
-        default: return .v26
+    static func parseVisionOSVersion(_ version: String) throws -> VisionOSVersion {
+        try parseDeploymentVersion(version, platform: "visionOS", supported: VisionOSVersion.supportedCases)
+    }
+
+    private static func parseDeploymentVersion<Version: RawRepresentable>(_ text: String, platform: String, supported: [Version]) throws -> Version where Version.RawValue == String {
+        guard let version = supported.first(where: { $0.rawValue == text || shortVersionName($0.rawValue) == text }) else {
+            throw CLIError.invalidDeploymentVersion(platform: platform, version: text, valid: versionNames(supported))
         }
+        return version
+    }
+
+    /// The versions as the options take them, for help and error messages: "14, 15".
+    static func versionNames<Version: RawRepresentable>(_ versions: [Version]) -> String where Version.RawValue == String {
+        versions.map { shortVersionName($0.rawValue) }.joined(separator: ", ")
+    }
+
+    private static func shortVersionName(_ rawValue: String) -> String {
+        rawValue.hasSuffix(".0") ? String(rawValue.dropLast(2)) : rawValue
     }
 
     private func printConfigurationSummary(settings: BuildSettings, projectDir: URL, gameDataPath: URL) {
@@ -273,6 +278,7 @@ enum CLIError: LocalizedError {
     case invalidBundleIdentifier(String)
     case invalidPlatform(String)
     case invalidOptimization(String)
+    case invalidDeploymentVersion(platform: String, version: String, valid: String)
     case buildFailed(String)
 
     var errorDescription: String? {
@@ -283,6 +289,8 @@ enum CLIError: LocalizedError {
             return "Invalid platform: \(platform). Valid options: macos, ios, ios-ar, visionos, multi"
         case let .invalidOptimization(opt):
             return "Invalid optimization: \(opt). Valid options: none, speed, size"
+        case let .invalidDeploymentVersion(platform, version, valid):
+            return "Invalid \(platform) version: \(version). Valid options: \(valid)"
         case let .buildFailed(message):
             return "Build failed: \(message)"
         }

@@ -89,9 +89,9 @@ untoldengine create CrossGame --platform multi --team-id ABCD1234EF
 | `--platform` | Target platform | `macos` |
 | `--bundle-id` | Bundle identifier | — |
 | `--output` | Output directory | current directory |
-| `--macos-version` | macOS deployment target (`13`, `14`, `15`) | `15` |
-| `--ios-version` | iOS deployment target (`16`, `17`, `18`) | `17` |
-| `--visionos-version` | visionOS deployment target (`1`, `2`, `26`) | `2` |
+| `--macos-version` | macOS deployment target (`14`, `15`) | `15` |
+| `--ios-version` | iOS deployment target (`17`, `18`) | `17` |
+| `--visionos-version` | visionOS deployment target (`2`, `26`) | `2` |
 | `--team-id` | Apple Developer Team ID | — |
 | `--optimization` | Optimization level (`none`, `speed`, `size`) | `none` |
 | `--debug / --no-debug` | Include debug information | yes |

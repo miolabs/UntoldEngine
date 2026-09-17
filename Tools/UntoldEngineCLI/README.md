@@ -112,9 +112,9 @@ Creates a new UntoldEngine game project.
 - `--platform <platform>` - Target platform: `macos`, `ios`, `ios-ar`, `visionos`, `multi` (default: `macos`)
 - `--bundle-id <id>` - Bundle identifier (e.g., `com.company.game`)
 - `--output <path>` - Output directory (default: current directory)
-- `--macos-version <version>` - macOS deployment version: `13`, `14`, `15` (default: `15`)
-- `--ios-version <version>` - iOS deployment version: `16`, `17`, `18` (default: `17`)
-- `--visionos-version <version>` - visionOS deployment version: `1`, `2` (default: `2`)
+- `--macos-version <version>` - macOS deployment version: `14`, `15` (default: `15`)
+- `--ios-version <version>` - iOS deployment version: `17`, `18` (default: `17`)
+- `--visionos-version <version>` - visionOS deployment version: `2`, `26` (default: `2`)
 - `--team-id <id>` - Apple Developer Team ID for code signing
 - `--optimization <level>` - Optimization level: `none`, `speed`, `size` (default: `none`)
 - `--debug / --no-debug` - Include debug information (default: yes)
