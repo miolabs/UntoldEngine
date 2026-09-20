@@ -957,8 +957,11 @@ func makeSceneRenderTargetAccess(
         guard let encoderDescriptor = makeSceneRenderPassDescriptor(
             copying: descriptor,
             actions: actions
-        ), let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
-        else {
+        ) else {
+            return nil
+        }
+        GPUPassTiming.shared.attach(encoderDescriptor, label ?? "SceneTarget")
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor) else {
             return nil
         }
         encoder.label = label

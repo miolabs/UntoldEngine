@@ -5360,7 +5360,7 @@ public enum RenderPasses {
             {
                 let width = min(sourceDepth.width, opaqueDepthSnapshot.width)
                 let height = min(sourceDepth.height, opaqueDepthSnapshot.height)
-                if width > 0, height > 0, let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+                if width > 0, height > 0, let blitEncoder = GPUPassTiming.shared.makeBlitEncoder(commandBuffer, "GaussianDepthCopy") {
                     blitEncoder.label = "Copy Opaque Depth for Gaussian Occlusion"
                     blitEncoder.copy(
                         from: sourceDepth,

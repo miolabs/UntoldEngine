@@ -158,6 +158,39 @@ print("Update: \(frameStats.timing.updateMs) ms")
 print("Render: \(frameStats.timing.renderTotalMs) ms")
 ```
 
+## GPU Pass Timing
+
+`GPUPassTiming` times every render, compute and blit pass of the frame on the GPU itself, from `MTLCounterSampleBuffer` timestamps at the stage boundaries: a render pass's vertex and fragment stages, a compute or blit pass as a whole. It is off by default, and a GPU without stage-boundary sampling measures nothing.
+
+Enable it from the settings API:
+
+```swift
+setRendering(.gpuPassTiming(.enabled))
+```
+
+Read the recent frames' averages or the last resolved frame from the timer, or the last resolved frame through the engine stats snapshot:
+
+```swift
+for pass in GPUPassTiming.shared.averages() { // heaviest first
+    print("\(pass.label): vertex \(pass.vertexMs) ms, fragment \(pass.fragmentMs) ms")
+}
+let last = getEngineStatsSnapshot().gpuPasses // GPUPassTimingSnapshot
+print(last.ms(for: "Shadows") ?? 0)
+```
+
+The verbose stats output adds one line with the twelve heaviest passes of the last resolved frame:
+
+```
+GPU passes (9, sum 6.21ms): Forward 3.10 | Shadows 0.62 | SSAO 0.55 | Post 0.40 | HZB 0.12 | ...
+```
+
+| Field | What it tells you |
+|---|---|
+| `label` | The pass's name in the timer. The same label in one frame (one pass per eye on the headset, one per shadow cascade) adds up. |
+| `sum` | Sum of all pass times. Passes can overlap on the GPU, so this is an upper bound on the command buffer's GPU time. |
+
+Results come from the command buffer's completion handler, so the snapshot describes the most recently *completed* frame.
+
 ## OOC And Asset Triage Mode
 
 High-volume instrumentation categories are disabled by default:

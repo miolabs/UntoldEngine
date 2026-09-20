@@ -342,11 +342,13 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             let tileRenderCosts = auditVisibleTileRenderCosts()
             let memStats = MemoryBudgetManager.shared.getStats()
             let frame = currentFrameTime
+            let gpuPasses = GPUPassTimingSnapshot.current()
 
             EngineStatsMonitor.shared.update { snapshot in
                 snapshot.timing.frameTotalMs = frameTotalMs
                 snapshot.timing.presentationDeltaMs = frame.deltaTime * 1000.0
                 snapshot.timing.skippedFrames = frame.skippedFrames
+                snapshot.gpuPasses = gpuPasses
 
                 snapshot.render.drawCallsTotal = drawStats.drawCallsTotal
                 snapshot.render.drawCallsOpaque = drawStats.drawCallsOpaque
