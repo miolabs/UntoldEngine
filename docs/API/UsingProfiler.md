@@ -190,6 +190,10 @@ Each line is `{"type":"frame","frame":{...}}` with the full snapshot; `.perFrame
 
 `startEngineStatsRecording` throws `EngineStatsRecordingError.statsNotCompiledIn` in builds without `ENGINE_STATS_ENABLED`.
 
+## Benchmarking A Build
+
+`Examples/PerfBench` is a benchmark app for macOS, iOS and visionOS that runs a fixed set of scenes with the stats and the GPU pass timer on, records every frame with the recorder above and writes a `summary.json` per run. `scripts/perf/run_bench.sh <platform>` builds it, runs it (on a paired device through `devicectl`), pulls the results into `perf/results/` and compares them with the baseline stored under `perf/baselines/<device model>/` (`--update-baseline` writes one). See `Examples/PerfBench/README.md`.
+
 ## GPU Pass Timing
 
 `GPUPassTiming` times every render, compute and blit pass of the frame on the GPU itself, from `MTLCounterSampleBuffer` timestamps at the stage boundaries: a render pass's vertex and fragment stages, a compute or blit pass as a whole. It is off by default, and a GPU without stage-boundary sampling measures nothing.
