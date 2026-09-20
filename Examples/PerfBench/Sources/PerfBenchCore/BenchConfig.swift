@@ -24,6 +24,7 @@ import Foundation
 /// | `UNTOLD_BENCH_AUTOSTART` | `0` waits for the Start button (visionOS) | start on launch |
 /// | `UNTOLD_BENCH_IMMERSION` | `full` or `mixed` (visionOS) | `full` |
 /// | `UNTOLD_BENCH_PER_FRAME` | `0` records one line per second instead of per frame | per frame |
+/// | `UNTOLD_BENCH_AA` | `fxaa`, `smaa`, `msaa` or `none`: anti-aliasing for every scene (the post-FX scene keeps SMAA) | engine default (FXAA) |
 public struct BenchConfig: Sendable {
     public var sceneIDs: [String]
     public var warmupSeconds: Double
@@ -35,6 +36,8 @@ public struct BenchConfig: Sendable {
     public var autoStart: Bool
     public var immersion: String
     public var perFrame: Bool
+    /// Anti-aliasing mode name from the environment, or nil to leave the engine's default.
+    public var antiAliasing: String?
 
     public static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> BenchConfig {
         func double(_ key: String, _ fallback: Double) -> Double {
@@ -65,7 +68,8 @@ public struct BenchConfig: Sendable {
             exitWhenDone: environment["UNTOLD_BENCH_KEEP_OPEN"] != "1",
             autoStart: environment["UNTOLD_BENCH_AUTOSTART"] != "0",
             immersion: environment["UNTOLD_BENCH_IMMERSION"] ?? "full",
-            perFrame: environment["UNTOLD_BENCH_PER_FRAME"] != "0"
+            perFrame: environment["UNTOLD_BENCH_PER_FRAME"] != "0",
+            antiAliasing: environment["UNTOLD_BENCH_AA"].map { $0.lowercased() }
         )
     }
 
