@@ -212,12 +212,14 @@ final class PostFXScene: BenchScene {
     let title = "1024 primitives with SSAO, bloom, depth of field and SMAA"
     let notes = "Same geometry as primitives-1k; the difference is the full-screen pass chain."
     let orbit = BenchCameraOrbit(center: .zero, radius: 22.0, height: 11.0, period: 14.0)
+    private var previousAntiAliasing: AntiAliasingMode = .fxaa
 
     func build(origin: simd_float3) {
         BenchSceneBuilder.makeCamera(eye: origin + orbit.eye(at: 0), target: origin)
         BenchSceneBuilder.makeSun()
         _ = BenchSceneBuilder.makeGrid(origin: origin, gridSize: 32, spacing: 1.0, batched: false, namePrefix: id)
         BenchSceneBuilder.makePointLights(count: 4, around: origin, radius: 12.0, height: 2.0)
+        previousAntiAliasing = antiAliasingMode
         setRendering(.postProcessing(.enabled))
         setRendering(.antiAliasing(.smaa))
         setPostFX(.ssao(.enabled(true)))
@@ -232,7 +234,9 @@ final class PostFXScene: BenchScene {
         setPostFX(.bloomComposite(.enabled(false)))
         setPostFX(.bloomThreshold(.enabled(false)))
         setPostFX(.ssao(.enabled(false)))
-        setRendering(.antiAliasing(.none))
+        // Restore the engine's mode (FXAA by default); forcing .none here left every later scene
+        // without anti-aliasing, which showed as shimmering edges on the headset.
+        setRendering(.antiAliasing(previousAntiAliasing))
     }
 }
 
