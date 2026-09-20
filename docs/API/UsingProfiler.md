@@ -39,6 +39,7 @@ With `profile: .verbose`, the engine logs a multi-line snapshot every interval:
 ```
 Frame 1234 | CPU 12.34ms (81.0 fps, smoothed)  GPU 8.45ms exec / 90.0 fps cadence  [GPU-bound]
 Timing: frame 12.34ms (raw CPU) | update 1.23ms | render 8.45ms | cull 0.45ms | stream 2.34ms | batchTick 0.12ms | batchRebuild 0.00ms
+Systems: scenegraph 0.05ms | extensions 0.02ms | lod 0.10ms | animation 0.60ms | scripting 0.01ms | physics 0.30ms (1 steps) | custom 0.00ms | game 0.12ms | semWait 0.00ms
 Render: draws 45 (opaque 32, transparent 3, shadow 8, batched 28) | triangles 125000 | visible 89
 Culling: frustum 234/512 failed 278 | occlusion 198/234 failed 36 | usedHZB true validHZB true
 Streaming: loaded 847 loading 3 unloaded 12 | active 3 | nearby 124 candidates 5 slots 4 | backlog 0 | pendingUploads 3 | gateMs 0.00
@@ -65,6 +66,20 @@ Compositor: views 2 @ 2048x1984 | update 2.10ms | inputSlack 1.45ms | submit 3.2
 | `noAnchor` | Frames presented without a fresh device anchor since reset (tracking gaps). |
 
 Programmatic access: `getEngineStatsSnapshot().compositor` (`EngineCompositorStats`), including `missedDeadlineRate`.
+
+**Systems line** — where the `update` time goes, per engine system. Each value is the CPU time of that system this frame; `physics` and `custom` sum every fixed step and the step count is shown. The same scopes are emitted as signposts in the `Systems` category, so Instruments shows them as lanes without symbolication.
+
+| Field | What it tells you |
+|---|---|
+| `scenegraph` | World-transform propagation. Non-zero only when something moved; large values mean many dirty transforms or a deep hierarchy scan. |
+| `extensions` | Render and engine extension `update` hooks. |
+| `lod` | Mesh and Gaussian LOD selection (interval and camera-displacement gated). |
+| `animation` | Clip sampling, blending, root motion, IK, pose and joint matrix updates for every animated entity. |
+| `scripting` | USC script execution. |
+| `physics` | Fixed-step physics, summed over the steps taken this frame. More than one step per frame at 90 Hz means the frame is late. |
+| `custom` | Registered custom systems, summed over the fixed steps. |
+| `game` | The app's `gameUpdate` callback. |
+| `semWait` | Time waiting for a free in-flight command buffer before encoding (see the Compositor line). |
 
 **Streaming line 1** — entity counts and slot pressure:
 

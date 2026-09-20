@@ -47,6 +47,21 @@ public struct EngineTimingStats {
     /// Persistently non-zero means the GPU (or the compositor) is pacing the CPU.
     public var semaphoreWaitMs: Double = 0.0
 
+    // Per-system CPU time inside updateMs. Systems that did not run this frame stay at zero.
+    public var scenegraphMs: Double = 0.0
+    public var extensionsUpdateMs: Double = 0.0
+    public var lodMs: Double = 0.0
+    public var animationMs: Double = 0.0
+    public var scriptingMs: Double = 0.0
+    /// All fixed-step physics updates this frame, summed.
+    public var physicsMs: Double = 0.0
+    /// Number of fixed-step physics updates this frame (0 when the accumulator did not reach a step).
+    public var physicsStepCount: Int = 0
+    /// All fixed-step custom system updates this frame, summed.
+    public var customSystemsMs: Double = 0.0
+    /// The app's game update callback.
+    public var gameUpdateMs: Double = 0.0
+
     public init(
         frameTotalMs: Double = 0.0,
         smoothedFrameMs: Double = 0.0,
@@ -65,7 +80,16 @@ public struct EngineTimingStats {
         batchingRebuildMs: Double = 0.0,
         presentationDeltaMs: Double = 0.0,
         skippedFrames: Int = 0,
-        semaphoreWaitMs: Double = 0.0
+        semaphoreWaitMs: Double = 0.0,
+        scenegraphMs: Double = 0.0,
+        extensionsUpdateMs: Double = 0.0,
+        lodMs: Double = 0.0,
+        animationMs: Double = 0.0,
+        scriptingMs: Double = 0.0,
+        physicsMs: Double = 0.0,
+        physicsStepCount: Int = 0,
+        customSystemsMs: Double = 0.0,
+        gameUpdateMs: Double = 0.0
     ) {
         self.frameTotalMs = frameTotalMs
         self.smoothedFrameMs = smoothedFrameMs
@@ -85,6 +109,15 @@ public struct EngineTimingStats {
         self.presentationDeltaMs = presentationDeltaMs
         self.skippedFrames = skippedFrames
         self.semaphoreWaitMs = semaphoreWaitMs
+        self.scenegraphMs = scenegraphMs
+        self.extensionsUpdateMs = extensionsUpdateMs
+        self.lodMs = lodMs
+        self.animationMs = animationMs
+        self.scriptingMs = scriptingMs
+        self.physicsMs = physicsMs
+        self.physicsStepCount = physicsStepCount
+        self.customSystemsMs = customSystemsMs
+        self.gameUpdateMs = gameUpdateMs
     }
 }
 
