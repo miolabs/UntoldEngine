@@ -68,6 +68,9 @@ public struct BenchRenderSettings: Codable, Sendable {
     public var displayRefreshHz: Double = 0.0
     /// Anti-aliasing mode the scenes ran with (the post-FX scene always uses SMAA).
     public var antiAliasing: String = "fxaa"
+    /// Whether the visionOS frame pacer may start the submission phase ahead of the compositor's
+    /// optimal input time. Always false off visionOS.
+    public var xrFramePacing: Bool = false
 
     public init(platform: String) {
         self.platform = platform

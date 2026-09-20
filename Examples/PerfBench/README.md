@@ -79,6 +79,7 @@ from its Start button; it reads its configuration from the environment:
 | `UNTOLD_BENCH_IMMERSION` | `full` or `mixed` (visionOS) | `full` |
 | `UNTOLD_BENCH_PER_FRAME` | `0` writes one line per second instead of per frame | per frame |
 | `UNTOLD_BENCH_AA` | `fxaa`, `smaa`, `msaa` or `none` for every scene (the post-FX scene keeps SMAA) | engine default, FXAA |
+| `UNTOLD_XR_PACER` | visionOS only: `0` keeps the submission phase at the compositor's optimal input time instead of letting the frame pacer start it early (recorded as `render.xrFramePacing`) | pacer on |
 
 On a device the app exits when the run is done so that `devicectl ... --console` returns; the run
 folder is then pulled from the app's Documents container. With the app opened from Xcode, set
