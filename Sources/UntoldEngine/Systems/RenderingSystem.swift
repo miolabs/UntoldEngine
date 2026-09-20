@@ -33,7 +33,16 @@ func UpdateRenderingSystem(in view: MTKView) {
     }
 
     // Wait for available command buffer slot to prevent unbounded memory growth
+    #if ENGINE_STATS_ENABLED
+        let semaphoreWaitStart = CACurrentMediaTime()
+    #endif
     commandBufferSemaphore.wait()
+    #if ENGINE_STATS_ENABLED
+        let semaphoreWaitMs = (CACurrentMediaTime() - semaphoreWaitStart) * 1000.0
+        EngineStatsMonitor.shared.update { snapshot in
+            snapshot.timing.semaphoreWaitMs = semaphoreWaitMs
+        }
+    #endif
 
     if let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() {
         #if ENGINE_STATS_ENABLED

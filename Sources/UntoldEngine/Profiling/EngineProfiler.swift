@@ -67,6 +67,11 @@ public final class EngineProfiler: @unchecked Sendable {
         signposts.endScope(scope)
     }
 
+    public func emitEvent(_ event: ProfileEvent) {
+        guard isEnabled else { return }
+        signposts.emitEvent(event)
+    }
+
     public func attach(to commandBuffer: MTLCommandBuffer, label: String? = nil) {
         guard isEnabled else { return }
         gpuMetrics.attach(to: commandBuffer, label: label)

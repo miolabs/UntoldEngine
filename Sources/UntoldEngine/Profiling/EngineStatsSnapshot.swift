@@ -29,6 +29,9 @@ public struct EngineTimingStats {
     public var geometryStreamingMs: Double = 0.0
     public var batchingTickMs: Double = 0.0
     public var batchingRebuildMs: Double = 0.0
+    /// CPU time spent waiting for a free in-flight command buffer slot before encoding.
+    /// Persistently non-zero means the GPU (or the compositor) is pacing the CPU.
+    public var semaphoreWaitMs: Double = 0.0
 
     public init(
         frameTotalMs: Double = 0.0,
@@ -44,7 +47,8 @@ public struct EngineTimingStats {
         streamingRegionMs: Double = 0.0,
         geometryStreamingMs: Double = 0.0,
         batchingTickMs: Double = 0.0,
-        batchingRebuildMs: Double = 0.0
+        batchingRebuildMs: Double = 0.0,
+        semaphoreWaitMs: Double = 0.0
     ) {
         self.frameTotalMs = frameTotalMs
         self.smoothedFrameMs = smoothedFrameMs
@@ -60,6 +64,75 @@ public struct EngineTimingStats {
         self.geometryStreamingMs = geometryStreamingMs
         self.batchingTickMs = batchingTickMs
         self.batchingRebuildMs = batchingRebuildMs
+        self.semaphoreWaitMs = semaphoreWaitMs
+    }
+}
+
+/// Compositor Services frame accounting. Only populated on visionOS, where the compositor
+/// hands the app a deadline for every frame; on other platforms every field stays at its default.
+///
+/// The per-frame values describe the last completed frame. The GPU-side values (deadline and
+/// presentation margins) come from the command buffer completion handler and therefore describe
+/// the most recently *completed* command buffer, which can lag the CPU frame by one or two frames.
+public struct EngineCompositorStats {
+    /// CPU time between `startUpdate()` and `endUpdate()`.
+    public var updateMs: Double = 0.0
+    /// Time left until `optimalInputTime` when the update phase ended.
+    /// Negative means the update phase ran past the compositor's optimal input time.
+    public var inputSlackMs: Double = 0.0
+    /// CPU time between `startSubmission()` and the command buffer commit.
+    public var submissionMs: Double = 0.0
+    /// Time between the GPU finishing the frame and the compositor's rendering deadline.
+    /// Negative means the deadline was missed and the compositor reprojected an older frame.
+    public var deadlineMarginMs: Double = 0.0
+    /// Time between the GPU finishing the frame and the frame's presentation time.
+    public var presentationMarginMs: Double = 0.0
+    /// Whether the most recently completed frame missed its rendering deadline.
+    public var missedDeadline: Bool = false
+    /// Frames whose GPU work finished after the rendering deadline since the monitor was reset.
+    public var missedDeadlineCount: Int = 0
+    /// Frames with a GPU completion sample since the monitor was reset (denominator for the miss rate).
+    public var deadlineSampleCount: Int = 0
+    /// Frames rendered without a fresh device anchor since the monitor was reset.
+    public var missingAnchorCount: Int = 0
+    /// Number of views (eyes) rendered this frame. Zero outside Compositor Services.
+    public var viewCount: Int = 0
+    /// Drawable size per view in pixels.
+    public var viewTextureWidth: Int = 0
+    public var viewTextureHeight: Int = 0
+
+    /// Fraction of sampled frames that missed the rendering deadline, in the range 0...1.
+    public var missedDeadlineRate: Double {
+        guard deadlineSampleCount > 0 else { return 0.0 }
+        return Double(missedDeadlineCount) / Double(deadlineSampleCount)
+    }
+
+    public init(
+        updateMs: Double = 0.0,
+        inputSlackMs: Double = 0.0,
+        submissionMs: Double = 0.0,
+        deadlineMarginMs: Double = 0.0,
+        presentationMarginMs: Double = 0.0,
+        missedDeadline: Bool = false,
+        missedDeadlineCount: Int = 0,
+        deadlineSampleCount: Int = 0,
+        missingAnchorCount: Int = 0,
+        viewCount: Int = 0,
+        viewTextureWidth: Int = 0,
+        viewTextureHeight: Int = 0
+    ) {
+        self.updateMs = updateMs
+        self.inputSlackMs = inputSlackMs
+        self.submissionMs = submissionMs
+        self.deadlineMarginMs = deadlineMarginMs
+        self.presentationMarginMs = presentationMarginMs
+        self.missedDeadline = missedDeadline
+        self.missedDeadlineCount = missedDeadlineCount
+        self.deadlineSampleCount = deadlineSampleCount
+        self.missingAnchorCount = missingAnchorCount
+        self.viewCount = viewCount
+        self.viewTextureWidth = viewTextureWidth
+        self.viewTextureHeight = viewTextureHeight
     }
 }
 
@@ -352,6 +425,7 @@ public struct EngineStatsSnapshot {
     public var streaming: EngineStreamingStats = .init()
     public var batching: EngineBatchingStats = .init()
     public var memory: EngineMemoryStats = .init()
+    public var compositor: EngineCompositorStats = .init()
 
     public init(
         frameIndex: UInt64 = 0,
@@ -361,7 +435,8 @@ public struct EngineStatsSnapshot {
         culling: EngineCullingStats = .init(),
         streaming: EngineStreamingStats = .init(),
         batching: EngineBatchingStats = .init(),
-        memory: EngineMemoryStats = .init()
+        memory: EngineMemoryStats = .init(),
+        compositor: EngineCompositorStats = .init()
     ) {
         self.frameIndex = frameIndex
         self.timestampSeconds = timestampSeconds
@@ -371,5 +446,6 @@ public struct EngineStatsSnapshot {
         self.streaming = streaming
         self.batching = batching
         self.memory = memory
+        self.compositor = compositor
     }
 }

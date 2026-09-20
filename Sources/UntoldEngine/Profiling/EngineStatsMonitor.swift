@@ -33,6 +33,14 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         private var _latestGPUFrameCadenceMs: Double = 0.0
         private var _lastGPUCompletionTime: Double = 0.0 // 0 = no completion seen yet
 
+        // Compositor deadline accounting (visionOS) — written from addCompletedHandler, read at completeFrame()
+        private var _latestDeadlineMarginMs: Double = 0.0
+        private var _latestPresentationMarginMs: Double = 0.0
+        private var _latestMissedDeadline: Bool = false
+        private var _missedDeadlineCount: Int = 0
+        private var _deadlineSampleCount: Int = 0
+        private var _missingAnchorCount: Int = 0
+
         // 30-frame rolling average for smoothed CPU frame time
         private let kSmoothingWindow = 30
         private var _frameMsBuffer: [Double] = .init(repeating: 0.0, count: 30)
@@ -134,6 +142,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             currentSnapshot.frameIndex &+= 1
             currentSnapshot.timestampSeconds = timestampSeconds
             currentSnapshot.timing = .init()
+            currentSnapshot.compositor = .init()
             lock.unlock()
         #endif
     }
@@ -162,6 +171,35 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         #endif
     }
 
+    /// Called from MTLCommandBuffer.addCompletedHandler on visionOS with the GPU completion time
+    /// measured against the compositor's rendering deadline and presentation time for that frame.
+    /// Safe to call from any thread.
+    public func recordCompositorCompletion(deadlineMarginMs: Double, presentationMarginMs: Double) {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            _latestDeadlineMarginMs = deadlineMarginMs
+            _latestPresentationMarginMs = presentationMarginMs
+            _latestMissedDeadline = deadlineMarginMs < 0.0
+            _deadlineSampleCount += 1
+            if deadlineMarginMs < 0.0 {
+                _missedDeadlineCount += 1
+            }
+            lock.unlock()
+        #else
+            _ = deadlineMarginMs
+            _ = presentationMarginMs
+        #endif
+    }
+
+    /// Called once per frame that is presented without a fresh device anchor (visionOS).
+    public func recordMissingAnchor() {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            _missingAnchorCount += 1
+            lock.unlock()
+        #endif
+    }
+
     /// Publishes the current frame so API readers can safely consume it next frame.
     public func completeFrame() {
         #if ENGINE_STATS_ENABLED
@@ -169,6 +207,14 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             // Pull in latest GPU timing from async handler
             currentSnapshot.timing.gpuExecutionMs = _latestGPUExecutionMs
             currentSnapshot.timing.gpuFrameCadenceMs = _latestGPUFrameCadenceMs
+
+            // Pull in the latest compositor deadline sample and the cumulative counters
+            currentSnapshot.compositor.deadlineMarginMs = _latestDeadlineMarginMs
+            currentSnapshot.compositor.presentationMarginMs = _latestPresentationMarginMs
+            currentSnapshot.compositor.missedDeadline = _latestMissedDeadline
+            currentSnapshot.compositor.missedDeadlineCount = _missedDeadlineCount
+            currentSnapshot.compositor.deadlineSampleCount = _deadlineSampleCount
+            currentSnapshot.compositor.missingAnchorCount = _missingAnchorCount
 
             // Update 30-frame rolling average for CPU frame time
             let frameMs = currentSnapshot.timing.frameTotalMs
@@ -206,6 +252,12 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             _latestGPUExecutionMs = 0.0
             _latestGPUFrameCadenceMs = 0.0
             _lastGPUCompletionTime = 0.0
+            _latestDeadlineMarginMs = 0.0
+            _latestPresentationMarginMs = 0.0
+            _latestMissedDeadline = false
+            _missedDeadlineCount = 0
+            _deadlineSampleCount = 0
+            _missingAnchorCount = 0
             _frameMsBuffer = .init(repeating: 0.0, count: kSmoothingWindow)
             _frameMsBufferIndex = 0
             _frameMsFilled = 0

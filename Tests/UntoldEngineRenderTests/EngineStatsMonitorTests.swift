@@ -215,4 +215,107 @@ final class EngineStatsMonitorTests: XCTestCase {
         XCTAssertFalse(overlay.contains("nan"), "Output should not contain NaN")
         XCTAssertFalse(compact.contains("nan"), "Output should not contain NaN")
     }
+
+    // MARK: - Compositor frame accounting
+
+    func testRecordCompositorCompletion_publishesLatestMarginAndCumulativeCounts() {
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1.0)
+        EngineStatsMonitor.shared.recordCompositorCompletion(deadlineMarginMs: -1.5, presentationMarginMs: 2.0)
+        EngineStatsMonitor.shared.recordCompositorCompletion(deadlineMarginMs: 3.0, presentationMarginMs: 5.5)
+        EngineStatsMonitor.shared.completeFrame()
+
+        let published = getEngineStatsSnapshot()
+        XCTAssertEqual(published.compositor.deadlineMarginMs, 3.0)
+        XCTAssertEqual(published.compositor.presentationMarginMs, 5.5)
+        XCTAssertFalse(published.compositor.missedDeadline)
+        XCTAssertEqual(published.compositor.missedDeadlineCount, 1)
+        XCTAssertEqual(published.compositor.deadlineSampleCount, 2)
+        XCTAssertEqual(published.compositor.missedDeadlineRate, 0.5, accuracy: 1e-9)
+    }
+
+    func testRecordCompositorCompletion_negativeMargin_flagsMissedDeadline() {
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1.0)
+        EngineStatsMonitor.shared.recordCompositorCompletion(deadlineMarginMs: -0.25, presentationMarginMs: 1.0)
+        EngineStatsMonitor.shared.completeFrame()
+
+        let published = getEngineStatsSnapshot()
+        XCTAssertTrue(published.compositor.missedDeadline)
+        XCTAssertEqual(published.compositor.missedDeadlineCount, 1)
+        XCTAssertEqual(published.compositor.deadlineSampleCount, 1)
+        XCTAssertEqual(published.compositor.missedDeadlineRate, 1.0, accuracy: 1e-9)
+    }
+
+    func testCompositorCounters_survive_beginFrame_butPerFrameFieldsReset() {
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1.0)
+        EngineStatsMonitor.shared.update { snapshot in
+            snapshot.compositor.updateMs = 4.0
+            snapshot.compositor.inputSlackMs = 1.25
+            snapshot.compositor.viewCount = 2
+        }
+        EngineStatsMonitor.shared.recordMissingAnchor()
+        EngineStatsMonitor.shared.recordCompositorCompletion(deadlineMarginMs: -2.0, presentationMarginMs: 0.5)
+        EngineStatsMonitor.shared.completeFrame()
+
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 2.0)
+        let inProgress = getEngineStatsSnapshotInProgress()
+        XCTAssertEqual(inProgress.compositor.updateMs, 0.0)
+        XCTAssertEqual(inProgress.compositor.inputSlackMs, 0.0)
+        XCTAssertEqual(inProgress.compositor.viewCount, 0)
+
+        EngineStatsMonitor.shared.completeFrame()
+        let published = getEngineStatsSnapshot()
+        XCTAssertEqual(published.compositor.missedDeadlineCount, 1)
+        XCTAssertEqual(published.compositor.deadlineSampleCount, 1)
+        XCTAssertEqual(published.compositor.missingAnchorCount, 1)
+        // The latest GPU sample carries over until a newer completion arrives.
+        XCTAssertEqual(published.compositor.deadlineMarginMs, -2.0)
+    }
+
+    func testReset_clearsCompositorCounters() {
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1.0)
+        EngineStatsMonitor.shared.recordMissingAnchor()
+        EngineStatsMonitor.shared.recordCompositorCompletion(deadlineMarginMs: -2.0, presentationMarginMs: 0.5)
+        EngineStatsMonitor.shared.completeFrame()
+
+        EngineStatsMonitor.shared.reset()
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 2.0)
+        EngineStatsMonitor.shared.completeFrame()
+
+        let published = getEngineStatsSnapshot()
+        XCTAssertEqual(published.compositor.missedDeadlineCount, 0)
+        XCTAssertEqual(published.compositor.deadlineSampleCount, 0)
+        XCTAssertEqual(published.compositor.missingAnchorCount, 0)
+        XCTAssertEqual(published.compositor.deadlineMarginMs, 0.0)
+        XCTAssertFalse(published.compositor.missedDeadline)
+    }
+
+    func testTimingSemaphoreWaitMs_roundTripsThroughSnapshot() {
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1.0)
+        EngineStatsMonitor.shared.update { snapshot in
+            snapshot.timing.semaphoreWaitMs = 0.75
+        }
+        EngineStatsMonitor.shared.completeFrame()
+
+        XCTAssertEqual(getEngineStatsSnapshot().timing.semaphoreWaitMs, 0.75)
+    }
+
+    func testFormatEngineStats_compositorLine_onlyForCompositorFrames() {
+        var snapshot = EngineStatsSnapshot()
+        XCTAssertFalse(formatEngineStatsOverlay(snapshot).contains("Compositor:"))
+
+        snapshot.compositor.viewCount = 2
+        snapshot.compositor.viewTextureWidth = 2048
+        snapshot.compositor.viewTextureHeight = 1984
+        snapshot.compositor.deadlineMarginMs = -0.5
+        snapshot.compositor.missedDeadline = true
+        snapshot.compositor.missedDeadlineCount = 3
+        snapshot.compositor.deadlineSampleCount = 300
+        snapshot.timing.semaphoreWaitMs = 0.1
+
+        let overlay = formatEngineStatsOverlay(snapshot)
+        XCTAssertTrue(overlay.contains("Compositor: views 2 @ 2048x1984"), overlay)
+        XCTAssertTrue(overlay.contains("deadlineMargin -0.50ms MISSED"), overlay)
+        XCTAssertTrue(overlay.contains("missed 3/300 (1.00%)"), overlay)
+        XCTAssertTrue(overlay.contains("semWait 0.10ms"), overlay)
+    }
 }
