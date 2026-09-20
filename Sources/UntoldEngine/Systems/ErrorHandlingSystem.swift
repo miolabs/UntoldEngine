@@ -281,8 +281,9 @@ public func handleError(_ error: ErrorHandlingSystem) {
 }
 
 public func handleError(_ error: ErrorHandlingSystem, _ entityId: EntityID) {
-    let name = getEntityName(entityId: entityId)
-    handleError(error, name)
+    // The message is an autoclosure: the entity name is only looked up and formatted when the
+    // logger's level admits errors, so the per-entity call sites pay nothing otherwise.
+    Logger.logError(message: "\(error.rawValue): \(error.description) for \(getEntityName(entityId: entityId))")
 }
 
 public func handleError(_ error: ErrorHandlingSystem, _ name: String) {
@@ -294,8 +295,7 @@ public func handleError(_ error: ErrorHandlingSystem, _ argument: String, _ name
 }
 
 public func handleError(_ error: ErrorHandlingSystem, _ argument: String, _ entityId: EntityID) {
-    let name = getEntityName(entityId: entityId)
-    handleError(error, argument, name)
+    Logger.logError(message: "\(error.rawValue): \(argument) \(error.description) for \(getEntityName(entityId: entityId))")
 }
 
 /// warnings

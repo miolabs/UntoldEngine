@@ -595,10 +595,26 @@
             #endif
             frame.endUpdate()
 
-            // 7. Call wait(until:tolerace) to puase your render loop until the optimal rendering time
+            // 7. Wait until the optimal input time, less the pacer's early start. The pacer moves the
+            // submission start ahead of `optimalInputTime` when recent frames finished on the GPU
+            // after their rendering deadline (see XRFramePacer).
+            let requestedEarlyStartMs = XRFramePacer.shared.earlyStartMs
+            let submissionStartInstant: LayerRenderer.Clock.Instant = requestedEarlyStartMs > 0.0
+                ? timing.optimalInputTime.advanced(by: .milliseconds(-requestedEarlyStartMs))
+                : timing.optimalInputTime
             EngineProfiler.shared.beginScope(.compositorWaitForInput)
-            LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
+            LayerRenderer.Clock().wait(until: submissionStartInstant, tolerance: .zero)
             EngineProfiler.shared.endScope(.compositorWaitForInput)
+            // How far ahead of the optimal input time the loop really resumed; negative when the
+            // update phase ran past the requested start. The pacer uses it to tell "the GPU is late"
+            // from "the update phase is the limit".
+            let achievedEarlyStartMs = milliseconds(LayerRenderer.Clock().now.duration(to: timing.optimalInputTime))
+            XRFramePacer.shared.noteAchievedEarlyStart(achievedEarlyStartMs)
+            #if ENGINE_STATS_ENABLED
+                EngineStatsMonitor.shared.update { snapshot in
+                    snapshot.compositor.earlyStartMs = max(0.0, achievedEarlyStartMs)
+                }
+            #endif
 
             // The compositor or app state can transition while waiting. If not running anymore,
             // skip submission entirely to avoid using an invalid frame.
@@ -635,12 +651,16 @@
             }
 
             // 10. Fetch the predicted device anchor from ARKit using the frameTiming information, and
-            // apply the anchor to your frame
+            // apply the anchor to your frame. The compositor names the instant to query the anchor for
+            // (`trackableAnchorTime`); in mixed immersion it is aligned with the passthrough camera
+            // frame, so querying at the presentation time instead makes rendered content lead the
+            // passthrough.
             let presentationInstant = drawable.frameTiming.presentationTime
             let presentationTimeCA: TimeInterval = compositorInstantToCATime(presentationInstant)
+            let trackableAnchorTimeCA: TimeInterval = compositorInstantToCATime(drawable.frameTiming.trackableAnchorTime)
             // The compositor's deadline for this drawable's GPU work; the completion handler measures against it.
             let renderingDeadlineCA: TimeInterval = compositorInstantToCATime(drawable.frameTiming.renderingDeadline)
-            var deviceAnchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: presentationTimeCA)
+            var deviceAnchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: trackableAnchorTimeCA)
 
             // If predicted-time query misses, retry at "now" to reduce one-frame anchor gaps.
             if deviceAnchor == nil {
@@ -954,6 +974,9 @@
                         )
                     }
                 #endif
+                if renderingDeadlineCA > 0.0, gpuEndTime > 0.0 {
+                    XRFramePacer.shared.recordDeadlineMargin((renderingDeadlineCA - gpuEndTime) * 1000.0)
+                }
                 if renderingDeadlineCA > 0.0, gpuEndTime > renderingDeadlineCA {
                     EngineProfiler.shared.emitEvent(.missedDeadline)
                 }
@@ -1097,6 +1120,11 @@
         }
 
         @inline(__always)
+        private func milliseconds(_ duration: Duration) -> Double {
+            let components = duration.components
+            return Double(components.seconds) * 1000.0 + Double(components.attoseconds) / 1e15
+        }
+
         private func compositorInstantToCATime(_ instant: LayerRenderer.Clock.Instant) -> TimeInterval {
             let compositorClock = LayerRenderer.Clock()
             let nowInstant = compositorClock.now

@@ -161,6 +161,7 @@ public final class EngineStatsRecorder: @unchecked Sendable {
             ("animationMs", t.animationMs), ("scriptingMs", t.scriptingMs), ("physicsMs", t.physicsMs),
             ("customSystemsMs", t.customSystemsMs), ("gameUpdateMs", t.gameUpdateMs),
             ("compositorUpdateMs", c.updateMs), ("compositorInputSlackMs", c.inputSlackMs),
+            ("compositorEarlyStartMs", c.earlyStartMs),
             ("compositorSubmissionMs", c.submissionMs), ("compositorDeadlineMarginMs", c.deadlineMarginMs),
         ]
         for (name, value) in fields {

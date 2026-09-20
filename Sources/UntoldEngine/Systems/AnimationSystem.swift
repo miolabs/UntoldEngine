@@ -162,7 +162,9 @@ private func updateAnimationSystem(deltaTime: Float) {
             continue
         }
 
-        if isAnimationComponentPaused(entityId: entity) {
+        // Each animated entity is visited by this loop on its own, so its own pause flag decides;
+        // isAnimationComponentPaused(entityId:) walks the whole subtree and allocates per node.
+        if animationComponent.pause {
             continue
         }
 

@@ -50,6 +50,7 @@ final class BenchHost: ObservableObject {
         render.foveation = XRHolder.shared.foveation
         render.immersion = config.immersion
         render.displayRefreshHz = 90.0
+        render.xrFramePacing = XRFramePacer.shared.isEnabled
         runner = BenchRunner(config: config, render: render)
         // Scenes are built three metres in front of the user, slightly below eye level.
         runner.sceneOrigin = simd_float3(0.0, -0.8, -3.0)

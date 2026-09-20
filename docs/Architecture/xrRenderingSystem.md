@@ -86,10 +86,13 @@ Everything between `startUpdate` and `endUpdate` is CPU-side frame preparation:
 ### 2c. Wait for Optimal Input Time
 
 ```swift
-LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
+let earlyStartMs = XRFramePacer.shared.earlyStartMs
+LayerRenderer.Clock().wait(until: timing.optimalInputTime.advanced(by: .milliseconds(-earlyStartMs)), tolerance: .zero)
 ```
 
 The thread sleeps until the compositor says it's the best moment to submit GPU work. Submitting too early wastes GPU time on a stale pose; submitting too late misses the scanline. This one call is what makes visionOS rendering feel low-latency.
+
+The compositor leaves about one display period between `optimalInputTime` and `renderingDeadline`, and the CPU encode plus the GPU execution of the frame have to fit in it back to back. When they do not, the compositor shows an older frame reprojected to the new head pose, which reads as shaking near the viewer even at a steady 90 Hz. `XRFramePacer` therefore moves the submission start ahead of `optimalInputTime` by however much recent frames missed their deadline (plus a target margin, 1.5 ms by default), and lets that early start decay while there is surplus. It never starts a frame before its own update phase ends, so it does not wind up on CPU-bound frames. The cost is a few milliseconds of pose age, which the compositor's reprojection corrects; the gain is a frame that lands before its deadline. `XRFramePacer.shared.isEnabled`, `targetMarginMs` and `maxEarlyStartMs` tune it, and `UNTOLD_XR_PACER=0` in the environment disables it for an A/B run. The stats `Compositor` line reports the early start each frame got as `earlyStart`.
 
 ### 2d. Submission Phase
 
@@ -103,11 +106,13 @@ The `defer` is important: `endSubmission()` **must** be called even if rendering
 ### 2e. Device Anchor Acquisition
 
 ```swift
-let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTimeCA)
+let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: trackableAnchorTimeCA)
 drawable.deviceAnchor = anchor
 ```
 
 The device anchor is the head pose — a 4×4 transform from world space to the device. The compositor requires it to be attached to the drawable before presenting; without it, the system can't reproject the frame correctly for the user's eyes.
+
+The anchor is queried for the drawable's `trackableAnchorTime`, the instant the compositor names for it. In mixed immersion that instant is aligned with the passthrough camera frame the content is composited over; querying at the presentation time instead makes rendered content lead the passthrough by the difference.
 
 The engine queries the anchor at **presentation time** (the future moment when the frame will appear on screen), not at "now". This is predictive — it compensates for the latency between encoding and display by predicting where the head will be.
 
@@ -216,10 +221,10 @@ The snapshot is processed on the next frame's update phase by `spatialGestureRec
         │       ├─ updateSpatialInputState()   (drain gesture queue)
         │       └─ renderer.updateXR()         (gameUpdate + handleInput)
         ├─ frame.endUpdate()
-        ├─ wait(until: optimalInputTime)       (sleep until compositor deadline)
+        ├─ wait(until: optimalInputTime - earlyStart)   (XRFramePacer; earlyStart is 0 while frames make their deadline)
         ├─ frame.startSubmission()
         ├─ queryDrawable()                     (get per-eye textures)
-        ├─ queryDeviceAnchor() → fallback chain → drawable.deviceAnchor = anchor
+        ├─ queryDeviceAnchor(at: trackableAnchorTime) → fallback chain → drawable.deviceAnchor = anchor
         │
         └─ executeXRSystemPass()
                 │
