@@ -162,9 +162,11 @@ private func updateAnimationSystem(deltaTime: Float) {
             continue
         }
 
+        // Each animated entity is visited by this loop on its own, so its own pause flag decides;
+        // isAnimationComponentPaused(entityId:) walks the whole subtree and allocates per node.
         // A paused clip still re-poses when an external pose drives it
         // (motion capture over a frozen base pose); time just stands still.
-        let paused = isAnimationComponentPaused(entityId: entity)
+        let paused = animationComponent.pause
         if paused, animationComponent.externalPose.isActive == false {
             continue
         }
