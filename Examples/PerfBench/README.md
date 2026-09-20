@@ -14,6 +14,7 @@ compared with a number from after it.
 
 | id | What it measures |
 |---|---|
+| `cube` | One lit, shadowed cube on a plane: the fixed per-frame cost of the pass chain, and the scene to judge image quality on a headset. |
 | `primitives-1k` | 1024 individual cubes and spheres, 4 point lights, cascaded shadows: per-entity CPU cost and encoder overhead. |
 | `primitives-10k` | 10 000 primitives merged by the static batcher: batched draw cost and light-loop cost at scale. |
 | `lights-64` | 1024 batched primitives with 64 point lights: the per-pixel light loop. |
@@ -77,6 +78,7 @@ from its Start button; it reads its configuration from the environment:
 | `UNTOLD_BENCH_AUTOSTART` | `0` waits for the Start button | start on launch |
 | `UNTOLD_BENCH_IMMERSION` | `full` or `mixed` (visionOS) | `full` |
 | `UNTOLD_BENCH_PER_FRAME` | `0` writes one line per second instead of per frame | per frame |
+| `UNTOLD_BENCH_AA` | `fxaa`, `smaa`, `msaa` or `none` for every scene (the post-FX scene keeps SMAA) | engine default, FXAA |
 
 On a device the app exits when the run is done so that `devicectl ... --console` returns; the run
 folder is then pulled from the app's Documents container. With the app opened from Xcode, set

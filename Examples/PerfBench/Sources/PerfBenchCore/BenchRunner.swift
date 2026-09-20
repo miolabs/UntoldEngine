@@ -98,6 +98,17 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
             // refresh was skipped: more than one and a half intervals.
             EngineStatsMonitor.shared.frameBudgetMs = 1.5 * 1000.0 / render.displayRefreshHz
         }
+        if let mode = config.antiAliasing {
+            switch mode {
+            case "none": setRendering(.antiAliasing(.none))
+            case "fxaa": setRendering(.antiAliasing(.fxaa))
+            case "smaa": setRendering(.antiAliasing(.smaa))
+            case "msaa": setRendering(.antiAliasing(.msaa))
+            default: print("PERFBENCH unknown UNTOLD_BENCH_AA value \(mode); keeping the engine default")
+            }
+        }
+        render.antiAliasing = String(describing: antiAliasingMode)
+        summary.render = render
         gameMode = true
         setState(.building(0))
     }

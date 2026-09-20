@@ -66,6 +66,8 @@ public struct BenchRenderSettings: Codable, Sendable {
     public var vsync: Bool = true
     /// Refresh rate the frame budget is derived from (0 when unknown).
     public var displayRefreshHz: Double = 0.0
+    /// Anti-aliasing mode the scenes ran with (the post-FX scene always uses SMAA).
+    public var antiAliasing: String = "fxaa"
 
     public init(platform: String) {
         self.platform = platform

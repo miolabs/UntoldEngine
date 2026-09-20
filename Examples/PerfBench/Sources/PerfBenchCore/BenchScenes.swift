@@ -53,6 +53,7 @@ public extension BenchScene {
 
 public enum BenchScenes {
     public static let all: [BenchScene] = [
+        SingleCubeScene(),
         PrimitivesScene(id: "primitives-1k", gridSize: 32, spacing: 1.0, batched: false, pointLights: 4),
         PrimitivesScene(id: "primitives-10k", gridSize: 100, spacing: 1.0, batched: true, pointLights: 4),
         PrimitivesScene(id: "lights-64", gridSize: 32, spacing: 1.0, batched: true, pointLights: 64),
@@ -159,6 +160,32 @@ enum BenchSceneBuilder {
 }
 
 // MARK: - Scenes
+
+/// One cube and a sun: the fixed cost of a frame with almost nothing in it, and the scene to judge
+/// image quality on a headset (edge stability, shadow swim, reprojection) without any load.
+final class SingleCubeScene: BenchScene {
+    let id = "cube"
+    let title = "A single cube"
+    let notes = "One lit, shadowed cube in front of the viewer; measures the frame's fixed per-frame cost."
+    let orbit = BenchCameraOrbit(center: simd_float3(0, 0.5, 0), radius: 4.0, height: 1.5, period: 14.0)
+
+    func build(origin: simd_float3) {
+        BenchSceneBuilder.makeCamera(eye: origin + orbit.eye(at: 0), target: origin + simd_float3(0, 0.5, 0))
+        BenchSceneBuilder.makeSun()
+        let cube = createEntity()
+        setEntityName(entityId: cube, name: "Bench Cube")
+        setEntityMeshDirect(entityId: cube, meshes: BasicPrimitives.createCube(extent: 0.5), assetName: "bench_single_cube")
+        translateTo(entityId: cube, position: origin + simd_float3(0, 0.5, 0))
+        updateMaterialColor(entityId: cube, color: Color(hue: 0.58, saturation: 0.6, brightness: 0.9))
+        updateMaterialRoughness(entityId: cube, roughness: 0.6)
+        let floor = createEntity()
+        setEntityName(entityId: floor, name: "Bench Floor")
+        setEntityMeshDirect(entityId: floor, meshes: BasicPrimitives.createPlane(width: 6.0, depth: 6.0), assetName: "bench_floor")
+        translateTo(entityId: floor, position: origin)
+        updateMaterialColor(entityId: floor, color: Color(hue: 0.1, saturation: 0.15, brightness: 0.8))
+        updateMaterialRoughness(entityId: floor, roughness: 0.9)
+    }
+}
 
 /// A grid of individual primitives: draw-call and per-entity CPU cost, shadows, a few lights.
 final class PrimitivesScene: BenchScene {
