@@ -514,7 +514,7 @@ public enum RenderPasses {
         let height = min(sourceDepth.height, hzbSourceDepth.height)
         guard width > 0, height > 0 else { return }
 
-        guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return }
+        guard let blitEncoder = commandBuffer.makeBlitCommandEncoder(passLabel: "Copy Opaque Depth for HZB") else { return }
         blitEncoder.label = "Copy Opaque Depth for HZB"
         blitEncoder.copy(
             from: sourceDepth,
@@ -1028,7 +1028,7 @@ public enum RenderPasses {
         encoderDescriptor.colorAttachments[0].storeAction = MTLStoreAction.store
         encoderDescriptor.colorAttachments[0].loadAction = loadAction
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Grid Pass")
         else {
             handleError(.renderPassCreationFailed, "Grid Pass")
             return
@@ -1119,7 +1119,7 @@ public enum RenderPasses {
         encoderDescriptor.colorAttachments[0].storeAction = MTLStoreAction.store
         encoderDescriptor.colorAttachments[0].loadAction = MTLLoadAction.clear
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Sky Pass")
         else {
             handleError(.renderPassCreationFailed, "Sky Pass")
             return
@@ -1189,7 +1189,7 @@ public enum RenderPasses {
         encoderDescriptor.colorAttachments[0].storeAction = MTLStoreAction.store
         encoderDescriptor.colorAttachments[0].loadAction = MTLLoadAction.clear
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Environment Pass")
         else {
             handleError(.renderPassCreationFailed, "Environment Pass")
             return
@@ -1301,7 +1301,7 @@ public enum RenderPasses {
             descriptor.depthAttachment.storeAction = .store
             descriptor.depthAttachment.clearDepth = 1.0
 
-            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: "Shadow Cascade \(cascadeIdx)") else {
                 handleError(.renderPassCreationFailed, "Shadow Cascade \(cascadeIdx)")
                 continue
             }
@@ -1413,7 +1413,7 @@ public enum RenderPasses {
             let descriptor = renderInfo.csmRenderPassDescriptors[cascadeIdx]
             descriptor.depthAttachment.loadAction = .load
 
-            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: "Batched Shadow Cascade \(cascadeIdx)") else {
                 handleError(.renderPassCreationFailed, "Batched Shadow Cascade \(cascadeIdx)")
                 continue
             }
@@ -1501,7 +1501,7 @@ public enum RenderPasses {
             return
         }
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: "Spot Shadow") else {
             handleError(.renderPassCreationFailed, "Spot Shadow")
             return
         }
@@ -1632,7 +1632,7 @@ public enum RenderPasses {
             descriptor.depthAttachment.clearDepth = 1.0
             descriptor.depthAttachment.slice = face
 
-            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: "Point Shadow Face \(face)") else {
                 handleError(.renderPassCreationFailed, "Point Shadow")
                 return
             }
@@ -1775,7 +1775,7 @@ public enum RenderPasses {
         encoderDescriptor.depthAttachment.loadAction = .clear
         encoderDescriptor.depthAttachment.clearDepth = sceneDepthClearValue()
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Model Pass")
         else {
             handleError(.renderPassCreationFailed, "Model Pass")
             return
@@ -2031,7 +2031,7 @@ public enum RenderPasses {
         encoderDescriptor.colorAttachments[Int(emissiveTarget.rawValue)].loadAction = .load
         encoderDescriptor.depthAttachment.loadAction = .load
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Batched Model Pass")
         else {
             handleError(.renderPassCreationFailed, "Batched Model Pass")
             return
@@ -2262,7 +2262,7 @@ public enum RenderPasses {
         encoderDescriptor.depthAttachment.storeAction = renderInfo.opaqueSampleCount > 1 ? .multisampleResolve : .store
         encoderDescriptor.depthAttachment.clearDepth = sceneDepthClearValue()
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Combined G-buffer + Light Pass") else {
             handleError(.renderPassCreationFailed, "Combined G-buffer + Light Pass")
             return
         }
@@ -2515,7 +2515,7 @@ public enum RenderPasses {
             lightPassDescriptor.depthAttachment.loadAction = .load
             lightPassDescriptor.depthAttachment.storeAction = .store
 
-            guard let lightEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: lightPassDescriptor) else {
+            guard let lightEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: lightPassDescriptor, passLabel: "Light Pass (Simulator)") else {
                 handleError(.renderPassCreationFailed, "Light Pass (Simulator)")
                 return
             }
@@ -2661,7 +2661,7 @@ public enum RenderPasses {
 
         // set your encoder here
         guard
-            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "SSAO Pass")
         else {
             handleError(.renderPassCreationFailed, "SSAO Pass")
             return
@@ -2761,7 +2761,7 @@ public enum RenderPasses {
 
         // set your encoder here
         guard
-            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "SSAO Blur Pass")
         else {
             handleError(.renderPassCreationFailed, "SSAO Blur Pass")
             return
@@ -2887,7 +2887,7 @@ public enum RenderPasses {
             return
         }
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "SSAO Low-Res Pass") else {
             handleError(.renderPassCreationFailed, "SSAO Low-Res Pass")
             return
         }
@@ -2981,7 +2981,7 @@ public enum RenderPasses {
         direction: simd_float2,
         label: String
     ) {
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: destinationDescriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: destinationDescriptor, passLabel: label) else {
             handleError(.renderPassCreationFailed, label)
             return
         }
@@ -3046,7 +3046,7 @@ public enum RenderPasses {
             return
         }
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "SSAO Simple Blur Pass") else {
             handleError(.renderPassCreationFailed, "SSAO Blur Pass")
             return
         }
@@ -3097,7 +3097,7 @@ public enum RenderPasses {
             return
         }
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "SSAO Upsample Pass") else {
             handleError(.renderPassCreationFailed, "SSAO Upsample Pass")
             return
         }
@@ -3187,7 +3187,7 @@ public enum RenderPasses {
 
         // set your encoder here
         guard
-            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "Light Pass")
         else {
             handleError(.renderPassCreationFailed, "Light Pass")
             return
@@ -3410,7 +3410,7 @@ public enum RenderPasses {
 
         // set your encoder here
         guard
-            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+            let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "Pre Composite Pass")
         else {
             handleError(.renderPassCreationFailed, "Pre Composite Pass")
             return
@@ -3528,7 +3528,7 @@ public enum RenderPasses {
         encoderDescriptor.depthAttachment.loadAction = .load
         encoderDescriptor.depthAttachment.storeAction = .store
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Transparency Pass")
         else {
             handleError(.renderPassCreationFailed, "Transparency Pass")
             return
@@ -3896,7 +3896,7 @@ public enum RenderPasses {
         descriptor.depthAttachment.loadAction = .load
         descriptor.depthAttachment.storeAction = .store
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: "Mesh Occluder Shell Pass") else {
             handleError(.renderPassCreationFailed, "Mesh Occluder Shell Pass")
             return
         }
@@ -4037,7 +4037,7 @@ public enum RenderPasses {
         descriptor.depthAttachment.loadAction = .load
         descriptor.depthAttachment.storeAction = .store
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: "Wireframe Occlusion Depth Pass") else {
             handleError(.renderPassCreationFailed, "Wireframe Occlusion Depth Pass")
             return
         }
@@ -4223,7 +4223,7 @@ public enum RenderPasses {
         encoderDescriptor.depthAttachment.loadAction = .load
         encoderDescriptor.depthAttachment.storeAction = .store
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Wireframe Pass")
         else {
             handleError(.renderPassCreationFailed, "Wireframe Pass")
             return
@@ -4583,7 +4583,7 @@ public enum RenderPasses {
         encoderDescriptor.depthAttachment.loadAction = .load
         encoderDescriptor.depthAttachment.storeAction = .store
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Spatial Debug Bounds Pass") else {
             handleError(.renderPassCreationFailed, "Spatial Debug Bounds Pass")
             return
         }
@@ -4721,7 +4721,7 @@ public enum RenderPasses {
             {
                 let width = min(sourceDepth.width, opaqueDepthSnapshot.width)
                 let height = min(sourceDepth.height, opaqueDepthSnapshot.height)
-                if width > 0, height > 0, let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+                if width > 0, height > 0, let blitEncoder = commandBuffer.makeBlitCommandEncoder(passLabel: "Copy Opaque Depth for Gaussian Occlusion") {
                     blitEncoder.label = "Copy Opaque Depth for Gaussian Occlusion"
                     blitEncoder.copy(
                         from: sourceDepth,
@@ -4736,7 +4736,7 @@ public enum RenderPasses {
                 }
             }
 
-            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "Gaussian Pass") else {
                 handleError(.renderPassCreationFailed, "Gaussian Pass")
                 return
             }
@@ -4888,7 +4888,7 @@ public enum RenderPasses {
 
             // set your encoder here
             guard
-                let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+                let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "Post-Processing Pass")
             else {
                 handleError(.renderPassCreationFailed, "Post Process \(pipeline.name!) Pass")
                 return

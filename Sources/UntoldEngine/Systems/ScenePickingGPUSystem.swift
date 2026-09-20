@@ -699,7 +699,7 @@ private func scenePickingExecuteRayVsModelHit(
         return false
     }
 
-    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Scene Picking Ray Hit pass") else { return false }
     computeEncoder.label = "Scene Picking Ray Hit pass"
     computeEncoder.setComputePipelineState(pipelineState)
     computeEncoder.setAccelerationStructure(
@@ -796,7 +796,7 @@ func pickEntityGPUWithCandidates(
     }
 
     guard let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() else { return nil }
-    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return nil }
+    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Scene Picking Octree+GPU Ray Hit pass") else { return nil }
     computeEncoder.label = "Scene Picking Octree+GPU Ray Hit pass"
     computeEncoder.setComputePipelineState(pipelineState)
     computeEncoder.setAccelerationStructure(

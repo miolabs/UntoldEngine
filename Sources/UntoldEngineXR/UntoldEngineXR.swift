@@ -813,6 +813,7 @@
                 commandBufferSemaphore.signal()
                 return
             }
+            GPUPassTimer.shared.beginFrame(commandBuffer: commandBuffer)
             #if ENGINE_STATS_ENABLED
                 let renderTotalStart = CACurrentMediaTime()
             #endif
@@ -961,6 +962,7 @@
                 let submitStart = CACurrentMediaTime()
             #endif
             commandBuffer.commit()
+            GPUPassTimer.shared.endFrame()
             #if ENGINE_STATS_ENABLED
                 let submitMs = (CACurrentMediaTime() - submitStart) * 1000.0
                 let renderTotalMs = (CACurrentMediaTime() - renderTotalStart) * 1000.0

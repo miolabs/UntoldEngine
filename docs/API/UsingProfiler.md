@@ -158,6 +158,47 @@ print("Update: \(frameStats.timing.updateMs) ms")
 print("Render: \(frameStats.timing.renderTotalMs) ms")
 ```
 
+## GPU Pass Timing
+
+`GPUPassTimer` measures every labelled render, compute and blit pass of the frame command buffer on the GPU, using `MTLCounterSampleBuffer` timestamps at stage boundaries (the only sampling point Apple GPUs support). It costs two timestamp samples per pass and no extra GPU work, so it can stay on during a benchmark.
+
+Enable it at runtime or from the environment:
+
+```swift
+GPUPassTimer.shared.isEnabled = true
+```
+
+```bash
+UNTOLD_GPU_PASS_TIMING=1 ./YourApp
+```
+
+Read the last resolved frame directly, or through the engine stats snapshot:
+
+```swift
+let passes = GPUPassTimer.shared.snapshot()          // GPUPassTimingSnapshot
+for pass in passes.passes {
+    print("\(pass.label): \(pass.ms) ms x\(pass.count)")
+}
+print(getEngineStatsSnapshot().gpuPasses.ms(for: "Shadow Cascade 0") ?? 0)
+```
+
+The verbose stats output adds one line with the twelve heaviest passes:
+
+```
+GPU passes (14, sum 6.21ms): G-Buffer + Light Pass (TBDR)x2 3.10 | Shadow Cascade 0 0.62 | SSAO Passx2 0.55 | Post-Processing Passx2 0.40 | HZB Build Mip 0 0.12 | ...
+```
+
+| Field | What it tells you |
+|---|---|
+| `label` | The encoder label, the same name Metal System Trace and the Metal debugger show. |
+| `xN` | The pass was encoded N times this frame under that label (once per eye on visionOS, once per cascade only when the label does not carry the index). The time is the sum. |
+| `sum` | Sum of all pass times. Passes can overlap on the GPU, so this is an upper bound on the command buffer's GPU time. |
+| `skipped` | Passes beyond `GPUPassTimer.maxPassesPerFrame` (128) that were not timed this frame. |
+
+Results come from the command buffer's completion handler, so the snapshot describes the most recently *completed* frame. `GPUPassTimer.shared.isSupported` is false on devices without stage-boundary timestamp sampling, in which case the snapshot stays empty.
+
+Passes are timed when they create their encoder through the labelled helpers `makeRenderCommandEncoder(descriptor:passLabel:)`, `makeComputeCommandEncoder(passLabel:)` or `makeBlitCommandEncoder(passLabel:)` on `MTLCommandBuffer`. New passes and rendering extensions should use them; they behave exactly like the plain Metal calls when the timer is off or the command buffer is not the frame's.
+
 ## OOC And Asset Triage Mode
 
 High-volume instrumentation categories are disabled by default:

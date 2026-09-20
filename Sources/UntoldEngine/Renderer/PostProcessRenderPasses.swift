@@ -32,7 +32,7 @@ func executePostProcess(postProcessPipeline: RenderPipeline, uCommandBuffer: MTL
 
     // set your encoder here
     guard
-        let renderEncoder = uCommandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+        let renderEncoder = uCommandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "Post-Processing Pass")
     else {
         handleError(.renderPassCreationFailed, "Post Process \(pipelineName) Pass")
         return
@@ -94,7 +94,7 @@ func executeIBLPreFilterPass(uCommandBuffer: MTLCommandBuffer, _ envTexture: MTL
         renderPassDescriptor.colorAttachments[2].storeAction = MTLStoreAction.store
 
         // set your encoder here
-        if let renderEncoder = uCommandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
+        if let renderEncoder = uCommandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "IBL Pre-Filter Pass") {
             renderEncoder.setRenderPipelineState(iblPrefilterPipeline.pipelineState!)
 
             renderEncoder.pushDebugGroup("IBL Pre-Filter Pass")
@@ -137,7 +137,7 @@ func executeIBLPreFilterPass(uCommandBuffer: MTLCommandBuffer, _ envTexture: MTL
         renderPassDescriptor.colorAttachments[0].loadAction = .dontCare
         renderPassDescriptor.colorAttachments[0].storeAction = .store
 
-        guard let renderEncoder = uCommandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+        guard let renderEncoder = uCommandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "IBL Specular Pre-Filter Mip \(mipLevel)") else {
             continue
         }
 
@@ -204,7 +204,7 @@ public func executeXRIBLCubePreFilterPass(
     renderPassDescriptor.colorAttachments[2].loadAction = .dontCare
     renderPassDescriptor.colorAttachments[2].storeAction = .store
 
-    guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+    guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "XR IBL Cube Pre-Filter Pass") else {
         return false
     }
 
@@ -235,7 +235,7 @@ public func executeXRIBLCubePreFilterPass(
         mipRenderPassDescriptor.colorAttachments[0].loadAction = .dontCare
         mipRenderPassDescriptor.colorAttachments[0].storeAction = .store
 
-        guard let mipEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: mipRenderPassDescriptor) else {
+        guard let mipEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: mipRenderPassDescriptor, passLabel: "XR IBL Cube Specular Pre-Filter Mip \(mipLevel)") else {
             continue
         }
 

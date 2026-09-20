@@ -294,7 +294,7 @@ public func executeGaussianFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         return
     }
 
-    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Gaussian Frustum Culling") else { return }
     computeEncoder.label = "Gaussian Frustum Culling"
 
     // Chunked (.untoldgs) entities cull chunk by chunk and are fitted to the budget; their
@@ -785,7 +785,7 @@ public func executeGaussianPreprocess(_ commandBuffer: MTLCommandBuffer) {
     let uniformQuotas = GaussianDebugOptions.shared.disableScreenWeightedQuotas
     let levelSwitches = GaussianPagingFrameSwitches()
 
-    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Gaussian Preprocess") else { return }
     computeEncoder.label = "Gaussian Preprocess"
 
     // Zero the shared set's append counter on this same serial encoder, so the reset can never
@@ -1115,7 +1115,7 @@ public func executeRadixSort(_ commandBuffer: MTLCommandBuffer) {
 
     // Single compute encoder for all passes. Dispatches within one encoder execute
     // sequentially on the GPU, so no inter-encoder synchronisation is needed.
-    guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+    guard let enc = commandBuffer.makeComputeCommandEncoder(passLabel: "Radix Sort") else { return }
     enc.label = "Radix Sort"
 
     for pass in 0 ..< 4 {

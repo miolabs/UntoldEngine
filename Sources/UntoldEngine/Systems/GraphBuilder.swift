@@ -944,7 +944,7 @@ func makeSceneRenderTargetAccess(
         guard let encoderDescriptor = makeSceneRenderPassDescriptor(
             copying: descriptor,
             actions: actions
-        ), let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        ), let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: label ?? "Scene Render Target Pass")
         else {
             return nil
         }

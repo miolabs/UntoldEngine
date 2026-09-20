@@ -459,6 +459,8 @@ public struct EngineStatsSnapshot {
     public var batching: EngineBatchingStats = .init()
     public var memory: EngineMemoryStats = .init()
     public var compositor: EngineCompositorStats = .init()
+    /// Per-pass GPU timings of the last resolved frame (see `GPUPassTimer`). Empty when the timer is off.
+    public var gpuPasses: GPUPassTimingSnapshot = .init()
 
     public init(
         frameIndex: UInt64 = 0,
@@ -469,7 +471,8 @@ public struct EngineStatsSnapshot {
         streaming: EngineStreamingStats = .init(),
         batching: EngineBatchingStats = .init(),
         memory: EngineMemoryStats = .init(),
-        compositor: EngineCompositorStats = .init()
+        compositor: EngineCompositorStats = .init(),
+        gpuPasses: GPUPassTimingSnapshot = .init()
     ) {
         self.frameIndex = frameIndex
         self.timestampSeconds = timestampSeconds
@@ -480,5 +483,6 @@ public struct EngineStatsSnapshot {
         self.batching = batching
         self.memory = memory
         self.compositor = compositor
+        self.gpuPasses = gpuPasses
     }
 }

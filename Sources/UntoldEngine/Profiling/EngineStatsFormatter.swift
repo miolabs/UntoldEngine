@@ -57,6 +57,7 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     let memPct = String(format: "%.0f%%", snapshot.memory.utilizationPercent * 100)
     let pressure = snapshot.memory.isUnderPressure ? " PRESSURE" : ""
     let compositorLine = compositorStatsLine(snapshot)
+    let gpuPassLine = gpuPassStatsLine(snapshot)
     return """
     Frame \(snapshot.frameIndex) | CPU \(formatMs(snapshot.timing.smoothedFrameMs))ms (\(formatFPS(frameMs: snapshot.timing.smoothedFrameMs)) fps, smoothed)  GPU \(formatMs(snapshot.timing.gpuExecutionMs))ms exec / \(formatFPS(frameMs: snapshot.timing.gpuFrameCadenceMs)) fps cadence  [\(bottleneck)]
     Timing: frame \(formatMs(snapshot.timing.frameTotalMs))ms (raw CPU) | update \(formatMs(snapshot.timing.updateMs))ms | render \(formatMs(snapshot.timing.renderTotalMs))ms | cull \(formatMs(snapshot.timing.cullingMs))ms | stream \(formatMs(snapshot.timing.streamingRegionMs + snapshot.timing.geometryStreamingMs))ms | batchTick \(formatMs(snapshot.timing.batchingTickMs))ms | batchRebuild \(formatMs(snapshot.timing.batchingRebuildMs))ms
@@ -68,8 +69,22 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     TileReps: resident full/lod/hlod \(snapshot.streaming.residentFullTileRepresentations)/\(snapshot.streaming.residentLODRepresentations)/\(snapshot.streaming.residentHLODRepresentations) | visible full/lod/hlod \(snapshot.streaming.visibleFullTileRepresentations)/\(snapshot.streaming.visibleLODRepresentations)/\(snapshot.streaming.visibleHLODRepresentations) | overlap visible full+lod/full+hlod/lod+hlod \(snapshot.streaming.fullAndLODVisibleOverlapTiles)/\(snapshot.streaming.fullAndHLODVisibleOverlapTiles)/\(snapshot.streaming.lodAndHLODVisibleOverlapTiles) residentFull+fallback \(snapshot.streaming.fullAndFallbackResidentOverlapTiles) | fades \(snapshot.streaming.activeTileRepresentationFades) waiting \(snapshot.streaming.waitingTileRepresentationFades)
     TileRenderCost: visible full/lod/hlod \(snapshot.render.tileFullVisibleInstances)/\(snapshot.render.tileLODVisibleInstances)/\(snapshot.render.tileHLODVisibleInstances) | draws full/lod/hlod \(snapshot.render.tileFullDrawsEstimate)/\(snapshot.render.tileLODDrawsEstimate)/\(snapshot.render.tileHLODDrawsEstimate) | tris full/lod/hlod \(snapshot.render.tileFullTrianglesEstimate)/\(snapshot.render.tileLODTrianglesEstimate)/\(snapshot.render.tileHLODTrianglesEstimate)
     Batching: groups \(snapshot.batching.batchGroupCount) | batchedMeshes \(snapshot.batching.batchedMeshCount) | dirty \(snapshot.batching.dirtyCellsBeforePrune)→\(snapshot.batching.dirtyCellsAfterPrune) | defWork \(snapshot.batching.deferredByWorkBudget) skipComplex \(snapshot.batching.skippedByComplexityGuard) | dispatched \(snapshot.batching.dispatchedBuilds)→\(snapshot.batching.lastRebuildOutputBatchCount) groups | rebuilds/s \(snapshot.batching.rebuildsThisSecond) | rebuildMs \(formatMs(snapshot.batching.lastRebuildCostMs))
-    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure)\(compositorLine)
+    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure)\(compositorLine)\(gpuPassLine)
     """
+}
+
+/// One line with the heaviest GPU passes of the last resolved frame, prefixed with a newline.
+/// Empty when the GPU pass timer is off.
+private func gpuPassStatsLine(_ snapshot: EngineStatsSnapshot) -> String {
+    let g = snapshot.gpuPasses
+    guard !g.passes.isEmpty else { return "" }
+    let shown = g.passes.sorted { $0.ms > $1.ms }.prefix(12)
+    let entries = shown.map { pass -> String in
+        let repeats = pass.count > 1 ? "x\(pass.count)" : ""
+        return "\(pass.label)\(repeats) \(formatMs(pass.ms))"
+    }.joined(separator: " | ")
+    let skipped = g.passesSkipped > 0 ? " skipped \(g.passesSkipped)" : ""
+    return "\nGPU passes (\(g.passes.count), sum \(formatMs(g.totalMs))ms\(skipped)): \(entries)"
 }
 
 /// One line of Compositor Services frame accounting, prefixed with a newline so it can be appended
