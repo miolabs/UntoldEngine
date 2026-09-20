@@ -466,6 +466,9 @@ final class EngineStatsMonitorTests: XCTestCase {
         XCTAssertEqual(summary.durationSeconds, 1.0, accuracy: 1e-9)
         XCTAssertEqual(summary.meanGPUExecutionMs, 10.0, accuracy: 1e-9)
         XCTAssertEqual(summary.gpuPassMeanMs["Model Pass"] ?? 0, 5.0, accuracy: 1e-9)
+        XCTAssertEqual(summary.gpuPassMinMs["Model Pass"] ?? 0, 2.5, accuracy: 1e-9)
+        XCTAssertEqual(summary.timingMeanMs["updateMs"] ?? -1, 0.0, accuracy: 1e-9)
+        XCTAssertEqual(summary.timingMeanMs["semaphoreWaitMs"] ?? -1, 0.0, accuracy: 1e-9)
         XCTAssertNil(stopEngineStatsRecording(), "Stopping twice must not report a second recording")
 
         let lines = try String(contentsOf: url, encoding: .utf8)

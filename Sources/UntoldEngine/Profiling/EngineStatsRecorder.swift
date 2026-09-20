@@ -40,6 +40,12 @@ public struct EngineStatsRecordingSummary: Codable, Equatable, Sendable {
     public var deadlineSamples: Int = 0
     /// Mean GPU time per pass label over the frames in which the pass appeared.
     public var gpuPassMeanMs: [String: Double] = [:]
+    /// Minimum GPU time per pass label. GPU clocks drift on a lightly loaded device, which only
+    /// ever inflates a pass; the minimum is the robust number to compare across runs.
+    public var gpuPassMinMs: [String: Double] = [:]
+    /// Mean of the per-frame CPU timing fields (`EngineTimingStats` and the compositor phases),
+    /// keyed by field name: what a CPU-side optimization changes.
+    public var timingMeanMs: [String: Double] = [:]
     public var worstThermalState: Int = 0
     public var peakGPUAllocatedBytes: Int = 0
 
@@ -72,6 +78,9 @@ public final class EngineStatsRecorder: @unchecked Sendable {
     private var gpuExecutionSum = 0.0
     private var gpuExecutionSamples = 0
     private var gpuPassSums: [String: (sum: Double, samples: Int)] = [:]
+    private var gpuPassMins: [String: Double] = [:]
+    private var timingSums: [String: Double] = [:]
+    private var timingSamples = 0
     private var firstTimestamp: Double?
     private var lastTimestamp: Double = 0.0
     private var lastWrittenSecond: Double = -1.0
@@ -134,7 +143,25 @@ public final class EngineStatsRecorder: @unchecked Sendable {
         for pass in snapshot.gpuPasses.passes {
             let entry = gpuPassSums[pass.label] ?? (0.0, 0)
             gpuPassSums[pass.label] = (entry.sum + pass.ms, entry.samples + 1)
+            gpuPassMins[pass.label] = min(gpuPassMins[pass.label] ?? .greatestFiniteMagnitude, pass.ms)
         }
+        let t = snapshot.timing
+        let c = snapshot.compositor
+        let fields: [(String, Double)] = [
+            ("updateMs", t.updateMs), ("renderTotalMs", t.renderTotalMs), ("renderPrepMs", t.renderPrepMs),
+            ("encodeMs", t.encodeMs), ("submitMs", t.submitMs), ("cullingMs", t.cullingMs),
+            ("streamingRegionMs", t.streamingRegionMs), ("geometryStreamingMs", t.geometryStreamingMs),
+            ("batchingTickMs", t.batchingTickMs), ("semaphoreWaitMs", t.semaphoreWaitMs),
+            ("scenegraphMs", t.scenegraphMs), ("extensionsUpdateMs", t.extensionsUpdateMs), ("lodMs", t.lodMs),
+            ("animationMs", t.animationMs), ("scriptingMs", t.scriptingMs), ("physicsMs", t.physicsMs),
+            ("customSystemsMs", t.customSystemsMs), ("gameUpdateMs", t.gameUpdateMs),
+            ("compositorUpdateMs", c.updateMs), ("compositorInputSlackMs", c.inputSlackMs),
+            ("compositorSubmissionMs", c.submissionMs), ("compositorDeadlineMarginMs", c.deadlineMarginMs),
+        ]
+        for (name, value) in fields {
+            timingSums[name, default: 0.0] += value
+        }
+        timingSamples += 1
         if snapshot.timestampSeconds > 0 {
             if firstTimestamp == nil {
                 firstTimestamp = snapshot.timestampSeconds
@@ -169,6 +196,12 @@ public final class EngineStatsRecorder: @unchecked Sendable {
         }
         for (label, entry) in gpuPassSums where entry.samples > 0 {
             result.gpuPassMeanMs[label] = entry.sum / Double(entry.samples)
+        }
+        result.gpuPassMinMs = gpuPassMins
+        if timingSamples > 0 {
+            for (name, sum) in timingSums {
+                result.timingMeanMs[name] = sum / Double(timingSamples)
+            }
         }
         result.worstThermalState = lastSnapshotMaxThermal
         result.peakGPUAllocatedBytes = peakGPUAllocated
