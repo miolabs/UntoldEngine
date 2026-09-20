@@ -36,7 +36,6 @@ public struct BenchConfig: Sendable {
     public var immersion: String
     public var perFrame: Bool
 
-    @MainActor
     public static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> BenchConfig {
         func double(_ key: String, _ fallback: Double) -> Double {
             guard let raw = environment[key], let value = Double(raw), value > 0 else { return fallback }

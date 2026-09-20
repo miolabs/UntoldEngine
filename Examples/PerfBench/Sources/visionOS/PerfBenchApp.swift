@@ -102,16 +102,15 @@ struct PerfBenchApp: App {
         }
         XRHolder.shared.xr = xr
         let host = BenchHost.shared
+        let runner = host.runner
         // The XR module's UntoldImmersionMode cannot be named here (the module and its class share
         // a name), so let the parameter type pick the enum.
         xr.setImmersionMode(xrImmersionMode: host.isMixedImmersion ? .mixed : .full)
         xr.setupCallbacks(
             gameUpdate: { deltaTime in
-                // The XR loop runs on its own thread; the runner is main-actor bound but the
-                // engine's callbacks are invoked synchronously from the frame loop, so hop in place.
-                MainActor.assumeIsolated {
-                    host.runner.update(deltaTime: deltaTime)
-                }
+                // Runs on the XR render thread, inside the frame's update phase, which is where the
+                // engine expects scene mutations from; the runner publishes its UI state to main.
+                runner.update(deltaTime: deltaTime)
             },
             handleInput: {}
         )
