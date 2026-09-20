@@ -263,8 +263,10 @@ public final class GPUPassTimer: @unchecked Sendable {
         return try? device.makeCounterSampleBuffer(descriptor: descriptor)
     }
 
-    /// GPU timestamps tick in nanoseconds on Apple GPUs, but the unit is not guaranteed. Sample the
-    /// CPU and GPU clocks together on two frames at least 100 ms apart and take the ratio.
+    /// `MTLDevice.sampleTimestamps()` reports the CPU and GPU clocks in nanoseconds, and GPU
+    /// timestamps tick in nanoseconds on Apple GPUs. The unit is not guaranteed by the API, so
+    /// sample both clocks on two frames at least 100 ms apart and take the ratio; on Apple
+    /// silicon it comes out at 1.0 and the pass times match `gpuEndTime - gpuStartTime`.
     private func calibrateIfNeeded(device: MTLDevice) {
         guard !isCalibrated else { return }
         let sample = device.sampleTimestamps()
@@ -272,7 +274,7 @@ public final class GPUPassTimer: @unchecked Sendable {
             calibration = (sample.cpu, sample.gpu)
             return
         }
-        let cpuDeltaNs = Double(sample.cpu &- first.cpu) * Self.nanosecondsPerCPUTick
+        let cpuDeltaNs = Double(sample.cpu &- first.cpu)
         guard cpuDeltaNs >= 100_000_000, sample.gpu > first.gpu else { return }
         let ratio = cpuDeltaNs / Double(sample.gpu - first.gpu)
         // Guard against a nonsensical sample (clock reset); keep the 1 ns default in that case.
@@ -281,13 +283,6 @@ public final class GPUPassTimer: @unchecked Sendable {
         }
         isCalibrated = true
     }
-
-    private static let nanosecondsPerCPUTick: Double = {
-        var info = mach_timebase_info_data_t()
-        mach_timebase_info(&info)
-        guard info.denom != 0 else { return 1.0 }
-        return Double(info.numer) / Double(info.denom)
-    }()
 
     // MARK: - Resolve (completion handler thread)
 

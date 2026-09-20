@@ -2262,7 +2262,7 @@ public enum RenderPasses {
         encoderDescriptor.depthAttachment.storeAction = renderInfo.opaqueSampleCount > 1 ? .multisampleResolve : .store
         encoderDescriptor.depthAttachment.clearDepth = sceneDepthClearValue()
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "Combined G-buffer + Light Pass") else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor, passLabel: "G-Buffer + Light Pass (TBDR)") else {
             handleError(.renderPassCreationFailed, "Combined G-buffer + Light Pass")
             return
         }

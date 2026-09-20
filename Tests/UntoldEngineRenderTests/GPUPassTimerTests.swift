@@ -83,6 +83,40 @@ final class GPUPassTimerTests: BaseRenderSetup {
         XCTAssertEqual(Set(labels).count, labels.count, "Labels must be merged, not repeated: \(labels)")
     }
 
+    func testTimerOn_passTotalIsConsistentWithCommandBufferTime() throws {
+        guard renderer != nil else { throw XCTSkip("Renderer not initialized") }
+
+        let previousMetricsState = enableEngineMetrics
+        enableEngineMetrics = true
+        defer { enableEngineMetrics = previousMetricsState }
+        EngineProfiler.shared.reset()
+        GPUPassTimer.shared.isEnabled = true
+
+        // The clock calibration needs two frames more than 100 ms apart.
+        for _ in 0 ..< 10 {
+            renderer.draw(in: renderer.metalView)
+            try drainGPU()
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        guard GPUPassTimer.shared.isSupported else {
+            throw XCTSkip("Stage-boundary counter sampling is not supported on this device")
+        }
+
+        let passes = GPUPassTimer.shared.snapshot()
+        let commandBufferMs = EngineProfiler.shared.snapshot().gpuCommandBuffer.meanMs
+        guard commandBufferMs > 0 else { throw XCTSkip("gpuStartTime/gpuEndTime not reported on this device") }
+
+        // Passes may overlap on the GPU, so the sum can exceed the buffer time, but not by an
+        // order of magnitude; and the sum cannot be far below it either.
+        XCTAssertLessThan(passes.totalMs, commandBufferMs * 4.0,
+                          "pass sum \(passes.totalMs) ms vs command buffer \(commandBufferMs) ms: \(passes.passes)")
+        XCTAssertGreaterThan(passes.totalMs, commandBufferMs * 0.2,
+                             "pass sum \(passes.totalMs) ms vs command buffer \(commandBufferMs) ms")
+        for pass in passes.passes {
+            XCTAssertLessThan(pass.ms, commandBufferMs * 2.0, "\(pass.label) \(pass.ms) ms exceeds the whole command buffer")
+        }
+    }
+
     func testTimerOn_feedsEngineStatsSnapshot() throws {
         guard renderer != nil else { throw XCTSkip("Renderer not initialized") }
 

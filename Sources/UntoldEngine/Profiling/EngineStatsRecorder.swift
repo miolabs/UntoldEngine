@@ -135,10 +135,12 @@ public final class EngineStatsRecorder: @unchecked Sendable {
             let entry = gpuPassSums[pass.label] ?? (0.0, 0)
             gpuPassSums[pass.label] = (entry.sum + pass.ms, entry.samples + 1)
         }
-        if firstTimestamp == nil {
-            firstTimestamp = snapshot.timestampSeconds
+        if snapshot.timestampSeconds > 0 {
+            if firstTimestamp == nil {
+                firstTimestamp = snapshot.timestampSeconds
+            }
+            lastTimestamp = snapshot.timestampSeconds
         }
-        lastTimestamp = snapshot.timestampSeconds
         lastSnapshot = snapshot
     }
 
