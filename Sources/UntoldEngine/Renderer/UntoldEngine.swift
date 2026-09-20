@@ -293,6 +293,13 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             let tileRenderCosts = auditVisibleTileRenderCosts()
             let memStats = MemoryBudgetManager.shared.getStats()
             let gpuPasses = GPUPassTimer.shared.snapshot()
+            let gpuAllocatedBytes = renderInfo.device?.currentAllocatedSize ?? 0
+            let thermalState = ProcessInfo.processInfo.thermalState.rawValue
+            #if os(iOS) || os(visionOS) || os(tvOS)
+                let availableMemoryBytes = Int(os_proc_available_memory())
+            #else
+                let availableMemoryBytes = 0
+            #endif
 
             EngineStatsMonitor.shared.update { snapshot in
                 snapshot.timing.frameTotalMs = frameTotalMs
@@ -388,6 +395,9 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
                 snapshot.memory.utilizationPercent = Double(memStats.utilizationPercent)
                 snapshot.memory.isUnderPressure = memStats.isUnderPressure
                 snapshot.memory.trackedEntityCount = memStats.trackedEntityCount
+                snapshot.memory.gpuAllocatedBytes = gpuAllocatedBytes
+                snapshot.memory.availableMemoryBytes = availableMemoryBytes
+                snapshot.memory.thermalState = thermalState
             }
             EngineStatsMonitor.shared.completeFrame()
         }

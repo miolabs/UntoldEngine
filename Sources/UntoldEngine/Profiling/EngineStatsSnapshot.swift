@@ -11,7 +11,7 @@
 import Foundation
 import simd
 
-public struct EngineTimingStats {
+public struct EngineTimingStats: Codable, Sendable {
     public var frameTotalMs: Double = 0.0
     /// CPU frame time averaged over the last 30 frames — use this for smooth FPS display.
     public var smoothedFrameMs: Double = 0.0
@@ -107,7 +107,7 @@ public struct EngineTimingStats {
 /// The per-frame values describe the last completed frame. The GPU-side values (deadline and
 /// presentation margins) come from the command buffer completion handler and therefore describe
 /// the most recently *completed* command buffer, which can lag the CPU frame by one or two frames.
-public struct EngineCompositorStats {
+public struct EngineCompositorStats: Codable, Sendable {
     /// CPU time between `startUpdate()` and `endUpdate()`.
     public var updateMs: Double = 0.0
     /// Time left until `optimalInputTime` when the update phase ended.
@@ -169,7 +169,7 @@ public struct EngineCompositorStats {
     }
 }
 
-public struct EngineRenderStats {
+public struct EngineRenderStats: Codable, Sendable {
     public var drawCallsTotal: Int = 0
     public var drawCallsOpaque: Int = 0
     public var drawCallsTransparent: Int = 0
@@ -224,7 +224,7 @@ public struct EngineRenderStats {
     }
 }
 
-public struct EngineCullingStats {
+public struct EngineCullingStats: Codable, Sendable {
     public var frustumTested: Int = 0
     public var frustumPassed: Int = 0
     public var frustumFailed: Int = 0
@@ -267,7 +267,7 @@ public struct EngineCullingStats {
     }
 }
 
-public struct EngineStreamingStats {
+public struct EngineStreamingStats: Codable, Sendable {
     public var activeLoads: Int = 0
     public var loadCandidates: Int = 0
     public var pendingLoadBacklog: Int = 0
@@ -380,7 +380,7 @@ public struct EngineStreamingStats {
     }
 }
 
-public struct EngineBatchingStats {
+public struct EngineBatchingStats: Codable, Sendable {
     public var batchGroupCount: Int = 0
     public var batchedMeshCount: Int = 0
     public var rebuildsThisSecond: Int = 0
@@ -421,7 +421,7 @@ public struct EngineBatchingStats {
     }
 }
 
-public struct EngineMemoryStats {
+public struct EngineMemoryStats: Codable, Sendable {
     public var meshMemoryBytes: Int = 0
     public var textureMemoryBytes: Int = 0
     public var geometryBudgetBytes: Int = 0
@@ -429,6 +429,23 @@ public struct EngineMemoryStats {
     public var utilizationPercent: Double = 0.0
     public var isUnderPressure: Bool = false
     public var trackedEntityCount: Int = 0
+    /// Bytes the Metal device currently has allocated for this process (`MTLDevice.currentAllocatedSize`).
+    public var gpuAllocatedBytes: Int = 0
+    /// Memory the process may still allocate before the system terminates it (`os_proc_available_memory`).
+    /// Zero on platforms that do not report it (macOS).
+    public var availableMemoryBytes: Int = 0
+    /// `ProcessInfo.ThermalState` raw value: 0 nominal, 1 fair, 2 serious, 3 critical.
+    public var thermalState: Int = 0
+
+    public var thermalStateName: String {
+        switch thermalState {
+        case 0: return "nominal"
+        case 1: return "fair"
+        case 2: return "serious"
+        case 3: return "critical"
+        default: return "unknown"
+        }
+    }
 
     public init(
         meshMemoryBytes: Int = 0,
@@ -449,7 +466,7 @@ public struct EngineMemoryStats {
     }
 }
 
-public struct EngineStatsSnapshot {
+public struct EngineStatsSnapshot: Codable, Sendable {
     public var frameIndex: UInt64 = 0
     public var timestampSeconds: Double = 0.0
     public var timing: EngineTimingStats = .init()
@@ -461,6 +478,8 @@ public struct EngineStatsSnapshot {
     public var compositor: EngineCompositorStats = .init()
     /// Per-pass GPU timings of the last resolved frame (see `GPUPassTimer`). Empty when the timer is off.
     public var gpuPasses: GPUPassTimingSnapshot = .init()
+    /// Frame-time distribution and over-budget counts since the monitor was reset.
+    public var hitches: EngineHitchStats = .init()
 
     public init(
         frameIndex: UInt64 = 0,
@@ -472,7 +491,8 @@ public struct EngineStatsSnapshot {
         batching: EngineBatchingStats = .init(),
         memory: EngineMemoryStats = .init(),
         compositor: EngineCompositorStats = .init(),
-        gpuPasses: GPUPassTimingSnapshot = .init()
+        gpuPasses: GPUPassTimingSnapshot = .init(),
+        hitches: EngineHitchStats = .init()
     ) {
         self.frameIndex = frameIndex
         self.timestampSeconds = timestampSeconds
@@ -484,5 +504,56 @@ public struct EngineStatsSnapshot {
         self.memory = memory
         self.compositor = compositor
         self.gpuPasses = gpuPasses
+        self.hitches = hitches
+    }
+}
+
+/// Frame-time distribution since the monitor was reset, plus the last completed one-second window.
+/// Mean and percentile numbers hide single long frames; these counts do not.
+public struct EngineHitchStats: Codable, Sendable {
+    /// Upper bounds of the histogram buckets in milliseconds; the last bucket is open-ended.
+    /// 11.2 and 16.8 sit just above the 90 Hz and 60 Hz frame periods.
+    public static let bucketUpperBoundsMs: [Double] = [4.0, 8.0, 11.2, 16.8, 33.4, 100.0]
+
+    /// Frame budget used for the over-budget counts. 16.67 ms at 60 Hz, 11.11 ms at 90 Hz.
+    public var frameBudgetMs: Double = 1000.0 / 60.0
+    public var framesSampled: Int = 0
+    public var framesOverBudget: Int = 0
+    /// Frames, frames over budget and worst frame time in the last completed one-second window.
+    public var framesLastSecond: Int = 0
+    public var framesOverBudgetLastSecond: Int = 0
+    public var worstFrameMsLastSecond: Double = 0.0
+    /// Cumulative frame count per bucket. Bucket `i` holds frames below `bucketUpperBoundsMs[i]`;
+    /// the final bucket holds everything at or above the last bound.
+    public var histogram: [Int] = Array(repeating: 0, count: EngineHitchStats.bucketUpperBoundsMs.count + 1)
+
+    public var overBudgetRate: Double {
+        guard framesSampled > 0 else { return 0.0 }
+        return Double(framesOverBudget) / Double(framesSampled)
+    }
+
+    public static func bucketIndex(forFrameMs frameMs: Double) -> Int {
+        for (index, bound) in bucketUpperBoundsMs.enumerated() where frameMs < bound {
+            return index
+        }
+        return bucketUpperBoundsMs.count
+    }
+
+    public init(
+        frameBudgetMs: Double = 1000.0 / 60.0,
+        framesSampled: Int = 0,
+        framesOverBudget: Int = 0,
+        framesLastSecond: Int = 0,
+        framesOverBudgetLastSecond: Int = 0,
+        worstFrameMsLastSecond: Double = 0.0,
+        histogram: [Int] = Array(repeating: 0, count: EngineHitchStats.bucketUpperBoundsMs.count + 1)
+    ) {
+        self.frameBudgetMs = frameBudgetMs
+        self.framesSampled = framesSampled
+        self.framesOverBudget = framesOverBudget
+        self.framesLastSecond = framesLastSecond
+        self.framesOverBudgetLastSecond = framesOverBudgetLastSecond
+        self.worstFrameMsLastSecond = worstFrameMsLastSecond
+        self.histogram = histogram
     }
 }

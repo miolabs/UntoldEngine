@@ -120,6 +120,8 @@
             }
 
             renderer = untoldrenderer
+            // Hitch counts measure against the compositor's nominal 90 Hz period.
+            EngineStatsMonitor.shared.frameBudgetMs = 1000.0 / 90.0
         }
 
         @MainActor

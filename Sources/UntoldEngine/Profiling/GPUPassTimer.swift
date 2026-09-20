@@ -12,7 +12,7 @@ import Foundation
 import Metal
 
 /// GPU time of one labelled pass in the most recently resolved frame.
-public struct GPUPassTiming: Equatable {
+public struct GPUPassTiming: Codable, Equatable, Sendable {
     public let label: String
     /// GPU time from the pass's first stage start to its last stage end, in milliseconds.
     /// Passes encoded more than once per frame under the same label (one per eye) are summed.
@@ -28,7 +28,7 @@ public struct GPUPassTiming: Equatable {
 }
 
 /// Per-pass GPU timings of the last frame whose command buffer completed.
-public struct GPUPassTimingSnapshot: Equatable {
+public struct GPUPassTimingSnapshot: Codable, Equatable, Sendable {
     /// Counts frames the timer has resolved since it was enabled or reset.
     public var frameIndex: UInt64 = 0
     /// Timed passes in encode order.

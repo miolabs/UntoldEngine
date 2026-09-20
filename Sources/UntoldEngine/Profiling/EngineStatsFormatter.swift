@@ -58,6 +58,9 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     let pressure = snapshot.memory.isUnderPressure ? " PRESSURE" : ""
     let compositorLine = compositorStatsLine(snapshot)
     let gpuPassLine = gpuPassStatsLine(snapshot)
+    let hitchLine = hitchStatsLine(snapshot)
+    let gpuAllocMB = formatMB(snapshot.memory.gpuAllocatedBytes)
+    let availableMB = snapshot.memory.availableMemoryBytes > 0 ? " | avail \(formatMB(snapshot.memory.availableMemoryBytes))mb" : ""
     return """
     Frame \(snapshot.frameIndex) | CPU \(formatMs(snapshot.timing.smoothedFrameMs))ms (\(formatFPS(frameMs: snapshot.timing.smoothedFrameMs)) fps, smoothed)  GPU \(formatMs(snapshot.timing.gpuExecutionMs))ms exec / \(formatFPS(frameMs: snapshot.timing.gpuFrameCadenceMs)) fps cadence  [\(bottleneck)]
     Timing: frame \(formatMs(snapshot.timing.frameTotalMs))ms (raw CPU) | update \(formatMs(snapshot.timing.updateMs))ms | render \(formatMs(snapshot.timing.renderTotalMs))ms | cull \(formatMs(snapshot.timing.cullingMs))ms | stream \(formatMs(snapshot.timing.streamingRegionMs + snapshot.timing.geometryStreamingMs))ms | batchTick \(formatMs(snapshot.timing.batchingTickMs))ms | batchRebuild \(formatMs(snapshot.timing.batchingRebuildMs))ms
@@ -69,8 +72,28 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     TileReps: resident full/lod/hlod \(snapshot.streaming.residentFullTileRepresentations)/\(snapshot.streaming.residentLODRepresentations)/\(snapshot.streaming.residentHLODRepresentations) | visible full/lod/hlod \(snapshot.streaming.visibleFullTileRepresentations)/\(snapshot.streaming.visibleLODRepresentations)/\(snapshot.streaming.visibleHLODRepresentations) | overlap visible full+lod/full+hlod/lod+hlod \(snapshot.streaming.fullAndLODVisibleOverlapTiles)/\(snapshot.streaming.fullAndHLODVisibleOverlapTiles)/\(snapshot.streaming.lodAndHLODVisibleOverlapTiles) residentFull+fallback \(snapshot.streaming.fullAndFallbackResidentOverlapTiles) | fades \(snapshot.streaming.activeTileRepresentationFades) waiting \(snapshot.streaming.waitingTileRepresentationFades)
     TileRenderCost: visible full/lod/hlod \(snapshot.render.tileFullVisibleInstances)/\(snapshot.render.tileLODVisibleInstances)/\(snapshot.render.tileHLODVisibleInstances) | draws full/lod/hlod \(snapshot.render.tileFullDrawsEstimate)/\(snapshot.render.tileLODDrawsEstimate)/\(snapshot.render.tileHLODDrawsEstimate) | tris full/lod/hlod \(snapshot.render.tileFullTrianglesEstimate)/\(snapshot.render.tileLODTrianglesEstimate)/\(snapshot.render.tileHLODTrianglesEstimate)
     Batching: groups \(snapshot.batching.batchGroupCount) | batchedMeshes \(snapshot.batching.batchedMeshCount) | dirty \(snapshot.batching.dirtyCellsBeforePrune)→\(snapshot.batching.dirtyCellsAfterPrune) | defWork \(snapshot.batching.deferredByWorkBudget) skipComplex \(snapshot.batching.skippedByComplexityGuard) | dispatched \(snapshot.batching.dispatchedBuilds)→\(snapshot.batching.lastRebuildOutputBatchCount) groups | rebuilds/s \(snapshot.batching.rebuildsThisSecond) | rebuildMs \(formatMs(snapshot.batching.lastRebuildCostMs))
-    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure)\(compositorLine)\(gpuPassLine)
+    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure) | gpuAlloc \(gpuAllocMB)mb\(availableMB) | thermal \(snapshot.memory.thermalStateName)\(hitchLine)\(compositorLine)\(gpuPassLine)
     """
+}
+
+/// One line of frame-time distribution, prefixed with a newline. Empty until a frame was sampled.
+private func hitchStatsLine(_ snapshot: EngineStatsSnapshot) -> String {
+    let h = snapshot.hitches
+    guard h.framesSampled > 0 else { return "" }
+    let rate = String(format: "%.2f%%", h.overBudgetRate * 100)
+    var buckets: [String] = []
+    for (index, count) in h.histogram.enumerated() {
+        if index < EngineHitchStats.bucketUpperBoundsMs.count {
+            buckets.append("<\(formatBound(EngineHitchStats.bucketUpperBoundsMs[index])) \(count)")
+        } else {
+            buckets.append(">=\(formatBound(EngineHitchStats.bucketUpperBoundsMs.last ?? 0)) \(count)")
+        }
+    }
+    return "\nHitches: budget \(formatMs(h.frameBudgetMs))ms | over \(h.framesOverBudget)/\(h.framesSampled) (\(rate)) | lastSec \(h.framesOverBudgetLastSecond)/\(h.framesLastSecond) over, worst \(formatMs(h.worstFrameMsLastSecond))ms | hist \(buckets.joined(separator: " | "))"
+}
+
+private func formatBound(_ value: Double) -> String {
+    value == value.rounded() ? String(format: "%.0f", value) : String(format: "%.1f", value)
 }
 
 /// One line with the heaviest GPU passes of the last resolved frame, prefixed with a newline.

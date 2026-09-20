@@ -41,6 +41,19 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         private var _deadlineSampleCount: Int = 0
         private var _missingAnchorCount: Int = 0
 
+        // Hitch accounting (frame-time histogram, over-budget counts, one-second window)
+        private var _frameBudgetMs: Double = 1000.0 / 60.0
+        private var _hitches = EngineHitchStats()
+        private var _windowStartSeconds: Double = 0.0
+        private var _windowStarted = false
+        private var _windowFrames: Int = 0
+        private var _windowFramesOverBudget: Int = 0
+        private var _windowWorstFrameMs: Double = 0.0
+        private var _lastThermalState: Int = -1
+
+        /// Optional JSON Lines recorder fed with every published snapshot.
+        private var recorder: EngineStatsRecorder?
+
         // 30-frame rolling average for smoothed CPU frame time
         private let kSmoothingWindow = 30
         private var _frameMsBuffer: [Double] = .init(repeating: 0.0, count: 30)
@@ -71,6 +84,40 @@ public final class EngineStatsMonitor: @unchecked Sendable {
                 lock.unlock()
             #endif
         }
+    }
+
+    /// Frame budget for the hitch counts (`EngineHitchStats`). Defaults to 60 Hz; the visionOS
+    /// runtime sets it to the 90 Hz period. Changing it does not rewrite past counts.
+    public var frameBudgetMs: Double {
+        get {
+            #if ENGINE_STATS_ENABLED
+                lock.lock()
+                defer { lock.unlock() }
+                return _frameBudgetMs
+            #else
+                return 1000.0 / 60.0
+            #endif
+        }
+        set {
+            #if ENGINE_STATS_ENABLED
+                lock.lock()
+                _frameBudgetMs = max(0.1, newValue)
+                lock.unlock()
+            #endif
+        }
+    }
+
+    /// Attaches a recorder that receives every published snapshot, replacing any earlier one.
+    func attachRecorder(_ newRecorder: EngineStatsRecorder?) -> EngineStatsRecorder? {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            let previous = recorder
+            recorder = newRecorder
+            lock.unlock()
+            return previous
+        #else
+            return newRecorder
+        #endif
     }
 
     public var loggingProfile: EngineStatsLoggingProfile {
@@ -229,8 +276,50 @@ public final class EngineStatsMonitor: @unchecked Sendable {
                 ? sum / Double(_frameMsFilled)
                 : frameMs
 
+            // Hitch accounting: cumulative histogram and over-budget count, plus a one-second window
+            _hitches.frameBudgetMs = _frameBudgetMs
+            _hitches.framesSampled += 1
+            let overBudget = frameMs > _frameBudgetMs
+            if overBudget {
+                _hitches.framesOverBudget += 1
+            }
+            _hitches.histogram[EngineHitchStats.bucketIndex(forFrameMs: frameMs)] += 1
+
+            let now = currentSnapshot.timestampSeconds
+            if !_windowStarted {
+                _windowStarted = true
+                _windowStartSeconds = now
+            }
+            if now - _windowStartSeconds >= 1.0 {
+                _hitches.framesLastSecond = _windowFrames
+                _hitches.framesOverBudgetLastSecond = _windowFramesOverBudget
+                _hitches.worstFrameMsLastSecond = _windowWorstFrameMs
+                _windowFrames = 0
+                _windowFramesOverBudget = 0
+                _windowWorstFrameMs = 0.0
+                _windowStartSeconds = now
+            }
+            _windowFrames += 1
+            if overBudget {
+                _windowFramesOverBudget += 1
+            }
+            _windowWorstFrameMs = max(_windowWorstFrameMs, frameMs)
+            currentSnapshot.hitches = _hitches
+
+            // Thermal transitions are rare and worth a mark on the Instruments timeline
+            let thermalState = currentSnapshot.memory.thermalState
+            let thermalChanged = _lastThermalState >= 0 && thermalState != _lastThermalState
+            _lastThermalState = thermalState
+
             publishedSnapshot = currentSnapshot
+            let recordedSnapshot = currentSnapshot
+            let activeRecorder = recorder
             lock.unlock()
+
+            if thermalChanged {
+                EngineProfiler.shared.emitEvent(.thermalStateChanged)
+            }
+            activeRecorder?.enqueue(recordedSnapshot)
         #endif
     }
 
@@ -258,6 +347,13 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             _missedDeadlineCount = 0
             _deadlineSampleCount = 0
             _missingAnchorCount = 0
+            _hitches = EngineHitchStats(frameBudgetMs: _frameBudgetMs)
+            _windowStartSeconds = 0.0
+            _windowStarted = false
+            _windowFrames = 0
+            _windowFramesOverBudget = 0
+            _windowWorstFrameMs = 0.0
+            _lastThermalState = -1
             _frameMsBuffer = .init(repeating: 0.0, count: kSmoothingWindow)
             _frameMsBufferIndex = 0
             _frameMsFilled = 0
