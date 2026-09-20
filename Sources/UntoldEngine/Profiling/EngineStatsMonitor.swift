@@ -9,6 +9,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
+import os
 import QuartzCore
 
 public enum EngineStatsLoggingProfile: Equatable {
@@ -18,6 +19,10 @@ public enum EngineStatsLoggingProfile: Equatable {
 
 public final class EngineStatsMonitor: @unchecked Sendable {
     public static let shared = EngineStatsMonitor()
+
+    /// Runtime switch for stats collection. Read on every frame-loop call site without taking the
+    /// monitor lock; defaults to on in debug builds and off in release builds, or to `UNTOLD_STATS=1`.
+    private let collecting: OSAllocatedUnfairLock<Bool>
 
     #if ENGINE_STATS_ENABLED
         private let lock = NSLock()
@@ -62,9 +67,28 @@ public final class EngineStatsMonitor: @unchecked Sendable {
     #endif
 
     private init() {
+        let environmentValue = ProcessInfo.processInfo.environment["UNTOLD_STATS"]
+        let initialState: Bool
+        if let environmentValue {
+            initialState = environmentValue == "1"
+        } else {
+            #if DEBUG
+                initialState = true
+            #else
+                initialState = false
+            #endif
+        }
+        collecting = OSAllocatedUnfairLock(initialState: initialState)
         #if ENGINE_STATS_ENABLED
             lastLogTime = CACurrentMediaTime()
         #endif
+    }
+
+    /// Whether the monitor collects and publishes stats. When false every per-frame call returns
+    /// at once and `snapshot()` keeps returning the last published frame.
+    public var isCollecting: Bool {
+        get { collecting.withLock { $0 } }
+        set { collecting.withLock { $0 = newValue } }
     }
 
     public var enableLogging: Bool {
@@ -185,6 +209,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
 
     public func beginFrame(timestampSeconds: Double = CACurrentMediaTime()) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             currentSnapshot.frameIndex &+= 1
             currentSnapshot.timestampSeconds = timestampSeconds
@@ -196,6 +221,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
 
     public func update(_ updater: (inout EngineStatsSnapshot) -> Void) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             updater(&currentSnapshot)
             lock.unlock()
@@ -206,6 +232,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
     /// Safe to call from any thread.
     public func recordGPUCompletion(executionMs: Double) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             let now = CACurrentMediaTime()
             lock.lock()
             let cadenceMs = _lastGPUCompletionTime > 0
@@ -223,6 +250,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
     /// Safe to call from any thread.
     public func recordCompositorCompletion(deadlineMarginMs: Double, presentationMarginMs: Double) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             _latestDeadlineMarginMs = deadlineMarginMs
             _latestPresentationMarginMs = presentationMarginMs
@@ -241,6 +269,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
     /// Called once per frame that is presented without a fresh device anchor (visionOS).
     public func recordMissingAnchor() {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             _missingAnchorCount += 1
             lock.unlock()
@@ -250,6 +279,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
     /// Publishes the current frame so API readers can safely consume it next frame.
     public func completeFrame() {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             // Pull in latest GPU timing from async handler
             currentSnapshot.timing.gpuExecutionMs = _latestGPUExecutionMs
@@ -363,6 +393,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
 
     public func tick() {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             let now = CACurrentMediaTime()
             var shouldLog = false
             var snapshotToLog: EngineStatsSnapshot = .init()
@@ -407,6 +438,17 @@ public func getEngineStatsSnapshotInProgress() -> EngineStatsSnapshot {
 
 public func setEngineStatsLogging(enabled: Bool) {
     EngineStatsMonitor.shared.enableLogging = enabled
+}
+
+/// Turns stats collection on or off at runtime. Collection is on by default in debug builds and
+/// off in release builds (`UNTOLD_STATS=1` in the environment turns it on anywhere). Turning it on
+/// in a release build is how device measurements are taken.
+public func setEngineStatsCollection(enabled: Bool) {
+    EngineStatsMonitor.shared.isCollecting = enabled
+}
+
+public func isEngineStatsCollectionEnabled() -> Bool {
+    EngineStatsMonitor.shared.isCollecting
 }
 
 public func setEngineStatsLogging(

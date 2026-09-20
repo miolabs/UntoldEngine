@@ -273,6 +273,9 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         }
 
         private func publishEngineStats(frameStartTime: Double) {
+            // Gathering the per-frame snapshot walks visible entities and batch groups; skip all of
+            // it when collection is off (the default in release builds).
+            guard EngineStatsMonitor.shared.isCollecting else { return }
             let frameTotalMs: Double
             if let dt = timeSinceLastUpdate as Float?, dt > 0 {
                 frameTotalMs = Double(dt) * 1000.0

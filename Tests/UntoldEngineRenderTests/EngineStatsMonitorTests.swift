@@ -502,4 +502,52 @@ final class EngineStatsMonitorTests: XCTestCase {
             .split(separator: "\n", omittingEmptySubsequences: true)
         XCTAssertEqual(lines.count, 3, "one line for second 10, one for second 11, one summary")
     }
+
+    // MARK: - Runtime collection switch
+
+    func testCollectionOff_ignoresFrameCallsAndKeepsLastPublishedFrame() {
+        let wasCollecting = isEngineStatsCollectionEnabled()
+        defer { setEngineStatsCollection(enabled: wasCollecting) }
+
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1.0)
+        EngineStatsMonitor.shared.update { $0.timing.updateMs = 2.5 }
+        EngineStatsMonitor.shared.completeFrame()
+        XCTAssertEqual(getEngineStatsSnapshot().frameIndex, 1)
+
+        setEngineStatsCollection(enabled: false)
+        XCTAssertFalse(isEngineStatsCollectionEnabled())
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 2.0)
+        EngineStatsMonitor.shared.update { $0.timing.updateMs = 9.0 }
+        EngineStatsMonitor.shared.recordGPUCompletion(executionMs: 4.0)
+        EngineStatsMonitor.shared.completeFrame()
+
+        let published = getEngineStatsSnapshot()
+        XCTAssertEqual(published.frameIndex, 1, "Frames must not advance while collection is off")
+        XCTAssertEqual(published.timing.updateMs, 2.5)
+        XCTAssertEqual(published.timing.gpuExecutionMs, 0.0)
+
+        setEngineStatsCollection(enabled: true)
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 3.0)
+        EngineStatsMonitor.shared.update { $0.timing.updateMs = 1.0 }
+        EngineStatsMonitor.shared.completeFrame()
+        XCTAssertEqual(getEngineStatsSnapshot().frameIndex, 2)
+        XCTAssertEqual(getEngineStatsSnapshot().timing.updateMs, 1.0)
+    }
+
+    func testSetEngineMetrics_alsoTogglesCollection() {
+        let wasCollecting = isEngineStatsCollectionEnabled()
+        let wasMetrics = enableEngineMetrics
+        defer {
+            setEngineStatsCollection(enabled: wasCollecting)
+            enableEngineMetrics = wasMetrics
+        }
+
+        setEngine(.metrics(.disabled))
+        XCTAssertFalse(isEngineStatsCollectionEnabled())
+        XCTAssertFalse(enableEngineMetrics)
+
+        setEngine(.metrics(.enabled))
+        XCTAssertTrue(isEngineStatsCollectionEnabled())
+        XCTAssertTrue(enableEngineMetrics)
+    }
 }

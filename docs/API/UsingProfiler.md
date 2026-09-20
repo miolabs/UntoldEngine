@@ -493,10 +493,10 @@ To inspect timeline data:
 ## Build Configuration Notes
 
 - `EngineProfiler` is available in all configs, but disabled by default until enabled at runtime.
-- `EngineStats` collection is compiled in debug by default (`ENGINE_STATS_ENABLED`).
-- For release profiling with `EngineStats`, build with `-DENGINE_STATS_ENABLED`.
+- `EngineStats` collection is compiled into every configuration (`ENGINE_STATS_ENABLED`) and switched at runtime: on by default in debug builds, off by default in release builds. Turn it on with `setEngine(.metrics(.enabled))` (which also enables the profiler), `setEngineStatsCollection(enabled: true)`, or `UNTOLD_STATS=1` in the environment. This is how device measurements are taken from a release build.
+- When collection is off, every per-frame call returns immediately, draw counting is skipped, and the per-frame snapshot is not gathered; `getEngineStatsSnapshot()` keeps returning the last published frame.
 
-If `ENGINE_STATS_ENABLED` is not compiled in, `getEngineStatsSnapshot()` returns default values and `setEngineStatsLogging(...)` is effectively a no-op.
+If `ENGINE_STATS_ENABLED` is removed from the package settings, `getEngineStatsSnapshot()` returns default values and `setEngineStatsLogging(...)` is effectively a no-op.
 
 ## Category Toggle Notes
 

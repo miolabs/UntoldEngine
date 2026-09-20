@@ -102,8 +102,10 @@ let package = Package(
             resources: engineResources,
             swiftSettings: [
                 // Compile engine stats collection only in debug by default.
-                // Release builds can still opt in explicitly with -DENGINE_STATS_ENABLED.
-                .define("ENGINE_STATS_ENABLED", .when(configuration: .debug)),
+                // Compiled into every configuration; collection is a runtime switch
+                // (setEngineStatsCollection(enabled:), UNTOLD_STATS=1) that defaults to on in
+                // debug builds and off in release builds.
+                .define("ENGINE_STATS_ENABLED"),
                 .swiftLanguageMode(.v6),
             ],
             linkerSettings: [
@@ -134,7 +136,7 @@ let package = Package(
                 // Must mirror the engine flag so #if ENGINE_STATS_ENABLED blocks in this
                 // target are active; without it, xrFrameStartTime is never declared and
                 // finalizeXRStatsAndMonitors receives 0.0, producing garbage frameTotalMs.
-                .define("ENGINE_STATS_ENABLED", .when(configuration: .debug)),
+                .define("ENGINE_STATS_ENABLED"),
                 .swiftLanguageMode(.v6),
             ],
             linkerSettings: [
