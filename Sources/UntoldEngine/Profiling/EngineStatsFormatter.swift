@@ -56,6 +56,7 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     let texBudgetMB = formatMB(snapshot.memory.textureBudgetBytes)
     let memPct = String(format: "%.0f%%", snapshot.memory.utilizationPercent * 100)
     let pressure = snapshot.memory.isUnderPressure ? " PRESSURE" : ""
+    let compositorLine = compositorStatsLine(snapshot)
     return """
     Frame \(snapshot.frameIndex) | CPU \(formatMs(snapshot.timing.smoothedFrameMs))ms (\(formatFPS(frameMs: snapshot.timing.smoothedFrameMs)) fps, smoothed)  GPU \(formatMs(snapshot.timing.gpuExecutionMs))ms exec / \(formatFPS(frameMs: snapshot.timing.gpuFrameCadenceMs)) fps cadence  [\(bottleneck)]
     Timing: frame \(formatMs(snapshot.timing.frameTotalMs))ms (raw CPU) | update \(formatMs(snapshot.timing.updateMs))ms | render \(formatMs(snapshot.timing.renderTotalMs))ms | cull \(formatMs(snapshot.timing.cullingMs))ms | stream \(formatMs(snapshot.timing.streamingRegionMs + snapshot.timing.geometryStreamingMs))ms | batchTick \(formatMs(snapshot.timing.batchingTickMs))ms | batchRebuild \(formatMs(snapshot.timing.batchingRebuildMs))ms
@@ -66,8 +67,18 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     TileReps: resident full/lod/hlod \(snapshot.streaming.residentFullTileRepresentations)/\(snapshot.streaming.residentLODRepresentations)/\(snapshot.streaming.residentHLODRepresentations) | visible full/lod/hlod \(snapshot.streaming.visibleFullTileRepresentations)/\(snapshot.streaming.visibleLODRepresentations)/\(snapshot.streaming.visibleHLODRepresentations) | overlap visible full+lod/full+hlod/lod+hlod \(snapshot.streaming.fullAndLODVisibleOverlapTiles)/\(snapshot.streaming.fullAndHLODVisibleOverlapTiles)/\(snapshot.streaming.lodAndHLODVisibleOverlapTiles) residentFull+fallback \(snapshot.streaming.fullAndFallbackResidentOverlapTiles) | fades \(snapshot.streaming.activeTileRepresentationFades) waiting \(snapshot.streaming.waitingTileRepresentationFades)
     TileRenderCost: visible full/lod/hlod \(snapshot.render.tileFullVisibleInstances)/\(snapshot.render.tileLODVisibleInstances)/\(snapshot.render.tileHLODVisibleInstances) | draws full/lod/hlod \(snapshot.render.tileFullDrawsEstimate)/\(snapshot.render.tileLODDrawsEstimate)/\(snapshot.render.tileHLODDrawsEstimate) | tris full/lod/hlod \(snapshot.render.tileFullTrianglesEstimate)/\(snapshot.render.tileLODTrianglesEstimate)/\(snapshot.render.tileHLODTrianglesEstimate)
     Batching: groups \(snapshot.batching.batchGroupCount) | batchedMeshes \(snapshot.batching.batchedMeshCount) | dirty \(snapshot.batching.dirtyCellsBeforePrune)→\(snapshot.batching.dirtyCellsAfterPrune) | defWork \(snapshot.batching.deferredByWorkBudget) skipComplex \(snapshot.batching.skippedByComplexityGuard) | dispatched \(snapshot.batching.dispatchedBuilds)→\(snapshot.batching.lastRebuildOutputBatchCount) groups | rebuilds/s \(snapshot.batching.rebuildsThisSecond) | rebuildMs \(formatMs(snapshot.batching.lastRebuildCostMs))
-    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure)
+    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure)\(compositorLine)
     """
+}
+
+/// One line of Compositor Services frame accounting, prefixed with a newline so it can be appended
+/// to the expanded block. Empty when the frame was not rendered through Compositor Services.
+private func compositorStatsLine(_ snapshot: EngineStatsSnapshot) -> String {
+    let c = snapshot.compositor
+    guard c.viewCount > 0 else { return "" }
+    let missRate = String(format: "%.2f%%", c.missedDeadlineRate * 100)
+    let missed = c.missedDeadline ? " MISSED" : ""
+    return "\nCompositor: views \(c.viewCount) @ \(c.viewTextureWidth)x\(c.viewTextureHeight) | update \(formatMs(c.updateMs))ms | inputSlack \(formatMs(c.inputSlackMs))ms | submit \(formatMs(c.submissionMs))ms | semWait \(formatMs(snapshot.timing.semaphoreWaitMs))ms | deadlineMargin \(formatMs(c.deadlineMarginMs))ms\(missed) | presentMargin \(formatMs(c.presentationMarginMs))ms | missed \(c.missedDeadlineCount)/\(c.deadlineSampleCount) (\(missRate)) | noAnchor \(c.missingAnchorCount)"
 }
 
 private func formatMB(_ bytes: Int) -> String {

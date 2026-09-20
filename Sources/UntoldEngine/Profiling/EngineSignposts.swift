@@ -40,6 +40,17 @@ public enum ProfileScope {
     case gaussianDepth
     case gaussianSort
     case gaussianDraw
+
+    // Compositor Services frame phases (visionOS)
+    case compositorUpdate
+    case compositorWaitForInput
+    case compositorSubmission
+}
+
+/// Point events (no duration) that mark something worth seeing on the Instruments timeline.
+public enum ProfileEvent {
+    /// The GPU finished a frame after the compositor's rendering deadline.
+    case missedDeadline
 }
 
 final class EngineSignposts {
@@ -51,6 +62,7 @@ final class EngineSignposts {
     private static let cullingLog = OSLog(subsystem: subsystem, category: "Culling")
     private static let streamingLog = OSLog(subsystem: subsystem, category: "Streaming")
     private static let batchingLog = OSLog(subsystem: subsystem, category: "Batching")
+    private static let compositorLog = OSLog(subsystem: subsystem, category: "Compositor")
     private static let gaussianLog = OSLog(subsystem: subsystem, category: "Gaussian")
 
     // One stable signpost ID per scope.
@@ -65,6 +77,10 @@ final class EngineSignposts {
     private static let geometryStreamingID = OSSignpostID(log: streamingLog)
     private static let batchingTickID = OSSignpostID(log: batchingLog)
     private static let batchingRebuildID = OSSignpostID(log: batchingLog)
+    private static let compositorUpdateID = OSSignpostID(log: compositorLog)
+    private static let compositorWaitForInputID = OSSignpostID(log: compositorLog)
+    private static let compositorSubmissionID = OSSignpostID(log: compositorLog)
+    private static let missedDeadlineID = OSSignpostID(log: compositorLog)
     private static let gaussianCullID = OSSignpostID(log: gaussianLog)
     private static let gaussianDepthID = OSSignpostID(log: gaussianLog)
     private static let gaussianSortID = OSSignpostID(log: gaussianLog)
@@ -78,6 +94,13 @@ final class EngineSignposts {
     func endScope(_ scope: ProfileScope) {
         let (log, id, name) = descriptor(for: scope)
         os_signpost(.end, log: log, name: name, signpostID: id)
+    }
+
+    func emitEvent(_ event: ProfileEvent) {
+        switch event {
+        case .missedDeadline:
+            os_signpost(.event, log: Self.compositorLog, name: "MissedDeadline", signpostID: Self.missedDeadlineID)
+        }
     }
 
     private func descriptor(for scope: ProfileScope) -> (OSLog, OSSignpostID, StaticString) {
@@ -97,6 +120,9 @@ final class EngineSignposts {
         case .gaussianDepth: return (Self.gaussianLog, Self.gaussianDepthID, "GaussianDepth")
         case .gaussianSort: return (Self.gaussianLog, Self.gaussianSortID, "GaussianSort")
         case .gaussianDraw: return (Self.gaussianLog, Self.gaussianDrawID, "GaussianDraw")
+        case .compositorUpdate: return (Self.compositorLog, Self.compositorUpdateID, "CompositorUpdate")
+        case .compositorWaitForInput: return (Self.compositorLog, Self.compositorWaitForInputID, "CompositorWaitForInput")
+        case .compositorSubmission: return (Self.compositorLog, Self.compositorSubmissionID, "CompositorSubmission")
         }
     }
 }

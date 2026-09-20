@@ -786,6 +786,7 @@
                 EngineStatsMonitor.shared.beginFrame(timestampSeconds: xrFrameStartTime)
                 RenderStatsCollector.shared.reset()
             #endif
+            EngineProfiler.shared.beginScope(.compositorUpdate)
 
             // Snapshot loading gate once per frame to keep update/submission behavior consistent.
             let loading = AssetLoadingGate.shared.isLoadingAny
@@ -824,6 +825,16 @@
             }
 
             // 6. Call endupdate() to mark the end of the update phase
+            EngineProfiler.shared.endScope(.compositorUpdate)
+            #if ENGINE_STATS_ENABLED
+                let updateEndTime = CACurrentMediaTime()
+                let optimalInputTimeCA = Self.mediaTime(of: timing.optimalInputTime)
+                EngineStatsMonitor.shared.update { snapshot in
+                    snapshot.compositor.updateMs = (updateEndTime - xrFrameStartTime) * 1000.0
+                    // Negative slack means the update phase ran past the compositor's optimal input time.
+                    snapshot.compositor.inputSlackMs = (optimalInputTimeCA - updateEndTime) * 1000.0
+                }
+            #endif
             frame.endUpdate()
 
             // 7. Call wait(until:tolerace) to puase your render loop until the optimal rendering time
@@ -835,9 +846,11 @@
             // the wait's length earlier and the head is predicted from earlier; the automatic
             // mode waits while the frames meet the deadline and not while they do not.
             let waitLengthMs = max(0, Self.milliseconds(LayerRenderer.Clock().now.duration(to: timing.optimalInputTime)))
+            EngineProfiler.shared.beginScope(.compositorWaitForInput)
             if waitsForOptimalInput(skippedWaitMs: waitLengthMs) {
                 LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
             }
+            EngineProfiler.shared.endScope(.compositorWaitForInput)
             #if ENGINE_STATS_ENABLED
                 let xrWaitMs = (CACurrentMediaTime() - xrWaitStart) * 1000.0
                 EngineStatsMonitor.shared.update { snapshot in
@@ -857,11 +870,13 @@
 
             // 8. Call startSubmission() to mark the start of submission phase
             frame.startSubmission()
+            EngineProfiler.shared.beginScope(.compositorSubmission)
             #if ENGINE_STATS_ENABLED
                 let xrSubmissionStart = CACurrentMediaTime()
             #endif
             var shouldEndSubmission = true
             defer {
+                EngineProfiler.shared.endScope(.compositorSubmission)
                 if shouldEndSubmission, layerRenderer.state == .running {
                     frame.endSubmission()
                 }
@@ -879,6 +894,9 @@
             }
             guard !drawables.isEmpty else {
                 #if ENGINE_STATS_ENABLED
+                    EngineStatsMonitor.shared.update { snapshot in
+                        snapshot.compositor.submissionMs = (CACurrentMediaTime() - xrSubmissionStart) * 1000.0
+                    }
                     renderer.finalizeXRStatsAndMonitors(frameStartTime: xrFrameStartTime)
                 #else
                     renderer.finalizeXRStatsAndMonitors(frameStartTime: 0.0)
@@ -907,6 +925,7 @@
             // The frame's presentation time is checked on its first drawable (the built-in
             // display); a capture drawable shares the timing.
             var presentationChecked = false
+            var anchorMissingThisFrame = false
             for drawable in drawables {
                 // 10. Fetch the predicted device anchor from ARKit using the frameTiming information, and
                 // apply the anchor to your frame
@@ -938,12 +957,14 @@
                     drawable.deviceAnchor = anchor
                 } else if let cachedAnchor = lastValidDeviceAnchor {
                     missingAnchorFrameCount += 1
+                    anchorMissingThisFrame = true
                     if shouldLogAnchorDiagnostics() {
                         printXRAnchorDiagnostics(message: "XR device anchor missing; using cached anchor")
                     }
                     drawable.deviceAnchor = cachedAnchor
                 } else {
                     missingAnchorFrameCount += 1
+                    anchorMissingThisFrame = true
                     if shouldLogAnchorDiagnostics() {
                         printXRAnchorDiagnostics(message: "XR device anchor missing; no cached anchor available")
                     }
@@ -964,10 +985,17 @@
                     presentCleared(drawable)
                 }
             }
+            if anchorMissingThisFrame {
+                // Once per frame: a capture drawable shares the frame's anchor.
+                #if ENGINE_STATS_ENABLED
+                    EngineStatsMonitor.shared.recordMissingAnchor()
+                #endif
+            }
             #if ENGINE_STATS_ENABLED
                 let xrEncodeMs = (CACurrentMediaTime() - xrSubmissionStart) * 1000.0
                 EngineStatsMonitor.shared.update { snapshot in
                     snapshot.timing.encodeMs = xrEncodeMs
+                    snapshot.compositor.submissionMs = xrEncodeMs
                 }
                 renderer.finalizeXRStatsAndMonitors(frameStartTime: xrFrameStartTime)
             #else
@@ -1183,6 +1211,11 @@
                 commandBufferSemaphore.wait()
             }
             let semaphoreWaitMs = (CACurrentMediaTime() - semaphoreWaitStart) * 1000.0
+            #if ENGINE_STATS_ENABLED
+                EngineStatsMonitor.shared.update { snapshot in
+                    snapshot.timing.semaphoreWaitMs += semaphoreWaitMs
+                }
+            #endif
             if semaphoreWaitMs > 16.0, shouldLogXRStallDiagnostics() {
                 printXRCommandBufferStallDiagnostics(waitMs: semaphoreWaitMs, phase: "acquired")
             }
@@ -1211,6 +1244,16 @@
                     print("✓ Updated VisionOS viewport to: \(actualViewPort)")
                 }
             }
+            #if ENGINE_STATS_ENABLED
+                let viewCount = drawable.views.count
+                let viewTextureWidth = drawable.colorTextures.first?.width ?? 0
+                let viewTextureHeight = drawable.colorTextures.first?.height ?? 0
+                EngineStatsMonitor.shared.update { snapshot in
+                    snapshot.compositor.viewCount = viewCount
+                    snapshot.compositor.viewTextureWidth = viewTextureWidth
+                    snapshot.compositor.viewTextureHeight = viewTextureHeight
+                }
+            #endif
 
             // Update visible entity list only when not loading (avoids reading mutating ECS data).
             // When loading, we render from the last-known-good visible list.
@@ -1334,9 +1377,20 @@
                     // The frame's GPU time beyond the previous frame's: the two overlap on the
                     // GPU, and the command buffer's own span would count the overlap twice.
                     EngineStatsMonitor.shared.recordGPUCompletion(gpuStartTime: cb.gpuStartTime, gpuEndTime: cb.gpuEndTime)
+                    // The GPU's margin against the compositor's deadlines, for the stats; gpuEndTime
+                    // is zero where the driver does not report it.
+                    if countsDeadline, cb.gpuEndTime > 0.0 {
+                        EngineStatsMonitor.shared.recordCompositorCompletion(
+                            deadlineMarginMs: (deadline - cb.gpuEndTime) * 1000.0,
+                            presentationMarginMs: (presentation - cb.gpuEndTime) * 1000.0
+                        )
+                    }
                 #endif
                 if countsDeadline {
                     self?.noteGPUCompletion(at: cb.gpuEndTime, start: cb.gpuStartTime, deadline: deadline, presentation: presentation)
+                    if cb.gpuEndTime > deadline {
+                        EngineProfiler.shared.emitEvent(.missedDeadline)
+                    }
                 }
                 commandBufferSemaphore.signal()
             }
