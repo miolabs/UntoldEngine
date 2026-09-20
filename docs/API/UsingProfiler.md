@@ -47,7 +47,8 @@ Streaming: tick=true workMs 1.23 | evictions 0 | avgLoadMs 45.67 | applyMs 0.89 
 TileReps: resident full/lod/hlod 24/8/2 | visible full/lod/hlod 18/5/1 | overlap visible full+lod/full+hlod/lod+hlod 0/0/0 residentFull+fallback 0 | fades 0 waiting 0
 TileRenderCost: visible full/lod/hlod 18/5/1 | draws full/lod/hlod 22/6/1 | tris full/lod/hlod 84000/9000/1200
 Batching: groups 132 | batchedMeshes 916 | dirty 0→0 | defWork 0 skipComplex 2 | dispatched 0→0 groups | rebuilds/s 0 | rebuildMs 0.00
-Memory: mesh 312/512mb | tex 198/512mb | total 50% | entities 847
+Memory: mesh 312/512mb | tex 198/512mb | total 50% | entities 847 | gpuAlloc 910mb | avail 2400mb | thermal nominal
+Hitches: budget 11.11ms | over 3/5400 (0.06%) | lastSec 0/90 over, worst 9.80ms | hist <4 0 | <8 1200 | <11.2 4190 | <16.8 8 | <33.4 2 | <100 0 | >=100 0
 Compositor: views 2 @ 2048x1984 | update 2.10ms | inputSlack 1.45ms | submit 3.20ms | semWait 0.00ms | deadlineMargin 2.35ms | presentMargin 6.80ms | missed 3/5400 (0.06%) | noAnchor 0
 ```
 
@@ -142,6 +143,20 @@ Programmatic access: `getEngineStatsSnapshot().compositor` (`EngineCompositorSta
 | `tex X/Ymb` | Texture memory used vs texture budget. |
 | `total X%` | Combined utilization across both pools. |
 | `PRESSURE` | Appears when either pool hits ≥ 85 % utilization. |
+| `gpuAlloc` | Bytes the Metal device has allocated for the process (`MTLDevice.currentAllocatedSize`): drawables, render targets, streamed meshes and textures together. |
+| `avail` | Memory the process may still allocate before the system terminates it (`os_proc_available_memory`). iOS and visionOS only. |
+| `thermal` | `ProcessInfo.thermalState`: nominal, fair, serious or critical. A `ThermalStateChanged` signpost event marks every transition. A benchmark that ends in `serious` is a failed run whatever the frame times say. |
+
+**Hitches line** — the frame-time distribution since the monitor was reset. Means and percentiles hide single long frames; these counts do not.
+
+| Field | What it tells you |
+|---|---|
+| `budget` | Frame budget for the over-budget counts. 16.67 ms by default; the visionOS runtime sets 11.11 ms (90 Hz). Change it with `EngineStatsMonitor.shared.frameBudgetMs`. |
+| `over a/b (rate)` | Frames over budget out of all frames sampled. |
+| `lastSec x/y over, worst` | The last completed one-second window: frames over budget, frames, and the worst frame time. Use this for a live overlay. |
+| `hist` | Cumulative frame count per bucket. The bucket bounds (4, 8, 11.2, 16.8, 33.4, 100 ms) straddle the 90 Hz and 60 Hz periods, so the `<11.2`/`<16.8` split shows how many frames just missed 90 Hz. |
+
+Programmatic access: `getEngineStatsSnapshot().hitches` (`EngineHitchStats`, with `overBudgetRate`).
 
 ---
 
@@ -157,6 +172,23 @@ print("Frame: \(frameStats.frameIndex)")
 print("Update: \(frameStats.timing.updateMs) ms")
 print("Render: \(frameStats.timing.renderTotalMs) ms")
 ```
+
+## Recording A Run To Disk
+
+Every field of `EngineStatsSnapshot` is `Codable`. A recorder writes the published snapshots to a JSON Lines file on a utility queue, so a benchmark can dump a whole run and a script can compare it against a baseline:
+
+```swift
+let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("perf/starter-scene.jsonl")
+try startEngineStatsRecording(to: url, interval: .perSecond)   // or .perFrame
+// ... run the scene ...
+let summary = stopEngineStatsRecording()
+print(summary?.p99FrameMs ?? 0, summary?.missedDeadlines ?? 0)
+```
+
+Each line is `{"type":"frame","frame":{...}}` with the full snapshot; `.perFrame` writes every frame, `.perSecond` the last frame of each second. The final line is `{"type":"summary","summary":{...}}` (`EngineStatsRecordingSummary`): frame count and duration, mean, p50, p95, p99 and worst frame time, frames over budget, mean GPU execution time, compositor deadline misses, the mean GPU time per pass label, the worst thermal state seen and the peak GPU allocation. The summary always covers every frame, whatever the interval. On a device, pull the file with `xcrun devicectl device copy from`.
+
+`startEngineStatsRecording` throws `EngineStatsRecordingError.statsNotCompiledIn` in builds without `ENGINE_STATS_ENABLED`.
 
 ## GPU Pass Timing
 

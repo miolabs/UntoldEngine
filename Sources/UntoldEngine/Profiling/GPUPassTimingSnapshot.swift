@@ -12,7 +12,7 @@ import Foundation
 
 /// The per-pass GPU times of the last frame `GPUPassTiming` resolved, as the engine stats
 /// carry them: a copy taken when the frame's stats are published.
-public struct GPUPassTimingSnapshot: Equatable, Sendable {
+public struct GPUPassTimingSnapshot: Codable, Equatable, Sendable {
     /// A number that changes with each resolved frame; zero before the first.
     public var frameIndex: Int = 0
     /// The frame's passes, heaviest first. Empty when the timer is off.

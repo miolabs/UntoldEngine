@@ -61,6 +61,8 @@ public enum ProfileScope {
 public enum ProfileEvent {
     /// The GPU finished a frame after the compositor's rendering deadline.
     case missedDeadline
+    /// `ProcessInfo.thermalState` changed between two frames.
+    case thermalStateChanged
 }
 
 final class EngineSignposts {
@@ -92,6 +94,7 @@ final class EngineSignposts {
     private static let compositorWaitForInputID = OSSignpostID(log: compositorLog)
     private static let compositorSubmissionID = OSSignpostID(log: compositorLog)
     private static let missedDeadlineID = OSSignpostID(log: compositorLog)
+    private static let thermalStateChangedID = OSSignpostID(log: frameLog)
     private static let scenegraphID = OSSignpostID(log: systemsLog)
     private static let extensionsUpdateID = OSSignpostID(log: systemsLog)
     private static let lodID = OSSignpostID(log: systemsLog)
@@ -119,6 +122,8 @@ final class EngineSignposts {
         switch event {
         case .missedDeadline:
             os_signpost(.event, log: Self.compositorLog, name: "MissedDeadline", signpostID: Self.missedDeadlineID)
+        case .thermalStateChanged:
+            os_signpost(.event, log: Self.frameLog, name: "ThermalStateChanged", signpostID: Self.thermalStateChangedID)
         }
     }
 
