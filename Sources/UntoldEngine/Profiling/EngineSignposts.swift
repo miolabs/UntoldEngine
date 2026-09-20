@@ -45,6 +45,16 @@ public enum ProfileScope {
     case compositorUpdate
     case compositorWaitForInput
     case compositorSubmission
+
+    // Per-system CPU work inside the Update scope
+    case scenegraph
+    case extensionsUpdate
+    case lod
+    case animation
+    case scripting
+    case physics
+    case customSystems
+    case gameUpdate
 }
 
 /// Point events (no duration) that mark something worth seeing on the Instruments timeline.
@@ -63,6 +73,7 @@ final class EngineSignposts {
     private static let streamingLog = OSLog(subsystem: subsystem, category: "Streaming")
     private static let batchingLog = OSLog(subsystem: subsystem, category: "Batching")
     private static let compositorLog = OSLog(subsystem: subsystem, category: "Compositor")
+    private static let systemsLog = OSLog(subsystem: subsystem, category: "Systems")
     private static let gaussianLog = OSLog(subsystem: subsystem, category: "Gaussian")
 
     // One stable signpost ID per scope.
@@ -81,6 +92,14 @@ final class EngineSignposts {
     private static let compositorWaitForInputID = OSSignpostID(log: compositorLog)
     private static let compositorSubmissionID = OSSignpostID(log: compositorLog)
     private static let missedDeadlineID = OSSignpostID(log: compositorLog)
+    private static let scenegraphID = OSSignpostID(log: systemsLog)
+    private static let extensionsUpdateID = OSSignpostID(log: systemsLog)
+    private static let lodID = OSSignpostID(log: systemsLog)
+    private static let animationID = OSSignpostID(log: systemsLog)
+    private static let scriptingID = OSSignpostID(log: systemsLog)
+    private static let physicsID = OSSignpostID(log: systemsLog)
+    private static let customSystemsID = OSSignpostID(log: systemsLog)
+    private static let gameUpdateID = OSSignpostID(log: systemsLog)
     private static let gaussianCullID = OSSignpostID(log: gaussianLog)
     private static let gaussianDepthID = OSSignpostID(log: gaussianLog)
     private static let gaussianSortID = OSSignpostID(log: gaussianLog)
@@ -123,6 +142,14 @@ final class EngineSignposts {
         case .compositorUpdate: return (Self.compositorLog, Self.compositorUpdateID, "CompositorUpdate")
         case .compositorWaitForInput: return (Self.compositorLog, Self.compositorWaitForInputID, "CompositorWaitForInput")
         case .compositorSubmission: return (Self.compositorLog, Self.compositorSubmissionID, "CompositorSubmission")
+        case .scenegraph: return (Self.systemsLog, Self.scenegraphID, "Scenegraph")
+        case .extensionsUpdate: return (Self.systemsLog, Self.extensionsUpdateID, "ExtensionsUpdate")
+        case .lod: return (Self.systemsLog, Self.lodID, "LOD")
+        case .animation: return (Self.systemsLog, Self.animationID, "Animation")
+        case .scripting: return (Self.systemsLog, Self.scriptingID, "Scripting")
+        case .physics: return (Self.systemsLog, Self.physicsID, "Physics")
+        case .customSystems: return (Self.systemsLog, Self.customSystemsID, "CustomSystems")
+        case .gameUpdate: return (Self.systemsLog, Self.gameUpdateID, "GameUpdate")
         }
     }
 }

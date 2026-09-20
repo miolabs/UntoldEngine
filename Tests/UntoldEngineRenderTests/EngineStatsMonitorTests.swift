@@ -289,6 +289,20 @@ final class EngineStatsMonitorTests: XCTestCase {
         XCTAssertFalse(published.compositor.missedDeadline)
     }
 
+    func testFormatEngineStatsOverlay_containsSystemsLine() {
+        var snapshot = EngineStatsSnapshot()
+        snapshot.timing.animationMs = 1.5
+        snapshot.timing.physicsMs = 0.75
+        snapshot.timing.physicsStepCount = 2
+        snapshot.timing.gameUpdateMs = 0.25
+
+        let overlay = formatEngineStatsOverlay(snapshot)
+        XCTAssertTrue(overlay.contains("Systems: "), overlay)
+        XCTAssertTrue(overlay.contains("animation 1.50ms"), overlay)
+        XCTAssertTrue(overlay.contains("physics 0.75ms (2 steps)"), overlay)
+        XCTAssertTrue(overlay.contains("game 0.25ms"), overlay)
+    }
+
     func testTimingSemaphoreWaitMs_roundTripsThroughSnapshot() {
         EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1.0)
         EngineStatsMonitor.shared.update { snapshot in
