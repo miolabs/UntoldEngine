@@ -15,6 +15,7 @@
 #   --out DIR             where run folders land (default: perf/results)
 #   --label TEXT          stored in summary.json (default: git describe)
 #   --config Debug|Release (default: Release)
+#   --repeat N            run the whole scene set N times and aggregate (min of times, mean of rates)
 #   --xctrace TEMPLATE    also record an Instruments trace, e.g. "Metal System Trace" (device runs)
 #   --no-compare          skip the baseline comparison
 #   --update-baseline     write this run as the new baseline for the device model
@@ -41,6 +42,7 @@ DEVICE=""
 XCTRACE_TEMPLATE=""
 COMPARE=1
 UPDATE_BASELINE=0
+REPEAT=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     --label) LABEL="$2"; shift 2 ;;
     --config) CONFIG="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
+    --repeat) REPEAT="$2"; shift 2 ;;
     --xctrace) XCTRACE_TEMPLATE="$2"; shift 2 ;;
     --no-compare) COMPARE=0; shift ;;
     --update-baseline) UPDATE_BASELINE=1; shift ;;
@@ -83,6 +86,9 @@ xcodebuild build \
   ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
   -quiet
 
+SUMMARIES=()
+for ((REP = 1; REP <= REPEAT; REP++)); do
+if [ "$REPEAT" -gt 1 ]; then RUN_ID="$(date +%Y%m%d-%H%M%S)-$PLATFORM-r$REP"; echo "== Repeat $REP of $REPEAT"; fi
 case "$PLATFORM" in
   macos)
     APP="$DERIVED/Build/Products/$CONFIG/PerfBench.app"
@@ -129,9 +135,11 @@ esac
 RUN_DIR="$OUT_DIR/$RUN_ID"
 [ -f "$RUN_DIR/summary.json" ] || { echo "no summary.json in $RUN_DIR"; exit 1; }
 echo "== Results: $RUN_DIR"
+SUMMARIES+=("$RUN_DIR/summary.json")
+done
 
 if [ "$UPDATE_BASELINE" = 1 ]; then
-  python3 "$REPO/scripts/perf/compare_baseline.py" "$RUN_DIR/summary.json" --baselines "$BASELINES" --update
+  python3 "$REPO/scripts/perf/compare_baseline.py" "${SUMMARIES[@]}" --baselines "$BASELINES" --update
 elif [ "$COMPARE" = 1 ]; then
-  python3 "$REPO/scripts/perf/compare_baseline.py" "$RUN_DIR/summary.json" --baselines "$BASELINES"
+  python3 "$REPO/scripts/perf/compare_baseline.py" "${SUMMARIES[@]}" --baselines "$BASELINES"
 fi

@@ -52,8 +52,15 @@ scripts/perf/run_bench.sh visionos --device <udid> --xctrace "Metal System Trace
 
 Runs land in `perf/results/<timestamp>-<platform>/` with `<scene>.jsonl`, `summary.json` and the
 console log. The comparison prints one block per scene and exits non-zero on a regression (10 %
-on frame-time and GPU-time metrics, 0.5 points on the over-budget and missed-deadline rates, 20 %
-on a per-pass GPU mean).
+on frame-time, GPU-time and per-system CPU metrics, 0.5 points on the over-budget and
+missed-deadline rates, 20 % on a per-pass GPU minimum).
+
+Single runs are noisy on a machine that idles most of each frame: CPU and GPU clocks drift between
+runs and the same build can differ by 20 to 50 % in a per-pass or per-system time. `--repeat 3`
+runs the scene set three times and the comparer aggregates by the minimum of each time metric (a
+clock drift only ever inflates a time) and the mean of each rate; record the baseline the same way.
+The CPU-bound scenes (`primitives-10k`) are the least noisy; for the others read
+`timingMeanMs` and `gpuPassMinMs` rather than frame time.
 
 The app can also be opened in Xcode (`xcodegen generate`, then `PerfBench.xcodeproj`) and started
 from its Start button; it reads its configuration from the environment:
