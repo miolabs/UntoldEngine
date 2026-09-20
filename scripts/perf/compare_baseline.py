@@ -22,8 +22,10 @@ FRAME_METRICS = [
     ("p95FrameMs", "p95 frame ms"),
     ("p99FrameMs", "p99 frame ms"),
     ("meanFrameMs", "mean frame ms"),
-    ("meanGPUExecutionMs", "mean GPU ms"),
+    ("minGPUExecutionMs", "min GPU ms"),
 ]
+# Reported, never judged: it follows the GPU clock state more than the workload.
+INFO_METRICS = [("meanGPUExecutionMs", "mean GPU ms")]
 # Per-system CPU means worth a line each; the rest are compared silently.
 TIMING_FIELDS = [
     "updateMs", "encodeMs", "cullingMs", "scenegraphMs", "animationMs", "physicsMs",
@@ -53,7 +55,7 @@ def aggregate(scenes):
     """Fold the same scene from several runs into one record: min of times, mean of rates."""
     first = json.loads(json.dumps(scenes[0]))
     s = first["summary"]
-    for key, _ in FRAME_METRICS:
+    for key, _ in FRAME_METRICS + INFO_METRICS:
         s[key] = min(x["summary"].get(key, 0.0) for x in scenes)
     s["worstFrameMs"] = min(x["summary"].get("worstFrameMs", 0.0) for x in scenes)
     frames = sum(x["summary"].get("frames", 0) for x in scenes)
@@ -148,6 +150,10 @@ def main():
 
         for key, label in FRAME_METRICS:
             judge(label, s.get(key, 0.0), b.get(key, 0.0), args.time_tolerance)
+        for key, label in INFO_METRICS:
+            now, ref = s.get(key, 0.0), b.get(key, 0.0)
+            if ref > 0:
+                print(f"    {label:28s} {now:9.3f} vs {ref:9.3f} ms {(now-ref)/ref*100:+7.1f}%  (info)")
         judge("overBudgetRate", over, bover, args.rate_tolerance, relative=False)
         judge("missedDeadlineRate", missed, bmissed, args.rate_tolerance, relative=False)
         tnow, tref = s.get("timingMeanMs", {}), b.get("timingMeanMs", {})
