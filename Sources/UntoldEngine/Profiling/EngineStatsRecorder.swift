@@ -35,6 +35,9 @@ public struct EngineStatsRecordingSummary: Codable, Equatable, Sendable {
     public var worstFrameMs: Double = 0.0
     public var framesOverBudget: Int = 0
     public var meanGPUExecutionMs: Double = 0.0
+    /// Fastest GPU frame of the run. Clock drift on a lightly loaded GPU only inflates frames,
+    /// so the minimum is the number to compare across runs; the mean tracks the clock state.
+    public var minGPUExecutionMs: Double = 0.0
     /// Compositor deadline misses and samples over the run (visionOS), zero elsewhere.
     public var missedDeadlines: Int = 0
     public var deadlineSamples: Int = 0
@@ -77,6 +80,7 @@ public final class EngineStatsRecorder: @unchecked Sendable {
     private var frameTimes: [Double] = []
     private var gpuExecutionSum = 0.0
     private var gpuExecutionSamples = 0
+    private var gpuExecutionMin = Double.greatestFiniteMagnitude
     private var gpuPassSums: [String: (sum: Double, samples: Int)] = [:]
     private var gpuPassMins: [String: Double] = [:]
     private var timingSums: [String: Double] = [:]
@@ -139,6 +143,7 @@ public final class EngineStatsRecorder: @unchecked Sendable {
         if snapshot.timing.gpuExecutionMs > 0 {
             gpuExecutionSum += snapshot.timing.gpuExecutionMs
             gpuExecutionSamples += 1
+            gpuExecutionMin = min(gpuExecutionMin, snapshot.timing.gpuExecutionMs)
         }
         for pass in snapshot.gpuPasses.passes {
             let entry = gpuPassSums[pass.label] ?? (0.0, 0)
@@ -193,6 +198,7 @@ public final class EngineStatsRecorder: @unchecked Sendable {
         }
         if gpuExecutionSamples > 0 {
             result.meanGPUExecutionMs = gpuExecutionSum / Double(gpuExecutionSamples)
+            result.minGPUExecutionMs = gpuExecutionMin
         }
         for (label, entry) in gpuPassSums where entry.samples > 0 {
             result.gpuPassMeanMs[label] = entry.sum / Double(entry.samples)
