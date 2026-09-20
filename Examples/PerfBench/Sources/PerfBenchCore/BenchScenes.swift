@@ -35,8 +35,8 @@ public struct BenchCameraOrbit: Sendable {
 }
 
 /// One benchmark scene. `build` creates every entity relative to `origin`; the runner destroys
-/// them afterwards, so `teardown` only has to undo global settings the scene changed.
-@MainActor
+/// them afterwards, so `teardown` only has to undo global settings the scene changed. Scenes are
+/// built from the engine's update callback, on the main thread or the XR render thread.
 public protocol BenchScene {
     var id: String { get }
     var title: String { get }
@@ -52,7 +52,7 @@ public extension BenchScene {
 }
 
 public enum BenchScenes {
-    @MainActor public static let all: [BenchScene] = [
+    public static let all: [BenchScene] = [
         PrimitivesScene(id: "primitives-1k", gridSize: 32, spacing: 1.0, batched: false, pointLights: 4),
         PrimitivesScene(id: "primitives-10k", gridSize: 100, spacing: 1.0, batched: true, pointLights: 4),
         PrimitivesScene(id: "lights-64", gridSize: 32, spacing: 1.0, batched: true, pointLights: 64),
@@ -62,14 +62,13 @@ public enum BenchScenes {
         GaussianScene(),
     ]
 
-    @MainActor public static func scenes(withIDs ids: [String]) -> [BenchScene] {
+    public static func scenes(withIDs ids: [String]) -> [BenchScene] {
         ids.compactMap { id in all.first { $0.id == id } }
     }
 }
 
 // MARK: - Shared helpers
 
-@MainActor
 enum BenchSceneBuilder {
     static func makeCamera(eye: simd_float3, target: simd_float3) {
         let camera = createEntity()
@@ -162,7 +161,6 @@ enum BenchSceneBuilder {
 // MARK: - Scenes
 
 /// A grid of individual primitives: draw-call and per-entity CPU cost, shadows, a few lights.
-@MainActor
 final class PrimitivesScene: BenchScene {
     let id: String
     let gridSize: Int
@@ -209,7 +207,6 @@ final class PrimitivesScene: BenchScene {
 }
 
 /// The 1k primitive grid with SSAO, bloom, depth of field and SMAA on: the post-processing chain.
-@MainActor
 final class PostFXScene: BenchScene {
     let id = "postfx"
     let title = "1024 primitives with SSAO, bloom, depth of field and SMAA"
@@ -240,7 +237,6 @@ final class PostFXScene: BenchScene {
 }
 
 /// Sixteen skinned characters playing a clip: animation sampling, joint updates and the deformation pass.
-@MainActor
 final class AnimationScene: BenchScene {
     let id = "animation-16"
     let title = "16 skinned characters running"
@@ -265,7 +261,6 @@ final class AnimationScene: BenchScene {
 }
 
 /// A textured, multi-material asset with a ground plane: material binds and texture bandwidth.
-@MainActor
 final class StadiumScene: BenchScene {
     let id = "stadium"
     let title = "Stadium and grass (textured assets)"
@@ -287,7 +282,6 @@ final class StadiumScene: BenchScene {
 }
 
 /// A Gaussian splat next to primitives: the splat cull, depth-key and radix-sort passes every frame.
-@MainActor
 final class GaussianScene: BenchScene {
     let id = "gaussian"
     let title = "Gaussian splat with primitives"
