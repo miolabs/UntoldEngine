@@ -631,6 +631,13 @@ public class TextureStreamingSystem: @unchecked Sendable {
                         material.normalSourceDimensions,
                         false
                     ),
+                    (
+                        .height,
+                        material.height.texture,
+                        material.heightMDLTexture.map { TextureSource.mdl($0) } ?? urlSource(material.heightURL),
+                        material.heightSourceDimensions,
+                        false
+                    ),
                 ]
 
                 for descriptor in descriptors {
@@ -785,6 +792,7 @@ public class TextureStreamingSystem: @unchecked Sendable {
                 total += mat.roughness.texture?.allocatedSize ?? 0
                 total += mat.metallic.texture?.allocatedSize ?? 0
                 total += mat.normal.texture?.allocatedSize ?? 0
+                total += mat.height.texture?.allocatedSize ?? 0
             }
         }
         return total
@@ -891,12 +899,23 @@ public class TextureStreamingSystem: @unchecked Sendable {
                 // ASTC textures: skip the sRGB view step — the color space is baked
                 // into the pixel format at encode time (ASTC_4X4_SRGB vs ASTC_4X4_LDR),
                 // and ASTC formats cannot be reinterpreted via makeTextureView.
-                // Non-ASTC textures still need the view to ensure the correct sRGB variant.
+                //
+                // Resampled textures (targetMaxDimension != nil) come back from
+                // downsampleTexture already holding genuinely linear bytes in a linear
+                // pixel format — do NOT force them through textureViewMatchingSRGB, or
+                // the sRGB view re-tags already-linear data as sRGB and the material
+                // shader's hardware sRGB decode double-applies on sample (visible color/
+                // tint shift on every downgrade or partial upgrade of a base color texture).
+                // Only a texture returned at full source resolution (no resample; loaded
+                // directly by loadSourceTexture with the correct .SRGB option) needs this
+                // reconciliation, and it's a no-op there since the format already matches.
                 let texView: MTLTexture
                 if case .utex = item.slot.source {
                     texView = texture
-                } else {
+                } else if item.targetMaxDimension == nil {
                     texView = self.textureViewMatchingSRGB(texture, wantSRGB: item.slot.isSRGB)
+                } else {
+                    texView = texture
                 }
                 loaded.append(LoadedTexture(
                     meshIndex: item.slot.meshIndex,
@@ -958,6 +977,9 @@ public class TextureStreamingSystem: @unchecked Sendable {
                             case .normal:
                                 material.normal.texture = item.texture
                                 material.normalStreamingLevel = streamLevel
+                            case .height:
+                                material.height.texture = item.texture
+                                material.heightStreamingLevel = streamLevel
                             }
                         }
 
@@ -993,6 +1015,9 @@ public class TextureStreamingSystem: @unchecked Sendable {
                             case .normal:
                                 batchMaterial.normal.texture = item.texture
                                 batchMaterial.normalStreamingLevel = streamLevel
+                            case .height:
+                                batchMaterial.height.texture = item.texture
+                                batchMaterial.heightStreamingLevel = streamLevel
                             }
                         }
                     }
@@ -1152,9 +1177,17 @@ public class TextureStreamingSystem: @unchecked Sendable {
             return nil
         }
 
-        // MPS can read an sRGB texture but cannot write to one, so target was
-        // allocated in the linear sibling format; view it back as the original
-        // (possibly sRGB) format for the caller.
+        // MPS reads sRGB source textures through the texture unit, which auto-decodes
+        // sRGB → linear before filtering, and writes raw (already-linear) bytes to the
+        // destination. Metal also disallows a writable sRGB destination, so target was
+        // allocated in the linear sibling format (mpsWritableFormat).
+        //
+        // target's bytes are therefore genuinely linear, not sRGB-encoded — do NOT view
+        // it back as the source's sRGB format. Doing so previously caused the material
+        // shader's hardware sRGB decode to run a second time on already-linear data,
+        // visibly darkening/shifting base color textures every time they were resampled
+        // (medium/minimum streaming tiers). Returning target in its natural linear
+        // format is correct as-is.
         let scale = MPSImageBilinearScale(device: renderInfo.device)
         scale.encode(commandBuffer: commandBuffer, sourceTexture: texture, destinationTexture: target)
 
@@ -1168,8 +1201,7 @@ public class TextureStreamingSystem: @unchecked Sendable {
             commandBuffer.commit()
         }
 
-        guard target.pixelFormat != texture.pixelFormat else { return target }
-        return target.makeTextureView(pixelFormat: texture.pixelFormat) ?? target
+        return target
     }
 
     // MARK: - sRGB Helper

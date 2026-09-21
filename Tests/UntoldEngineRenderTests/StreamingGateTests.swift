@@ -24,6 +24,13 @@ final class StreamingGateTests: BaseRenderSetup {
     override func setUp() async throws {
         try await super.setUp()
         destroyAllEntities()
+        // A test elsewhere in this target (e.g. GaussianRenderingTest's scene-root-offset
+        // culling test) can leave SceneRootTransform.shared non-identity if it doesn't get
+        // torn down cleanly in the same process. update(cameraPosition:) below runs it through
+        // SceneRootTransform.shared.effectiveCameraPosition, so a stale offset silently shifts
+        // every distance/zone check in this file away from the camera position the test thinks
+        // it's using -- reset it alongside the other shared singletons this suite depends on.
+        SceneRootTransform.shared.reset()
         GeometryStreamingSystem.shared.reset()
         GeometryStreamingSystem.shared.enabled = true
         GeometryStreamingSystem.shared.maxConcurrentLoads = 3
@@ -51,6 +58,7 @@ final class StreamingGateTests: BaseRenderSetup {
     }
 
     override func tearDown() async throws {
+        SceneRootTransform.shared.reset()
         GeometryStreamingSystem.shared.reset()
         GeometryStreamingSystem.shared.enabled = false
         GeometryStreamingSystem.shared.maxConcurrentLoads = 3
@@ -182,6 +190,8 @@ final class StreamingGateTests: BaseRenderSetup {
         GeometryStreamingSystem.shared.update(cameraPosition: .zero, deltaTime: 0.016)
 
         let s = try XCTUnwrap(scene.get(component: StreamingComponent.self, for: entity))
+        XCTAssertEqual(s.loadDispatchCount, 0,
+                       "Interior gate must block loading when camera is outside interiorZone")
         XCTAssertEqual(s.state, .unloaded,
                        "Interior gate must block loading when camera is outside interiorZone")
     }
@@ -198,8 +208,10 @@ final class StreamingGateTests: BaseRenderSetup {
         GeometryStreamingSystem.shared.update(cameraPosition: .zero, deltaTime: 0.016)
 
         let s = try XCTUnwrap(scene.get(component: StreamingComponent.self, for: entity))
-        XCTAssertNotEqual(s.state, .unloaded,
-                          "Interior gate must allow loading when camera is inside interiorZone")
+        // The stub asset does not exist, so the dispatched load fails at once on a background
+        // task and puts the state back to .unloaded; the dispatch count is the gate's verdict.
+        XCTAssertEqual(s.loadDispatchCount, 1,
+                       "Interior gate must allow loading when camera is inside interiorZone")
     }
 
     func testInteriorZoneGate_doesNotApplyWhenZoneIsNil() throws {
@@ -211,8 +223,10 @@ final class StreamingGateTests: BaseRenderSetup {
         GeometryStreamingSystem.shared.update(cameraPosition: .zero, deltaTime: 0.016)
 
         let s = try XCTUnwrap(scene.get(component: StreamingComponent.self, for: entity))
-        XCTAssertNotEqual(s.state, .unloaded,
-                          "Interior gate must be inactive when interiorZone is nil")
+        // The stub asset does not exist, so the dispatched load fails at once on a background
+        // task and puts the state back to .unloaded; the dispatch count is the gate's verdict.
+        XCTAssertEqual(s.loadDispatchCount, 1,
+                       "Interior gate must be inactive when interiorZone is nil")
     }
 
     func testInteriorZoneGate_doesNotApplyToNonInteriorEntities() throws {
@@ -228,8 +242,10 @@ final class StreamingGateTests: BaseRenderSetup {
         GeometryStreamingSystem.shared.update(cameraPosition: .zero, deltaTime: 0.016)
 
         let s = try XCTUnwrap(scene.get(component: StreamingComponent.self, for: entity))
-        XCTAssertNotEqual(s.state, .unloaded,
-                          "Non-interior entities must not be blocked by the interior zone gate")
+        // The stub asset does not exist, so the dispatched load fails at once on a background
+        // task and puts the state back to .unloaded; the dispatch count is the gate's verdict.
+        XCTAssertEqual(s.loadDispatchCount, 1,
+                       "Non-interior entities must not be blocked by the interior zone gate")
     }
 
     // MARK: - Frustum gate

@@ -44,7 +44,11 @@ public struct Mesh {
     public var localSpace: simd_float4x4 = .identity
     public var worldSpace: simd_float4x4 = .identity
     var assetName: String
-    var boundingBox: (min: simd_float3, max: simd_float3)
+    /// Public so callers outside the engine that mutate GPU vertex data directly (e.g. an
+    /// `EngineExtension`-based plugin doing an in-place geometry update) can keep this in sync
+    /// without going through a full mesh rebuild. `localBounds` is the read-only equivalent for
+    /// callers that only need to read it.
+    public var boundingBox: (min: simd_float3, max: simd_float3)
     var skin: Skin?
     var morphTargets: MorphTargetSet?
     var featureEdgeIndexBuffer: MTLBuffer?
@@ -329,6 +333,142 @@ public struct Mesh {
         }
     }
 
+    /// Build an engine `Mesh` directly from CPU-side vertex/index arrays.
+    ///
+    /// For runtime-generated geometry (e.g. procedural extensions) that has neither a source
+    /// file nor a packed runtime-asset payload to decode. Builds the same buffer layout as
+    /// `makeMesh(from: RuntimeMeshPrimitive, device:)`, minus the binary decode step, then
+    /// passes through the same `MDLMesh`/`MTKMesh` construction path used everywhere else so
+    /// the mesh renders through the standard model pipeline.
+    ///
+    /// `tangents` is optional — if omitted, a placeholder is written in its place. In practice
+    /// this rarely matters either way: the underlying ModelIO construction path recomputes a
+    /// proper tangent basis from the UVs/normals whenever texture coordinates are present,
+    /// overwriting whatever was passed in here.
+    public static func makeMesh(
+        positions: [SIMD3<Float>],
+        normals: [SIMD3<Float>],
+        uvs: [SIMD2<Float>],
+        tangents: [SIMD4<Float>]? = nil,
+        indices: [UInt32],
+        name: String
+    ) -> Mesh? {
+        let vertexCount = positions.count
+        guard vertexCount > 0,
+              normals.count == vertexCount,
+              uvs.count == vertexCount,
+              tangents == nil || tangents?.count == vertexCount,
+              !indices.isEmpty
+        else {
+            handleError(.meshCreationFailed, "Mismatched or empty vertex/index arrays", name)
+            return nil
+        }
+
+        guard let device = renderInfo.device else {
+            handleError(.metalDeviceNotFound, name)
+            return nil
+        }
+        let allocator = MTKMeshBufferAllocator(device: device)
+
+        let positionBuffer = allocator.newBuffer(MemoryLayout<simd_float4>.stride * vertexCount, type: .vertex)
+        let normalBuffer = allocator.newBuffer(MemoryLayout<simd_float4>.stride * vertexCount, type: .vertex)
+        let uvBuffer = allocator.newBuffer(MemoryLayout<simd_float2>.stride * vertexCount, type: .vertex)
+        let tangentBuffer = allocator.newBuffer(MemoryLayout<simd_float4>.stride * vertexCount, type: .vertex)
+        let jointIndexBuffer = allocator.newBuffer(MemoryLayout<simd_ushort4>.stride * vertexCount, type: .vertex)
+        let jointWeightBuffer = allocator.newBuffer(MemoryLayout<simd_float4>.stride * vertexCount, type: .vertex)
+
+        let positionsOut = positionBuffer.map().bytes.bindMemory(to: simd_float4.self, capacity: vertexCount)
+        let normalsOut = normalBuffer.map().bytes.bindMemory(to: simd_float4.self, capacity: vertexCount)
+        let uvsOut = uvBuffer.map().bytes.bindMemory(to: simd_float2.self, capacity: vertexCount)
+        let tangentsOut = tangentBuffer.map().bytes.bindMemory(to: simd_float4.self, capacity: vertexCount)
+        let jointIndicesOut = jointIndexBuffer.map().bytes.bindMemory(to: simd_ushort4.self, capacity: vertexCount)
+        let jointWeightsOut = jointWeightBuffer.map().bytes.bindMemory(to: simd_float4.self, capacity: vertexCount)
+
+        for index in 0 ..< vertexCount {
+            let position = positions[index]
+            positionsOut[index] = simd_float4(position.x, position.y, position.z, 1.0)
+
+            let normal = normals[index]
+            normalsOut[index] = simd_float4(normal.x, normal.y, normal.z, 0.0)
+
+            uvsOut[index] = uvs[index]
+
+            tangentsOut[index] = tangents?[index] ?? simd_float4(1, 0, 0, 1)
+
+            // Procedural geometry has no armature; keep these zeroed so the shader's
+            // hasArmature == false path remains valid (same convention as the
+            // non-skinned runtime-asset path above).
+            jointIndicesOut[index] = simd_ushort4(0, 0, 0, 0)
+            jointWeightsOut[index] = simd_float4(0, 0, 0, 0)
+        }
+
+        let indexBuffer = allocator.newBuffer(indices.count * MemoryLayout<UInt32>.stride, type: .index)
+        _ = indices.withUnsafeBytes { rawBuffer in
+            memcpy(indexBuffer.map().bytes, rawBuffer.baseAddress!, rawBuffer.count)
+        }
+
+        // A submesh with a nil material is skipped entirely by the renderer (see
+        // UntoldEngine.swift's `guard let material = submesh.material else { continue }`), so
+        // unlike ModelIO's own box/sphere/etc. convenience initializers (which come with a
+        // default material attached), this hand-built submesh needs one explicitly or it's
+        // invisible.
+        let mdlSubmesh = MDLSubmesh(
+            indexBuffer: indexBuffer,
+            indexCount: indices.count,
+            indexType: .uInt32,
+            geometryType: .triangles,
+            material: makeDefaultMDLMaterial()
+        )
+
+        let mdlMesh = MDLMesh(
+            vertexBuffers: [
+                positionBuffer,
+                normalBuffer,
+                uvBuffer,
+                tangentBuffer,
+                jointIndexBuffer,
+                jointWeightBuffer,
+            ],
+            vertexCount: vertexCount,
+            descriptor: vertexDescriptor.model,
+            submeshes: [mdlSubmesh]
+        )
+        mdlMesh.name = name
+
+        let textureLoader = TextureLoader(device: device)
+        guard var mesh = Mesh(
+            modelIOMesh: mdlMesh,
+            vertexDescriptor: vertexDescriptor.model,
+            textureLoader: textureLoader,
+            device: device,
+            flip: true
+        ) else {
+            return nil
+        }
+
+        mesh.assetName = name
+
+        var minBounds = simd_float3(repeating: Float.infinity)
+        var maxBounds = simd_float3(repeating: -Float.infinity)
+        for position in positions {
+            minBounds = simd_min(minBounds, position)
+            maxBounds = simd_max(maxBounds, position)
+        }
+        mesh.boundingBox = (min: minBounds, max: maxBounds)
+
+        return mesh
+    }
+
+    /// A plain gray, non-metallic, medium-roughness material — the default appearance for
+    /// procedurally generated geometry that hasn't been given a material of its own.
+    private static func makeDefaultMDLMaterial() -> MDLMaterial {
+        let material = MDLMaterial(name: "ProceduralDefault", scatteringFunction: MDLPhysicallyPlausibleScatteringFunction())
+        material.setProperty(MDLMaterialProperty(name: "baseColor", semantic: .baseColor, float4: SIMD4<Float>(0.7, 0.7, 0.7, 1.0)))
+        material.setProperty(MDLMaterialProperty(name: "roughness", semantic: .roughness, float: 0.6))
+        material.setProperty(MDLMaterialProperty(name: "metallic", semantic: .metallic, float: 0.0))
+        return material
+    }
+
     private static func decodeRuntimeVertices(from data: Data, expectedCount: Int) throws -> [UntoldPBRStaticVertexV1] {
         let reader = UntoldBinaryReader(data: data)
         var vertices: [UntoldPBRStaticVertexV1] = []
@@ -590,6 +730,14 @@ public struct Material {
     public var metallic: TextureDescriptor
     public var normal: TextureDescriptor
     public var emissive: TextureDescriptor
+    public var height: TextureDescriptor = .init()
+
+    /// True when `normal` was baked with astcenc's `-normal` mode (2-component X+Y,
+    /// Z reconstructed in-shader) rather than a direct 3-component tangent-space normal.
+    /// Determined once from the .utex header at material load time — it does not change
+    /// across texture-streaming tier swaps, since those swap resolution, not encoding.
+    /// See NativeTexFlags.normalPackedXY.
+    public var normalIsPackedXY: Bool = false
 
     // Texture URLs
     public var baseColorURL: URL?
@@ -597,6 +745,7 @@ public struct Material {
     public var metallicURL: URL?
     public var normalURL: URL?
     public var emissiveURL: URL?
+    public var heightURL: URL?
 
     // Store MDLTexture references for embedded textures (USDZ)
     // These allow us to re-export or extract texture data later
@@ -605,6 +754,7 @@ public struct Material {
     public var metallicMDLTexture: MDLTexture?
     public var normalMDLTexture: MDLTexture?
     public var emissiveMDLTexture: MDLTexture?
+    public var heightMDLTexture: MDLTexture?
 
     // Original texture dimensions before any loader-time capping.
     // Used by runtime texture streaming to know the true source resolution.
@@ -613,6 +763,7 @@ public struct Material {
     public var metallicSourceDimensions: simd_int2?
     public var normalSourceDimensions: simd_int2?
     public var emissiveSourceDimensions: simd_int2?
+    public var heightSourceDimensions: simd_int2?
 
     // Texture streaming level tracking (for progressive streaming)
     public var baseColorStreamingLevel: TextureStreamingLevel = .full
@@ -620,6 +771,7 @@ public struct Material {
     public var metallicStreamingLevel: TextureStreamingLevel = .full
     public var normalStreamingLevel: TextureStreamingLevel = .full
     public var emissiveStreamingLevel: TextureStreamingLevel = .full
+    public var heightStreamingLevel: TextureStreamingLevel = .full
 
     // Default values
     public var baseColorValue: simd_float4 = .init(1.0, 1.0, 1.0, 1.0)
@@ -645,6 +797,24 @@ public struct Material {
     public var alphaMode: MaterialAlphaMode = .opaque
     public var alphaCutoff: Float = 0.5
 
+    /// Parallax Occlusion Mapping height parameters. `heightScale` is the total ray-march
+    /// depth in UV-normalized units — named after Blender's Displacement node "Scale" input,
+    /// but NOT unit-equivalent: Blender's Scale is a world-space distance, this is a
+    /// UV-space fraction. A raw Scale value carried through from Blender needs retuning, not
+    /// a straight copy (see the exporter's `ExportedMaterial.height_scale` docstring).
+    /// `heightMidlevel` matches Blender's "Midlevel" input. See
+    /// docs/proposals/HeightMapParallaxOcclusionMapping.md.
+    public var heightScale: Float = 0.05
+    public var heightMidlevel: Float = 0.5
+    /// Contrast-stretch applied to the raw height sample before `heightMidlevel`:
+    /// `(raw - heightRemapMin) / (heightRemapMax - heightRemapMin)`, saturated to [0,1].
+    /// Identity by default (0,1). Many real-world displacement maps (e.g. Substance/Poliigon
+    /// exports) only use a narrow slice of the full [0,1] range — POM has almost no local
+    /// contrast to work with unless that slice is stretched back out first.
+    public var heightRemapMin: Float = 0.0
+    public var heightRemapMax: Float = 1.0
+    public var heightEnabled: Bool = true
+
     /// Texture presence flags
     public var hasNormalMap: Bool {
         normal.texture != nil
@@ -664,6 +834,10 @@ public struct Material {
 
     public var hasEmissiveMap: Bool {
         emissive.texture != nil
+    }
+
+    public var hasHeightMap: Bool {
+        height.texture != nil
     }
 
     public var hasTransparency: Bool {
@@ -750,23 +924,40 @@ public struct Material {
             }
         }
 
+        /// The normal texture's .utex header records whether it was baked with astcenc's
+        /// `-normal` mode (2-component X+Y, Z reconstructed in-shader) instead of a direct
+        /// 3-component tangent-space normal — see NativeTexFlags.normalPackedXY. This is a
+        /// cheap, header-only, mmap'd read (NativeTexReader never touches the ASTC payload),
+        /// done once at material load time rather than threaded through NativeTextureLoader's
+        /// GPU-upload path, since the flag doesn't change across texture-streaming tier swaps.
+        func normalTexturePackedXY(reference: RuntimeTextureReference?) -> Bool {
+            guard let reference, reference.textureFormat.isNativeContainer, let url = reference.sourceURL else { return false }
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return false }
+            guard let (header, _) = try? NativeTexReader().read(from: data) else { return false }
+            return (header.flags & NativeTexFlags.normalPackedXY) != 0
+        }
+
         let baseTexture = loadRuntimeTexture("Base color", reference: runtimeMaterial.baseColorTexture, isSRGB: runtimeMaterial.baseColorTexture?.isSRGB ?? true)
         let normalTexture = loadRuntimeTexture("Normal", reference: runtimeMaterial.normalTexture, isSRGB: false)
         let metallicTexture = loadRuntimeTexture("Metallic", reference: runtimeMaterial.metallicTexture, isSRGB: false)
         let roughnessTexture = loadRuntimeTexture("Roughness", reference: runtimeMaterial.roughnessTexture, isSRGB: false)
         let emissiveTexture = loadRuntimeTexture("Emissive", reference: runtimeMaterial.emissiveTexture, isSRGB: runtimeMaterial.emissiveTexture?.isSRGB ?? true)
+        let heightTexture = loadRuntimeTexture("Height", reference: runtimeMaterial.heightTexture, isSRGB: false)
 
         baseColor = createTextureDescriptor(device: device, texture: baseTexture, wrapMode: .repeat)
         roughness = createTextureDescriptor(device: device, texture: roughnessTexture, wrapMode: .repeat)
         metallic = createTextureDescriptor(device: device, texture: metallicTexture, wrapMode: .repeat)
-        normal = createTextureDescriptor(device: device, texture: normalTexture, wrapMode: .clampToEdge)
+        normal = createTextureDescriptor(device: device, texture: normalTexture, wrapMode: .repeat)
         emissive = createTextureDescriptor(device: device, texture: emissiveTexture, wrapMode: .repeat)
+        height = createTextureDescriptor(device: device, texture: heightTexture, wrapMode: .repeat)
+        normalIsPackedXY = normalTexturePackedXY(reference: runtimeMaterial.normalTexture)
 
         baseColorURL = runtimeMaterial.baseColorTexture?.sourceURL
         normalURL = runtimeMaterial.normalTexture?.sourceURL
         roughnessURL = runtimeMaterial.roughnessTexture?.sourceURL
         metallicURL = runtimeMaterial.metallicTexture?.sourceURL
         emissiveURL = runtimeMaterial.emissiveTexture?.sourceURL
+        heightURL = runtimeMaterial.heightTexture?.sourceURL
 
         baseColorSourceDimensions = runtimeMaterial.baseColorTexture.flatMap { tex in
             guard let width = tex.width, let height = tex.height else { return nil }
@@ -788,6 +979,10 @@ public struct Material {
             guard let width = tex.width, let height = tex.height else { return nil }
             return simd_int2(Int32(width), Int32(height))
         }
+        heightSourceDimensions = runtimeMaterial.heightTexture.flatMap { tex in
+            guard let width = tex.width, let height = tex.height else { return nil }
+            return simd_int2(Int32(width), Int32(height))
+        }
 
         baseColorValue = runtimeMaterial.baseColorFactor
         emissiveValue = runtimeMaterial.emissiveFactor
@@ -796,6 +991,10 @@ public struct Material {
         roughnessChannel = runtimeMaterial.roughnessTextureChannel
         metallicChannel = runtimeMaterial.metallicTextureChannel
         alphaCutoff = runtimeMaterial.alphaCutoff
+        heightScale = runtimeMaterial.heightScale
+        heightMidlevel = runtimeMaterial.heightMidlevel
+        heightRemapMin = runtimeMaterial.heightRemapMin
+        heightRemapMax = runtimeMaterial.heightRemapMax
 
         let alphaModeBits = runtimeMaterial.flags & 0b11
         alphaMode = MaterialAlphaMode(rawValue: Int32(alphaModeBits)) ?? .opaque
@@ -808,6 +1007,7 @@ public struct Material {
         var metallicDims: simd_int2?
         var normalDims: simd_int2?
         var emissiveDims: simd_int2?
+        var heightDims: simd_int2?
 
         // Load textures and set URLs
         let baseColorTex = textureLoader.loadTexture(
@@ -828,7 +1028,7 @@ public struct Material {
             outputSourceDimensions: &normalDims,
             mapType: "Normal map"
         )
-        normal = createTextureDescriptor(device: renderInfo.device, texture: normalTex, wrapMode: .clampToEdge)
+        normal = createTextureDescriptor(device: renderInfo.device, texture: normalTex, wrapMode: .repeat)
 
         let roughnessTex = textureLoader.loadTexture(
             from: mdlMaterial.property(with: .roughness),
@@ -860,11 +1060,25 @@ public struct Material {
         )
         emissive = createTextureDescriptor(device: renderInfo.device, texture: emissiveTex, wrapMode: .repeat)
 
+        let heightTex = textureLoader.loadTexture(
+            from: mdlMaterial.property(with: .displacement),
+            isSRGB: false,
+            outputURL: &heightURL,
+            outputMDLTexture: &heightMDLTexture,
+            outputSourceDimensions: &heightDims,
+            mapType: "Height map"
+        )
+        height = createTextureDescriptor(device: renderInfo.device, texture: heightTex, wrapMode: .repeat)
+        if let displacementScale = mdlMaterial.property(with: .displacementScale)?.floatValue {
+            heightScale = displacementScale
+        }
+
         baseColorSourceDimensions = baseColorDims
         normalSourceDimensions = normalDims
         roughnessSourceDimensions = roughnessDims
         metallicSourceDimensions = metallicDims
         emissiveSourceDimensions = emissiveDims
+        heightSourceDimensions = heightDims
 
         /// Set texture streaming levels based on whether textures were dimension-capped.
         func isCapped(_ texture: MTLTexture?, _ sourceDims: simd_int2?) -> Bool {
@@ -886,6 +1100,9 @@ public struct Material {
         }
         if isCapped(emissiveTex, emissiveSourceDimensions) {
             emissiveStreamingLevel = .capped
+        }
+        if isCapped(heightTex, heightSourceDimensions) {
+            heightStreamingLevel = .capped
         }
 
         var baseColorHasExplicitAlpha = false
@@ -1029,9 +1246,18 @@ final class TextureLoader {
               let commandBuffer = downsampleCommandQueue?.makeCommandBuffer()
         else { return texture }
 
-        // MPS can read an sRGB texture but cannot write to one, so target was
-        // allocated in the linear sibling format; view it back as the original
-        // (possibly sRGB) format for the caller.
+        // MPS reads sRGB source textures through the texture unit, which auto-decodes
+        // sRGB → linear before filtering, and writes raw (already-linear) bytes to the
+        // destination. Metal also disallows a writable sRGB destination, so target was
+        // allocated in the linear sibling format (mpsWritableFormat).
+        //
+        // target's bytes are therefore genuinely linear, not sRGB-encoded — do NOT view
+        // it back as the source's sRGB format. Doing so previously caused the material
+        // shader's hardware sRGB decode to run a second time on already-linear data,
+        // silently darkening/shifting every base color texture capped at import time
+        // (see TextureStreamingSystem.downsampleTexture for the same fix on the
+        // streaming-tier resample path). Returning target in its natural linear format
+        // is correct as-is.
         let scale = MPSImageBilinearScale(device: device)
         scale.encode(commandBuffer: commandBuffer, sourceTexture: texture, destinationTexture: target)
 
@@ -1043,8 +1269,7 @@ final class TextureLoader {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        guard target.pixelFormat != texture.pixelFormat else { return target }
-        return target.makeTextureView(pixelFormat: texture.pixelFormat) ?? target
+        return target
     }
 
     /// Log a summary of all textures loaded by this loader instance
@@ -1068,13 +1293,19 @@ final class TextureLoader {
         sourceDimensionsCache[cacheKey] = sourceDims
         _ = nameForLog
 
-        if texture.width < fullTexture.width || texture.height < fullTexture.height {
+        let wasDownsampled = texture.width < fullTexture.width || texture.height < fullTexture.height
+        if wasDownsampled {
             savedBytesByCapping += fullTexture.allocatedSize - texture.allocatedSize
         }
         loadedTextureCount += 1
         loadedTextureBytes += texture.allocatedSize
 
-        let texView = textureViewMatchingSRGB(texture, wantSRGB: isSRGB)
+        // A downsampled texture already carries the correct linear pixel format from
+        // downsampleIfNeeded — its bytes are genuinely linear (see the comment there).
+        // Only a texture returned at full resolution (never resampled) needs the sRGB
+        // view reconciliation, and it's a no-op there since the loader-assigned format
+        // already matches.
+        let texView = wasDownsampled ? texture : textureViewMatchingSRGB(texture, wantSRGB: isSRGB)
         textureCache[cacheKey] = texView
         return texView
     }
@@ -1516,6 +1747,12 @@ private func cachedSamplerState(device: MTLDevice, wrapMode: WrapMode) -> MTLSam
     samplerDescriptor.mipFilter = .linear
     samplerDescriptor.sAddressMode = (wrapMode == .repeat) ? .repeat : .clampToEdge
     samplerDescriptor.tAddressMode = (wrapMode == .repeat) ? .repeat : .clampToEdge
+    // Without this, minification of fine high-frequency textures viewed at a grazing
+    // angle (fabric weaves, floor tiles, ...) aliases into visible jagged/stair-stepped
+    // edges: trilinear filtering alone picks one isotropic mip level sized to the
+    // longest axis of the screen-space footprint, over-blurring the other axis instead
+    // of resolving it. 16 is the practical max on Apple GPUs and cheap to sample.
+    samplerDescriptor.maxAnisotropy = 16
 
     let sampler = device.makeSamplerState(descriptor: samplerDescriptor)
     if let sampler {

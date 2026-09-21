@@ -46,7 +46,7 @@ Texture slot → ASTC format mapping:
     ─────────── ──────── ─────── ───────────────────────────────────
     base_color   yes      4×4    186  (astc_4x4_sRGB)
     emissive     yes      4×4    186  (astc_4x4_sRGB)
-    normal       no       4×4    204  (astc_4x4_ldr)
+    normal       no       4×4    204  (astc_4x4_ldr, `-normal -perceptual` encode — see below)
     roughness    no       6×6    208  (astc_6x6_ldr)
     metallic     no       6×6    208  (astc_6x6_ldr)
     occlusion    no       6×6    208  (astc_6x6_ldr)
@@ -54,6 +54,15 @@ Texture slot → ASTC format mapping:
     opacity      no       4×4    204  (astc_4x4_ldr)
     data         no       4×4    204  (astc_4x4_ldr)  ← default for unrecognised slots
     lut          no       1×1    115  (rgba16Float, uncompressed, one mip)
+
+Normal map encoding:
+    Normal maps are compressed with astcenc's `-normal -perceptual` mode instead of
+    generic RGB compression. `-normal` re-weights the ASTC error metric for unit-vector
+    data (RGB color compression perceptually favors green, which is the wrong tradeoff
+    for X/Y/Z surface vectors) and repacks the map as a 2-component X+Y map — stored as
+    (RGB=X, A=Y) — with Z reconstructed at sample time. FLAG_NORMAL_PACKED_XY is set in
+    the .utex header so the engine's shaders know to reconstruct Z instead of reading it
+    directly; see the decode in modelShader.metal / TransparencyShader.metal.
 """
 
 from __future__ import annotations
@@ -69,6 +78,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 try:
     from PIL import Image
@@ -114,10 +124,19 @@ MTL_ASTC_5X5_LDR = 206
 MTL_ASTC_6X6_LDR = 208
 MTL_ASTC_8X8_LDR = 212
 MTL_RGBA16_FLOAT = 115
+# Single-channel, 16-bit, linear, uncompressed — height/displacement map data. Bypasses
+# ASTC deliberately: block compression's stepping artifacts are especially visible when
+# the height field is ray-marched per-pixel (POM), and most source displacement maps are
+# already single-channel grayscale where RGBA conversion + block compression only wastes
+# precision without any benefit. See docs/proposals/HeightMapParallaxOcclusionMapping.md.
+MTL_R16_UNORM = 20
 
 # Flags (matches NativeTexFlags in Swift)
 FLAG_HAS_ALPHA = 1 << 0
 FLAG_PREMULTIPLIED_ALPHA = 1 << 1
+# Normal map was compressed with astcenc's `-normal` mode: RGB=X (duplicated across
+# R/G/B), A=Y, Z reconstructed in-shader. See modelShader.metal / TransparencyShader.metal.
+FLAG_NORMAL_PACKED_XY = 1 << 2
 
 # KHR ASTC container magic (16-byte header produced by astcenc)
 _ASTC_MAGIC = b"\x13\xab\xa1\x5c"
@@ -150,6 +169,8 @@ _SLOT_CONFIG: dict[str, SlotConfig] = {
     # LUTs remain uncompressed RGBA16Float. ASTC errors become color-transform
     # errors and are especially visible in dark gradients.
     "lut":        SlotConfig(srgb=False, block_size="1x1", block_w=1, block_h=1, pixel_format=MTL_RGBA16_FLOAT, generate_mips=False, encoding="rgba16f"),
+    # Height/displacement maps stay uncompressed single-channel R16Unorm — see MTL_R16_UNORM.
+    "height":     SlotConfig(srgb=False, block_size="1x1", block_w=1, block_h=1, pixel_format=MTL_R16_UNORM, generate_mips=True, encoding="r16"),
 }
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp"}
@@ -165,8 +186,10 @@ def detect_slot(path: Path) -> str:
         return "base_color"
     if any(k in stem for k in ("emissive", "emission", "_emit", "emit_")):
         return "emissive"
-    if any(k in stem for k in ("normal", "_nrm", "nrm_", "_nml", "nml_", "_bump", "bump_")):
+    if any(k in stem for k in ("normal", "_nrm", "nrm_", "_nml", "nml_")):
         return "normal"
+    if any(k in stem for k in ("height", "displacement", "_disp", "disp_", "_bump", "bump_")):
+        return "height"
     if any(k in stem for k in ("roughness", "_rough", "rough_")):
         return "roughness"
     if any(k in stem for k in ("metallic", "_metal", "metal_", "metalness")):
@@ -192,6 +215,8 @@ def _slot_from_texture_flags(flags: int) -> str | None:
     """
     if flags & _UNTOLD_TEX_FLAG_LUT:
         return "lut"
+    if flags & _UNTOLD_TEX_FLAG_HEIGHT:
+        return "height"
     if flags & _UNTOLD_TEX_FLAG_NORMAL_MAP:
         return "normal"
     if flags & _UNTOLD_TEX_FLAG_EMISSIVE:
@@ -278,10 +303,17 @@ def compress_mip_to_astc(
     srgb: bool,
     tmp_dir: Path,
     label: str,
+    extra_args: list[str] | None = None,
 ) -> bytes:
     """
     Compress a single PIL Image to raw ASTC block bytes.
     Returns only the block payload (strips the 16-byte KHR ASTC container header).
+
+    extra_args: additional astcenc CLI options appended after the required
+    profile/input/output/blocksize/quality arguments (e.g. ["-normal", "-perceptual"]
+    for normal maps — see astcenc's -normal mode, which re-weights the error metric
+    for unit-vector data instead of the default RGB-luminance weighting, and packs
+    the map as a 2-component X+Y map with Z reconstructed in-shader).
     """
     input_png = tmp_dir / f"{label}.png"
     output_astc = tmp_dir / f"{label}.astc"
@@ -299,6 +331,8 @@ def compress_mip_to_astc(
         block_size,
         f"-{quality}",
     ]
+    if extra_args:
+        cmd.extend(extra_args)
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -344,6 +378,7 @@ def write_utex(
     mip_dimensions: list[tuple[int, int]],
     cfg: SlotConfig,
     has_alpha: bool,
+    extra_flags: int = 0,
 ) -> None:
     """Assemble and write a .utex file from per-mip ASTC block payloads."""
     mip_count = len(mip_payloads)
@@ -364,7 +399,7 @@ def write_utex(
         cursor = align_up(cursor + len(payload), UTEX_PAYLOAD_ALIGNMENT)
 
     total_payload_size = cursor
-    flags = FLAG_HAS_ALPHA if has_alpha else 0
+    flags = (FLAG_HAS_ALPHA if has_alpha else 0) | extra_flags
     base_w, base_h = mip_dimensions[0]
 
     header_bytes = struct.pack(
@@ -447,6 +482,44 @@ def bake_texture(
         print(f"  Written   {output_path.name}  ({size_kb:.1f} KB, RGBA16Float)")
         return
 
+    if cfg.encoding == "r16":
+        # Height/displacement data is single-channel and precision-sensitive —
+        # ASTC's block quantization introduces visible stair-stepping in the
+        # POM ray march, so this stays uncompressed R16Unorm instead. Source
+        # 16-bit grayscale (e.g. Poliigon Displacement.tiff) is preserved
+        # bit-exact; 8-bit sources are rescaled (×257) to fill the 16-bit range.
+        gray = img.convert("I")
+        high_precision_modes = {"I", "I;16", "I;16B", "I;16L", "I;16N", "F"}
+        source_is_16bit = img.mode in high_precision_modes
+        scale = 1 if source_is_16bit else 257
+
+        if cfg.generate_mips:
+            levels = mip_count_for(gray.width, gray.height)
+            mip_imgs = [gray] + [
+                gray.resize((max(1, gray.width >> lvl), max(1, gray.height >> lvl)), Image.LANCZOS)
+                for lvl in range(1, levels)
+            ]
+        else:
+            mip_imgs = [gray]
+        print(f"  Mip chain {gray.width}×{gray.height} → {len(mip_imgs)} levels")
+
+        mip_payloads: list[bytes] = []
+        mip_dimensions: list[tuple[int, int]] = []
+        for mip_img in mip_imgs:
+            w, h = mip_img.size
+            pixels = list(mip_img.getdata())
+            payload = bytearray(w * h * 2)
+            for i, value in enumerate(pixels):
+                clamped = max(0, min(65535, int(value) * scale))
+                struct.pack_into("<H", payload, i * 2, clamped)
+            mip_payloads.append(bytes(payload))
+            mip_dimensions.append((w, h))
+
+        write_utex(output_path, mip_payloads, mip_dimensions, cfg, has_alpha=False)
+        size_kb = output_path.stat().st_size / 1024
+        print(f"  Written   {output_path.name}  ({size_kb:.1f} KB, R16Unorm, {len(mip_payloads)} mip levels)")
+        return
+
     astcenc = find_astcenc()
 
     if cfg.generate_mips:
@@ -455,6 +528,17 @@ def bake_texture(
     else:
         mips = [img.convert("RGBA")]
         print(f"  Mip chain {img.size[0]}×{img.size[1]} → 1 level (mips disabled for slot '{slot}')")
+
+    # Normal maps are unit-vector data, not color/luminance data: astcenc's default RGB
+    # error metric perceptually weights green (tuned for human color vision) over red/blue,
+    # which is the wrong tradeoff for X/Y/Z surface vectors and shows up as visible noise on
+    # fine, high-frequency normal detail (fabric weave, wrinkles, ...). `-normal` re-weights
+    # the error metric for vector data and repacks the map as 2-component X+Y (RGB=X, A=Y)
+    # with Z reconstructed in-shader, freeing up bits that would otherwise encode a
+    # redundant/inferable Z channel. `-perceptual` is also valid for normal-map data.
+    # See FLAG_NORMAL_PACKED_XY and the decode in modelShader.metal / TransparencyShader.metal.
+    extra_args = ["-normal", "-perceptual"] if slot == "normal" else None
+    extra_flags = FLAG_NORMAL_PACKED_XY if slot == "normal" else 0
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="texbake_"))
     try:
@@ -472,6 +556,7 @@ def bake_texture(
                 srgb=cfg.srgb,
                 tmp_dir=tmp_dir,
                 label=label,
+                extra_args=extra_args,
             )
             expected = expected_block_bytes(w, h, cfg.block_w, cfg.block_h)
             if len(payload) != expected:
@@ -483,7 +568,7 @@ def bake_texture(
             mip_dimensions.append((w, h))
             print(f"  mip {i:2d}  {w:5d}×{h:<5d}  {len(payload):>8,} bytes  [{label}]")
 
-        write_utex(output_path, mip_payloads, mip_dimensions, cfg, has_alpha)
+        write_utex(output_path, mip_payloads, mip_dimensions, cfg, has_alpha, extra_flags=extra_flags)
         size_kb = output_path.stat().st_size / 1024
         print(f"  Written   {output_path.name}  ({size_kb:.1f} KB)")
 
@@ -578,6 +663,7 @@ def bake_directory(
     directory: Path,
     quality: str,
     keep_temp: bool,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> None:
     sources = sorted(
         p for p in directory.iterdir()
@@ -595,8 +681,9 @@ def bake_directory(
 
     print(f"Batch baking {len(sources)} texture(s) in {directory}\n")
     errors: list[tuple[Path, str]] = []
+    total = len(sources)
 
-    for src in sources:
+    for index, src in enumerate(sources):
         stem  = src.stem.lower()
         flags = flags_map.get(stem)
         slot  = (_slot_from_texture_flags(flags) if flags is not None else None) or detect_slot(src)
@@ -608,6 +695,8 @@ def bake_directory(
             errors.append((src, str(exc)))
             print(f"  [error] {exc}")
         print()
+        if progress_callback is not None:
+            progress_callback(index + 1, total, src.name)
 
     if errors:
         print(f"\n{len(errors)} error(s):")
@@ -638,7 +727,12 @@ _UNTOLD_HEADER_FMT   = "<8sIIIIIIIIIII6f16f32s32s"
 _UNTOLD_CHUNK_FMT    = "<IIQQQII"   # 40 bytes
 _UNTOLD_ENTITY_FMT   = "<6I6f6f16f" # 136 bytes
 _UNTOLD_MESH_FMT     = "<8I6Q6f"    # 104 bytes
-_UNTOLD_MATERIAL_FMT = "<II12f8I"   # 88 bytes
+# nameOffset(I) flags(I) baseColorFactor(4f) emissiveFactor(3f) normalScale(f)
+# metallicFactor(f) roughnessFactor(f) occlusionStrength(f) alphaCutoff(f)
+# baseColorTex(I) normalTex(I) metallicTex(I) roughnessTex(I) emissiveTex(I)
+# occlusionTex(I) heightTex(I) heightScale(f) heightMidlevel(f) heightRemapMin(f)
+# heightRemapMax(f) packedChannels(I) reserved(I)
+_UNTOLD_MATERIAL_FMT = "<II12f7I4f2I"   # 108 bytes (format version >= 4, height + remap fields)
 _UNTOLD_TEXTURE_FMT  = "<8I"        # 32 bytes
 # entityId(I) nameOffset(I) lightType(I) flags(I) color(3f) intensity(f)
 # position(3f) radius(f) direction(3f) falloff(f) right(3f) innerCone(f)
@@ -667,7 +761,7 @@ assert struct.calcsize(_UNTOLD_HEADER_FMT)   == _UNTOLD_HEADER_SIZE
 assert struct.calcsize(_UNTOLD_CHUNK_FMT)    == _UNTOLD_CHUNK_ENTRY_SIZE
 assert struct.calcsize(_UNTOLD_ENTITY_FMT)   == 136
 assert struct.calcsize(_UNTOLD_MESH_FMT)     == 104
-assert struct.calcsize(_UNTOLD_MATERIAL_FMT) == 88
+assert struct.calcsize(_UNTOLD_MATERIAL_FMT) == 108
 assert struct.calcsize(_UNTOLD_TEXTURE_FMT)  == 32
 assert struct.calcsize(_UNTOLD_LIGHT_FMT)    == 176
 assert struct.calcsize(_UNTOLD_CAMERA_FMT)   == 144
@@ -682,6 +776,7 @@ assert struct.calcsize(_UNTOLD_ANIM_CHANNEL_FMT)    == 28
 _UNTOLD_TEX_FLAG_SRGB       = 1 << 0   # base-color / any sRGB texture
 _UNTOLD_TEX_FLAG_NORMAL_MAP = 1 << 1
 _UNTOLD_TEX_FLAG_LUT        = 1 << 2   # color-grading LUT strip — never mip-filtered
+_UNTOLD_TEX_FLAG_HEIGHT     = 1 << 3   # displacement/bump height map — baked to R16Unorm
 _UNTOLD_TEX_FLAG_EMISSIVE   = 1 << 6
 _UNTOLD_TEX_FLAG_OCCLUSION  = 1 << 7
 
@@ -711,10 +806,13 @@ _UNTOLD_FORMAT_ASTC_5X5 = 5
 _UNTOLD_FORMAT_ASTC_6X6 = 6
 _UNTOLD_FORMAT_ASTC_8X8 = 7
 _UNTOLD_FORMAT_RGBA16_FLOAT = 8
+_UNTOLD_FORMAT_R16_UNORM = 9
 
 def _untold_format_for_config(cfg: SlotConfig) -> int:
     if cfg.pixel_format == MTL_RGBA16_FLOAT:
         return _UNTOLD_FORMAT_RGBA16_FLOAT
+    if cfg.pixel_format == MTL_R16_UNORM:
+        return _UNTOLD_FORMAT_R16_UNORM
     return {
         "4x4": _UNTOLD_FORMAT_ASTC_4X4,
         "5x5": _UNTOLD_FORMAT_ASTC_5X5,

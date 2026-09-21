@@ -260,7 +260,7 @@ public enum RenderPasses {
     }
 
     @inline(__always)
-    private static func lodDebugColor(for lodIndex: Int) -> simd_float3 {
+    static func lodDebugColor(for lodIndex: Int) -> simd_float3 {
         let clamped = max(0, lodIndex)
         return lodDebugPalette[clamped % lodDebugPalette.count]
     }
@@ -340,6 +340,38 @@ public enum RenderPasses {
             0.0,
             0.0
         )
+    }
+
+    // MARK: - Mesh occluder shells and fades (MeshOccluderComponent, MeshFadeComponent)
+
+    /// An entity with an occluder shell or a running fade draws through the per-entity path even
+    /// while its batch group still contains it (the group is rebuilt without it a few frames
+    /// later), like an entity in a LOD or tile fade.
+    @inline(__always)
+    private static func isEntityInMeshOccluderOrFade(_ entityId: EntityID) -> Bool {
+        scene.get(component: MeshOccluderComponent.self, for: entityId) != nil
+            || scene.get(component: MeshFadeComponent.self, for: entityId) != nil
+    }
+
+    /// A mesh whose occluder shell has taken over draws no colour: depth comes from the shell
+    /// (`meshOccluderShellExecution`); shadows, physics and picking stay on because
+    /// `RenderComponent.isVisible` is untouched.
+    @inline(__always)
+    private static func meshSkipsColor(_ entityId: EntityID) -> Bool {
+        scene.get(component: MeshOccluderComponent.self, for: entityId)?.drawsColor == false
+    }
+
+    /// The app-driven cross-fade dither: outgoing (mode 2) or incoming (mode 1). Applied last so
+    /// it wins over a LOD or tile fade on the same entity.
+    @inline(__always)
+    private static func applyMeshFadeDither(
+        entityId: EntityID,
+        materialParameters: inout MaterialParametersUniform
+    ) {
+        guard let fade = scene.get(component: MeshFadeComponent.self, for: entityId) else { return }
+        let threshold = simd_clamp(fade.progress, 0.0, 1.0)
+        let mode: Float = fade.direction == .fadeOut ? 2.0 : 1.0
+        materialParameters.lodDither = simd_float4(threshold, mode, 0.0, 0.0)
     }
 
     @inline(__always)
@@ -540,7 +572,12 @@ public enum RenderPasses {
             else { continue }
             // Batch-eligible entities always cast shadows via shadowCasterBatchGroups.
             // Excluding them here prevents O(n_loaded_tiles) individual shadow draw calls.
-            if batchingEnabled, scene.get(component: StaticBatchComponent.self, for: entityId) != nil { continue }
+            // A mesh carrying an occluder shell or fade is out of its batch and casts on its
+            // own (the system that adds or removes those components invalidates this cache).
+            if batchingEnabled,
+               scene.get(component: StaticBatchComponent.self, for: entityId) != nil,
+               !isEntityInMeshOccluderOrFade(entityId)
+            { continue }
             candidates.append(entityId)
         }
 
@@ -557,6 +594,22 @@ public enum RenderPasses {
         runtimeState.lock.lock()
         runtimeState.shadowCacheDirty = true
         runtimeState.lock.unlock()
+    }
+
+    /// Returns the current shadow entity candidate cache, rebuilding first if dirty.
+    /// Internal — exposed for testing via @testable import. Lets tests pin the exact
+    /// staleness bug this cache has had before: a non-streaming load that skips
+    /// invalidateShadowEntityCache() is silently absent from shadow candidates.
+    static func shadowEntityCandidatesForTesting() -> [EntityID] {
+        runtimeState.lock.lock()
+        let dirty = runtimeState.shadowCacheDirty
+        runtimeState.lock.unlock()
+        if dirty {
+            rebuildShadowEntityCache()
+        }
+        runtimeState.lock.lock()
+        defer { runtimeState.lock.unlock() }
+        return runtimeState.shadowEntityCandidates
     }
 
     private static func shadowCasterEntityIds(for cascadeIdx: Int) -> [EntityID] {
@@ -599,7 +652,11 @@ public enum RenderPasses {
                 // scale with the scene and eventually overflow the GPU command buffer budget.
                 // During the brief batch-rebuild window their shadow is absent; this is
                 // preferable to the alternative of the app freezing at ~300+ loaded tiles.
-                if scene.get(component: StaticBatchComponent.self, for: entityId) != nil { continue }
+                // The exception is a mesh carrying an occluder shell or fade: it stays out of
+                // its batch for as long as the component is there, so it casts on its own.
+                if scene.get(component: StaticBatchComponent.self, for: entityId) != nil,
+                   !isEntityInMeshOccluderOrFade(entityId)
+                { continue }
                 if BatchingSystem.shared.isBatched(entityId: entityId) { continue }
             }
 
@@ -821,7 +878,7 @@ public enum RenderPasses {
             Int32(material.hasBaseMap ? 1 : 0),
             Int32(material.hasRoughMap ? 1 : 0),
             Int32(material.hasMetalMap ? 1 : 0),
-            0
+            Int32((material.hasHeightMap && material.heightEnabled) ? 1 : 0)
         )
         materialParameters.textureChannels = simd_int4(
             Int32(material.roughnessChannel.rawValue),
@@ -829,6 +886,23 @@ public enum RenderPasses {
             0,
             0
         )
+        materialParameters.heightScale = material.heightScale
+        materialParameters.heightMidlevel = material.heightMidlevel
+        materialParameters.heightRemapMin = material.heightRemapMin
+        materialParameters.heightRemapMax = material.heightRemapMax
+    }
+
+    /// Builds the GPU-side POM quality uniform from the current global `POMQualitySettings`
+    /// (a renderer-level setting, not per-material — see docs on `setPOMQuality`).
+    @inline(__always)
+    private static func currentPOMQualityUniform() -> POMQualityUniform {
+        let settings = getPOMQuality()
+        var uniform = POMQualityUniform()
+        uniform.minSteps = settings.minSteps
+        uniform.maxSteps = settings.maxSteps
+        uniform.maxDistance = settings.maxDistance
+        uniform.fadeStartDistance = settings.fadeStartDistance
+        return uniform
     }
 
     @inline(__always)
@@ -904,7 +978,9 @@ public enum RenderPasses {
         materialParameters.hasTexture.x = 0
     }
 
-    public static let gridExecution: RenderPassExecution = { commandBuffer in
+    /// loadAction controls whether this draw clears the target (grid used as the sole background)
+    /// or loads over whatever a prior pass already wrote (grid overlaid on top of the sky pass).
+    private static func encodeGridPass(_ commandBuffer: MTLCommandBuffer, loadAction: MTLLoadAction) {
         guard let gridPipeline = PipelineManager.shared.renderPipelinesByType[.grid] else {
             handleError(.pipelineStateNulled, "gridPipeline is nil")
             return
@@ -950,7 +1026,7 @@ public enum RenderPasses {
         }
         encoderDescriptor.colorAttachments[0].clearColor = mtkBackgroundColor
         encoderDescriptor.colorAttachments[0].storeAction = MTLStoreAction.store
-        encoderDescriptor.colorAttachments[0].loadAction = MTLLoadAction.clear
+        encoderDescriptor.colorAttachments[0].loadAction = loadAction
 
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
         else {
@@ -989,6 +1065,103 @@ public enum RenderPasses {
         renderEncoder.drawPrimitivesTracked(type: MTLPrimitiveType.triangle, vertexStart: 0, vertexCount: 6)
 
         renderEncoder.updateFence(renderInfo.fence, after: .fragment)
+    }
+
+    public static let gridExecution: RenderPassExecution = { commandBuffer in
+        encodeGridPass(commandBuffer, loadAction: .clear)
+    }
+
+    public static let skyExecution: RenderPassExecution = { commandBuffer in
+        guard let skyPipeline = PipelineManager.shared.renderPipelinesByType[.sky] else {
+            handleError(.pipelineStateNulled, "skyPipeline is nil")
+            return
+        }
+
+        if skyPipeline.success == false {
+            handleError(.pipelineStateNulled, skyPipeline.name!)
+            return
+        }
+
+        guard let camera = CameraSystem.shared.activeCamera, let cameraComponent = scene.get(component: CameraComponent.self, for: camera) else {
+            handleError(.noActiveCamera)
+            return
+        }
+
+        // update uniforms
+        var skyUniforms = SkyUniforms()
+
+        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
+        skyUniforms.invViewMatrix = viewMatrix.inverse
+        skyUniforms.invProjectionMatrix = renderInfo.perspectiveSpace.inverse
+        skyUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+
+        let sunParameters = getDirectionalLightParameters()
+        skyUniforms.sunDirection = sunParameters.direction
+        skyUniforms.sunColor = sunParameters.color
+        skyUniforms.sunIntensity = sunParameters.intensity
+
+        if let skyUniformBuffer = bufferResources.skyUniforms {
+            skyUniformBuffer.contents().copyMemory(
+                from: &skyUniforms, byteCount: MemoryLayout<SkyUniforms>.stride
+            )
+        } else {
+            handleError(.bufferAllocationFailed, bufferResources.skyUniforms!.label!)
+            return
+        }
+
+        // create the encoder
+
+        guard let encoderDescriptor = renderInfo.environmentRenderPassDescriptor else {
+            handleError(.renderPassCreationFailed, "Environment render pass descriptor not initialized")
+            return
+        }
+        encoderDescriptor.colorAttachments[0].clearColor = mtkBackgroundColor
+        encoderDescriptor.colorAttachments[0].storeAction = MTLStoreAction.store
+        encoderDescriptor.colorAttachments[0].loadAction = MTLLoadAction.clear
+
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        else {
+            handleError(.renderPassCreationFailed, "Sky Pass")
+            return
+        }
+
+        defer {
+            // Make sure no matter what we end the encoding at the end of the function
+            renderEncoder.popDebugGroup()
+            renderEncoder.endEncoding()
+        }
+
+        renderEncoder.label = "Sky Pass"
+
+        renderEncoder.pushDebugGroup("Sky Pass")
+
+        renderEncoder.setRenderPipelineState(skyPipeline.pipelineState!)
+        renderEncoder.setDepthStencilState(skyPipeline.depthState)
+
+        // send the uniforms
+        renderEncoder.setVertexBuffer(
+            bufferResources.skyVertexBuffer, offset: 0, index: Int(skyPassPositionIndex.rawValue)
+        )
+
+        renderEncoder.setVertexBuffer(
+            bufferResources.skyUniforms, offset: 0, index: Int(skyPassUniformIndex.rawValue)
+        )
+
+        renderEncoder.setFragmentBuffer(
+            bufferResources.skyUniforms, offset: 0, index: Int(skyPassUniformIndex.rawValue)
+        )
+
+        renderEncoder.drawPrimitivesTracked(type: MTLPrimitiveType.triangle, vertexStart: 0, vertexCount: 6)
+
+        renderEncoder.updateFence(renderInfo.fence, after: .fragment)
+    }
+
+    /// Sky pass followed by the grid overlaid on top (loaded, not cleared), so the reference grid
+    /// reads over the sky's flat ground fill the same way Unity's Scene view overlays its grid on
+    /// top of the sky/horizon background.
+    public static let skyGridExecution: RenderPassExecution = { commandBuffer in
+        skyExecution(commandBuffer)
+        encodeGridPass(commandBuffer, loadAction: .load)
     }
 
     public static let executeEnvironmentPass: RenderPassExecution = { commandBuffer in
@@ -1636,13 +1809,15 @@ public enum RenderPasses {
             if BatchingSystem.shared.isEnabled(),
                BatchingSystem.shared.isBatched(entityId: entityId),
                !isEntityInActiveLODFade(entityId),
-               !isEntityInActiveTileRepresentationFade(entityId)
+               !isEntityInActiveTileRepresentationFade(entityId),
+               !isEntityInMeshOccluderOrFade(entityId)
             {
                 continue
             }
 
             if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { continue }
             if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
+            if meshSkipsColor(entityId) { continue }
 
             guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
                 handleError(.noRenderComponent, entityId)
@@ -1719,6 +1894,9 @@ public enum RenderPasses {
 
                         renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
 
+                        var pomQuality = Self.currentPOMQualityUniform()
+                        renderEncoder.setFragmentBytes(&pomQuality, length: MemoryLayout<POMQualityUniform>.stride, index: Int(modelPassFragmentPOMQualityIndex.rawValue))
+
                         // set base texture
                         renderEncoder.setFragmentTexture(
                             material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue)
@@ -1739,11 +1917,15 @@ public enum RenderPasses {
                         )
 
                         // set normal
-                        // set normal
                         var hasNormal: Bool = (material.normal.texture != nil)
                         renderEncoder.setFragmentBytes(
                             &hasNormal, length: MemoryLayout<Bool>.stride,
                             index: Int(modelPassFragmentHasNormalTextureIndex.rawValue)
+                        )
+                        var normalIsPackedXY = material.normalIsPackedXY
+                        renderEncoder.setFragmentBytes(
+                            &normalIsPackedXY, length: MemoryLayout<Bool>.stride,
+                            index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue)
                         )
 
                         var materialParameters = MaterialParametersUniform()
@@ -1771,6 +1953,7 @@ public enum RenderPasses {
                         applyStreamingTierDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
                         applyLODDither(draw: lodDraw, materialParameters: &materialParameters)
                         applyTileRepresentationDither(entityId: entityId, materialParameters: &materialParameters)
+                        applyMeshFadeDither(entityId: entityId, materialParameters: &materialParameters)
 
                         renderEncoder.setFragmentBytes(
                             &materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride,
@@ -1782,6 +1965,12 @@ public enum RenderPasses {
                         )
 
                         renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
+
+                        renderEncoder.setFragmentTexture(
+                            material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue)
+                        )
+
+                        renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
 
                         renderEncoder.drawIndexedPrimitivesTracked(
                             type: subMesh.metalKitSubmesh.primitiveType,
@@ -1954,6 +2143,9 @@ public enum RenderPasses {
             var stScale: Float = material.stScale
             renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
 
+            var pomQuality = Self.currentPOMQualityUniform()
+            renderEncoder.setFragmentBytes(&pomQuality, length: MemoryLayout<POMQualityUniform>.stride, index: Int(modelPassFragmentPOMQualityIndex.rawValue))
+
             renderEncoder.setFragmentTexture(material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue))
             renderEncoder.setFragmentSamplerState(material.baseColor.sampler, index: Int(modelPassBaseSamplerIndex.rawValue))
 
@@ -1965,6 +2157,8 @@ public enum RenderPasses {
 
             var hasNormal: Bool = (material.normal.texture != nil)
             renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
+            var normalIsPackedXY = material.normalIsPackedXY
+            renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
             // Logger.log(message: "  🎨 Material baseColor: \(material.baseColorValue)")
             var materialParameters = MaterialParametersUniform()
             materialParameters.specular = material.specular
@@ -2001,6 +2195,8 @@ public enum RenderPasses {
 
             renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
             renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
+            renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
+            renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
 
             // SINGLE DRAW CALL FOR ENTIRE BATCH
             // Logger.log(message: "✅ Drawing batch \(batchGroup.id): \(batchGroup.indexCount) indices, \(batchGroup.vertexCount) vertices")
@@ -2101,12 +2297,14 @@ public enum RenderPasses {
             if BatchingSystem.shared.isEnabled(),
                BatchingSystem.shared.isBatched(entityId: entityId),
                !isEntityInActiveLODFade(entityId),
-               !isEntityInActiveTileRepresentationFade(entityId)
+               !isEntityInActiveTileRepresentationFade(entityId),
+               !isEntityInMeshOccluderOrFade(entityId)
             { continue }
             if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { continue }
             if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
             if hasComponent(entityId: entityId, componentType: GizmoComponent.self) { continue }
             if hasComponent(entityId: entityId, componentType: LightComponent.self) { continue }
+            if meshSkipsColor(entityId) { continue }
 
             guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else { continue }
             guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else { continue }
@@ -2138,6 +2336,8 @@ public enum RenderPasses {
 
                         var stScale: Float = material.stScale
                         renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
+                        var pomQuality = Self.currentPOMQualityUniform()
+                        renderEncoder.setFragmentBytes(&pomQuality, length: MemoryLayout<POMQualityUniform>.stride, index: Int(modelPassFragmentPOMQualityIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue))
                         renderEncoder.setFragmentSamplerState(material.baseColor.sampler, index: Int(modelPassBaseSamplerIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.roughness.texture, index: Int(modelPassRoughnessTextureIndex.rawValue))
@@ -2146,6 +2346,8 @@ public enum RenderPasses {
 
                         var hasNormal = (material.normal.texture != nil)
                         renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
+                        var normalIsPackedXY = material.normalIsPackedXY
+                        renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
 
                         var materialParameters = MaterialParametersUniform()
                         materialParameters.specular = material.specular
@@ -2171,10 +2373,13 @@ public enum RenderPasses {
                         applyStreamingTierDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
                         applyLODDither(draw: lodDraw, materialParameters: &materialParameters)
                         applyTileRepresentationDither(entityId: entityId, materialParameters: &materialParameters)
+                        applyMeshFadeDither(entityId: entityId, materialParameters: &materialParameters)
 
                         renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
                         renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
+                        renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
+                        renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
 
                         renderEncoder.drawIndexedPrimitivesTracked(
                             type: subMesh.metalKitSubmesh.primitiveType,
@@ -2231,6 +2436,8 @@ public enum RenderPasses {
 
                     var stScale: Float = material.stScale
                     renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
+                    var pomQuality = Self.currentPOMQualityUniform()
+                    renderEncoder.setFragmentBytes(&pomQuality, length: MemoryLayout<POMQualityUniform>.stride, index: Int(modelPassFragmentPOMQualityIndex.rawValue))
                     renderEncoder.setFragmentTexture(material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue))
                     renderEncoder.setFragmentSamplerState(material.baseColor.sampler, index: Int(modelPassBaseSamplerIndex.rawValue))
                     renderEncoder.setFragmentTexture(material.roughness.texture, index: Int(modelPassRoughnessTextureIndex.rawValue))
@@ -2239,6 +2446,8 @@ public enum RenderPasses {
 
                     var hasNormal = (material.normal.texture != nil)
                     renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
+                    var normalIsPackedXY = material.normalIsPackedXY
+                    renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
 
                     var materialParameters = MaterialParametersUniform()
                     materialParameters.specular = material.specular
@@ -2266,6 +2475,8 @@ public enum RenderPasses {
                     renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
                     renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
                     renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
+                    renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
+                    renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
 
                     renderEncoder.drawIndexedPrimitivesTracked(
                         type: .triangle,
@@ -2507,6 +2718,9 @@ public enum RenderPasses {
 
         var reverseZ = renderInfo.reverseZEnabled
         renderEncoder.setFragmentBytes(&reverseZ, length: MemoryLayout<Bool>.stride, index: Int(ssaoPassReverseZIndex.rawValue))
+
+        var projScale = simd_float2(renderInfo.perspectiveSpace.columns.0.x, renderInfo.perspectiveSpace.columns.1.y)
+        renderEncoder.setFragmentBytes(&projScale, length: MemoryLayout<simd_float2>.stride, index: Int(ssaoPassProjScaleIndex.rawValue))
         // set the draw command
 
         renderEncoder.drawIndexedPrimitivesTracked(
@@ -2704,6 +2918,9 @@ public enum RenderPasses {
 
         var reverseZ = renderInfo.reverseZEnabled
         renderEncoder.setFragmentBytes(&reverseZ, length: MemoryLayout<Bool>.stride, index: Int(ssaoPassReverseZIndex.rawValue))
+
+        var projScale = simd_float2(renderInfo.perspectiveSpace.columns.0.x, renderInfo.perspectiveSpace.columns.1.y)
+        renderEncoder.setFragmentBytes(&projScale, length: MemoryLayout<simd_float2>.stride, index: Int(ssaoPassProjScaleIndex.rawValue))
 
         // SSAO properties
         renderEncoder.setFragmentBytes(&SSAOParams.shared.radius, length: MemoryLayout<Float>.stride, index: Int(ssaoPassRadiusIndex.rawValue))
@@ -3456,6 +3673,8 @@ public enum RenderPasses {
             if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
             if hasComponent(entityId: entityId, componentType: GizmoComponent.self) { continue }
             if hasComponent(entityId: entityId, componentType: LightComponent.self) { continue }
+            // Blend submeshes go with the colour (there is no dither path here).
+            if meshSkipsColor(entityId) { continue }
 
             guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
                 continue
@@ -3566,6 +3785,12 @@ public enum RenderPasses {
                         length: MemoryLayout<Bool>.stride,
                         index: Int(transparencyPassFragmentHasNormalTextureIndex.rawValue)
                     )
+                    var normalIsPackedXY = material.normalIsPackedXY
+                    renderEncoder.setFragmentBytes(
+                        &normalIsPackedXY,
+                        length: MemoryLayout<Bool>.stride,
+                        index: Int(transparencyPassFragmentNormalIsPackedXYIndex.rawValue)
+                    )
 
                     var materialParameters = MaterialParametersUniform()
                     materialParameters.specular = material.specular
@@ -3618,6 +3843,124 @@ public enum RenderPasses {
         }
 
         renderEncoder.updateFence(renderInfo.fence, after: .fragment)
+    }
+
+    /// Depth-only occluder shells of the meshes that carry a `MeshOccluderComponent`. Each mesh is
+    /// drawn again with depth only, pushed along its normals away from the camera by the
+    /// component's margin (`vertexMeshOccluderShellShader`), into the resolved opaque depth after
+    /// the colour geometry and before the HZB copy, SSAO and the splat pass's depth snapshot: a
+    /// stand-in shown in the mesh's place (a captured splat twin) is hidden only behind the
+    /// object's far side, never by the surface it sits on. Blend submeshes are left out (their
+    /// stand-in shows through them), and the unshrunk mesh keeps casting shadows as before.
+    public static let meshOccluderShellExecution: RenderPassExecution = { commandBuffer in
+        guard !GaussianDebugOptions.shared.disableOccluderShell else { return }
+        guard let depthTexture = textureResources.depthMap else { return }
+        guard let pipeline = PipelineManager.shared.renderPipelinesByType[.meshOccluderShell] else {
+            handleError(.pipelineStateNulled, "meshOccluderShellPipeline is nil")
+            return
+        }
+        guard pipeline.success, let pipelineState = pipeline.pipelineState else {
+            handleError(.pipelineStateNulled, pipeline.name ?? "Mesh Occluder Shell Pipeline")
+            return
+        }
+        guard let camera = CameraSystem.shared.activeCamera,
+              let cameraComponent = scene.get(component: CameraComponent.self, for: camera)
+        else {
+            handleError(.noActiveCamera)
+            return
+        }
+
+        let shellEntityIds = visibleEntityIds.filter { entityId in
+            guard scene.mask(for: entityId) != nil,
+                  scene.get(component: MeshOccluderComponent.self, for: entityId) != nil
+            else { return false }
+            if shouldHideSceneEntity(entityId: entityId) || shouldRenderSceneEntityAsWireframe(entityId: entityId) {
+                return false
+            }
+            guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId),
+                  renderComponent.isVisible,
+                  !renderComponent.mesh.isEmpty,
+                  scene.get(component: WorldTransformComponent.self, for: entityId) != nil
+            else { return false }
+            return true
+        }
+        guard !shellEntityIds.isEmpty else { return }
+
+        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
+        let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+
+        let descriptor = MTLRenderPassDescriptor()
+        descriptor.renderTargetWidth = depthTexture.width
+        descriptor.renderTargetHeight = depthTexture.height
+        descriptor.depthAttachment.texture = depthTexture
+        descriptor.depthAttachment.loadAction = .load
+        descriptor.depthAttachment.storeAction = .store
+
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            handleError(.renderPassCreationFailed, "Mesh Occluder Shell Pass")
+            return
+        }
+
+        defer {
+            renderEncoder.updateFence(renderInfo.fence, after: .fragment)
+            renderEncoder.popDebugGroup()
+            renderEncoder.endEncoding()
+        }
+
+        renderEncoder.label = "Mesh Occluder Shell Pass"
+        renderEncoder.pushDebugGroup("Mesh Occluder Shell Pass")
+        renderEncoder.setRenderPipelineState(pipelineState)
+        renderEncoder.setDepthStencilState(pipeline.depthState)
+        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.setCullMode(.none)
+        renderEncoder.setTriangleFillMode(.fill)
+
+        for entityId in shellEntityIds {
+            guard let occluder = scene.get(component: MeshOccluderComponent.self, for: entityId),
+                  let renderComponent = scene.get(component: RenderComponent.self, for: entityId),
+                  let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId)
+            else { continue }
+
+            var shrinkMeters = max(0, occluder.shrinkMeters)
+            renderEncoder.setVertexBytes(
+                &shrinkMeters,
+                length: MemoryLayout<Float>.stride,
+                index: Int(modelPassOccluderShrinkIndex.rawValue)
+            )
+
+            for mesh in renderComponent.mesh {
+                var modelUniforms = Uniforms()
+                let modelMatrix = simd_mul(worldTransformComponent.space, mesh.localSpace)
+                let modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
+                let normalMatrix = matrix3x3_upper_left(modelMatrix).inverse.transpose
+
+                modelUniforms.modelViewMatrix = modelViewMatrix
+                modelUniforms.normalMatrix = normalMatrix
+                modelUniforms.viewMatrix = viewMatrix
+                modelUniforms.modelMatrix = modelMatrix
+                modelUniforms.cameraPosition = effectiveCameraPosition
+                modelUniforms.projectionMatrix = renderInfo.perspectiveSpace
+
+                renderEncoder.setVertexBytes(
+                    &modelUniforms,
+                    length: MemoryLayout<Uniforms>.stride,
+                    index: Int(modelPassUniformIndex.rawValue)
+                )
+
+                renderEncoder.bindModelVertexStreams(mesh: mesh, entityId: entityId)
+
+                for subMesh in mesh.submeshes where subMesh.material?.alphaMode != .blend {
+                    renderEncoder.drawIndexedPrimitivesTracked(
+                        type: subMesh.metalKitSubmesh.primitiveType,
+                        indexCount: subMesh.metalKitSubmesh.indexCount,
+                        indexType: subMesh.metalKitSubmesh.indexType,
+                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
+                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                        category: .opaque
+                    )
+                }
+            }
+        }
     }
 
     public static let wireframeOcclusionDepthExecution: RenderPassExecution = { commandBuffer in
@@ -4313,12 +4656,16 @@ public enum RenderPasses {
     }
 
     public static let gaussianExecution: RenderPassExecution = { commandBuffer in
+        renderInfo.gaussianCoverageWritten = false
         #if targetEnvironment(simulator)
             // Gaussian splatting needs tile shaders, which the simulator doesn't
             // support — the pipelines were never created, so skip quietly.
             _ = commandBuffer
             return
         #else
+            EngineProfiler.shared.beginScope(.gaussianDraw)
+            defer { EngineProfiler.shared.endScope(.gaussianDraw) }
+
             let profileStart = gaussianProfilingStartTime()
             var profileTotals = GaussianProfileTotals()
             var activeSplatTotal = 0
@@ -4364,12 +4711,38 @@ public enum RenderPasses {
             renderPassDescriptor.tileHeight = 32
             renderPassDescriptor.imageblockSampleLength = initializePipelineState.imageblockSampleLength
 
+            // Snapshot the opaque depth before the pass so splats can be occluded by it.
+            // depthMap is also this pass's own .load'ed depth attachment below, and this
+            // engine never binds the same texture as both an attachment and a
+            // separately-sampled argument in one encoder (see copyOpaqueDepthForHZBExecution
+            // for the same precaution) — so the draw stage reads this copy instead.
+            if let sourceDepth = textureResources.depthMap,
+               let opaqueDepthSnapshot = textureResources.gaussianOpaqueDepthSnapshot
+            {
+                let width = min(sourceDepth.width, opaqueDepthSnapshot.width)
+                let height = min(sourceDepth.height, opaqueDepthSnapshot.height)
+                if width > 0, height > 0, let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
+                    blitEncoder.label = "Copy Opaque Depth for Gaussian Occlusion"
+                    blitEncoder.copy(
+                        from: sourceDepth,
+                        sourceSlice: 0, sourceLevel: 0,
+                        sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                        sourceSize: MTLSize(width: width, height: height, depth: 1),
+                        to: opaqueDepthSnapshot,
+                        destinationSlice: 0, destinationLevel: 0,
+                        destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+                    )
+                    blitEncoder.endEncoding()
+                }
+            }
+
             guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
                 handleError(.renderPassCreationFailed, "Gaussian Pass")
                 return
             }
 
             renderEncoder.label = "Gaussian Pass"
+            renderInfo.gaussianCoverageWritten = true
 
             renderEncoder.pushDebugGroup("Gaussian Pass")
 
@@ -4383,124 +4756,87 @@ public enum RenderPasses {
             renderEncoder.setRenderPipelineState(drawPipelineState)
             renderEncoder.setDepthStencilState(drawPipeline.depthState)
 
-            let transformId = getComponentId(for: WorldTransformComponent.self)
-            let gaussianId = getComponentId(for: GaussianComponent.self)
-            let entities = queryEntitiesWithComponentIds([transformId, gaussianId], in: scene)
+            renderEncoder.setFragmentTexture(
+                textureResources.gaussianOpaqueDepthSnapshot,
+                index: Int(gaussianTBDRDrawOpaqueDepthTextureIndex.rawValue)
+            )
+            var gaussianDrawReverseZ = renderInfo.reverseZEnabled
+            renderEncoder.setFragmentBytes(
+                &gaussianDrawReverseZ,
+                length: MemoryLayout<Bool>.stride,
+                index: Int(gaussianTBDRRenderReverseZIndex.rawValue)
+            )
+            var gaussianDrawDebug = GaussianDebugOptions.shared.drawConstants
+            renderEncoder.setFragmentBytes(
+                &gaussianDrawDebug,
+                length: MemoryLayout<GaussianTBDRDrawDebug>.stride,
+                index: Int(gaussianTBDRRenderDrawDebugIndex.rawValue)
+            )
+
             let effectiveViewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-            let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
 
-            for entityId in entities {
-                guard let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) else {
-                    handleError(.noGaussianComponent, entityId)
-                    continue
-                }
-                profileTotals.include(component: gaussianComponent)
+            // One instanced draw over the frame's shared, depth-sorted working set: every
+            // entity's splats in one list, so overlapping entities blend in true depth order.
+            // Each record names its entity by index into the enumeration the preprocess stamped
+            // into this slot (GaussianSharedWorkingSet.entityOrder) — not a fresh query, which
+            // could differ when an entity was added or removed since, or when the preprocess
+            // was skipped this frame behind the asset-loading gate and the slot is stale. This
+            // eye's projection and model-view matrices for those entities go into a table the
+            // vertex stage indexes, written per uniform ring index so the two eyes of a stereo
+            // frame keep their own matrices; an entity that has gone gets zero matrices, which
+            // makes its stale records fail the vertex stage's w test and draw nothing.
+            let workingSet = GaussianSharedWorkingSet.shared
+            let gaussianFrameSlot = min(renderInfo.currentInFlightFrameSlot, maxInFlightCommandBuffers - 1)
+            let uniformIndex = min(currentUniformBufferIndex(), totalPerMeshUniformBuffers() - 1)
+            let entities = workingSet.entityOrder(slot: gaussianFrameSlot)
+            if !entities.isEmpty,
+               let sortedKeys = workingSet.keys(slot: gaussianFrameSlot),
+               let sharedRecords = workingSet.records(slot: gaussianFrameSlot),
+               let sharedVisibleSet = workingSet.visibleSet(slot: gaussianFrameSlot),
+               let entityConstants = workingSet.entityConstants(uniformIndex: uniformIndex)
+            {
+                let constants = entityConstants.contents().bindMemory(
+                    to: GaussianEntityDrawConstants.self, capacity: Int(gaussianMaxEntitiesPerFrame)
+                )
+                let rejected = GaussianEntityDrawConstants(projectionMatrix: simd_float4x4(0), modelViewMatrix: simd_float4x4(0))
+                for (entityIndex, entityId) in entities.prefix(Int(gaussianMaxEntitiesPerFrame)).enumerated() {
+                    guard scene.exists(entityId),
+                          let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId),
+                          let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId)
+                    else {
+                        // Removed since the slot was written: its records must not borrow another
+                        // entity's matrices.
+                        constants[entityIndex] = rejected
+                        continue
+                    }
+                    profileTotals.include(component: gaussianComponent)
+                    // Profiling estimate only: a stale readback (see activeGaussianSortCount in
+                    // GaussianSystem.swift). The instance count the draw uses is the shared count
+                    // this frame's preprocess wrote, read by the indirect draw.
+                    activeSplatTotal += min(Int(gaussianComponent.visibleSplatCountForRendering), Int(gaussianComponent.splatCount))
 
-                let activeSplatCount = min(Int(gaussianComponent.visibleSplatCountForRendering), Int(gaussianComponent.splatCount))
-                guard activeSplatCount > 0 else { continue }
-                activeSplatTotal += activeSplatCount
-
-                guard gaussianComponent.encodedSplatData != nil else {
-                    handleError(.bufferAllocationFailed, "Encoded Gaussian splat buffer")
-                    continue
-                }
-
-                guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else {
-                    handleError(.noWorldTransformComponent, entityId)
-                    continue
-                }
-
-                guard let localTransformComponent = scene.get(component: LocalTransformComponent.self, for: entityId) else {
-                    handleError(.noLocalTransformComponent, entityId)
-                    continue
-                }
-
-                // update uniforms
-                var gaussianUniform = Uniforms()
-
-                let rootMatrix = worldTransformComponent.space
-                var modelMatrix = simd_mul(rootMatrix, .identity)
-
-                let viewMatrix: simd_float4x4 = effectiveViewMatrix
-
-                let modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
-
-                let upperModelMatrix: matrix_float3x3 = matrix3x3_upper_left(modelMatrix)
-
-                let inverseUpperModelMatrix: matrix_float3x3 = upperModelMatrix.inverse
-
-                let normalMatrix: matrix_float3x3 = inverseUpperModelMatrix.transpose
-
-                gaussianUniform.modelViewMatrix = modelViewMatrix
-
-                gaussianUniform.normalMatrix = normalMatrix
-
-                gaussianUniform.viewMatrix = viewMatrix
-
-                gaussianUniform.modelMatrix = modelMatrix
-
-                gaussianUniform.cameraPosition = effectiveCameraPosition
-
-                gaussianUniform.projectionMatrix = renderInfo.perspectiveSpace
-
-                guard !gaussianComponent.spaceUniform.isEmpty else {
-                    handleError(.bufferAllocationFailed, "Gaussian Uniform buffer")
-                    return
-                }
-                let uniformBufferIndex = min(currentUniformBufferIndex(), gaussianComponent.spaceUniform.count - 1)
-
-                if let gaussianUniformBuffer = gaussianComponent.spaceUniform[uniformBufferIndex] {
-                    gaussianUniformBuffer.contents().copyMemory(
-                        from: &gaussianUniform, byteCount: MemoryLayout<Uniforms>.stride
+                    // The same product the cull and preprocess used (GaussianEntityFrameMatrices):
+                    // the entity's world transform with the splat's placement inside it.
+                    let modelMatrix = simd_mul(worldTransformComponent.space, gaussianComponent.splatToEntity)
+                    constants[entityIndex] = GaussianEntityDrawConstants(
+                        projectionMatrix: renderInfo.perspectiveSpace,
+                        modelViewMatrix: simd_mul(effectiveViewMatrix, modelMatrix)
                     )
-                } else {
-                    handleError(.bufferAllocationFailed, "Gaussian Uniform buffer")
-                    return
                 }
+                profileTotals.sharedWorkingSetBytes = workingSet.residentBytes
 
-                // bind data here
-                renderEncoder.setVertexBuffer(
-                    gaussianComponent.gaussianSortedIndices,
-                    offset: 0,
-                    index: Int(gaussianTBDRRenderIndicesIndex.rawValue)
-                )
-
-                renderEncoder.setVertexBuffer(gaussianComponent.encodedSplatData, offset: 0, index: Int(gaussianTBDRRenderSplatIndex.rawValue))
-                renderEncoder.setVertexBuffer(
-                    gaussianComponent.spaceUniform[uniformBufferIndex], offset: 0, index: Int(gaussianTBDRRenderUniformIndex.rawValue)
-                )
+                renderEncoder.setVertexBuffer(sortedKeys, offset: 0, index: Int(gaussianTBDRRenderIndicesIndex.rawValue))
+                renderEncoder.setVertexBuffer(sharedRecords, offset: 0, index: Int(gaussianTBDRRenderWorkingSetIndex.rawValue))
+                renderEncoder.setVertexBuffer(entityConstants, offset: 0, index: Int(gaussianTBDRRenderEntityConstantsIndex.rawValue))
                 renderEncoder.setVertexBytes(&renderInfo.viewPort, length: MemoryLayout<simd_float2>.stride, index: Int(gaussianTBDRRenderViewPortIndex.rawValue))
 
-                var shMetadata = gaussianComponent.sphericalHarmonicsMetadata ?? GaussianSHMetadata(
-                    degree: 0,
-                    coefficientsPerChannel: 0,
-                    higherOrderCoefficientsPerSplat: 0,
-                    _pad0: 0
+                renderEncoder.drawPrimitivesTracked(
+                    type: .triangleStrip,
+                    indirectBuffer: sharedVisibleSet,
+                    indirectBufferOffset: Int(gaussianVisibleSetDrawArgumentsOffset),
+                    estimatedVertexCount: 4,
+                    estimatedInstanceCount: workingSet.lastVisibleCount
                 )
-                renderEncoder.setVertexBuffer(
-                    gaussianComponent.sphericalHarmonicsData ?? gaussianComponent.encodedSplatData,
-                    offset: 0,
-                    index: Int(gaussianTBDRRenderSHIndex.rawValue)
-                )
-                renderEncoder.setVertexBytes(
-                    &shMetadata,
-                    length: MemoryLayout<GaussianSHMetadata>.stride,
-                    index: Int(gaussianTBDRRenderSHMetadataIndex.rawValue)
-                )
-                var localCameraPosition = gaussianLocalCameraPosition(
-                    cameraWorldPosition: effectiveCameraPosition,
-                    modelMatrix: modelMatrix
-                )
-                renderEncoder.setVertexBytes(
-                    &localCameraPosition,
-                    length: MemoryLayout<simd_float3>.stride,
-                    index: Int(gaussianTBDRRenderLocalCameraIndex.rawValue)
-                )
-
-                renderEncoder.drawPrimitivesTracked(type: .triangleStrip,
-                                                    vertexStart: 0,
-                                                    vertexCount: 4,
-                                                    instanceCount: activeSplatCount)
                 profileTotals.drawCallCount += 1
             }
 

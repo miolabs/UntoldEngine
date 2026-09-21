@@ -60,7 +60,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             edgeIndexChunkData: edgeIndexChunkData,
             jointIndexChunkData: jointIndexChunkData,
             jointWeightChunkData: jointWeightChunkData,
-            morphChunkData: morphChunkData
+            morphChunkData: morphChunkData,
+            baseURL: url.deletingLastPathComponent()
         )
 
         return try RuntimeAsset(
@@ -73,6 +74,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             lights: makeRuntimeLights(decoded: decoded),
             cameras: makeRuntimeCameras(decoded: decoded),
             colorManagement: makeRuntimeColorManagement(decoded: decoded, baseURL: url.deletingLastPathComponent()),
+            colorGradeLUT: makeRuntimeColorGradeLUT(decoded: decoded, baseURL: url.deletingLastPathComponent()),
             animationClips: animationClips
         )
     }
@@ -96,11 +98,13 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
-        morphChunkData: Data?
+        morphChunkData: Data?,
+        baseURL: URL
     ) throws -> [RuntimeAssetNode] {
         guard decoded.header.fileType != .animation else { return [] }
         let entitiesByID = Dictionary(uniqueKeysWithValues: decoded.entities.map { ($0.entityId, $0) })
         let runtimeSkeletonsByEntity = try makeRuntimeSkeletonsByEntity(decoded: decoded)
+        let gaussianAssetsByEntity = try makeRuntimeGaussianAssetsByEntity(decoded: decoded, baseURL: baseURL)
         var worldTransformsByID: [UInt32: simd_float4x4] = [:]
         var visiting: Set<UInt32> = []
 
@@ -140,9 +144,47 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 jointIndexChunkData: jointIndexChunkData,
                 jointWeightChunkData: jointWeightChunkData,
                 morphChunkData: morphChunkData,
-                runtimeSkeletonsByEntity: runtimeSkeletonsByEntity
+                runtimeSkeletonsByEntity: runtimeSkeletonsByEntity,
+                gaussianAssetsByEntity: gaussianAssetsByEntity
             )
         }
+    }
+
+    /// The `gaussianAsset` records keyed by the entity they attach to. The payload path is
+    /// resolved next to the `.untold` file (or as the flattened bundle basename, like textures);
+    /// a missing file is not an error here — whoever loads the payload reports it.
+    private func makeRuntimeGaussianAssetsByEntity(
+        decoded: UntoldDecodedAsset,
+        baseURL: URL
+    ) throws -> [UInt32: RuntimeGaussianAssetLink] {
+        var links: [UInt32: RuntimeGaussianAssetLink] = [:]
+        for record in decoded.gaussianAssets {
+            guard links[record.entityId] == nil else {
+                Logger.logWarning(message: "[NativeFormatLoader] Entity \(record.entityId) has more than one gaussianAsset record; keeping the first")
+                continue
+            }
+            guard let path = try decoded.string(at: record.payloadPathOffset),
+                  let payloadURL = resolvedURL(from: path, baseURL: baseURL)
+            else { continue }
+            if record.flags & UntoldGaussianAssetFlags.meshTwin != 0,
+               let entity = decoded.entities.first(where: { $0.entityId == record.entityId }),
+               entity.meshRecordCount == 0
+            {
+                Logger.logWarning(message: "[NativeFormatLoader] meshTwin gaussianAsset record on entity \(record.entityId), which has no mesh to swap from")
+            }
+            links[record.entityId] = RuntimeGaussianAssetLink(
+                payloadURL: payloadURL,
+                flags: record.flags,
+                lodCount: Int(record.lodCount),
+                lodSplatCounts: Array(record.lodSplatCounts.prefix(Int(record.lodCount))),
+                lodSwitchScreenHeights: Array(record.lodSwitchScreenHeights.prefix(Int(record.lodCount))),
+                occluderShrinkMeters: record.occluderShrinkMeters,
+                exposureOffsetEV: record.exposureOffsetEV,
+                swapDistanceMeters: record.swapDistanceMeters,
+                alignment: record.alignment
+            )
+        }
+        return links
     }
 
     private func makeRuntimeLights(decoded: UntoldDecodedAsset) throws -> [RuntimeLightSource] {
@@ -238,6 +280,25 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         )
     }
 
+    private func makeRuntimeColorGradeLUT(decoded: UntoldDecodedAsset, baseURL: URL) throws -> RuntimeColorGradeLUT? {
+        guard let record = decoded.colorGradeLUT else { return nil }
+        guard (2 ... 129).contains(record.lutSize),
+              record.domainMax.x > record.domainMin.x,
+              record.domainMax.y > record.domainMin.y,
+              record.domainMax.z > record.domainMin.z
+        else {
+            throw UntoldValidationError.invalidColorGradeLUTRecord
+        }
+
+        let uriString = try decoded.string(at: record.lutUriOffset)
+        return RuntimeColorGradeLUT(
+            lutURL: resolvedURL(from: uriString, baseURL: baseURL),
+            lutSize: Int(record.lutSize),
+            domainMin: record.domainMin,
+            domainMax: record.domainMax
+        )
+    }
+
     private func runtimeLightKind(from lightType: UntoldLightType) -> RuntimeLightSourceKind {
         switch lightType {
         case .directional: .directional
@@ -258,7 +319,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
         morphChunkData: Data?,
-        runtimeSkeletonsByEntity: [UInt32: RuntimeSkeleton]
+        runtimeSkeletonsByEntity: [UInt32: RuntimeSkeleton],
+        gaussianAssetsByEntity: [UInt32: RuntimeGaussianAssetLink] = [:]
     ) throws -> RuntimeAssetNode {
         let nodeName = try decoded.string(at: entity.nameOffset) ?? "entity_\(entity.entityId)"
         let meshStart = Int(entity.firstMeshRecordIndex)
@@ -293,7 +355,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             localBounds: entity.localBounds,
             worldBounds: entity.worldBounds,
             skeleton: runtimeSkeletonsByEntity[entity.entityId],
-            primitives: primitives
+            primitives: primitives,
+            gaussianAsset: gaussianAssetsByEntity[entity.entityId]
         )
     }
 
@@ -490,10 +553,18 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         decoded: UntoldDecodedAsset,
         baseURL: URL
     ) throws -> RuntimeMaterialSource {
-        try RuntimeMaterialSource(
+        // Files older than minTrustedEmissiveVersion were exported before the
+        // Blender exporter multiplied emissive_factor by Emission Strength, so
+        // untouched materials carry a bogus (1,1,1) left over from Blender's
+        // default Emission Color rather than genuine authored emissive.
+        let emissiveFactor = decoded.header.formatVersion >= UntoldFormat.minTrustedEmissiveVersion
+            ? material.emissiveFactor
+            : SIMD3<Float>(repeating: 0)
+
+        return try RuntimeMaterialSource(
             name: decoded.string(at: material.nameOffset),
             baseColorFactor: material.baseColorFactor,
-            emissiveFactor: material.emissiveFactor,
+            emissiveFactor: emissiveFactor,
             normalScale: material.normalScale,
             metallicFactor: material.metallicFactor,
             roughnessFactor: material.roughnessFactor,
@@ -507,7 +578,12 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             metallicTexture: textureReference(at: material.metallicTextureIndex, decoded: decoded, baseURL: baseURL, isSRGB: false),
             roughnessTexture: textureReference(at: material.roughnessTextureIndex, decoded: decoded, baseURL: baseURL, isSRGB: false),
             emissiveTexture: textureReference(at: material.emissiveTextureIndex, decoded: decoded, baseURL: baseURL, isSRGB: true),
-            occlusionTexture: textureReference(at: material.occlusionTextureIndex, decoded: decoded, baseURL: baseURL, isSRGB: false)
+            occlusionTexture: textureReference(at: material.occlusionTextureIndex, decoded: decoded, baseURL: baseURL, isSRGB: false),
+            heightTexture: textureReference(at: material.heightTextureIndex, decoded: decoded, baseURL: baseURL, isSRGB: false),
+            heightScale: material.heightScale,
+            heightMidlevel: material.heightMidlevel,
+            heightRemapMin: material.heightRemapMin,
+            heightRemapMax: material.heightRemapMax
         )
     }
 

@@ -60,7 +60,8 @@ UntoldEngine4D/.DS_Store
 
 # Sources/UntoldEngine/Shaders/
 
-Sources/UntoldEngine/UntoldEngineKernels/UntoldEngineKernels.air
+# Metal compiler intermediates written by buildkernels.sh; only the .metallib files ship.
+Sources/UntoldEngine/UntoldEngineKernels/*.air
 
 # Sources/UntoldEngine/UntoldEngineKernels/UntoldEngineKernels.metal
 
@@ -93,3 +94,6 @@ scripts/untold-blender-addon/build/
 *.pyc
 
 scripts/tests/__pycache__/
+
+# Local SwiftPM scratch directories other than .build (e.g. .build-strict for the strict-concurrency build).
+.build*/

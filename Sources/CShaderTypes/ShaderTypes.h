@@ -100,6 +100,27 @@ typedef enum{
 }GridPassBufferIndices;
 
 typedef enum{
+    skyPassPositionIndex,
+    skyPassUniformIndex,
+}SkyPassBufferIndices;
+
+// Uniforms for the procedural atmospheric sky background pass. invViewMatrix/invProjectionMatrix
+// let the vertex shader reconstruct a world-space ray per pixel; sunDirection/sunColor/sunIntensity
+// are sourced from the engine's active directional light so the sun position drives the sky's
+// appearance. Physical scattering constants (Rayleigh/Mie/ozone coefficients, planet/atmosphere
+// radii) live as `constant` values inside SkyShader.metal, not here, so they can later be promoted
+// into LUT precompute passes (Transmittance/Sky-View/Aerial Perspective) without changing this struct.
+typedef struct
+{
+    matrix_float4x4 invViewMatrix;
+    matrix_float4x4 invProjectionMatrix;
+    simd_float3 cameraPosition;
+    simd_float3 sunDirection;
+    simd_float3 sunColor;
+    float sunIntensity;
+} SkyUniforms;
+
+typedef enum{
     modelPassVerticesIndex,
     modelPassNormalIndex,
     modelPassUVIndex,
@@ -110,12 +131,15 @@ typedef enum{
     modelPassUniformIndex,
     modelPassJointTransformIndex,
     modelPassHasArmature,
+    modelPassOccluderShrinkIndex,
 }ModelPassBufferIndices;
 typedef enum{
     modelPassFragmentUniformIndex,
     modelPassFragmentHasNormalTextureIndex,
     modelPassFragmentMaterialParameterIndex,
     modelPassFragmentSTScaleIndex,
+    modelPassFragmentPOMQualityIndex,
+    modelPassFragmentNormalIsPackedXYIndex,
 }ModelPassFragmentBufferIndices;
 
 typedef enum{
@@ -235,12 +259,14 @@ typedef enum{
     modelPassRoughnessTextureIndex,
     modelPassMetallicTextureIndex,
     modelPassNormalTextureIndex,
+    modelPassHeightTextureIndex,
 }ModelPassTextureIndices;
 
 typedef enum{
     modelPassBaseSamplerIndex,
     modelPassNormalSamplerIndex,
-    modelPassMaterialSamplerIndex
+    modelPassMaterialSamplerIndex,
+    modelPassHeightSamplerIndex
 }ModelPassSamplerIndices;
 
 typedef enum{
@@ -296,6 +322,46 @@ typedef enum{
     colorLUTSizeIndex,
 }ColorLUTPassBufferIndices;
 
+typedef enum {
+    colorGradeLUTTextureIndex = 2,   // texture(0)=sceneTexture, texture(1)=colorLUTTexture (whole-transform bake)
+} LookPassGradeLUTTextureIndices;
+
+typedef enum{
+    // An externally-authored .cube LUT (see CubeLUTLoader.swift), applied as a
+    // post-tonemap creative grade -- independent of, and composable with,
+    // ColorLUTPassBufferIndices above (which replaces the tonemap entirely).
+    colorGradeLUTEnabledIndex = 11,   // starts after ColorLUTPassBufferIndices (7-10)
+    colorGradeLUTDomainMinIndex,
+    colorGradeLUTDomainMaxIndex,
+}ColorGradeLUTPassBufferIndices;
+
+// Selects which native tonemap operator the look pass runs when colorLUTEnabled
+// (the whole-transform bake) is off. Only meaningful in that branch -- the
+// baked LUT and the .cube grade above are unaffected by this selector.
+typedef enum {
+    tonemapOperatorSelectIndex = 14,   // starts after ColorGradeLUTPassBufferIndices (11-13)
+} TonemapSelectBufferIndices;
+
+typedef enum {
+    tonemapOperatorACES = 0,
+    tonemapOperatorAgX = 1,
+} TonemapOperatorID;
+
+// The Gaussian pass's layer on the look pass: a splat pixel is display-referred already
+// (blended in the capture's own space, decoded once in the pre-composite) and keeps its colour
+// through the grade and the tone map; a partly covered pixel has only the scene behind the
+// splats graded. The gizmo layer says which pixels the pre-composite let the editor's gizmo
+// override, so those are graded whole.
+typedef enum {
+    lookPassSplatCoverageTextureIndex = 3,   // texture(0..2) above: the splat layer, premultiplied
+    lookPassGizmoTextureIndex = 4,
+} LookPassSplatTextureIndices;
+
+typedef enum {
+    lookPassSplatMaskIndex = 15,   // starts after TonemapSelectBufferIndices (14)
+    lookPassGizmoOverrideIndex = 16,   // bool: the gizmo layer overrides pixels (the editor, not game mode)
+} LookPassSplatBufferIndices;
+
 typedef enum{
     colorCorrectionPassColorTextureIndex,
     colorCorrectionPassTemperatureIndex,
@@ -345,6 +411,7 @@ typedef enum{
     ssaoPassViewPortIndex,
     ssaoPassFrustumIndex,
     ssaoPassReverseZIndex,
+    ssaoPassProjScaleIndex,
 }SSAOBufferIndices;
 
 typedef enum{
@@ -391,7 +458,7 @@ typedef enum RenderTargets{
 
 typedef struct{
     simd_float4 baseColor;
-    simd_int4 hasTexture; //x=hasbasecolor,y=hasroughmap, z=hasmetalmap
+    simd_int4 hasTexture; //x=hasbasecolor,y=hasroughmap, z=hasmetalmap, w=hasheightmap
     simd_int4 textureChannels; //x=roughness channel, y=metallic channel; 0=r,1=g,2=b,3=a
     simd_float4 edgeTint;
     simd_float3 emmissive;
@@ -411,7 +478,31 @@ typedef struct{
     int alphaMode; // 0=opaque, 1=mask, 2=blend
     simd_float4 lodDither; // x=threshold, y=mode: 0 off, 1 keep below, 2 keep at/above
     bool interactWithLight;
+    // Parallax Occlusion Mapping. heightScale is the total ray-march depth in UV-normalized
+    // units — named after Blender's Displacement node "Scale" input, but NOT unit-equivalent:
+    // Blender's Scale is a world-space distance, this is a UV-space fraction. A raw Scale
+    // value carried through from Blender needs retuning, not a straight copy (see the
+    // exporter's ExportedMaterial.height_scale docstring). heightMidlevel matches its
+    // "Midlevel" input.
+    float heightScale;
+    float heightMidlevel;
+    // Contrast-stretch applied to the raw height sample before heightMidlevel: many real-world
+    // displacement maps only use a narrow slice of [0,1], leaving POM almost no local
+    // contrast to work with unless that slice is remapped back out first. Identity is (0,1).
+    float heightRemapMin;
+    float heightRemapMax;
 }MaterialParametersUniform;
+
+// Runtime-tunable Parallax Occlusion Mapping cost controls (global, not per-material — see
+// POMQualitySettings in Globals.swift). minSteps/maxSteps bound the adaptive ray-march step
+// count; maxDistance/fadeStartDistance fade POM out entirely beyond a configurable distance,
+// gating the ray march itself for distant fragments rather than just fading the visual result.
+typedef struct{
+    float minSteps;
+    float maxSteps;
+    float maxDistance;
+    float fadeStartDistance;
+}POMQualityUniform;
 
 typedef struct{
     float ambientIntensity;
@@ -541,7 +632,83 @@ typedef enum{
     gaussianIndicesIndex,
     gaussianVisibleIndicesIndex,
     gaussianVisibleCountIndex,
+    gaussianCullHZBReverseZIndex,
+    gaussianCullHZBOcclusionBiasIndex,
+    gaussianCullHZBValidIndex,
 }GaussianDepthBufferIndices;
+
+typedef enum{
+    gaussianCullHZBDepthPyramidTextureIndex = 0,
+}GaussianCullTextureIndices;
+
+/// Threads per threadgroup for every pass that runs over the visible splat list (depth keys,
+/// preprocess, radix histogram and scatter). Fixed so the threadgroup count the GPU writes
+/// into GaussianVisibleSet matches what the CPU encodes as threadsPerThreadgroup.
+#define gaussianVisibleBlockSize 256
+
+/// Per-entity, per-in-flight-frame record of the splats that survived gaussianFrustumCull.
+/// The cull appends into visibleCount atomically; gaussianFinalizeVisibleSet then derives the
+/// indirect dispatch and draw arguments from it, so every later stage of the frame (depth
+/// keys, preprocess, radix sort, draw) is sized on the GPU from this frame's count. The CPU
+/// only ever sees this count through a completed-buffer readback two or three frames later,
+/// and a list that grew since then must not be cut to that older size.
+///
+/// The same record shape describes an entity's visible-chunk list (gaussianChunkCull /
+/// gaussianFinalizeVisibleChunks / gaussianComputeChunkQuotas): there threadgroupCount and
+/// threadgroupsPerGrid[0] are the number of visible chunks — one threadgroup of
+/// gaussianChunkDecodePreprocess per chunk — instanceCount is the sum of the visible chunks'
+/// splat counts (what the entity asked of the frame's budget) and visibleCount the sum of their
+/// quotas (the most the fused pass can append for this entity), both for readbacks only.
+typedef struct{
+    uint32_t visibleCount;           // atomic_uint appended by gaussianFrustumCull
+    uint32_t threadgroupCount;       // ceil(visibleCount / gaussianVisibleBlockSize)
+    uint32_t overflowCount;          // shared set only: splats appended past its capacity (dropped)
+    uint32_t _pad0;
+    uint32_t threadgroupsPerGrid[3]; // MTLDispatchThreadgroupsIndirectArguments
+    uint32_t _pad1;
+    uint32_t vertexCount;            // MTLDrawPrimitivesIndirectArguments: 4 (the splat quad)
+    uint32_t instanceCount;          //   visibleCount
+    uint32_t vertexStart;            //   0
+    uint32_t baseInstance;           //   0
+}GaussianVisibleSet;
+
+/// Byte offsets of the two indirect-argument blocks inside GaussianVisibleSet.
+#define gaussianVisibleSetDispatchArgumentsOffset 16
+#define gaussianVisibleSetDrawArgumentsOffset 32
+
+/// Upper bound on splat entities the shared draw addresses per frame (entity slot in each record).
+#define gaussianMaxEntitiesPerFrame 256
+
+/// One entry of the frame's shared working set, written by gaussianPreprocess for every splat
+/// that survived its entity's cull: everything the splat draw needs. The draw projects
+/// `position` with the entity's per-eye constants, so one record serves both eyes.
+typedef struct{
+    simd_float4 positionAndEntity;  // xyz: entity-local centre; w: entity index as uint bits (index into GaussianEntityDrawConstants)
+    simd_float4 conicAndOpacity;    // xyz: inverse 2D covariance, head-centre view; w: opacity
+    simd_float4 color;              // xyz: linear colour, spherical harmonics evaluated for the head-centre view; w unused
+    simd_float4 axes;               // xy: quad semi-axis 1, zw: semi-axis 2, in pixels
+}GaussianWorkingSetSplat;           // 64 bytes; with its 8-byte key, the per-slot cost the removed per-entity buffers had
+
+/// Per-entity constants the shared splat draw reads through GaussianWorkingSetSplat.entityIndex,
+/// written per eye by the draw pass.
+typedef struct{
+    matrix_float4x4 projectionMatrix;
+    matrix_float4x4 modelViewMatrix;
+}GaussianEntityDrawConstants;
+
+/// Per-entity inputs of gaussianPreprocess beyond the splat data.
+typedef struct{
+    uint32_t entityIndex;
+    uint32_t workingSetCapacity;
+    uint32_t debugColorEnabled;
+    uint32_t _pad0;
+    simd_float4 debugColor;
+    simd_float4 colorGain;     // xyz: linear multiplier on the splat colour (capture exposure, editor offset, XR tint); w unused
+    float opacityScale;        // multiplier on every splat's opacity: 1 normal, 0 hidden (nothing is appended), between for a cross-fade
+    float maxScreenRadius;     // GaussianRuntimeLimits.maxScreenRadius: ceiling on a splat's screen-space half-extent, in pixels; the preprocess also caps it at the viewport's shorter side
+    uint32_t crispKernel;      // non-zero: GaussianDebugOptions.crispSplatKernel — the quad stops at 2√2 σ, where the crisp falloff reaches zero
+    float _pad1;
+}GaussianPreprocessEntityConstants;
 
 typedef struct{
     simd_float4 center;
@@ -551,20 +718,28 @@ typedef struct{
     float opacity;
 }GaussianSplat;
 
+// position stays full float precision (fed directly into world/view/clip-space matrix math,
+// where half-precision error would visibly drift); covariance and color/opacity are
+// half-precision, matching the density another native Metal/simd Gaussian-splat renderer
+// (MetalSplatter) uses for the same fields. simd_half3/simd_half4 pack tightly (8 bytes each,
+// no padding between them) unlike simd_float3 (16-byte-aligned even for a 3-component vector),
+// so this is 48 bytes total per splat vs. the previous 128 — not just "half the bytes" of the
+// 3 vector fields, but a ~2.7x reduction overall once the float3 alignment padding that also
+// disappears is accounted for. colorAndOpacity folds opacity into color's 4th component
+// (again matching MetalSplatter) since a lone scalar field here would otherwise force the
+// same kind of alignment padding this change is trying to eliminate.
 typedef struct{
     simd_float3 position;
-    float opacity;
-    simd_float3 color;
-    float _pad0;
-    simd_float3 covA;
-    float _pad1;
-    simd_float3 covB;
-    float _pad2;
+    simd_half3  covA;
+    simd_half3  covB;
+    simd_half4  colorAndOpacity; // .xyz = SH0 base color, .w = opacity
 }EncodedGaussianSplat;
 
-// Higher-order SH coefficients are stored in a separate packed half buffer.
+// Higher-order SH coefficients are stored in a separate packed byte buffer,
+// quantized to a fixed [-1, 1] range: byte = round(clamp(x,-1,1)*127)+128,
+// dequantized on read as (byte-128)/128 — see loadGaussianSHCoefficient.
 // Layout per splat: R[1...n], G[1...n], B[1...n]. The DC coefficient remains
-// represented by EncodedGaussianSplat.color.
+// represented by EncodedGaussianSplat.colorAndOpacity.xyz.
 typedef struct{
     uint degree;
     uint coefficientsPerChannel;
@@ -572,16 +747,398 @@ typedef struct{
     uint _pad0;
 }GaussianSHMetadata;
 
+// Per-splat conic/axes/color, computed once per splat per frame by the gaussianPreprocess
+// compute kernel instead of redundantly 4x per splat (once per instanced quad vertex) in the
+// draw vertex shader — see gaussianPreprocess in Gaussians.metal. Indexed by the same
+// original splat index as EncodedGaussianSplat.
+//
+// axis1/axis2 are the projected covariance ellipse's two (orthogonal) semi-axis vectors in
+// screen pixels — i.e. eigenvectors of the 2D covariance scaled by sigma*sqrt(eigenvalue),
+// where sigma is this splat's opacity-adaptive extent (gaussianAdaptiveSigma in Gaussians.metal,
+// which reaches kGaussianQuadSigma exactly at opacity 1 and shrinks below it as opacity drops) —
+// used to build a tight, rotated quad instead of an axis-aligned bounding box. An axis-aligned
+// box has to cover a rotated ellipse's full extent along screen X/Y, which for an anisotropic
+// splat (the common case — Gaussians are oriented however the surface they came from sits) can
+// be several times larger in area than the ellipse itself, costing that many more rasterized/
+// shaded fragments regardless of how cheap the per-fragment TBDR blend itself is.
+
 typedef enum{
-      gaussianTBDRRenderIndicesIndex = 0,
-      gaussianTBDRRenderSplatIndex,
-      gaussianTBDRRenderUniformIndex,
+    gaussianPreprocessSplatIndex = 0,
+    gaussianPreprocessUniformIndex,
+    gaussianPreprocessNumOfSplatsIndex,
+    gaussianPreprocessVisibleIndicesIndex,
+    gaussianPreprocessVisibleCountIndex,
+    gaussianPreprocessViewportIndex,
+    gaussianPreprocessSHIndex,
+    gaussianPreprocessSHMetadataIndex,
+    gaussianPreprocessLocalCameraIndex,
+    gaussianPreprocessEntityConstantsIndex,   // GaussianPreprocessEntityConstants
+    gaussianPreprocessWorkingSetIndex,        // GaussianWorkingSetSplat[], shared per frame
+    gaussianPreprocessSharedKeysIndex,        // uint64_t depth keys, shared per frame
+    gaussianPreprocessSharedVisibleSetIndex,  // GaussianVisibleSet, shared per frame
+}GaussianPreprocessBufferIndices;
+
+typedef enum{
+      gaussianTBDRRenderIndicesIndex = 0,      // sorted shared keys
+      gaussianTBDRRenderWorkingSetIndex,       // GaussianWorkingSetSplat[]
+      gaussianTBDRRenderEntityConstantsIndex,  // GaussianEntityDrawConstants[] for this eye
       gaussianTBDRRenderViewPortIndex,
       gaussianTBDRRenderReverseZIndex,
-      gaussianTBDRRenderSHIndex,
-      gaussianTBDRRenderSHMetadataIndex,
-      gaussianTBDRRenderLocalCameraIndex,
+      gaussianTBDRRenderDrawDebugIndex,        // GaussianTBDRDrawDebug
   }GaussianTBDRRenderBufferIndices;
+
+/// Per-draw switches for the splat fragment shader, set from GaussianDebugOptions each frame.
+typedef struct{
+    uint32_t maxBlendedSplatsPerPixel;  // GaussianRuntimeLimits.maxBlendedSplatsPerPixel (64 mobile, 128 Mac); 255 lifts the cap
+    uint32_t skipOpaqueDepthTest;       // non-zero: never occlude splats by the opaque depth snapshot
+    uint32_t crispKernel;               // non-zero: GaussianDebugOptions.crispSplatKernel — cut every splat at 2√2 σ with the falloff renormalised to reach zero there
+}GaussianTBDRDrawDebug;
+
+typedef enum{
+      gaussianTBDRDrawOpaqueDepthTextureIndex = 0,
+  }GaussianTBDRDrawTextureIndices;
+
+// Per-chunk constants for decoding a .untoldgs v3 chunk on the GPU — see gaussianDecodeChunks
+// in Gaussians.metal, gaussianChunkDecodePreprocess in GaussianChunkPreprocess.metal and
+// UntoldGSChunkEntry (Swift). Plain floats rather than simd_float3 so the C, Swift and Metal
+// layouts agree byte for byte (48 bytes, no alignment padding).
+typedef struct{
+    float aabbMinX, aabbMinY, aabbMinZ;
+    float logScaleMin;
+    float aabbMaxX, aabbMaxY, aabbMaxZ;
+    float logScaleMax;
+    uint  firstSplat;   // index of this chunk's first record in the packed input and the output
+    uint  splatCount;
+    uint  _pad0;
+    uint  _pad1;
+}GaussianChunkDecodeConstants;
+
+typedef enum{
+    gaussianDecodePackedIndex = 0,   // uint4 per splat: packed position, rotation, scale, rgba
+    gaussianDecodeChunksIndex,       // GaussianChunkDecodeConstants[]
+    gaussianDecodeChunkCountIndex,   // uint
+    gaussianDecodeOutputIndex,       // EncodedGaussianSplat[]
+}GaussianDecodeBufferIndices;
+
+// MARK: - Chunk-level cull of .untoldgs entities (GaussianChunkCull.metal)
+
+/// One entry of the per-entity, per-in-flight-frame visible-chunk list gaussianChunkCull appends
+/// to: the chunk's index into the entity's GaussianChunkDecodeConstants table, its splat count,
+/// the quota gaussianComputeChunkQuotas grants it from the frame's working-set budget — the
+/// number of its first (most important) splats one threadgroup of gaussianChunkDecodePreprocess
+/// then decodes, tests and appends — and the screen area the quota is weighted by: the chunk's
+/// padded box projected and clipped to the guard-banded view, in view units (a box filling the
+/// view has area 1; kGaussianScreenAreaGuard when it reaches behind the eye), the larger of the
+/// two eyes' in stereo, clamped to at least kGaussianScreenAreaMin. The cull writes
+/// quota = splatCount; the quota pass lowers it to min(splatCount, floor(densityCap × screenArea)).
+/// With GaussianDebugOptions.disableScreenWeightedQuotas the cull writes screenArea = splatCount
+/// (every chunk at density 1), which turns that rule into the uniform floor(scale × splatCount).
+typedef struct{
+    uint32_t chunkIndex;
+    uint32_t splatCount;
+    uint32_t quota;
+    float screenArea;
+}GaussianVisibleChunk;   // 16 bytes
+
+/// The smallest screen area a visible chunk is charged for: 2^-24 view units, a quarter of a
+/// pixel at 4K. A chunk no view keeps (GaussianDebugOptions.disableChunkCull) carries it and is
+/// therefore the densest chunk of the frame, cut first under a budget.
+#define kGaussianScreenAreaMin (1.0f / 16777216.0f)
+
+/// The screen area of a chunk whose padded box reaches behind the eye — the chunk the camera
+/// stands in: the whole guard-banded clip volume, (1 + clipGuardBand)² with the 0.25 band. The
+/// cull recomputes it from its own limit; this is the value for the 0.25 band.
+#define kGaussianScreenAreaGuard 1.5625f
+
+/// Per-entity inputs of gaussianChunkCull. Both view-projections already include the entity's
+/// model matrix; a chunk is visible when its padded box passes either one (viewCount 2, the two
+/// eyes of a stereo frame) or the first (viewCount 1, mono). In stereo both views are always
+/// evaluated: the chunk's screen area is the larger of the two eyes' that keep it.
+typedef struct{
+    matrix_float4x4 viewProjection0;
+    matrix_float4x4 viewProjection1;
+    simd_float2 viewport;        // pixels; picks the HZB mip whose texel covers the chunk's rect
+    float clipGuardBand;         // the per-splat cull's guard band (0.25)
+    float hzbOcclusionBias;      // the mesh cull's bias (0.02)
+    uint32_t chunkCount;
+    uint32_t viewCount;          // 1 or 2
+    uint32_t hzbValid;           // non-zero: also test the box against the previous frame's HZB
+    uint32_t hzbReverseZ;
+    uint32_t hzbMipCount;
+    uint32_t forceAllVisible;    // GaussianDebugOptions.disableChunkCull: every chunk is appended
+    uint32_t uniformQuotas;      // GaussianDebugOptions.disableScreenWeightedQuotas: screenArea = splatCount, the uniform quota rule
+    uint32_t paged;              // 0: every record resident; 1: a paged entity (the cull writes the demand table and lists resident ranks only, the fused pass reads the page pool); 2: demand only (a warming tier: write the demand word and return)
+    uint32_t rangeCount;         // entries of ranges[] (gaussianChunkCullRangesIndex, GaussianChunkTreeCull); a thread whose chunkIndex falls in none of them skips the per-chunk test. 0 (GaussianDebugOptions.disableTreeSkip, or a file without a tree) skips the check entirely, as before the tree was wired in
+}GaussianChunkCullConstants;  // 192 bytes (176 + rangeCount, padded to the struct's 16-byte alignment)
+
+/// One span of GaussianChunkTreeCull.visibleChunkRanges (Swift): chunk indices [firstChunk,
+/// firstChunk + chunkCount) the tree walk could not rule out this frame. Every chunk still gets
+/// a thread (the dispatch grid is unchanged, one thread per chunk of chunkCount) — a thread
+/// outside every span skips the frustum/HZB test and the histogram/visible-list writes, clearing
+/// its demand word first if the entity pages, so a chunk the tree prunes still tells the pager
+/// it is not wanted. ranges[] is sorted by firstChunk; a thread finds its span (or finds none)
+/// with a short linear scan, cheap next to the per-chunk work it decides whether to do.
+typedef struct{
+    uint32_t firstChunk;
+    uint32_t chunkCount;
+}GaussianChunkCullRange;  // 8 bytes
+
+typedef enum{
+    gaussianChunkCullChunkTableIndex = 0,  // GaussianChunkDecodeConstants[]
+    gaussianChunkCullConstantsIndex,       // GaussianChunkCullConstants
+    gaussianChunkCullVisibleChunksIndex,   // GaussianVisibleChunk[] (output, chunkCount entries)
+    gaussianChunkCullSplatTotalIndex,      // atomic_uint: the chunk record's visibleCount (sum of appended splat counts), byte offset 0
+    gaussianChunkCullChunkTotalIndex,      // atomic_uint: the chunk record's threadgroupCount (appended chunks), byte offset 4
+    gaussianChunkCullBudgetStateIndex = 6, // gaussianFinalizeVisibleChunks: GaussianBudgetState whose requestedSplats the entity's total joins (the record itself sits at gaussianVisibleCountIndex, 5)
+    gaussianChunkCullDensityHistogramIndex = 7, // gaussianChunkCull: the frame's GaussianBudgetDensityHistogram tiers as atomic_uint words (8t splats, 8t + 1 scaledArea, 8t + 2 coarse1, 8t + 3 coarse2, 8t + 4 levelledSplats, 8t + 5 levelledScaledArea); gaussianFinalizeVisibleChunks: its visibleChunks, bound at byte offset 2060
+    gaussianChunkCullResidencyIndex = 8,   // GaussianChunkResidency[] of this slot (paged entities; a never-read stand-in otherwise)
+    gaussianChunkCullDemandIndex = 9,      // uint[] of this slot: the chunk's seen screen area as float bits, 0 unseen (paged entities; a never-read stand-in otherwise)
+    gaussianChunkCullCoarseTableIndex = 10, // GaussianChunkDecodeConstants[levelCount × chunkCount]: the coarse levels' rows, level-major (entities with coarse levels; a never-read stand-in otherwise)
+    gaussianChunkCullLevelStateIndex = 11, // GaussianChunkLevelState[chunkCount], persistent, written by gaussianComputeChunkQuotas (a never-read stand-in without coarse levels)
+    gaussianChunkCullLevelConstantsIndex = 12, // GaussianChunkLevelConstants (setBytes); hasCoarse = 0 keeps every path as it was
+    gaussianChunkCullRangesIndex = 13,     // GaussianChunkCullRange[rangeCount] (setBytes; a never-read stand-in when rangeCount == 0)
+}GaussianChunkCullBufferIndices;
+
+typedef enum{
+    gaussianChunkCullHZBDepthPyramidTextureIndex = 0,
+}GaussianChunkCullTextureIndices;
+
+// MARK: - Budgeted working set (GaussianWorkingSetBudget.metal)
+
+/// The frame's working-set budget state, one persistent buffer read and written on the GPU
+/// every frame (command buffers on one queue run in order, so frame N+1 sees frame N's scale
+/// and density cap): gaussianFinalizeVisibleChunks adds each chunked entity's visible splat
+/// total to requestedSplats, gaussianReserveBudgetSplats adds each whole-buffer entity's
+/// visible count to reservedSplats, gaussianComputeBudgetScale fits the request to what the
+/// reservation leaves of the budget — the scale (the uniform rule's fraction, diagnostic when
+/// the quotas are weighted) and the density cap the weighted quotas apply, each with its own
+/// hysteresis (a fall taken at once, a rise smoothed against the previous frame's) —
+/// gaussianComputeChunkQuotas adds the quotas it grants to quotaSplats, and
+/// gaussianPublishBudgetState copies the record into the frame's in-flight slot for the CPU
+/// readback (profiling, tests).
+typedef struct{
+    uint32_t requestedSplats;   // atomic: Σ over chunked entities of their visible chunks' splat counts
+    uint32_t quotaSplats;       // atomic: Σ over chunked entities of the quotas granted
+    uint32_t budget;            // records the quotas were fitted to this frame (the shared set's capacity)
+    uint32_t frameCount;        // frames the state has been through; 0 means the first frame takes the target as is
+    float targetScale;          // min(1, (headroom · budget − reservedSplats) / requestedSplats)
+    float scale;                // targetScale, or the previous frame's scale raised by at most one step when the target is above it
+    uint32_t reservedSplats;    // atomic: Σ over whole-buffer entities of their visible counts, granted before the quotas
+    float densityCap;           // splats per view unit of screen area the quotas apply this frame, after the density hysteresis: +inf = every chunk whole, 0 = nothing left; the scale itself with uniform quotas
+    uint32_t transitionSplats;  // 32, atomic: Σ over the outgoing windows of fading chunks the culls listed this frame (inside requestedSplats; the solve fits the rest)
+    uint32_t coarseChunks;      // 36, atomic: incoming entries drawn at a coarse level this frame
+    uint32_t coarseSplats;      // 40, atomic: their quota sum
+    uint32_t _pad0;             // 44
+}GaussianBudgetState;           // 48 bytes
+
+/// Inputs of gaussianComputeBudgetScale.
+typedef struct{
+    uint32_t budget;            // the shared set's capacity this frame
+    uint32_t forceUnitScale;    // GaussianDebugOptions.disableWorkingSetBudget: every chunk keeps its whole splat count
+    float headroom;             // fraction of the budget the quotas aim for (0.98), leaving room for rounding
+    float maxStepFraction;      // largest relative rise of scale (and of the density cap) per frame (0.1)
+    float minStep;              // smallest absolute rise of the scale per frame (0.05), so a climb from a low scale does not crawl
+    uint32_t resetHysteresis;   // 1: take the target as on the first frame (a frame without splat entities went by)
+    uint32_t uniformQuotas;     // GaussianDebugOptions.disableScreenWeightedQuotas: the density cap is the scale, no solve
+    float densityMinStepFraction; // smallest rise of the density cap per frame as a fraction of its target (0.05)
+    float densityFloor;         // 32: the level rule's density floor, maxSplatsPerPixel × viewport pixels (+inf when the knob is off) — the solve evaluates the rule at min(cap, floor)
+    uint32_t tierShift1;        // 36: half-octave tiers under a chunk's own density at which its level 1 is chosen, the maximum over the frame's entities with coarse levels (2 × (ratioLog2 − 1)) — the widest fine regime, so R(d) charges fine wherever any entity still draws fine
+    uint32_t tierShift2;        // 40: the same for level 2
+    uint32_t _pad0;             // 44
+}GaussianBudgetScaleConstants;  // 48 bytes
+
+/// The density histogram the weighted quotas are solved from: how many half-octave tiers of
+/// splats per view unit of screen area, from 2^gaussianBudgetDensityTierLog2Floor upward
+/// (densities above the last tier clamp into it).
+#define gaussianBudgetDensityTierCount 64
+#define gaussianBudgetDensityTiersPerOctave 2
+#define gaussianBudgetDensityTierLog2Floor (-2)
+
+/// The tail of the request a climb toward a fitting frame leaves to the whole: the density the
+/// cap climbs to (and becomes whole, +inf, at) is the floor of the tier above the densest tiers
+/// holding together at most this fraction of the requested splats, so the smallest chunks on
+/// screen — a sliver in the guard band, a forced chunk no view keeps — set neither the step nor
+/// the frames of the climb; they become whole with the cap.
+#define kGaussianBudgetDensityClimbTail 0.05f
+
+/// One tier of GaussianBudgetDensityHistogram: the splats of the visible chunks whose density
+/// falls in the tier, and their screen area in whole-splat units of the tier's lower density,
+/// Σ ceil(area × ρ_t) — an over-estimate of the area, so the grant it bounds is one-sided.
+/// For entities with per-chunk coarse levels (GaussianChunkLevelConstants.hasCoarse) the tier
+/// also holds, over its chunks that have a coarse level available, the level counts the rule
+/// would draw in the level-1 and level-2 regimes (coarse1, coarse2), the listed splats of those
+/// same chunks (levelledSplats, each at least its level-1 count) and their scaled area
+/// (levelledScaledArea), so splats − levelledSplats and scaledArea − levelledScaledArea are the
+/// population the solve keeps fine whatever the cap. The tier is binned by the chunk's full
+/// density (splatCount / screenArea) when the entity has coarse levels, by its listed density
+/// otherwise.
+typedef struct{
+    uint32_t splats;            //  0
+    uint32_t scaledArea;        //  4
+    uint32_t coarse1;           //  8
+    uint32_t coarse2;           // 12
+    uint32_t levelledSplats;    // 16
+    uint32_t levelledScaledArea; // 20
+    uint32_t _pad0[2];          // 24 … 31
+}GaussianBudgetDensityTier;     // 32 bytes
+
+/// The frame's density histogram, one persistent buffer beside GaussianBudgetState and a copy
+/// per in-flight slot for the readback: gaussianResetBudgetRequest zeroes it, gaussianChunkCull
+/// adds every visible chunk to the tier of its density (splatCount / screenArea),
+/// gaussianFinalizeVisibleChunks adds each entity's visible chunk count, and
+/// gaussianComputeBudgetScale solves the density cap from the tiers and records the solve in
+/// the header: the target cap before the hysteresis (+inf when the frame fits), the density at
+/// which every visible chunk is whole (+inf when no chunk is visible) and the grant the cap was
+/// solved against (the room the headroom leaves, or the request when it fits).
+typedef struct{
+    GaussianBudgetDensityTier tiers[gaussianBudgetDensityTierCount]; // atomics
+    float targetDensity;        // 2048
+    float fullDensity;          // 2052
+    uint32_t grant;             // 2056
+    uint32_t visibleChunks;     // 2060, atomic
+}GaussianBudgetDensityHistogram; // 2064 bytes
+
+typedef enum{
+    gaussianBudgetStateIndex = 0,        // GaussianBudgetState, persistent
+    gaussianBudgetScaleConstantsIndex,   // GaussianBudgetScaleConstants
+    gaussianBudgetChunkSetIndex,         // gaussianComputeChunkQuotas: the entity's chunk record (GaussianVisibleSet); gaussianReserveBudgetSplats: the whole-buffer entity's GaussianVisibleSet
+    gaussianBudgetVisibleChunksIndex,    // gaussianComputeChunkQuotas: the entity's GaussianVisibleChunk[]
+    gaussianBudgetReadbackIndex,         // gaussianPublishBudgetState: this frame slot's copy of the state
+    gaussianBudgetQuotaTotalIndex,       // gaussianComputeChunkQuotas: atomic_uint, the state's quotaSplats (byte offset 4)
+    gaussianBudgetReservedTotalIndex,    // gaussianReserveBudgetSplats: atomic_uint, the state's reservedSplats (byte offset 24)
+    gaussianBudgetDensityHistogramIndex = 7, // GaussianBudgetDensityHistogram, persistent (gaussianResetBudgetRequest, gaussianComputeBudgetScale, gaussianPublishBudgetState)
+    gaussianBudgetDensityReadbackIndex = 8,  // gaussianPublishBudgetState: this frame slot's copy of the histogram
+    gaussianBudgetLevelStateIndex = 9,       // gaussianComputeChunkQuotas: GaussianChunkLevelState[chunkCount], persistent, the one writer (a never-read stand-in without coarse levels)
+    gaussianBudgetResidencyIndex = 10,       // gaussianComputeChunkQuotas: GaussianChunkResidency[] of this slot (paged entities with coarse levels; a never-read stand-in otherwise)
+    gaussianBudgetCoarseTableIndex = 11,     // gaussianComputeChunkQuotas: GaussianChunkDecodeConstants[levelCount × chunkCount], the coarse rows (a never-read stand-in otherwise)
+    gaussianBudgetLevelConstantsIndex = 12,  // gaussianComputeChunkQuotas: GaussianChunkLevelConstants (setBytes)
+    gaussianBudgetChunkTableIndex = 13,      // gaussianComputeChunkQuotas: GaussianChunkDecodeConstants[chunkCount], the fine rows (the chunk's full splat count)
+    gaussianBudgetLevelTotalsIndex = 14,     // gaussianComputeChunkQuotas: atomic_uint[3] at the state's byte offset 32: transitionSplats, coarseChunks, coarseSplats
+}GaussianBudgetBufferIndices;
+
+// MARK: - Paged .untoldgs entities (GaussianPageManager.swift)
+
+/// Per chunk, per in-flight slot, of an entity whose records live in a page pool: how many of
+/// its first (most important) ranks are resident this frame — a prefix of 256-rank tiers, so
+/// 0, R, 2R, … up to the splat count — and the fade of the last arrival: the ranks from
+/// fadeFromRank up arrived at pager tick arrivalFrame and fade in over
+/// GaussianChunkPagingConstants.fadeFrames executed frames. All zero = absent: the cull lists no
+/// such chunk. The cull bounds the listed count by residentRanks, so the budget, the density
+/// histogram and the quotas see only drawable ranks.
+typedef struct{
+    uint32_t residentRanks;   //  0: 0, R, 2R, …, splatCount
+    uint32_t fadeFromRank;    //  4: ranks ≥ this arrived at arrivalFrame and fade in
+    uint32_t arrivalFrame;    //  8: pager tick of the last arrival
+    uint32_t coarseAvailable; // 12: bit 0 = the runtime's coarse level 1 has landed for this chunk, bit 1 = level 2 (per-chunk-lod-tiers; 0 for entities without coarse levels)
+}GaussianChunkResidency;      // 16 bytes
+
+/// Per paged entity, set per frame: how the fused pass maps a rank of a chunk to a record of
+/// the page pool. Tier k of chunk c is pool slot pageTable[c × pagesPerChunk + k]; rank r of
+/// that chunk is pool record (slot << ranksPerPageLog2) | (r & (R − 1)), the same index into
+/// the core pool (uint4 per record) and the spherical-harmonics pool (shBytesPerSplat per record).
+typedef struct{
+    uint32_t pagesPerChunk;    //  0: splatsPerChunk / ranksPerPage (1 … 64)
+    uint32_t ranksPerPageLog2; //  4: log2(min(256, splatsPerChunk))
+    uint32_t frameIndex;       //  8: the pager's tick this frame
+    uint32_t fadeFrames;       // 12: frames an arriving tier fades in over; 0 = at once
+    uint32_t debugMode;        // 16: 0 none; 1 tint by resident fraction (GaussianDebugOptions.residencyDebugTint)
+    uint32_t _pad0[3];         // 20 … 31
+}GaussianChunkPagingConstants; // 32 bytes
+
+/// A page-table entry of a tier that is not resident.
+#define kGaussianPageSlotInvalid 0xFFFFFFFFu
+
+// MARK: - Per-chunk coarse levels of .untoldgs entities (per-chunk-lod-tiers)
+
+/// Per chunked entity, set per frame (setBytes) for the cull, the quota pass and the fused pass.
+/// hasCoarse = 0 (an entity whose file has no coarse section, or whose coarse buffers did not
+/// fit) makes every kernel take the paths it took before the levels existed, byte for byte.
+/// The runtime's level 1 is the file's finest resident coarse level: with hasCoarse = 2 the
+/// file's level 1 and level 2 are resident, with hasCoarse = 1 only the file's coarsest, drawn
+/// as the runtime's level 1 with tierShift1 = tierShift2 = its own shift.
+typedef struct{
+    uint32_t hasCoarse;        //  0: 0 none; 1 one resident coarse level; 2 two
+    uint32_t tierShift1;       //  4: 2 × (ratioLog2 − 1) of the runtime's level 1: half-octave tiers under the chunk's own density at which the level is chosen
+    uint32_t tierShift2;       //  8: the same for level 2 (== tierShift1 when hasCoarse == 1)
+    uint32_t frameIndex;       // 12: the pager's tick, or the entity's executed-frame counter (whole-resident)
+    uint32_t fadeFrames;       // 16: frames a level switch cross-fades over; 0 = switch at once (GaussianDebugOptions.disableLevelCrossFade)
+    uint32_t levelMode;        // 20: gaussianChunkLevelModeAuto / FineOnly / CoarseOnly (GaussianDebugOptions.gaussianLevelMode)
+    uint32_t debugTint;        // 24: 1 = tint by level: fine white, level 1 yellow, level 2 red (GaussianDebugOptions.levelDebugTint)
+    float    densityFloor;     // 28: maxSplatsPerPixel × viewport pixels, +inf when the knob is off; the level rule runs at min(cap, floor), the quota on the cap
+    uint32_t chunkCount;       // 32: the entity's chunk count (the coarse rows of level L start at (L − 1) × chunkCount)
+    uint32_t paged;            // 36: the cull's `paged`: 1 = read this slot's residency for the resident ranks and the coarse availability
+    uint32_t uniformQuotas;    // 40: the cull's `uniformQuotas`: levels are off under the uniform rule
+    uint32_t _pad0;            // 44
+}GaussianChunkLevelConstants; // 48 bytes
+
+typedef enum{
+    gaussianChunkLevelModeAuto = 0,       // the level rule
+    gaussianChunkLevelModeFineOnly = 1,   // every chunk fine: byte for byte the frame of a file without a coarse section
+    gaussianChunkLevelModeCoarseOnly = 2, // every chunk at its coarsest available level
+}GaussianChunkLevelMode;
+
+/// Per chunk of an entity with coarse levels, one persistent buffer (not per slot) written only
+/// by gaussianComputeChunkQuotas and read by the cull of the next frame and the fused pass of
+/// the same frame, in encoder order on one queue. word0: bits 0–1 the level drawn (0 fine, 1,
+/// 2); bits 2–3 the outgoing window's level + 1 (0 = none: nothing is fading out); bits 4–5 the
+/// pending level; bit 6 pendingValid (a switch detected last frame, committed this frame once
+/// the cull has listed the outgoing window); bit 7 reserved; bits 8–31 outCount, the outgoing
+/// window's splat count (24 bits, at least splatsPerChunk). switchFrame: the frame the last
+/// switch committed, the fade's clock. All zero is the initial state: fine, nothing fading,
+/// nothing pending.
+typedef struct{
+    uint32_t word0;
+    uint32_t switchFrame;
+}GaussianChunkLevelState;     // 8 bytes
+
+#define kGaussianChunkLevelStateLevelMask     0x00000003u
+#define kGaussianChunkLevelStateOutShift      2u
+#define kGaussianChunkLevelStateOutMask       0x0000000Cu
+#define kGaussianChunkLevelStatePendingShift  4u
+#define kGaussianChunkLevelStatePendingMask   0x00000030u
+#define kGaussianChunkLevelStatePendingValid  0x00000040u
+#define kGaussianChunkLevelStateCountShift    8u
+
+/// GaussianVisibleChunk.chunkIndex tag bits of an entity with coarse levels (chunk indices are
+/// asserted below 2^24 at load; every consumer masks): bits 24–25 the level this entry draws
+/// (0 fine, 1, 2), bit 26 set on the outgoing window of a fading chunk, listed as a second entry
+/// after the incoming one. Without coarse levels no bit is ever set.
+#define kGaussianVisibleChunkIndexMask   0x00FFFFFFu
+#define kGaussianVisibleChunkLevelShift  24u
+#define kGaussianVisibleChunkLevelMask   0x03000000u
+#define kGaussianVisibleChunkOutgoing    0x04000000u
+
+// MARK: - Fused decode, test, project and compact of .untoldgs entities (GaussianChunkPreprocess.metal)
+
+/// Bindings of gaussianChunkDecodePreprocess: one threadgroup per visible chunk, indirect from
+/// the entity's chunk record, reading the resident 16-byte records and writing the frame's
+/// shared working set the way gaussianPreprocess does for a whole-buffer entity.
+typedef enum{
+    gaussianChunkPreprocessPackedIndex = 0,      // uint4 per splat: the resident .untoldgs core records
+    gaussianChunkPreprocessChunkTableIndex,      // GaussianChunkDecodeConstants[]
+    gaussianChunkPreprocessVisibleChunksIndex,   // GaussianVisibleChunk[] of this frame
+    gaussianChunkPreprocessUniformIndex,         // Uniforms: head-centre model-view and projection
+    gaussianChunkPreprocessCullConstantsIndex,   // GaussianChunkCullConstants: the eye view-projections and HZB inputs of the per-splat test
+    gaussianChunkPreprocessViewportIndex,        // float2
+    gaussianChunkPreprocessSHIndex,              // uchar[]: spherical harmonics by original splat index
+    gaussianChunkPreprocessSHMetadataIndex,      // GaussianSHMetadata
+    gaussianChunkPreprocessLocalCameraIndex,     // float3: camera position in entity space
+    gaussianChunkPreprocessEntityConstantsIndex, // GaussianPreprocessEntityConstants
+    gaussianChunkPreprocessWorkingSetIndex,      // GaussianWorkingSetSplat[], shared per frame
+    gaussianChunkPreprocessSharedKeysIndex,      // uint64_t depth keys, shared per frame
+    gaussianChunkPreprocessSharedVisibleSetIndex,// GaussianVisibleSet, shared per frame
+    gaussianChunkPreprocessResidencyIndex,       // 13: GaussianChunkResidency[] of this slot (paged entities; a never-read stand-in otherwise)
+    gaussianChunkPreprocessPageTableIndex,       // 14: uint[chunkCount × pagesPerChunk] of this slot: the pool slot of each tier, kGaussianPageSlotInvalid when absent
+    gaussianChunkPreprocessPagingConstantsIndex, // 15: GaussianChunkPagingConstants (setBytes)
+    gaussianChunkPreprocessCoarseRecordsIndex,   // 16: uint4[coarseRecordCount]: the coarse levels' records as stored (entities with coarse levels; a never-read stand-in otherwise)
+    gaussianChunkPreprocessCoarseTableIndex,     // 17: GaussianChunkDecodeConstants[levelCount × chunkCount], the coarse rows, level-major
+    gaussianChunkPreprocessLevelStateIndex,      // 18: GaussianChunkLevelState[chunkCount] as gaussianComputeChunkQuotas left it this frame
+    gaussianChunkPreprocessLevelConstantsIndex,  // 19: GaussianChunkLevelConstants (setBytes)
+}GaussianChunkPreprocessBufferIndices;
+
+typedef enum{
+    gaussianChunkPreprocessHZBDepthPyramidTextureIndex = 0,
+}GaussianChunkPreprocessTextureIndices;
 
 typedef enum{
       outputTransformPassEncodingModeIndex
@@ -594,7 +1151,7 @@ typedef enum{
 typedef enum{
     radixHistogramKeysIn    = 0,
     radixHistogramOutput    = 1,
-    radixHistogramNumElems  = 2,
+    radixHistogramVisibleSet = 2,  // GaussianVisibleSet: element count for this pass
     radixHistogramPassIndex = 3,
     radixHistogramPerTGOut  = 4,   // per-threadgroup local histogram output
 }RadixHistogramBufferIndices;
@@ -606,14 +1163,14 @@ typedef enum{
 
 typedef enum{
     radixScanPerTGBuffer    = 0,   // in-place: local histogram → per-TG prefix sums
-    radixScanPerTGNumGroups = 1,
+    radixScanPerTGVisibleSet = 1,  // GaussianVisibleSet: threadgroup count for this pass
 }RadixScanPerTGBufferIndices;
 
 typedef enum{
     radixScatterKeysIn      = 0,
     radixScatterKeysOut     = 1,
     radixScatterOffsets     = 2,
-    radixScatterNumElems    = 3,
+    radixScatterVisibleSet  = 3,   // GaussianVisibleSet: element count for this pass
     radixScatterPassIdx     = 4,
     radixScatterPerTGStart  = 5,   // per-TG starting offsets per digit
 }RadixScatterBufferIndices;
@@ -623,13 +1180,26 @@ typedef enum{
     fxaaPassEnabledIndex,
     fxaaPassSubpixelIndex,
     fxaaPassEdgeThresholdIndex,
-    fxaaPassEdgeThresholdMinIndex
+    fxaaPassEdgeThresholdMinIndex,
+    fxaaPassSplatMaskIndex          // non-zero: fxaaPassSplatCoverageTextureIndex is the Gaussian pass's coverage, kept un-filtered
 }FXAABufferIndices;
 
 typedef enum{
+    fxaaPassColorTextureIndex = 0,
+    fxaaPassSplatCoverageTextureIndex = 1
+}FXAATextureIndices;
+
+typedef enum{
     smaaPassTexelSizeIndex,
-    smaaPassEdgeThresholdIndex
+    smaaPassEdgeThresholdIndex,
+    smaaPassSplatMaskIndex          // non-zero: smaaNeighborhoodSplatCoverageTextureIndex is the Gaussian coverage
 }SMAABufferIndices;
+
+typedef enum{
+    smaaNeighborhoodColorTextureIndex = 0,
+    smaaNeighborhoodBlendTextureIndex = 1,
+    smaaNeighborhoodSplatCoverageTextureIndex = 2
+}SMAANeighborhoodTextureIndices;
 
 // Transparency
 typedef enum{
@@ -637,6 +1207,7 @@ typedef enum{
     transparencyPassFragmentHasNormalTextureIndex,
     transparencyPassFragmentMaterialParameterIndex,
     transparencyPassFragmentSTScaleIndex,
+    transparencyPassFragmentNormalIsPackedXYIndex,
 }TransparencyPassFragmentBufferIndices;
 
 typedef enum{
@@ -653,7 +1224,7 @@ typedef enum{
 }TransparencyPassSamplerIndices;
 
 typedef enum {
-    transparencyPassLightOrthoViewMatrixIndex = 4, // starts after TransparencyPassFragmentBufferIndices
+    transparencyPassLightOrthoViewMatrixIndex = 5, // starts after TransparencyPassFragmentBufferIndices
     transparencyPassLightParamsIndex,
     transparencyPassCameraPositionIndex,           // simd_float3 (camera position)
     transparencyPassPointLightsIndex,              // PointLightBlock

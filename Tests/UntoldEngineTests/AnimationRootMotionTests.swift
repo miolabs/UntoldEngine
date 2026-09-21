@@ -65,6 +65,26 @@ final class AnimationRootMotionTests: XCTestCase {
         return AnimationClip(runtimeClip: RuntimeAnimationClip(name: "walk", duration: 2.0, channels: [rootChannel]))
     }
 
+    /// One-shot lunge: root travels 1 m over the first second of a 2 s
+    /// clip, channel marked non-repeating — the sampler clamps it at its
+    /// last key for the rest of the clip instead of cycling.
+    private func makeOneShotClip() -> AnimationClip {
+        let rootChannel = RuntimeAnimationChannel(
+            jointPath: "root",
+            translations: [
+                .init(time: 0.0, value: simd_float3(0, 0.9, 0)),
+                .init(time: 1.0, value: simd_float3(0, 0.9, 1)),
+            ],
+            rotations: [
+                .init(time: 0.0, value: SIMD4<Float>(0, 0, 0, 1)),
+                .init(time: 1.0, value: SIMD4<Float>(0, 0, 0, 1)),
+            ]
+        )
+        let clip = AnimationClip(runtimeClip: RuntimeAnimationClip(name: "lunge", duration: 2.0, channels: [rootChannel]))
+        clip.jointAnimation["root"]?.repeatAnimation = false
+        return clip
+    }
+
     /// Turn in place: root yaws 90° about +Y over the 2 s loop, no travel.
     private func makeTurnClip() -> AnimationClip {
         func yawKey(_ angle: Float) -> SIMD4<Float> {
@@ -215,6 +235,274 @@ final class AnimationRootMotionTests: XCTestCase {
 
         let jump = abs(getLocalPosition(entityId: entityId).z - zBeforeSwitch)
         XCTAssertLessThan(jump, 1e-4, "Switching clips must re-baseline, not apply a spurious delta")
+    }
+
+    // MARK: - Non-repeating clips
+
+    func testNonRepeatingChannelDoesNotInjectLoopJump() {
+        animationComponent.animationClips["lunge"] = makeOneShotClip()
+
+        setRootMotionEnabled(entityId: entityId, enabled: true)
+        changeAnimation(entityId: entityId, name: "lunge", transitionHalflife: 0)
+
+        // 1.89 s: well past the channel's 1 s last key (the clamp window the
+        // old fmod misread as a loop wrap), still before the 2 s outer wrap.
+        var previousZ = getLocalPosition(entityId: entityId).z
+        var maxStep: Float = 0
+        run(frames: 170) { _ in
+            let z = getLocalPosition(entityId: self.entityId).z
+            maxStep = max(maxStep, abs(z - previousZ))
+            previousZ = z
+        }
+
+        XCTAssertEqual(
+            getLocalPosition(entityId: entityId).z, 1.0 - deltaTime, accuracy: 1e-3,
+            "Entity travels the authored 1 m; the clamped channel contributes no further delta"
+        )
+        XCTAssertLessThan(
+            maxStep, deltaTime * 1.5,
+            "Clamping at the last key must not read as a loop wrap and inject the per-loop displacement"
+        )
+    }
+
+    // MARK: - Pitch and roll preservation
+
+    /// The swing–twist split must remove only yaw. A body-frame lean —
+    /// pure pitch (and pure roll) applied after the model-space yaw,
+    /// `yaw * lean` — decomposes exactly: the twist is the yaw factor, so
+    /// grounding must return the authored lean untouched; a sign error,
+    /// axis mixup, or stripping on the wrong side would break this.
+    func testPitchAndRollSurviveGrounding() {
+        let yaw = simd_quatf(angle: 0.7, axis: simd_float3(0, 1, 0))
+        let leans: [(name: String, swing: simd_quatf)] = [
+            ("pitch", simd_quatf(angle: 0.4, axis: simd_float3(1, 0, 0))),
+            ("roll", simd_quatf(angle: -0.3, axis: simd_float3(0, 0, 1))),
+        ]
+
+        for (name, swing) in leans {
+            var pose = PoseBuffer()
+            pose.resize(jointCount: 1)
+            pose.translations[0] = simd_float3(0.3, 0.9, 1.2)
+            pose.rotations[0] = simd_normalize(yaw * swing)
+
+            stripRootMotion(from: &pose, rootIndex: 0)
+
+            XCTAssertEqual(pose.translations[0].x, 0, accuracy: 1e-6)
+            XCTAssertEqual(pose.translations[0].z, 0, accuracy: 1e-6)
+            XCTAssertEqual(pose.translations[0].y, 0.9, accuracy: 1e-6, "Vertical offset must survive grounding")
+
+            let (residualYaw, _) = yawTwist(pose.rotations[0])
+            XCTAssertEqual(residualYaw, 0, accuracy: 1e-5, "Yaw must be fully stripped (\(name) case)")
+
+            let dot = abs(simd_dot(pose.rotations[0].vector, swing.vector))
+            XCTAssertEqual(dot, 1.0, accuracy: 1e-5, "\(name) must come through the swing–twist split untouched")
+        }
+    }
+
+    // MARK: - Hierarchical assets
+
+    /// Hierarchical assets (setEntityMeshAsync) carry their
+    /// AnimationComponent on a skinned scenegraph child while the game
+    /// holds and steers the asset root. Root motion deltas must anchor to
+    /// the entity the public API was called on — the gameplay handle — not
+    /// the component's entity, or the child drifts inside the asset while
+    /// the root the game steers stays put.
+    func testHierarchicalAssetAnchorsMotionToAPIEntity() {
+        let root = createEntity()
+        registerComponent(entityId: root, componentType: LocalTransformComponent.self)
+        registerComponent(entityId: root, componentType: WorldTransformComponent.self)
+        registerComponent(entityId: root, componentType: ScenegraphComponent.self)
+        defer { destroyEntity(entityId: root) }
+
+        // Reparent the fixture entity (which carries all the components)
+        // under the root, then call every API on the root — like a game.
+        setParent(childId: entityId, parentId: root)
+
+        setRootMotionEnabled(entityId: root, enabled: true)
+        changeAnimation(entityId: root, name: "walk", transitionHalflife: 0)
+        run(frames: 90) // 1 s of the 1 m/s walk
+
+        XCTAssertGreaterThan(
+            getLocalPosition(entityId: root).z, 0.5,
+            "Root motion must move the API entity (the gameplay handle)"
+        )
+        XCTAssertEqual(
+            simd_length(getLocalPosition(entityId: entityId)), 0, accuracy: 1e-4,
+            "The component's child entity must not drift inside the asset"
+        )
+    }
+
+    /// Modular assets (one skinned part per mesh, e.g. a UE character
+    /// exported per body part) resolve to SEVERAL animation components that
+    /// all sample the same clips against the same anchor. The extracted
+    /// deltas must move the anchor once — not once per part.
+    func testMultiComponentAssetAppliesRootMotionOnce() throws {
+        let root = createEntity()
+        registerComponent(entityId: root, componentType: LocalTransformComponent.self)
+        registerComponent(entityId: root, componentType: WorldTransformComponent.self)
+        registerComponent(entityId: root, componentType: ScenegraphComponent.self)
+
+        // A second skinned part: same skeleton, same clip, own components.
+        let sibling = createEntity()
+        registerComponent(entityId: sibling, componentType: SkeletonComponent.self)
+        registerComponent(entityId: sibling, componentType: AnimationComponent.self)
+        registerComponent(entityId: sibling, componentType: RenderComponent.self)
+        registerComponent(entityId: sibling, componentType: ScenegraphComponent.self)
+        registerComponent(entityId: sibling, componentType: LocalTransformComponent.self)
+        registerComponent(entityId: sibling, componentType: WorldTransformComponent.self)
+        let runtimeSkeleton = RuntimeSkeleton(
+            jointPaths: ["root", "root/hips"],
+            parentIndices: [nil, 0],
+            bindTransforms: [.identity, simd_float4x4(translation: simd_float3(0, 1, 0))],
+            restTransforms: [.identity, simd_float4x4(translation: simd_float3(0, 1, 0))]
+        )
+        scene.get(component: SkeletonComponent.self, for: sibling)?.skeleton =
+            Skeleton(runtimeSkeleton: runtimeSkeleton)
+        let siblingAnimation = try XCTUnwrap(scene.get(component: AnimationComponent.self, for: sibling))
+        siblingAnimation.animationClips["walk"] = makeWalkClip()
+        defer {
+            destroyEntity(entityId: sibling)
+            destroyEntity(entityId: root)
+        }
+
+        setParent(childId: entityId, parentId: root)
+        setParent(childId: sibling, parentId: root)
+
+        setRootMotionEnabled(entityId: root, enabled: true)
+        changeAnimation(entityId: root, name: "walk", transitionHalflife: 0)
+        run(frames: 90) // 1 s of the 1 m/s walk
+
+        XCTAssertEqual(
+            getLocalPosition(entityId: root).z, 1.0 - deltaTime, accuracy: 1e-3,
+            "Two components sharing an anchor must move it at clip speed, not 2x"
+        )
+        for part in try [XCTUnwrap(entityId), sibling] {
+            let animationComponent = try XCTUnwrap(scene.get(component: AnimationComponent.self, for: part))
+            XCTAssertEqual(
+                animationComponent.localPose.translations[0].z, 0, accuracy: 1e-4,
+                "Every part must still ground its own pose"
+            )
+        }
+    }
+
+    /// A clip switch with a transition must not snap the entity's travel:
+    /// the applied velocity crossfades from the outgoing clip's to the
+    /// incoming clip's with the transition halflife.
+    func testTransitionCrossfadesAppliedVelocity() {
+        setRootMotionEnabled(entityId: entityId, enabled: true)
+        changeAnimation(entityId: entityId, name: "walk", transitionHalflife: 0)
+        run(frames: 90) // steady 1 m/s walk
+
+        let zBefore = getLocalPosition(entityId: entityId).z
+        changeAnimation(entityId: entityId, name: "turn", transitionHalflife: 0.15)
+        run(frames: 2)
+        let earlySpeed = (getLocalPosition(entityId: entityId).z - zBefore) / (2 * deltaTime)
+        XCTAssertGreaterThan(earlySpeed, 0.5,
+                             "Right after the switch the entity must keep most of the walk speed, not snap to the turn's zero travel")
+
+        run(frames: 90) // 1 s = ~6.7 halflives
+        let zSettled = getLocalPosition(entityId: entityId).z
+        AnimationSystem.shared.update(deltaTime)
+        let settledSpeed = (getLocalPosition(entityId: entityId).z - zSettled) / deltaTime
+        XCTAssertLessThan(abs(settledSpeed), 0.05,
+                          "The crossfade must settle to the incoming clip's travel")
+    }
+
+    // MARK: - Rest-rotated root
+
+    /// Rigs like the UE mannequin carry a rest rotation on the root bone
+    /// (90° about X) and author turns as a model-space yaw on top of it.
+    /// Grounding must remove only that yaw and leave the rest orientation
+    /// intact — removing the twist on the wrong side rolls the body onto
+    /// its side by the turn angle.
+    func testTurnOnRestRotatedRootKeepsBodyUpright() throws {
+        let rest = simd_quatf(angle: .pi / 2, axis: simd_float3(1, 0, 0))
+        let rigged = createEntity()
+        registerComponent(entityId: rigged, componentType: SkeletonComponent.self)
+        registerComponent(entityId: rigged, componentType: AnimationComponent.self)
+        registerComponent(entityId: rigged, componentType: RenderComponent.self)
+        registerComponent(entityId: rigged, componentType: ScenegraphComponent.self)
+        registerComponent(entityId: rigged, componentType: LocalTransformComponent.self)
+        registerComponent(entityId: rigged, componentType: WorldTransformComponent.self)
+        defer { destroyEntity(entityId: rigged) }
+
+        let restMatrix = simd_float4x4(rest)
+        let runtimeSkeleton = RuntimeSkeleton(
+            jointPaths: ["root", "root/hips"],
+            parentIndices: [nil, 0],
+            bindTransforms: [restMatrix, restMatrix * simd_float4x4(translation: simd_float3(0, 1, 0))],
+            restTransforms: [restMatrix, simd_float4x4(translation: simd_float3(0, 1, 0))]
+        )
+        let skeletonComponent = try XCTUnwrap(scene.get(component: SkeletonComponent.self, for: rigged))
+        skeletonComponent.skeleton = Skeleton(runtimeSkeleton: runtimeSkeleton)
+
+        // Turn: model-space yaw applied on the left of the rest, 90° per loop.
+        func key(_ yaw: Float) -> SIMD4<Float> {
+            let q = simd_quatf(angle: yaw, axis: simd_float3(0, 1, 0)) * rest
+            return SIMD4<Float>(q.imag.x, q.imag.y, q.imag.z, q.real)
+        }
+        let rootChannel = RuntimeAnimationChannel(
+            jointPath: "root",
+            translations: [
+                .init(time: 0.0, value: simd_float3(0, 0.9, 0)),
+                .init(time: 2.0, value: simd_float3(0, 0.9, 0)),
+            ],
+            rotations: [
+                .init(time: 0.0, value: key(0)),
+                .init(time: 1.0, value: key(.pi / 4)),
+                .init(time: 2.0, value: key(.pi / 2)),
+            ]
+        )
+        let clip = AnimationClip(runtimeClip: RuntimeAnimationClip(name: "turn", duration: 2.0, channels: [rootChannel]))
+        let component = try XCTUnwrap(scene.get(component: AnimationComponent.self, for: rigged))
+        component.animationClips["turn"] = clip
+
+        setRootMotionEnabled(entityId: rigged, enabled: true)
+        changeAnimation(entityId: rigged, name: "turn", transitionHalflife: 0)
+        for _ in 0 ..< 90 { // 1 s: 45° of turn
+            AnimationSystem.shared.update(deltaTime)
+        }
+
+        // The entity turned...
+        let (entityYaw, _) = yawTwist(getRotationQuaternion(entityId: rigged))
+        XCTAssertEqual(entityYaw, .pi / 4 - (.pi / 4) * deltaTime, accuracy: 0.02, "Entity must accumulate the clip's yaw")
+
+        // ...and the grounded pose root is exactly the rest orientation —
+        // upright, not rolled onto its side.
+        let rootPose = component.localPose.rotations[0]
+        let alignment = abs(simd_dot(rootPose.vector, rest.vector))
+        XCTAssertEqual(alignment, 1.0, accuracy: 1e-3, "Grounded root must keep its rest orientation (body upright)")
+    }
+
+    // MARK: - Clips authored off the model axis
+
+    /// A capture whose actor faces +X (root yaw 90°) and walks along +X
+    /// must move the entity along its own forward: the pose is stripped
+    /// of that yaw, so the travel has to be expressed relative to the
+    /// root's heading, not taken raw from model space.
+    func testTravelFollowsRootHeadingForClipsAuthoredOffAxis() {
+        let yaw: Float = .pi / 2
+        let heading = simd_quatf(angle: yaw, axis: simd_float3(0, 1, 0))
+        let key = SIMD4<Float>(heading.imag.x, heading.imag.y, heading.imag.z, heading.real)
+        let rootChannel = RuntimeAnimationChannel(
+            jointPath: "root",
+            translations: [
+                .init(time: 0.0, value: simd_float3(0, 0, 0)),
+                .init(time: 1.0, value: simd_float3(1, 0, 0)), // 1 m along +X in model space
+            ],
+            rotations: [.init(time: 0.0, value: key), .init(time: 1.0, value: key)]
+        )
+        animationComponent.animationClips["sidewaysAuthored"] = AnimationClip(
+            runtimeClip: RuntimeAnimationClip(name: "sidewaysAuthored", duration: 1.0, channels: [rootChannel])
+        )
+
+        setRootMotionEnabled(entityId: entityId, enabled: true)
+        changeAnimation(entityId: entityId, name: "sidewaysAuthored", transitionHalflife: 0)
+        run(frames: 90) // 1 s
+
+        let position = getLocalPosition(entityId: entityId)
+        XCTAssertEqual(position.z, 1.0 - deltaTime, accuracy: 1e-2, "Travel must land on the entity's forward (+Z)")
+        XCTAssertEqual(position.x, 0, accuracy: 1e-2, "No sideways drift from the model-space authoring axis")
     }
 
     // MARK: - Root joint override

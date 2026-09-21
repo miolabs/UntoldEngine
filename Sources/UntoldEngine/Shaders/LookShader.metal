@@ -61,10 +61,29 @@ inline float3 sampleColorLUT(
   return mix(sampleLow, sampleHigh, blueFrac);
 }
 
+// Samples an externally-authored standard .cube 3D LUT (see CubeLUTLoader.swift),
+// applied as a post-tonemap creative grade. Unlike sampleColorLUT above (which
+// bakes Blender's whole View Transform into a custom log2-stops shaper domain
+// and replaces the tonemap step entirely), this operates on already-tonemapped,
+// bounded [domainMin, domainMax] color and is a real 3D texture, so hardware
+// trilinear filtering handles all three axes -- no manual blue-axis blend needed.
+inline float3 sampleColorGradeLUT(
+  float3 color,
+  texture3d<float> gradeLUTTexture,
+  float3 domainMin,
+  float3 domainMax
+) {
+  constexpr sampler gradeLUTSampler(min_filter::linear, mag_filter::linear, mip_filter::none, address::clamp_to_edge);
+  float3 range = max(domainMax - domainMin, 1e-6);
+  float3 t = clamp((color - domainMin) / range, 0.0, 1.0);
+  return gradeLUTTexture.sample(gradeLUTSampler, t).rgb;
+}
+
 fragment float4 fragmentLookShader(
   VertexCompositeOutput in [[stage_in]],
   texture2d<float> sceneTexture [[texture(0)]],
   texture2d<float> colorLUTTexture [[texture(lookPassColorLUTTextureIndex)]],
+  texture3d<float> colorGradeLUTTexture [[texture(colorGradeLUTTextureIndex)]],
   constant float &brightness [[buffer(colorGradingPassBrightnessIndex)]],
   constant float &contrast [[buffer(colorGradingPassContrastIndex)]],
   constant float &saturation [[buffer(colorGradingPassSaturationIndex)]],
@@ -74,11 +93,47 @@ fragment float4 fragmentLookShader(
   constant bool &colorLUTEnabled [[buffer(colorLUTEnabledIndex)]],
   constant float &colorLUTShaperMinStops [[buffer(colorLUTShaperMinStopsIndex)]],
   constant float &colorLUTShaperMaxStops [[buffer(colorLUTShaperMaxStopsIndex)]],
-  constant int &colorLUTSize [[buffer(colorLUTSizeIndex)]]
+  constant int &colorLUTSize [[buffer(colorLUTSizeIndex)]],
+  constant bool &colorGradeLUTEnabled [[buffer(colorGradeLUTEnabledIndex)]],
+  constant float3 &colorGradeLUTDomainMin [[buffer(colorGradeLUTDomainMinIndex)]],
+  constant float3 &colorGradeLUTDomainMax [[buffer(colorGradeLUTDomainMaxIndex)]],
+  constant int &tonemapOperator [[buffer(tonemapOperatorSelectIndex)]],
+  texture2d<float> splatLayer [[texture(lookPassSplatCoverageTextureIndex)]],
+  constant int &splatMask [[buffer(lookPassSplatMaskIndex)]],
+  texture2d<float> gizmoTexture [[texture(lookPassGizmoTextureIndex)]],
+  constant bool &gizmoOverrides [[buffer(lookPassGizmoOverrideIndex)]]
 ) {
   constexpr sampler s(min_filter::linear, mag_filter::linear, address::clamp_to_edge);
   float4 sceneSample = sceneTexture.sample(s, in.uvCoords);
   float3 color = sceneSample.rgb;
+  // A Gaussian splat pixel is a finished photograph: blended in the capture's own
+  // display-referred space and decoded to linear once in the pre-composite, it must reach the
+  // output transform as it is — no grade, no tone map — or every capture is lifted and
+  // flattened. The splat pass's layer (premultiplied, in the capture's space; bound when
+  // splatMask is set) says how much of the pixel that is and what the splats put there. A
+  // pixel the editor's gizmo overrode in the pre-composite holds no splats any more.
+  float4 layer = float4(0.0);
+  if (splatMask) {
+      layer = splatLayer.sample(s, in.uvCoords);
+      layer.a = saturate(layer.a);
+      if (gizmoOverrides && getLuminance(gizmoTexture.sample(s, in.uvCoords).rgb) > 0.1) {
+          layer = float4(0.0);
+      }
+  }
+  const float splat = layer.a;
+  if (splat >= 0.999) {
+      return float4(sceneSample.rgb, sceneSample.a);
+  }
+  // Take the splats back out of a partly covered pixel: the composite is layer + (1 − a) ·
+  // scene, so the scene behind the splats is what the grade and the tone map apply to, and the
+  // layer goes back on top untouched. (Not a lerp between the graded and the raw composite:
+  // that passes a · (1 − a) of the scene through un-tone-mapped, a bright fringe along every
+  // splat silhouette over an HDR background.)
+  float3 splatLinear = float3(0.0);
+  if (splat > kSplatLayerAlphaFloor) {
+      splatLinear = splatSRGBToLinear(layer.rgb / splat) * splat;
+      color = max((sceneSample.rgb - splatLinear) / (1.0 - splat), 0.0);
+  }
 
   if (enabled) {
       color *= exposure;
@@ -93,10 +148,20 @@ fragment float4 fragmentLookShader(
       // the source scene's full View Transform (including its own tonemap
       // curve), so applying ACES on top would double-compress the image.
       color = sampleColorLUT(max(color, 0.0), colorLUTTexture, colorLUTShaperMinStops, colorLUTShaperMaxStops, colorLUTSize);
+  } else if (tonemapOperator == tonemapOperatorAgX) {
+      // Tone map ONCE, here.
+      color = agxToneMapping(max(color, 0.0));
   } else {
       // Tone map ONCE, here.
       color = ACESFilmicToneMapping(max(color, 0.0));
   }
-  return float4(color, sceneSample.a);
+
+  // Independent of the branch above: a .cube creative grade layers on top of
+  // whichever tonemap just ran (native ACES, or the whole-transform bake).
+  if (colorGradeLUTEnabled) {
+      color = sampleColorGradeLUT(color, colorGradeLUTTexture, colorGradeLUTDomainMin, colorGradeLUTDomainMax);
+  }
+
+  return float4(splatLinear + color * (1.0 - splat), sceneSample.a);
 }
 

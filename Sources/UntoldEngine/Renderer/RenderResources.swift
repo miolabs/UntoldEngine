@@ -55,6 +55,10 @@ public struct RenderInfo {
     public var colorPipeline: ColorPipelineConfig = .standard(presentFormat: .bgra8Unorm_srgb)
     public var hzbMipCount: Int = 0
     public var hzbIsValid: Bool = false
+    /// Whether the Gaussian pass encoded this frame, so `gaussianColorMap` holds this frame's
+    /// coverage: false on the simulator and on a frame the pass skipped, when the anti-aliasing
+    /// passes must not read the map.
+    public var gaussianCoverageWritten: Bool = false
     public var hzbDebugMipLevel: Int = 0
     public var gBufferDebugStorageEnabled: Bool = false
     public var opaqueSampleCount: Int = 1
@@ -65,6 +69,15 @@ public struct RenderInfo {
     public var isXRStereoMode: Bool = false
     public var xrEye0ViewProjection: simd_float4x4 = matrix_identity_float4x4
     public var xrEye1ViewProjection: simd_float4x4 = matrix_identity_float4x4
+    // The raw per-eye view and projection `renderXR` last received, without the scene root
+    // folded in (the two matrices above already include it, as of that frame). The Gaussian
+    // chunk cull rebuilds each eye's view-projection from these at prep time with the scene
+    // root of the frame being culled, so its frusta match the per-splat pass exactly even on
+    // a frame the root moved (recentre, pinch-drag).
+    public var xrEye0View: simd_float4x4 = matrix_identity_float4x4
+    public var xrEye0Projection: simd_float4x4 = matrix_identity_float4x4
+    public var xrEye1View: simd_float4x4 = matrix_identity_float4x4
+    public var xrEye1Projection: simd_float4x4 = matrix_identity_float4x4
 }
 
 @inline(__always)
@@ -104,6 +117,9 @@ public struct BufferResources {
 
     var gridUniforms: MTLBuffer?
     var gridVertexBuffer: MTLBuffer?
+
+    var skyUniforms: MTLBuffer?
+    var skyVertexBuffer: MTLBuffer?
 
     var voxelUniforms: MTLBuffer?
 
@@ -172,6 +188,12 @@ public struct TextureResources {
     public var msaaDepthMap: MTLTexture?
     public var msaaDeferredColorMap: MTLTexture?
     public var hzbSourceDepthMap: MTLTexture?
+    /// Snapshot of the opaque scene's depth, copied before the Gaussian pass so splats
+    /// can be occluded by opaque geometry. A dedicated copy (rather than reading
+    /// `depthMap` directly) mirrors `hzbSourceDepthMap`'s pattern — `depthMap` is also
+    /// this pass's own `.load`ed depth attachment, and no other pass in this engine
+    /// binds the same texture as both an attachment and a separately-sampled argument.
+    public var gaussianOpaqueDepthSnapshot: MTLTexture?
     public var environmentColorMap: MTLTexture?
 
     // deferred

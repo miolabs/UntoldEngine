@@ -122,6 +122,35 @@ class UntoldExplorerTests(unittest.TestCase):
         self.assertIsNotNone(texture)
         self.assertEqual(texture.channel, u.TEXTURE_CHANNEL_A)
 
+    def test_resolve_texture_from_socket_keeps_packed_images_distinct(self) -> None:
+        """Packed/generated images have an empty filepath. They must be keyed by
+        their Blender image name, never by a path derived from the empty string:
+        that resolves to the asset's parent directory, so every packed texture in a
+        material shared one staging key and collapsed onto the base color."""
+        base_image = FakeData(filepath="", library=None, size=(2048, 2048), name="T_Zombie_BC")
+        normal_image = FakeData(filepath="", library=None, size=(2048, 2048), name="T_Zombie_N")
+        base_input = FakeSocket("Base Color")
+        base_input.link_from(FakeNode("ShaderNodeTexImage", image=base_image), "Color")
+        normal_color_input = FakeSocket("Color")
+        normal_color_input.link_from(FakeNode("ShaderNodeTexImage", image=normal_image), "Color")
+        normal_input = FakeSocket("Normal")
+        normal_input.link_from(FakeNode("ShaderNodeNormalMap", inputs={"Color": normal_color_input}), "Normal")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asset_path = Path(tmpdir) / "asset.untold"
+            base = u.resolve_texture_from_socket(base_input, asset_path)
+            normal = u.resolve_texture_from_socket(normal_input, asset_path)
+
+        self.assertIsNotNone(base)
+        self.assertIsNotNone(normal)
+        for texture in (base, normal):
+            self.assertIsNone(texture.source_path, "packed images have no file on disk to key by")
+        self.assertEqual(base.source_image_name, "T_Zombie_BC")
+        self.assertEqual(normal.source_image_name, "T_Zombie_N")
+        self.assertNotEqual(base.name, normal.name)
+        self.assertNotEqual(base.uri, normal.uri)
+        self.assertNotEqual(u.texture_staging_key(base), u.texture_staging_key(normal))
+
     def test_unique_hdr_destination_name_deduplicates_collisions(self) -> None:
         context = u.HDRStagingContext()
 
@@ -143,6 +172,57 @@ class UntoldExplorerTests(unittest.TestCase):
         self.assertTrue(key.startswith("path:"))
         self.assertIn("forest.exr", key)
 
+    def test_clean_generated_sidecar_dirs_removes_stale_export_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "asset" / "asset.untold"
+            textures_dir = output_path.parent / "Textures"
+            hdr_dir = output_path.parent / "HDR"
+            textures_dir.mkdir(parents=True)
+            hdr_dir.mkdir()
+            (textures_dir / "old.png").write_bytes(b"stale texture")
+            (hdr_dir / "old.exr").write_bytes(b"stale hdr")
+            output_path.write_bytes(b"previous export")
+
+            u.clean_generated_sidecar_dirs(output_path)
+
+            self.assertFalse(textures_dir.exists())
+            self.assertFalse(hdr_dir.exists())
+            self.assertTrue(output_path.exists())
+
+    def test_cleanup_temporary_export_objects_removes_tagged_split_meshes(self) -> None:
+        class FakeBpyCollection:
+            def __init__(self) -> None:
+                self.removed = []
+
+            def remove(self, item, do_unlink=False) -> None:
+                self.removed.append((item, do_unlink))
+
+        class FakeBpy:
+            def __init__(self) -> None:
+                self.data = FakeData(objects=FakeBpyCollection(), meshes=FakeBpyCollection())
+
+        class FakeTempObject(dict):
+            def __init__(self, name: str, data=None, tagged: bool = False) -> None:
+                super().__init__()
+                self.name = name
+                self.data = data
+                if tagged:
+                    self[u.UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
+
+        previous_bpy = u.bpy
+        fake_bpy = FakeBpy()
+        mesh = FakeData(users=0)
+        temp_obj = FakeTempObject("Wall_mat0", mesh, tagged=True)
+        real_obj = FakeTempObject("Wall", FakeData(users=0), tagged=False)
+        try:
+            u.bpy = fake_bpy
+            u.cleanup_temporary_export_objects([real_obj, temp_obj])
+        finally:
+            u.bpy = previous_bpy
+
+        self.assertEqual(fake_bpy.data.objects.removed, [(temp_obj, True)])
+        self.assertEqual(fake_bpy.data.meshes.removed, [(mesh, False)])
+
     def test_normalize_and_pack_helpers_use_fallbacks_and_clamping(self) -> None:
         self.assertEqual(u.normalize3((0.0, 0.0, 0.0), (1.0, 2.0, 3.0)), (1.0, 2.0, 3.0))
         self.assertEqual(u.pack_snorm10(2.0), 511)
@@ -151,6 +231,23 @@ class UntoldExplorerTests(unittest.TestCase):
         self.assertEqual(u.pack_snorm2(0.0), 1)
         self.assertEqual(u.pack_normal((0.0, 0.0, 0.0)), u.pack_normal((0.0, 0.0, 1.0)))
         self.assertEqual(u.pack_tangent((0.0, 0.0, 0.0), -1.0), u.pack_tangent((1.0, 0.0, 0.0), -1.0))
+
+    def test_unique_pack_model_dir_name_disambiguates_sanitize_collisions(self) -> None:
+        used_names: set[str] = set()
+
+        first = u.unique_pack_model_dir_name("Chair.1", used_names)
+        second = u.unique_pack_model_dir_name("Chair 1", used_names)
+        third = u.unique_pack_model_dir_name("???", used_names)
+        fourth = u.unique_pack_model_dir_name("!!!", used_names)
+
+        # "Chair.1" and "Chair 1" both sanitize down to "Chair_1"; "???" and "!!!"
+        # both fall back to "model". Without disambiguation the second write of
+        # each pair would land in the first's folder and overwrite its .untold.
+        self.assertEqual(first, "Chair_1")
+        self.assertNotEqual(second, first)
+        self.assertEqual(third, "model")
+        self.assertNotEqual(fourth, third)
+        self.assertEqual(len({first, second, third, fourth}), 4)
 
     def test_binary_writer_alignment_and_string_table_dedup(self) -> None:
         writer = u.BinaryWriter()
@@ -257,83 +354,6 @@ class UntoldExplorerTests(unittest.TestCase):
         )
         u._set_scene_color_management_raw(scene_without_raw)
         self.assertEqual(scene_without_raw.view_settings.view_transform, "Standard")
-
-    def test_lut_shaper_decode_is_monotonic_and_anchors_middle_gray(self) -> None:
-        # t=0.5 with the default -10..+6 stop range lands 8 stops below the
-        # midpoint's own reference, not exactly at 0.18 -- what matters is that
-        # decode is monotonically increasing and passes through known stops.
-        anchor_t = (0.0 - u._LUT_SHAPER_MIN_STOPS) / (u._LUT_SHAPER_MAX_STOPS - u._LUT_SHAPER_MIN_STOPS)
-        self.assertAlmostEqual(u._lut_shaper_decode(anchor_t), u._LUT_SHAPER_MIDDLE_GRAY, places=5)
-
-        values = [u._lut_shaper_decode(i / 100) for i in range(101)]
-        self.assertEqual(values, sorted(values))
-        self.assertLess(values[0], u._LUT_SHAPER_MIDDLE_GRAY)
-        self.assertGreater(values[-1], u._LUT_SHAPER_MIDDLE_GRAY)
-
-    def test_identity_lut_grid_pixels_row_order_survives_blenders_vertical_flip(self) -> None:
-        # Regression test: Blender's `image.pixels` buffer is bottom-up, but
-        # `image.save_render()` flips vertically when writing a top-down PNG.
-        # build_identity_lut_grid_pixels must pre-compensate so that after that
-        # flip, PNG/texture row g still holds green-axis grid index g (the
-        # convention the runtime LUT sampler assumes). This test simulates the
-        # flip directly on the returned buffer rather than actually saving a
-        # PNG through Blender.
-        lut_size = 4
-        width = lut_size * lut_size
-        pixels = u.build_identity_lut_grid_pixels(lut_size)
-        self.assertEqual(len(pixels), width * lut_size * 4)
-
-        def buffer_pixel(px: int, py: int) -> tuple[float, float, float, float]:
-            idx = (py * width + px) * 4
-            return tuple(pixels[idx : idx + 4])
-
-        # Simulate save_render's vertical flip: post-flip row g == buffer row (lut_size - 1 - g).
-        def post_flip_pixel(px: int, g: int) -> tuple[float, float, float, float]:
-            return buffer_pixel(px, lut_size - 1 - g)
-
-        expected_green = [u._lut_shaper_decode(i / (lut_size - 1)) for i in range(lut_size)]
-        for g in range(lut_size):
-            # px=0 -> r index 0 within tile b=0; green channel (index 1) must
-            # equal expected_green[g] once the flip is undone.
-            _, green, _, _ = post_flip_pixel(0, g)
-            self.assertAlmostEqual(green, expected_green[g], places=5)
-
-    def test_rgba16f_utex_preserves_precision_orientation_and_format(self) -> None:
-        # Two bottom-up Blender rows. The native payload must reverse them so
-        # Metal row zero contains the image's top row.
-        bottom_row = [0.001, 0.002, 0.003, 1.0, 0.004, 0.005, 0.006, 1.0]
-        top_row = [0.501, 0.502, 0.503, 1.0, 0.504, 0.505, 0.506, 1.0]
-        data = u.build_rgba16f_utex_bytes(bottom_row + top_row, 2, 2)
-        width, height, decoded = u.decode_rgba16f_utex_bytes(data)
-
-        self.assertEqual((width, height), (2, 2))
-        header = struct.unpack_from(u._UTEX_HEADER_FMT, data, 0)
-        self.assertEqual(header[6], u._UTEX_RGBA16_FLOAT_PIXEL_FORMAT)
-        self.assertEqual((header[7], header[8]), (1, 1))
-        for actual, expected in zip(decoded[:8], top_row):
-            self.assertAlmostEqual(actual, expected, delta=0.0003)
-        for actual, expected in zip(decoded[8:], bottom_row):
-            self.assertAlmostEqual(actual, expected, delta=0.0003)
-
-    def test_color_lut_filename_is_content_addressed(self) -> None:
-        first = u.color_lut_filename(b"first LUT")
-        self.assertEqual(first, u.color_lut_filename(b"first LUT"))
-        self.assertNotEqual(first, u.color_lut_filename(b"second LUT"))
-        self.assertTrue(first.startswith("gradelut_"))
-        self.assertTrue(first.endswith(".utex"))
-
-    def test_cpu_lut_sampler_matches_identity_grid_at_grid_points(self) -> None:
-        lut_size = 4
-        source = u.build_identity_lut_grid_pixels(lut_size)
-        data = u.build_rgba16f_utex_bytes(source, lut_size * lut_size, lut_size)
-        _, _, pixels = u.decode_rgba16f_utex_bytes(data)
-        values = [u._lut_shaper_decode(index / (lut_size - 1)) for index in range(lut_size)]
-
-        for red_index, green_index, blue_index in ((0, 0, 0), (1, 2, 3), (3, 1, 2)):
-            color = (values[red_index], values[green_index], values[blue_index])
-            sampled = u.sample_color_lut_pixels(pixels, lut_size, color)
-            for actual, expected in zip(sampled, color):
-                self.assertAlmostEqual(actual, expected, delta=0.006)
 
     def test_write_header_uses_fixed_header_size(self) -> None:
         writer = u.BinaryWriter()
@@ -666,7 +686,8 @@ class UntoldExplorerTests(unittest.TestCase):
         u.write_entity_record(we, entity)
         self.assertEqual(we.count, 136)
 
-        # Material record: 88 bytes (per assetFormat.md schema)
+        # Material record: 108 bytes (per assetFormat.md schema — grew from 88 to 108
+        # bytes at FORMAT_VERSION 3/4 with the height-map and height-remap fields).
         wm = u.BinaryWriter()
         mat = u.MaterialRecord(
             name_offset=0, flags=0,
@@ -680,12 +701,15 @@ class UntoldExplorerTests(unittest.TestCase):
             roughness_texture_index=u.INVALID_INDEX,
             emissive_texture_index=u.INVALID_INDEX,
             occlusion_texture_index=u.INVALID_INDEX,
+            height_texture_index=u.INVALID_INDEX,
+            height_scale=0.05, height_midlevel=0.5,
+            height_remap_min=0.0, height_remap_max=1.0,
             roughness_texture_channel=u.TEXTURE_CHANNEL_G,
             metallic_texture_channel=u.TEXTURE_CHANNEL_B,
         )
         u.write_material_record(wm, mat)
-        self.assertEqual(wm.count, 88)
-        self.assertEqual(struct.unpack_from("<I", wm.data, 80)[0], 0b1001)
+        self.assertEqual(wm.count, 108)
+        self.assertEqual(struct.unpack_from("<I", wm.data, 100)[0], 0b1001)
 
         # Texture record: 8×u32 = 32 bytes
         wt = u.BinaryWriter()
@@ -884,377 +908,199 @@ class MaterialGraphAnalysisTests(unittest.TestCase):
         lines = u.material_fidelity_report_lines([supported_mesh, bakeable_mesh])
         self.assertIn("1 supported, 1 bakeable, 0 unbakeable", lines[0])
 
-    def test_safe_bake_stem_sanitizes_material_names(self) -> None:
-        self.assertEqual(u._safe_bake_stem("wall mat.001"), "wall_mat_001")
-        self.assertEqual(u._safe_bake_stem(""), "material")
+    def test_extract_material_exports_unit_factor_for_textured_metallic_roughness(self) -> None:
+        """Blender ignores a socket's slider once a texture is linked to it, and the
+        engine multiplies the texture sample by the exported factor. A textured
+        Metallic or Roughness socket must therefore export 1.0: exporting the slider
+        halved roughness (default 0.5) and zeroed metallic (default 0.0) on every
+        textured material. Unlinked sockets still export the slider value."""
+        orm = _make_image_node("orm")
+        separate_input = FakeSocket("Color")
+        separate_input.link_from(orm, "Color")
+        separate = FakeNode("ShaderNodeSeparateColor", inputs={"Color": separate_input})
+        separate.name = "Separate Color"
 
-    def test_extract_material_substitutes_baked_channels(self) -> None:
-        tex = _make_image_node("original")
-        principled, output = _make_principled_output(tex)
-        material = _make_material("baked_mat", [output, principled, tex])
-        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
-
-        def make_baked(suffix: str) -> u.ExportedTexture:
-            return u.ExportedTexture(
-                name=f"baked_mat_{suffix}.png", uri=f"baked_mat_{suffix}.png",
-                width=1024, height=1024, mip_count=1,
-                source_path=Path(f"/tmp/bake/baked_mat_{suffix}.png"),
-            )
-
-        baked = u.BakedMaterialTextures(
-            base_color=make_baked("basecolor"),
-            orm=make_baked("orm"),
-            normal=make_baked("normal"),
-        )
-        u._baked_material_textures["Wall"] = baked  # keyed by mesh object name, not material name
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
-        finally:
-            u._baked_material_textures.clear()
-
-        self.assertIs(exported.base_color_texture, baked.base_color)
-        self.assertEqual(exported.base_color_factor[:3], (1.0, 1.0, 1.0))
-        self.assertEqual(exported.roughness_texture.uri, "baked_mat_orm.png")
-        self.assertEqual(exported.roughness_texture_channel, u.TEXTURE_CHANNEL_G)
-        self.assertEqual(exported.metallic_texture.uri, "baked_mat_orm.png")
-        self.assertEqual(exported.metallic_texture_channel, u.TEXTURE_CHANNEL_B)
-        self.assertEqual(exported.roughness_factor, 1.0)
-        self.assertEqual(exported.metallic_factor, 1.0)
-        self.assertIs(exported.normal_texture, baked.normal)
-        self.assertEqual(exported.normal_scale, 1.0)
-
-    def test_bake_plan_marks_only_divergent_channels(self) -> None:
-        # Mix on base color, math node on roughness, clean normal/emissive.
-        mix = FakeNode("ShaderNodeMix")
-        mix.name = "Mix"
-        base_color = FakeSocket("Base Color")
-        base_color.link_from(mix, "Result")
-        math_node = FakeNode("ShaderNodeMath")
-        math_node.name = "Math"
-        roughness = FakeSocket("Roughness")
-        roughness.link_from(math_node, "Value")
-        principled = FakeNode(
-            "ShaderNodeBsdfPrincipled",
-            inputs={"Base Color": base_color, "Roughness": roughness},
-        )
-        surface = FakeSocket("Surface")
-        surface.link_from(principled, "BSDF")
-        output = FakeNode("ShaderNodeOutputMaterial", inputs={"Surface": surface})
-        material = _make_material("chan_mat", [output, principled, mix, math_node])
-
-        plan = u.material_bake_plan(material)
-        self.assertEqual(
-            plan,
-            {"base_color": True, "orm": True, "normal": False, "emissive": False},
-        )
-
-    def test_bake_plan_skips_view_dependent_channel_but_keeps_others(self) -> None:
-        mix = FakeNode("ShaderNodeMix")
-        mix.name = "Mix"
-        base_color = FakeSocket("Base Color")
-        base_color.link_from(mix, "Result")
-        fresnel = FakeNode("ShaderNodeFresnel")
-        fresnel.name = "Fresnel"
-        roughness = FakeSocket("Roughness")
-        roughness.link_from(fresnel, "Fac")
-        principled = FakeNode(
-            "ShaderNodeBsdfPrincipled",
-            inputs={"Base Color": base_color, "Roughness": roughness},
-        )
-        surface = FakeSocket("Surface")
-        surface.link_from(principled, "BSDF")
-        output = FakeNode("ShaderNodeOutputMaterial", inputs={"Surface": surface})
-        material = _make_material("partial_mat", [output, principled, mix, fresnel])
-
-        plan = u.material_bake_plan(material)
-        self.assertTrue(plan["base_color"])
-        self.assertFalse(plan["orm"])
-
-    def test_bake_plan_mix_shader_above_principled_is_unbakeable(self) -> None:
-        """The channel bake recipes only read individual Principled BSDF inputs, so they
-        cannot reproduce a Mix Shader combining the Principled with another shader —
-        baking per channel from the Principled alone would silently discard the
-        blending and produce a confidently wrong texture. The whole material must be
-        skipped, not partially baked."""
-        principled = FakeNode("ShaderNodeBsdfPrincipled", inputs={})
-        diffuse = FakeNode("ShaderNodeBsdfDiffuse")
-        diffuse.name = "Diffuse BSDF"
-        shader_a = FakeSocket("Shader")
-        shader_a.link_from(principled, "BSDF")
-        shader_b = FakeSocket("Shader")
-        shader_b.link_from(diffuse, "BSDF")
-        mix_shader = FakeNode("ShaderNodeMixShader", inputs={"Shader": shader_a, "Shader.001": shader_b})
-        mix_shader.name = "Mix Shader"
-        surface = FakeSocket("Surface")
-        surface.link_from(mix_shader, "Shader")
-        output = FakeNode("ShaderNodeOutputMaterial", inputs={"Surface": surface})
-        material = _make_material("global_mat", [output, mix_shader, principled, diffuse])
-
-        self.assertEqual(u.material_bake_plan(material), {})
-
-    def test_bake_plan_empty_for_supported_material(self) -> None:
-        tex = _make_image_node()
-        principled, output = _make_principled_output(tex)
-        material = _make_material("ok_mat", [output, principled, tex])
-        self.assertEqual(u.material_bake_plan(material), {})
-
-    def test_material_node_tree_fingerprint_deterministic_and_sensitive(self) -> None:
-        mix = FakeNode("ShaderNodeMix")
-        mix.name = "Mix"
-        principled, output = _make_principled_output(mix, "Result")
-        material = _make_material("fp_mat", [output, principled, mix])
-
-        fp1 = u._material_node_tree_fingerprint(material)
-        fp2 = u._material_node_tree_fingerprint(material)
-        self.assertEqual(fp1, fp2, "same material state must hash identically")
-
-        # An unlinked socket's default_value change must change the hash.
+        principled, output = _make_principled_output(_make_image_node("albedo"))
+        metallic = FakeSocket("Metallic")
+        metallic.default_value = 0.0
+        metallic.link_from(separate, "Blue")
         roughness = FakeSocket("Roughness")
         roughness.default_value = 0.5
+        roughness.link_from(separate, "Green")
+        principled.inputs["Metallic"] = metallic
         principled.inputs["Roughness"] = roughness
-        fp3 = u._material_node_tree_fingerprint(material)
-        self.assertNotEqual(fp1, fp3)
+        material = _make_material("orm_mat", [output, principled, separate, orm])
+        mesh_object = FakeSceneObject("Zombie", "MESH", FakeData(materials=[material]))
 
-        roughness.default_value = 0.9
-        fp4 = u._material_node_tree_fingerprint(material)
-        self.assertNotEqual(fp3, fp4)
-
-    def test_material_node_tree_fingerprint_sensitive_to_output_socket_value(self) -> None:
-        """Regression test: constant-value nodes (ShaderNodeRGB, ShaderNodeValue)
-        store their configured value on the OUTPUT socket, not an input. A fix
-        that only hashed inputs silently missed edits to these nodes, serving a
-        stale cached bake after an artist changed a Color/Value node's value."""
-        rgb = FakeNode("ShaderNodeRGB")
-        rgb.name = "Color"
-        color_socket = FakeSocket("Color")
-        color_socket.default_value = (0.6, 0.2, 0.2, 1.0)
-        rgb.outputs = {"Color": color_socket}
-        principled, output = _make_principled_output(rgb)
-        material = _make_material("rgb_mat", [output, principled, rgb])
-
-        fp1 = u._material_node_tree_fingerprint(material)
-        color_socket.default_value = (0.3, 0.2, 0.2, 1.0)
-        fp2 = u._material_node_tree_fingerprint(material)
-        self.assertNotEqual(fp1, fp2, "editing an RGB node's output color must change the fingerprint")
-
-    def test_material_node_tree_fingerprint_handles_missing_links_gracefully(self) -> None:
-        tex = _make_image_node()
-        principled, output = _make_principled_output(tex)
-        material = _make_material("no_links_mat", [output, principled, tex])
-        # _make_material's fake node_tree has no .links attribute at all.
-        self.assertFalse(hasattr(material.node_tree, "links"))
-        fp = u._material_node_tree_fingerprint(material)
-        self.assertTrue(fp)
-
-    class _FakeMaterialWithProps:
-        def __init__(self, name: str, props: dict | None = None) -> None:
-            self.name = name
-            self._props = props or {}
-
-        def get(self, key, default=None):
-            return self._props.get(key, default)
-
-    def test_resolution_for_material_uses_override_when_set(self) -> None:
-        mat = self._FakeMaterialWithProps("mat", {"untold_bake_resolution": 2048})
-        self.assertEqual(u._resolution_for_material(mat, 1024), 2048)
-
-    def test_resolution_for_material_falls_back_to_default_when_unset(self) -> None:
-        mat = self._FakeMaterialWithProps("mat")
-        self.assertEqual(u._resolution_for_material(mat, 1024), 1024)
-
-    def test_resolution_for_material_falls_back_on_invalid_override(self) -> None:
-        mat = self._FakeMaterialWithProps("mat", {"untold_bake_resolution": -5})
-        self.assertEqual(u._resolution_for_material(mat, 1024), 1024)
-
-        mat2 = self._FakeMaterialWithProps("mat2", {"untold_bake_resolution": "not-a-number"})
-        self.assertEqual(u._resolution_for_material(mat2, 1024), 1024)
-
-    def test_resolution_for_material_clamps_override_above_max(self) -> None:
-        mat = self._FakeMaterialWithProps("mat", {"untold_bake_resolution": 999999})
-        self.assertEqual(u._resolution_for_material(mat, 1024), u.MAX_BAKE_RESOLUTION)
-
-    def test_next_power_of_two(self) -> None:
-        self.assertEqual(u._next_power_of_two(0), 1)
-        self.assertEqual(u._next_power_of_two(1), 1)
-        self.assertEqual(u._next_power_of_two(2), 2)
-        self.assertEqual(u._next_power_of_two(3), 4)
-        self.assertEqual(u._next_power_of_two(4096), 4096)
-        self.assertEqual(u._next_power_of_two(4097), 8192)
-
-    def test_max_upstream_image_dimension_direct_texture(self) -> None:
-        image = FakeData(filepath="t.png", library=None, size=(2048, 1024), name="t")
-        tex = FakeNode("ShaderNodeTexImage", image=image)
-        tex.name = "tex"
-        principled, _ = _make_principled_output(tex)
-        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 2048)
-
-    def test_max_upstream_image_dimension_through_mix_node(self) -> None:
-        """Mirrors a real AO-multiplied-into-diffuse setup: Base Color is fed by a
-        Mix blending a high-res photo texture with a lower-res AO map. The largest
-        of the two source textures should win, regardless of the node sitting
-        between them and the Principled BSDF."""
-        base_color_image = FakeData(filepath="base.tga", library=None, size=(4096, 4096), name="base")
-        base_color_tex = FakeNode("ShaderNodeTexImage", image=base_color_image)
-        base_color_tex.name = "Base Color Tex"
-        ao_image = FakeData(filepath="ao.png", library=None, size=(2048, 2048), name="ao")
-        ao_tex = FakeNode("ShaderNodeTexImage", image=ao_image)
-        ao_tex.name = "AO Tex"
-
-        mix_input_a = FakeSocket("A")
-        mix_input_a.link_from(base_color_tex, "Color")
-        mix_input_b = FakeSocket("B")
-        mix_input_b.link_from(ao_tex, "Color")
-        mix = FakeNode("ShaderNodeMix", inputs={"A": mix_input_a, "B": mix_input_b})
-        mix.name = "Mix"
-
-        principled, _ = _make_principled_output(mix, "Result")
-        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 4096)
-
-    def test_max_upstream_image_dimension_no_texture_upstream(self) -> None:
-        mix = FakeNode("ShaderNodeMix")
-        mix.name = "Mix"
-        principled, _ = _make_principled_output(mix, "Result")
-        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 0)
-
-    def test_max_upstream_image_dimension_unlinked_socket(self) -> None:
-        principled, _ = _make_principled_output(None)
-        self.assertEqual(u._max_upstream_image_dimension(principled.inputs["Base Color"]), 0)
-
-    def test_resolution_for_material_auto_detects_from_source_texture(self) -> None:
-        image = FakeData(filepath="t.tga", library=None, size=(4096, 4096), name="t")
-        tex = FakeNode("ShaderNodeTexImage", image=image)
-        tex.name = "tex"
-        mix_input = FakeSocket("A")
-        mix_input.link_from(tex, "Color")
-        mix = FakeNode("ShaderNodeMix", inputs={"A": mix_input})
-        mix.name = "Mix"
-        principled, output = _make_principled_output(mix, "Result")
-        material = _make_material("bed_mat", [output, principled, mix, tex])
-        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
-
-        self.assertEqual(u._resolution_for_material(material, 1024, plan), 4096)
-
-    def test_resolution_for_material_auto_detected_rounds_up_to_power_of_two(self) -> None:
-        image = FakeData(filepath="t.tga", library=None, size=(3000, 3000), name="t")
-        tex = FakeNode("ShaderNodeTexImage", image=image)
-        tex.name = "tex"
-        principled, output = _make_principled_output(tex)
-        material = _make_material("odd_res_mat", [output, principled, tex])
-        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
-
-        self.assertEqual(u._resolution_for_material(material, 1024, plan), 4096)
-
-    def test_resolution_for_material_auto_detected_never_below_default(self) -> None:
-        image = FakeData(filepath="t.png", library=None, size=(512, 512), name="t")
-        tex = FakeNode("ShaderNodeTexImage", image=image)
-        tex.name = "tex"
-        principled, output = _make_principled_output(tex)
-        material = _make_material("small_tex_mat", [output, principled, tex])
-        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
-
-        self.assertEqual(u._resolution_for_material(material, 1024, plan), 1024)
-
-    def test_resolution_for_material_falls_back_to_default_without_plan(self) -> None:
-        image = FakeData(filepath="t.tga", library=None, size=(4096, 4096), name="t")
-        tex = FakeNode("ShaderNodeTexImage", image=image)
-        tex.name = "tex"
-        principled, output = _make_principled_output(tex)
-        material = _make_material("no_plan_mat", [output, principled, tex])
-
-        self.assertEqual(u._resolution_for_material(material, 1024, None), 1024)
-        self.assertEqual(u._resolution_for_material(material, 1024, {}), 1024)
-
-    def test_resolution_for_material_override_takes_precedence_over_auto_detected(self) -> None:
-        image = FakeData(filepath="t.tga", library=None, size=(4096, 4096), name="t")
-        tex = FakeNode("ShaderNodeTexImage", image=image)
-        tex.name = "tex"
-        principled, output = _make_principled_output(tex)
-        mat = self._FakeMaterialWithProps("mat", {"untold_bake_resolution": 2048})
-        mat.node_tree = FakeData(nodes=[output, principled, tex])
-        plan = {"base_color": True, "orm": False, "normal": False, "emissive": False}
-
-        self.assertEqual(u._resolution_for_material(mat, 1024, plan), 2048)
-
-    def test_material_bake_cache_put_then_get_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            cache_dir = Path(tmpdir) / "cache"
-            source_file = Path(tmpdir) / "source.png"
-            source_file.write_bytes(b"fake-png-bytes")
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
 
-            cache = u.MaterialBakeCache(cache_dir)
-            self.assertIsNone(cache.get("some-key"))
-            cached_path = cache.put("some-key", source_file)
-            self.assertTrue(cached_path.is_file())
-            self.assertEqual(cached_path.read_bytes(), b"fake-png-bytes")
-            self.assertEqual(cache.hits, 0)
-            self.assertEqual(cache.misses, 1)
+        self.assertIsNotNone(exported.metallic_texture)
+        self.assertIsNotNone(exported.roughness_texture)
+        self.assertEqual(exported.metallic_texture.channel, u.TEXTURE_CHANNEL_B)
+        self.assertEqual(exported.roughness_texture.channel, u.TEXTURE_CHANNEL_G)
+        self.assertEqual(exported.metallic_factor, 1.0, "textured metallic must not be scaled by the ignored slider")
+        self.assertEqual(exported.roughness_factor, 1.0, "textured roughness must not be scaled by the ignored slider")
 
-            cache.save_manifest()
-            self.assertTrue(cache.manifest_path.is_file())
+        principled_plain, output_plain = _make_principled_output(None)
+        principled_plain.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        metallic_plain = FakeSocket("Metallic")
+        metallic_plain.default_value = 0.25
+        roughness_plain = FakeSocket("Roughness")
+        roughness_plain.default_value = 0.8
+        principled_plain.inputs["Metallic"] = metallic_plain
+        principled_plain.inputs["Roughness"] = roughness_plain
+        plain_material = _make_material("plain_mat", [output_plain, principled_plain])
+        plain_object = FakeSceneObject("Cube", "MESH", FakeData(materials=[plain_material]))
 
-            # A fresh cache instance loading the saved manifest should find the entry.
-            reloaded = u.MaterialBakeCache(cache_dir)
-            found = reloaded.get("some-key")
-            self.assertEqual(found, cached_path)
-            self.assertEqual(reloaded.hits, 1)
-
-    def test_material_bake_cache_miss_when_cached_file_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            cache_dir = Path(tmpdir) / "cache"
-            source_file = Path(tmpdir) / "source.png"
-            source_file.write_bytes(b"fake-png-bytes")
+            exported_plain = u.extract_material(plain_object, Path(tmpdir) / "asset.untold")
 
-            cache = u.MaterialBakeCache(cache_dir)
-            cache.put("some-key", source_file)
-            cache.save_manifest()
+        self.assertAlmostEqual(exported_plain.metallic_factor, 0.25)
+        self.assertAlmostEqual(exported_plain.roughness_factor, 0.8)
 
-            reloaded = u.MaterialBakeCache(cache_dir)
-            (cache_dir / reloaded._manifest["some-key"]).unlink()
-            self.assertIsNone(reloaded.get("some-key"))
+    def test_extract_material_reads_height_from_displacement_node(self) -> None:
+        """The standard ArchViz/Poliigon authoring pattern: an Image Texture feeds a
+        Displacement node's Height socket, which feeds Material Output's Displacement
+        input. Scale becomes heightScale directly. Midlevel does NOT get copied into
+        heightMidlevel (which stays at its neutral default) — the engine's POM is
+        unidirectional and heightMidlevel is just an additive shift, not a true
+        zero-reference, so copying Blender's Midlevel there would not reproduce "neutral
+        gray = no visible depth". Instead Midlevel becomes the height_remap_max ceiling:
+        raw values at/above it clip to "no depth", values below get contrast-stretched
+        into the full depth range."""
+        height_tex = _make_image_node("height_map")
+        height_input = FakeSocket("Height")
+        height_input.link_from(height_tex, "Color")
+        scale_socket = FakeSocket("Scale")
+        scale_socket.default_value = 0.02
+        midlevel_socket = FakeSocket("Midlevel")
+        midlevel_socket.default_value = 0.7
+        displacement_node = FakeNode(
+            "ShaderNodeDisplacement",
+            inputs={"Height": height_input, "Scale": scale_socket, "Midlevel": midlevel_socket},
+        )
+        displacement_node.name = "Displacement"
 
-    def test_material_bake_cache_key_differs_by_channel_and_resolution(self) -> None:
-        tex = _make_image_node()
+        principled, output = _make_principled_output(None)
+        principled.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        displacement_socket = FakeSocket("Displacement")
+        displacement_socket.link_from(displacement_node, "Displacement")
+        output.inputs["Displacement"] = displacement_socket
+
+        material = _make_material("disp_mat", [output, principled, displacement_node, height_tex])
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertIsNotNone(exported.height_texture)
+        self.assertEqual(exported.height_texture.name, "height_map.png")
+        self.assertAlmostEqual(exported.height_scale, 0.02)
+        self.assertAlmostEqual(exported.height_midlevel, 0.5, msg="heightMidlevel stays neutral, Blender's Midlevel is not copied here")
+        self.assertAlmostEqual(exported.height_remap_min, 0.0)
+        self.assertAlmostEqual(exported.height_remap_max, 0.7, msg="Blender's Midlevel becomes the remap ceiling")
+
+        # The Displacement node's own type is not flagged as bakeable — it's now
+        # faithfully handled (extracted as height) — but its Height chain is still
+        # walked and would be individually classified if unsupported.
+        analysis = u.analyze_material(material)
+        self.assertEqual(analysis.classification, u.MATERIAL_GRAPH_SUPPORTED)
+
+    def _make_displacement_material(self, *, midlevel: float, name: str = "disp_mat") -> FakeData:
+        height_tex = _make_image_node("height_map")
+        height_input = FakeSocket("Height")
+        height_input.link_from(height_tex, "Color")
+        scale_socket = FakeSocket("Scale")
+        scale_socket.default_value = 0.02
+        midlevel_socket = FakeSocket("Midlevel")
+        midlevel_socket.default_value = midlevel
+        displacement_node = FakeNode(
+            "ShaderNodeDisplacement",
+            inputs={"Height": height_input, "Scale": scale_socket, "Midlevel": midlevel_socket},
+        )
+        displacement_node.name = "Displacement"
+
+        principled, output = _make_principled_output(None)
+        principled.inputs["Base Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        displacement_socket = FakeSocket("Displacement")
+        displacement_socket.link_from(displacement_node, "Displacement")
+        output.inputs["Displacement"] = displacement_socket
+
+        return _make_material(name, [output, principled, displacement_node, height_tex])
+
+    def test_extract_material_clamps_out_of_range_midlevel_to_remap_ceiling(self) -> None:
+        """Regression: a real Poliigon .blend was found with Midlevel authored as 7.4
+        (an artist overshooting a slider, not a valid [0,1] height reference). Raw texture
+        samples are always in [0,1], so an unclamped remap ceiling of 7.4 would make
+        virtually every real sample divide down toward "maximum depth" — a badly broken
+        result, not a validation error, so it must be clamped rather than trusted as-is."""
+        material = self._make_displacement_material(midlevel=7.4, name="overshoot_mat")
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertAlmostEqual(exported.height_remap_max, 1.0)
+
+    def test_extract_material_clamps_near_zero_midlevel_to_remap_floor(self) -> None:
+        material = self._make_displacement_material(midlevel=0.0, name="zero_mat")
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertAlmostEqual(exported.height_remap_max, 0.01)
+
+    def test_extract_material_falls_back_to_bump_height_when_no_displacement(self) -> None:
+        """Materials authored without a separate Displacement setup sometimes feed a
+        Bump node's Height socket into the Principled BSDF's Normal input directly."""
+        height_tex = _make_image_node("bump_height")
+        height_input = FakeSocket("Height")
+        height_input.link_from(height_tex, "Color")
+        distance_socket = FakeSocket("Distance")
+        distance_socket.default_value = 0.03
+        bump_node = FakeNode("ShaderNodeBump", inputs={"Height": height_input, "Distance": distance_socket})
+        bump_node.name = "Bump"
+
+        normal_socket = FakeSocket("Normal")
+        normal_socket.link_from(bump_node, "Normal")
+        base_color_socket = FakeSocket("Base Color")
+        base_color_socket.default_value = (1.0, 1.0, 1.0, 1.0)
+        principled = FakeNode("ShaderNodeBsdfPrincipled", inputs={"Base Color": base_color_socket, "Normal": normal_socket})
+        principled.name = "Principled BSDF"
+        surface = FakeSocket("Surface")
+        surface.link_from(principled, "BSDF")
+        output = FakeNode("ShaderNodeOutputMaterial", inputs={"Surface": surface})
+        output.name = "Material Output"
+
+        material = _make_material("bump_mat", [output, principled, bump_node, height_tex])
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
+
+        self.assertIsNotNone(exported.height_texture)
+        self.assertEqual(exported.height_texture.name, "bump_height.png")
+        self.assertAlmostEqual(exported.height_scale, 0.03)
+        # Bump has no Midlevel-equivalent input; height_midlevel/height_remap_max stay at
+        # their neutral defaults.
+        self.assertAlmostEqual(exported.height_midlevel, 0.5)
+        self.assertAlmostEqual(exported.height_remap_min, 0.0)
+        self.assertAlmostEqual(exported.height_remap_max, 1.0)
+
+    def test_extract_material_without_displacement_or_bump_has_no_height(self) -> None:
+        tex = _make_image_node("original")
         principled, output = _make_principled_output(tex)
-        material = _make_material("key_mat", [output, principled, tex])
-        mesh_object = FakeSceneObject("Obj", "MESH", FakeData(uv_layers=[], materials=[material]))
-        mesh_object.matrix_world = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+        material = _make_material("plain_mat", [output, principled, tex])
+        mesh_object = FakeSceneObject("Wall", "MESH", FakeData(materials=[material]))
 
-        key_a = u._material_bake_cache_key(mesh_object, material, "base_color", 1024)
-        key_b = u._material_bake_cache_key(mesh_object, material, "normal", 1024)
-        key_c = u._material_bake_cache_key(mesh_object, material, "base_color", 2048)
-        self.assertNotEqual(key_a, key_b)
-        self.assertNotEqual(key_a, key_c)
-        self.assertEqual(key_a, u._material_bake_cache_key(mesh_object, material, "base_color", 1024))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exported = u.extract_material(mesh_object, Path(tmpdir) / "asset.untold")
 
-    def test_validate_bake_resolution_rejects_non_positive(self) -> None:
-        for bad_value in (0, -1, -1024):
-            with self.assertRaises(RuntimeError):
-                u.validate_bake_resolution(bad_value)
-
-    def test_validate_bake_resolution_passes_through_normal_values(self) -> None:
-        self.assertEqual(u.validate_bake_resolution(1024), 1024)
-        self.assertEqual(u.validate_bake_resolution(1), 1)
-        self.assertEqual(u.validate_bake_resolution(u.MAX_BAKE_RESOLUTION), u.MAX_BAKE_RESOLUTION)
-
-    def test_validate_bake_resolution_clamps_high_values(self) -> None:
-        self.assertEqual(u.validate_bake_resolution(u.MAX_BAKE_RESOLUTION + 1), u.MAX_BAKE_RESOLUTION)
-        self.assertEqual(u.validate_bake_resolution(1_000_000), u.MAX_BAKE_RESOLUTION)
-
-    def test_cleanup_material_bake_temp_dir_removes_directory_and_is_idempotent(self) -> None:
-        with tempfile.TemporaryDirectory() as parent:
-            bake_dir = Path(parent) / "untold_material_bake_test"
-            bake_dir.mkdir()
-            (bake_dir / "wall_basecolor.png").write_bytes(b"fake")
-
-            u._set_material_bake_temp_dir(bake_dir)
-            self.assertTrue(bake_dir.is_dir())
-
-            u.cleanup_material_bake_temp_dir()
-            self.assertFalse(bake_dir.exists())
-
-            # Safe to call again with nothing pending, and safe when nothing was ever set.
-            u.cleanup_material_bake_temp_dir()
+        self.assertIsNone(exported.height_texture)
+        self.assertEqual(exported.height_scale, 0.05)
+        self.assertEqual(exported.height_midlevel, 0.5)
 
     def test_write_blender_image_forces_lazy_pixel_load_before_giving_up(self) -> None:
         """Blender reports has_data=False for packed/external images until something
@@ -1340,6 +1186,283 @@ class MaterialGraphAnalysisTests(unittest.TestCase):
         self.assertEqual(u.MORPH_ENTRY_SIZE, 16)
         if u._MORPH_DTYPE is not None:
             self.assertEqual(u._MORPH_DTYPE.itemsize, 16)
+
+
+def _build_minimal_png(bit_depth: int, color_type: int) -> bytes:
+    """A syntactically valid PNG containing only a magic + IHDR chunk. _png_ihdr only
+    reads the first 26 bytes, so the rest of a real PNG (IDAT/IEND, valid CRCs) is
+    unnecessary."""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\x0d"  # chunk length (unused by the reader)
+        + b"IHDR"
+        + b"\x00\x00\x00\x01\x00\x00\x00\x01"  # width=1, height=1 (unused)
+        + bytes([bit_depth, color_type])
+        + b"\x00\x00\x00\x00\x00"  # compression, filter, interlace + padding (unused)
+    )
+
+
+def _build_minimal_tiff(bits_per_sample: list[int], *, big_endian: bool = False) -> bytes:
+    """A minimal little/big-endian TIFF with BitsPerSample(258) and SamplesPerPixel(277)
+    tags, matching exactly what _tiff_bits_per_sample_and_channels reads. No image data —
+    the reader only walks the first IFD's tag table."""
+    endian = ">" if big_endian else "<"
+    samples_per_pixel = len(bits_per_sample)
+    entries: list[tuple[int, bytes]] = []
+    extra_data = b""
+
+    if samples_per_pixel == 1:
+        entries.append((258, struct.pack(endian + "HHI", 258, 3, 1) + struct.pack(endian + "HH", bits_per_sample[0], 0)))
+    else:
+        ifd_entry_count = 2
+        bits_offset = 8 + 2 + ifd_entry_count * 12 + 4
+        entries.append((258, struct.pack(endian + "HHI", 258, 3, samples_per_pixel) + struct.pack(endian + "I", bits_offset)))
+        extra_data = b"".join(struct.pack(endian + "H", v) for v in bits_per_sample)
+
+    entries.append((277, struct.pack(endian + "HHI", 277, 3, 1) + struct.pack(endian + "HH", samples_per_pixel, 0)))
+    entries.sort(key=lambda e: e[0])
+
+    header = (b"MM" if big_endian else b"II") + struct.pack(endian + "HI", 42, 8)
+    ifd_body = struct.pack(endian + "H", len(entries)) + b"".join(e[1] for e in entries) + struct.pack(endian + "I", 0)
+    return header + ifd_body + extra_data
+
+
+class TextureBitDepthDetectionTests(unittest.TestCase):
+    """Regression coverage for the needs_conversion detection bug: Blender's own
+    image.depth/image.channels report 32/4 ("already 8-bit RGBA") for genuinely
+    16-bit-per-channel PNG/TIFF sources, silently defeating the safety net that
+    downconverts 16-bit/grayscale textures to avoid the Metal sRGB-16-bit and
+    grayscale-loads-as-red bugs. _source_bit_depth_and_channels reads the true values
+    from the source file's own header instead of trusting Blender's post-load metadata."""
+
+    def test_tiff_single_channel_16bit_inline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            self.assertEqual(u._tiff_bits_per_sample_and_channels(path), (16, 1))
+
+    def test_tiff_multi_channel_8bit_via_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "color.tiff"
+            path.write_bytes(_build_minimal_tiff([8, 8, 8]))
+            self.assertEqual(u._tiff_bits_per_sample_and_channels(path), (8, 3))
+
+    def test_tiff_big_endian(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height_be.tiff"
+            path.write_bytes(_build_minimal_tiff([16], big_endian=True))
+            self.assertEqual(u._tiff_bits_per_sample_and_channels(path), (16, 1))
+
+    def test_tiff_invalid_file_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "not_a_tiff.tiff"
+            path.write_bytes(b"not a tiff file")
+            self.assertIsNone(u._tiff_bits_per_sample_and_channels(path))
+
+    def test_png_ihdr_16bit_grayscale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.png"
+            path.write_bytes(_build_minimal_png(bit_depth=16, color_type=0))
+            self.assertEqual(u._png_ihdr(path), (16, 0))
+            self.assertEqual(u._png_bit_depth(path), 16)
+
+    def test_png_ihdr_8bit_rgb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "color.png"
+            path.write_bytes(_build_minimal_png(bit_depth=8, color_type=2))
+            self.assertEqual(u._png_ihdr(path), (8, 2))
+
+    def test_png_ihdr_invalid_file_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "not_a_png.png"
+            path.write_bytes(b"not a png file")
+            self.assertIsNone(u._png_ihdr(path))
+
+    def test_source_bit_depth_dispatches_to_tiff_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = None  # exercise the no-bpy fallback path (Path(filepath) directly)
+                self.assertEqual(u._source_bit_depth_and_channels(image), (16, 1))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_dispatches_to_png_reader_with_channel_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.png"
+            path.write_bytes(_build_minimal_png(bit_depth=16, color_type=0))  # grayscale
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = None
+                self.assertEqual(u._source_bit_depth_and_channels(image), (16, 1))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_uses_bpy_path_abspath_when_available(self) -> None:
+        """Inside real Blender, filepath_raw can be a blend-relative '//' path that only
+        bpy.path.abspath knows how to resolve — this must be preferred over treating the
+        raw string as a plain OS path when bpy is available."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "height.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            image = FakeData(filepath_raw="//not/a/real/relative/path.tiff", filepath="", library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = FakeData(path=FakeData(abspath=lambda p, library=None: str(path)))
+                self.assertEqual(u._source_bit_depth_and_channels(image), (16, 1))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_returns_none_for_unsupported_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "photo.jpg"
+            path.write_bytes(b"not actually decoded, suffix-only dispatch")
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None)
+            original_bpy = u.bpy
+            try:
+                u.bpy = None
+                self.assertIsNone(u._source_bit_depth_and_channels(image))
+            finally:
+                u.bpy = original_bpy
+
+    def test_source_bit_depth_returns_none_when_no_filepath(self) -> None:
+        image = FakeData(filepath_raw="", filepath="", library=None)
+        original_bpy = u.bpy
+        try:
+            u.bpy = None
+            self.assertIsNone(u._source_bit_depth_and_channels(image))
+        finally:
+            u.bpy = original_bpy
+
+    def test_source_bit_depth_returns_none_when_file_missing(self) -> None:
+        image = FakeData(filepath_raw="/nonexistent/path/height.tiff", filepath="", library=None)
+        original_bpy = u.bpy
+        try:
+            u.bpy = None
+            self.assertIsNone(u._source_bit_depth_and_channels(image))
+        finally:
+            u.bpy = original_bpy
+
+    def test_needs_conversion_now_fires_for_real_world_16bit_grayscale_tiff(self) -> None:
+        """The actual regression: a genuinely 16-bit single-channel source (e.g. a
+        Poliigon displacement map) must compute depth=16, channels=1 -> needs_conversion
+        True, even though Blender's own image.depth/channels report 32/4 for this exact
+        case (confirmed against real Blender 5.1 + a real Poliigon TIFF asset)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "displacement.tiff"
+            path.write_bytes(_build_minimal_tiff([16]))
+            image = FakeData(filepath_raw=str(path), filepath=str(path), library=None,
+                              depth=32, channels=4)  # Blender's (misleading) post-load metadata
+            original_bpy = u.bpy
+            try:
+                u.bpy = None
+                source_info = u._source_bit_depth_and_channels(image)
+                self.assertEqual(source_info, (16, 1))
+                bits_per_sample, image_channels = source_info
+                image_depth = bits_per_sample * image_channels
+                needs_conversion = image_depth > 32 or image_channels < 3
+                self.assertTrue(needs_conversion, "16-bit grayscale source must trigger the 8-bit safety downconvert")
+            finally:
+                u.bpy = original_bpy
+
+
+_MINIMAL_CUBE_LUT = (
+    "TITLE \"Test LUT\"\n"
+    "# a comment line\n"
+    "LUT_3D_SIZE 2\n"
+    "0.0 0.0 0.0\n"
+    "1.0 0.0 0.0\n"
+    "0.0 1.0 0.0\n"
+    "1.0 1.0 0.0\n"
+    "0.0 0.0 1.0\n"
+    "1.0 0.0 1.0\n"
+    "0.0 1.0 1.0\n"
+    "1.0 1.0 1.0\n"
+)
+
+
+class ColorGradeLUTTests(unittest.TestCase):
+    """stage_color_grade_lut_for_output/_parse_cube_lut_header need no Blender
+    context (pure file I/O)."""
+
+    def test_parses_lut_3d_size_and_default_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cube_path = Path(tmp) / "test.cube"
+            cube_path.write_text(_MINIMAL_CUBE_LUT)
+            lut_size, domain_min, domain_max = u._parse_cube_lut_header(cube_path)
+            self.assertEqual(lut_size, 2)
+            self.assertEqual(domain_min, (0.0, 0.0, 0.0))
+            self.assertEqual(domain_max, (1.0, 1.0, 1.0))
+
+    def test_parses_custom_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cube_path = Path(tmp) / "test.cube"
+            cube_path.write_text(
+                "LUT_3D_SIZE 2\n"
+                "DOMAIN_MIN -1.0 -1.0 -1.0\n"
+                "DOMAIN_MAX 2.0 2.0 2.0\n"
+                "0.0 0.0 0.0\n" * 8
+            )
+            _, domain_min, domain_max = u._parse_cube_lut_header(cube_path)
+            self.assertEqual(domain_min, (-1.0, -1.0, -1.0))
+            self.assertEqual(domain_max, (2.0, 2.0, 2.0))
+
+    def test_rejects_missing_lut_3d_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cube_path = Path(tmp) / "bad.cube"
+            cube_path.write_text("TITLE \"bad\"\n0.0 0.0 0.0\n")
+            with self.assertRaises(RuntimeError):
+                u._parse_cube_lut_header(cube_path)
+
+    def test_rejects_1d_lut(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cube_path = Path(tmp) / "bad.cube"
+            cube_path.write_text("LUT_1D_SIZE 16\n")
+            with self.assertRaises(RuntimeError):
+                u._parse_cube_lut_header(cube_path)
+
+    def test_rejects_out_of_range_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cube_path = Path(tmp) / "bad.cube"
+            cube_path.write_text("LUT_3D_SIZE 1\n0.0 0.0 0.0\n")
+            with self.assertRaises(RuntimeError):
+                u._parse_cube_lut_header(cube_path)
+
+    def test_stage_copies_file_and_content_addresses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cube_path = tmp_path / "artist_grade.cube"
+            cube_path.write_text(_MINIMAL_CUBE_LUT)
+            output_dir = tmp_path / "out"
+
+            staged = u.stage_color_grade_lut_for_output(cube_path, output_dir)
+            self.assertEqual(staged.lut_size, 2)
+            self.assertTrue(staged.source_path.is_file())
+            self.assertTrue(staged.uri.startswith("Textures/"))
+            self.assertTrue(staged.uri.endswith(".cube"))
+            self.assertEqual(staged.source_path.read_text(), _MINIMAL_CUBE_LUT)
+
+            # Re-staging identical content resolves to the same destination
+            # (content-addressed), rather than piling up duplicate files.
+            staged_again = u.stage_color_grade_lut_for_output(cube_path, output_dir)
+            self.assertEqual(staged.uri, staged_again.uri)
+
+    def test_stage_rejects_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError):
+                u.stage_color_grade_lut_for_output(Path(tmp) / "missing.cube", Path(tmp) / "out")
+
+    def test_stage_rejects_non_cube_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bad_path = tmp_path / "grade.png"
+            bad_path.write_bytes(b"not a cube file")
+            with self.assertRaises(RuntimeError):
+                u.stage_color_grade_lut_for_output(bad_path, tmp_path / "out")
 
 
 if __name__ == "__main__":

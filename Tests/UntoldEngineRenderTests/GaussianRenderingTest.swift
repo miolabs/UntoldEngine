@@ -75,6 +75,261 @@ final class GaussianRenderingTest: BaseRenderSetup {
         wait(for: [expectation], timeout: TimeInterval(timeoutFactor))
     }
 
+    // MARK: - Anti-aliasing leaves splat pixels alone
+
+    /// FXAA and SMAA keep a splat pixel as the splat pass blended it: the passes read the
+    /// Gaussian coverage and mix the filtered colour back towards the source by it. Rendered
+    /// twice per mode — with the coverage mask (the default) and with `antiAliasSplatPixels`,
+    /// the filters' old behaviour — the masked output moves a covered pixel away from its
+    /// source by at most (1 − coverage) of what the unmasked filter moved it, a fully covered
+    /// pixel not at all, an uncovered pixel the same either way, and the mask holds back a
+    /// measurable amount somewhere (a mask that is silently not bound cannot pass).
+    func testAntiAliasingLeavesSplatPixelsUntouched() throws {
+        let savedMode = antiAliasingMode
+        let savedSwitch = GaussianDebugOptions.shared.antiAliasSplatPixels
+        defer {
+            antiAliasingMode = savedMode
+            GaussianDebugOptions.shared.antiAliasSplatPixels = savedSwitch
+        }
+
+        func frame() throws -> (source: [SIMD4<Float>], output: [SIMD4<Float>], coverage: [Float]) {
+            for _ in 0 ..< 3 {
+                renderer.draw(in: renderer.metalView)
+                renderInfo.lastCommandBuffer?.waitUntilCompleted()
+            }
+            let look = try XCTUnwrap(textureResources.lookTexture, "the look texture the pass reads")
+            let antiAliased = try XCTUnwrap(textureResources.antiAliasingTexture, "the pass's output")
+            let map = try XCTUnwrap(textureResources.gaussianColorMap, "the Gaussian pass's colour map")
+            XCTAssertEqual(look.width, antiAliased.width)
+            XCTAssertEqual(look.width, map.width)
+            return try (XCTUnwrap(Self.pixels(of: look)), XCTUnwrap(Self.pixels(of: antiAliased)), XCTUnwrap(Self.pixels(of: map)).map(\.w))
+        }
+
+        for mode in [AntiAliasingMode.fxaa, .smaa] {
+            let name = "\(mode)"
+            antiAliasingMode = mode
+            GaussianDebugOptions.shared.antiAliasSplatPixels = false
+            let masked = try frame()
+            GaussianDebugOptions.shared.antiAliasSplatPixels = true
+            let unmasked = try frame()
+            XCTAssertEqual(masked.coverage.count, unmasked.coverage.count)
+
+            let coveredPixels = masked.coverage.filter { $0 > 0.05 }.count
+            XCTAssertGreaterThan(coveredPixels, 500, "\(name): the fixture's splats cover pixels (max coverage \(masked.coverage.max() ?? 0))")
+            var worstExcess: Float = 0, worstUncovered: Float = 0, worstWhole: Float = 0, bestHoldBack: Float = 0, filteredCovered = 0
+            for index in masked.coverage.indices {
+                let coverage = masked.coverage[index]
+                let maskedMove = simd_reduce_max(simd_abs(masked.output[index] - masked.source[index]))
+                let unmaskedMove = simd_reduce_max(simd_abs(unmasked.output[index] - unmasked.source[index]))
+                if coverage <= 0 {
+                    worstUncovered = max(worstUncovered, abs(maskedMove - unmaskedMove))
+                } else {
+                    if coverage >= 0.999 { worstWhole = max(worstWhole, maskedMove) }
+                    // The filter moves the pixel by (1 − coverage) of its unmasked move, up to
+                    // half-float rounding of the two samples.
+                    worstExcess = max(worstExcess, maskedMove - (1 - coverage) * unmaskedMove)
+                    // The mix holds back coverage × the unmasked move of a pixel the filter
+                    // changed; the best pixel's share of that says the mask is bound at all.
+                    if unmaskedMove > 1e-3 {
+                        filteredCovered += 1
+                        bestHoldBack = max(bestHoldBack, (unmaskedMove - maskedMove) / (coverage * unmaskedMove))
+                    }
+                }
+            }
+            // The filter changes some covered pixel (SMAA few, on this fixture's soft blobs), and
+            // on the best of them the mask holds back close to its whole share, coverage × the
+            // move: a mask that is not bound, or a metallib without it, holds back nothing.
+            XCTAssertGreaterThan(filteredCovered, 0, "\(name): the unmasked filter changes a covered pixel")
+            XCTAssertGreaterThanOrEqual(bestHoldBack, 0.75, "\(name): the mask holds a covered pixel back from the filter by its coverage (a mask that is not bound holds back nothing)")
+            XCTAssertLessThanOrEqual(worstExcess, 4e-3, "\(name): a covered pixel moves by at most (1 − coverage) of the unmasked move")
+            XCTAssertLessThanOrEqual(worstWhole, 1e-6, "\(name): a fully covered pixel leaves the pass as it entered")
+            XCTAssertLessThanOrEqual(worstUncovered, 4e-3, "\(name): an uncovered pixel is filtered the same either way")
+        }
+    }
+
+    /// The look pass (grade, tone map) leaves the splats of a pixel as the pre-composite made
+    /// them and grades only the scene behind. Rendered with the mask (the default), with
+    /// `toneMapSplatPixels` (the old behaviour) and with the splats hidden (`opacityScale` 0,
+    /// which yields the graded scene behind them): a fully covered pixel leaves the pass as it
+    /// entered, a partly covered pixel equals the decoded splat layer plus (1 − coverage) of the
+    /// graded scene behind it, an uncovered pixel is graded the same either way, and the best
+    /// covered pixel is held back from the tone map by close to its whole share.
+    func testToneMapLeavesSplatPixelsUntouched() throws {
+        let savedSwitch = GaussianDebugOptions.shared.toneMapSplatPixels
+        defer { GaussianDebugOptions.shared.toneMapSplatPixels = savedSwitch }
+        let transformId = getComponentId(for: WorldTransformComponent.self)
+        let gaussianId = getComponentId(for: GaussianComponent.self)
+        let entity = try XCTUnwrap(queryEntitiesWithComponentIds([transformId, gaussianId], in: scene).first)
+        let component = try XCTUnwrap(scene.get(component: GaussianComponent.self, for: entity))
+        let savedOpacity = component.opacityScale
+        defer { component.opacityScale = savedOpacity }
+
+        struct Frame {
+            var input: [SIMD4<Float>]
+            var output: [SIMD4<Float>]
+            var layer: [SIMD4<Float>]
+        }
+        func frame() throws -> Frame {
+            for _ in 0 ..< 3 {
+                renderer.draw(in: renderer.metalView)
+                renderInfo.lastCommandBuffer?.waitUntilCompleted()
+            }
+            let input = try XCTUnwrap(textureResources.sceneCompositeTexture, "the look pass's input")
+            let output = try XCTUnwrap(textureResources.lookTexture, "the look pass's output")
+            let map = try XCTUnwrap(textureResources.gaussianColorMap)
+            return try Frame(input: XCTUnwrap(Self.pixels(of: input)), output: XCTUnwrap(Self.pixels(of: output)), layer: XCTUnwrap(Self.pixels(of: map)))
+        }
+        GaussianDebugOptions.shared.toneMapSplatPixels = false
+        let masked = try frame()
+        GaussianDebugOptions.shared.toneMapSplatPixels = true
+        let unmasked = try frame()
+        GaussianDebugOptions.shared.toneMapSplatPixels = false
+        component.opacityScale = 0
+        let hidden = try frame()
+        component.opacityScale = savedOpacity
+        XCTAssertEqual(masked.layer.count, unmasked.layer.count)
+        XCTAssertEqual(masked.layer.count, hidden.layer.count)
+        XCTAssertEqual(hidden.layer.map(\.w).max() ?? 0, 0, "hidden splats leave the layer empty")
+
+        func rgb(_ v: SIMD4<Float>) -> SIMD3<Float> {
+            SIMD3(v.x, v.y, v.z)
+        }
+        func move(_ f: Frame, _ index: Int) -> Float {
+            simd_reduce_max(simd_abs(rgb(f.input[index]) - rgb(f.output[index])))
+        }
+        var worstUncovered: Float = 0, worstFull: Float = 0, worstPartial: Float = 0, bestHoldBack: Float = 0
+        var mappedCovered = 0, partial = 0
+        for index in masked.layer.indices {
+            let coverage = min(masked.layer[index].w, 1)
+            let maskedMove = move(masked, index), unmaskedMove = move(unmasked, index)
+            if coverage <= 0 {
+                worstUncovered = max(worstUncovered, abs(maskedMove - unmaskedMove))
+                continue
+            }
+            if unmaskedMove > 1e-3 {
+                mappedCovered += 1
+                bestHoldBack = max(bestHoldBack, (unmaskedMove - maskedMove) / (coverage * unmaskedMove))
+            }
+            if coverage >= 0.999 {
+                worstFull = max(worstFull, maskedMove)
+            } else {
+                // The layer is premultiplied in the capture's space: decode the straight colour as
+                // the pre-composite does; the graded scene behind fills the rest of the pixel.
+                partial += 1
+                let straight = rgb(masked.layer[index]) / coverage
+                let splat = UntoldGSColor.linear(fromDisplay: straight) * coverage
+                let expected = splat + rgb(hidden.output[index]) * (1 - coverage)
+                worstPartial = max(worstPartial, simd_reduce_max(simd_abs(rgb(masked.output[index]) - expected)))
+            }
+        }
+        XCTAssertGreaterThan(mappedCovered, 100, "the tone map changes covered pixels when let through")
+        XCTAssertGreaterThan(partial, 100, "the fixture has partly covered pixels")
+        XCTAssertLessThanOrEqual(worstFull, 2e-3, "a fully covered pixel leaves the look pass as it entered")
+        XCTAssertLessThanOrEqual(worstPartial, 2e-2, "a partly covered pixel is the splat layer over the graded scene behind it (worst \(worstPartial))")
+        XCTAssertGreaterThanOrEqual(bestHoldBack, 0.75, "the mask holds a covered pixel back from the tone map by its coverage")
+        XCTAssertLessThanOrEqual(worstUncovered, 4e-3, "an uncovered pixel is tone-mapped the same either way")
+    }
+
+    /// The crisp kernel cuts every splat at 2√2 σ and renormalises the falloff to zero there, so
+    /// it never adds alpha to a pixel and takes the tails away: the layer's total alpha drops
+    /// and no pixel gains.
+    func testCrispKernelTightensEverySplat() throws {
+        let saved = GaussianDebugOptions.shared.crispSplatKernel
+        defer { GaussianDebugOptions.shared.crispSplatKernel = saved }
+        func layer() throws -> [SIMD4<Float>] {
+            for _ in 0 ..< 2 {
+                renderer.draw(in: renderer.metalView)
+                renderInfo.lastCommandBuffer?.waitUntilCompleted()
+            }
+            return try XCTUnwrap(Self.pixels(of: XCTUnwrap(textureResources.gaussianColorMap)))
+        }
+        GaussianDebugOptions.shared.crispSplatKernel = false
+        let gaussian = try layer()
+        GaussianDebugOptions.shared.crispSplatKernel = true
+        let crisp = try layer()
+        XCTAssertEqual(gaussian.count, crisp.count)
+        let total = gaussian.reduce(0) { $0 + Double($1.w) }
+        let crispTotal = crisp.reduce(0) { $0 + Double($1.w) }
+        XCTAssertGreaterThan(total, 100, "the fixture covers pixels")
+        XCTAssertLessThan(crispTotal, total * 0.995, "the crisp kernel takes the tails away (\(crispTotal) vs \(total))")
+        var gained: Float = 0
+        var thinned = 0
+        for (a, b) in zip(gaussian, crisp) {
+            gained = max(gained, b.w - a.w)
+            if a.w - b.w > 1.0 / 255 { thinned += 1 }
+        }
+        XCTAssertLessThanOrEqual(gained, 2e-3, "no pixel gains alpha under the crisp kernel")
+        XCTAssertGreaterThan(thinned, 100, "the tails of many pixels are cut")
+        XCTAssertEqual(GaussianDebugOptions.shared.drawConstants.crispKernel, 1, "the switch reaches the draw constants")
+    }
+
+    /// The per-pixel blend cap reaches the shader: a cap of one splat per pixel drops every
+    /// overlap on the fixture, while the Mac figure and no cap draw it the same, the fixture
+    /// never stacking that many splats on a pixel.
+    func testBlendCapReachesTheShader() throws {
+        let saved = GaussianRuntimeLimits.maxBlendedSplatsPerPixelOverride
+        defer { GaussianRuntimeLimits.maxBlendedSplatsPerPixelOverride = saved }
+
+        func layer() throws -> [SIMD4<Float>] {
+            for _ in 0 ..< 2 {
+                renderer.draw(in: renderer.metalView)
+                renderInfo.lastCommandBuffer?.waitUntilCompleted()
+            }
+            return try XCTUnwrap(Self.pixels(of: XCTUnwrap(textureResources.gaussianColorMap)))
+        }
+        func differing(_ a: [SIMD4<Float>], _ b: [SIMD4<Float>]) -> Int {
+            zip(a, b).reduce(0) { $0 + (simd_reduce_max(simd_abs($1.0 - $1.1)) > 1.0 / 255 ? 1 : 0) }
+        }
+        GaussianRuntimeLimits.maxBlendedSplatsPerPixelOverride = 255
+        let unlimited = try layer()
+        XCTAssertGreaterThan(unlimited.filter { $0.w > 0.05 }.count, 500, "the fixture covers pixels")
+        GaussianRuntimeLimits.maxBlendedSplatsPerPixelOverride = GaussianRuntimeLimits.maxBlendedSplatsPerPixelMac
+        let mac = try layer()
+        XCTAssertEqual(differing(mac, unlimited), 0, "the Mac cap and no cap draw the fixture the same")
+        GaussianRuntimeLimits.maxBlendedSplatsPerPixelOverride = 1
+        let one = try layer()
+        XCTAssertGreaterThan(differing(one, unlimited), 100, "a cap of one splat per pixel drops every overlap: the cap reaches the shader")
+    }
+
+    /// A CPU copy of a viewport texture as float RGBA, blitted through a shared texture.
+    private static func pixels(of texture: MTLTexture) -> [SIMD4<Float>]? {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: texture.pixelFormat, width: texture.width, height: texture.height, mipmapped: false)
+        descriptor.storageMode = .shared
+        descriptor.usage = [.shaderRead]
+        guard let copy = texture.device.makeTexture(descriptor: descriptor),
+              let queue = texture.device.makeCommandQueue(),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let blit = commandBuffer.makeBlitCommandEncoder()
+        else { return nil }
+        blit.copy(from: texture, to: copy)
+        blit.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        let count = texture.width * texture.height
+        let region = MTLRegionMake2D(0, 0, texture.width, texture.height)
+        switch texture.pixelFormat {
+        case .rgba16Float:
+            var raw = [Float16](repeating: 0, count: count * 4)
+            copy.getBytes(&raw, bytesPerRow: texture.width * 8, from: region, mipmapLevel: 0)
+            return (0 ..< count).map { SIMD4<Float>(Float(raw[$0 * 4]), Float(raw[$0 * 4 + 1]), Float(raw[$0 * 4 + 2]), Float(raw[$0 * 4 + 3])) }
+        case .rgba32Float:
+            var raw = [Float](repeating: 0, count: count * 4)
+            copy.getBytes(&raw, bytesPerRow: texture.width * 16, from: region, mipmapLevel: 0)
+            return (0 ..< count).map { SIMD4<Float>(raw[$0 * 4], raw[$0 * 4 + 1], raw[$0 * 4 + 2], raw[$0 * 4 + 3]) }
+        case .bgra8Unorm, .bgra8Unorm_srgb, .rgba8Unorm, .rgba8Unorm_srgb:
+            var raw = [UInt8](repeating: 0, count: count * 4)
+            copy.getBytes(&raw, bytesPerRow: texture.width * 4, from: region, mipmapLevel: 0)
+            let swapped = texture.pixelFormat == .bgra8Unorm || texture.pixelFormat == .bgra8Unorm_srgb
+            return (0 ..< count).map {
+                let r = Float(raw[$0 * 4 + (swapped ? 2 : 0)]) / 255, g = Float(raw[$0 * 4 + 1]) / 255
+                let b = Float(raw[$0 * 4 + (swapped ? 0 : 2)]) / 255, a = Float(raw[$0 * 4 + 3]) / 255
+                return SIMD4<Float>(r, g, b, a)
+            }
+        default:
+            return nil
+        }
+    }
+
     // MARK: - buildGaussianGraph Tests
 
     func testBuildGaussianGraph_CreatesGaussianPass() {
@@ -201,9 +456,9 @@ final class GaussianRenderingTest: BaseRenderSetup {
             return
         }
 
-        XCTAssertNotNil(gaussianComponent.spaceUniform,
-                        "Gaussian component should have space uniform array")
-        // Note: encodedSplatData and gaussianSortedIndices may be nil until loaded
+        XCTAssertEqual(gaussianComponent.gaussianVisibleCount.count, maxInFlightCommandBuffers,
+                       "Gaussian component should have one visible-set slot per frame in flight")
+        // Note: encodedSplatData and the per-slot buffers may be nil until loaded
     }
 
     func testLoadedGaussianUsesExactSizeGPUBufferAllocations() {
@@ -214,7 +469,7 @@ final class GaussianRenderingTest: BaseRenderSetup {
         guard let entity = entities.first,
               let component = scene.get(component: GaussianComponent.self, for: entity),
               let encodedSplats = component.encodedSplatData,
-              let sortedIndices = component.gaussianSortedIndices
+              let visibleIndices = component.gaussianVisibleIndices.first ?? nil
         else {
             XCTFail("Expected the Gaussian test asset to be loaded")
             return
@@ -227,8 +482,8 @@ final class GaussianRenderingTest: BaseRenderSetup {
             count * MemoryLayout<EncodedGaussianSplat>.stride
         )
         XCTAssertEqual(
-            sortedIndices.length,
-            count * MemoryLayout<UInt64>.stride
+            visibleIndices.length,
+            count * MemoryLayout<UInt32>.stride
         )
 
         let metadata = component.sphericalHarmonicsMetadata
@@ -245,7 +500,7 @@ final class GaussianRenderingTest: BaseRenderSetup {
             return
         }
         component.sphericalHarmonicsData = renderInfo.device.makeBuffer(
-            length: MemoryLayout<Float16>.stride,
+            length: MemoryLayout<UInt8>.stride,
             options: .storageModeShared
         )
         component.sphericalHarmonicsMetadata = GaussianSHMetadata(
@@ -261,6 +516,8 @@ final class GaussianRenderingTest: BaseRenderSetup {
     }
 
     func testPackedSphericalHarmonicsRoundTripsThroughMetalBuffer() throws {
+        // Coefficients 0.125...1.5 span in-range and clamped values so the
+        // round trip exercises both regimes.
         let sphericalHarmonics = GaussianSphericalHarmonics(
             degree: 1,
             coefficientsPerChannel: 4,
@@ -269,15 +526,15 @@ final class GaussianRenderingTest: BaseRenderSetup {
         let packed = try packGaussianSphericalHarmonics(sphericalHarmonics, splatCount: 1)
         guard let buffer = renderInfo.device.makeBuffer(
             bytes: packed.coefficients,
-            length: packed.coefficients.count * MemoryLayout<Float16>.stride,
+            length: packed.coefficients.count * MemoryLayout<UInt8>.stride,
             options: .storageModeShared
         ) else {
             XCTFail("Expected SH buffer allocation")
             return
         }
 
-        XCTAssertEqual(buffer.length, 9 * MemoryLayout<Float16>.stride)
-        let pointer = buffer.contents().bindMemory(to: Float16.self, capacity: 9)
+        XCTAssertEqual(buffer.length, 9 * MemoryLayout<UInt8>.stride)
+        let pointer = buffer.contents().bindMemory(to: UInt8.self, capacity: 9)
         let roundTripped = (0 ..< 9).map { pointer[$0] }
         XCTAssertEqual(roundTripped, packed.coefficients)
     }
@@ -299,16 +556,20 @@ final class GaussianRenderingTest: BaseRenderSetup {
         let packed = try packGaussianSphericalHarmonics(sphericalHarmonics, splatCount: 1)
         let baseColor = simd_float4(0.35, 0.5, 0.65, 1)
         let direction = simd_float4(0.25, -0.5, 0.75, 0)
+        // Dequantize the same way loadGaussianSHCoefficient does on the GPU,
+        // so the CPU and GPU sides evaluate the same quantized inputs and can
+        // be compared without any tolerance for the quantization step itself.
+        let dequantized = packed.coefficients.map { (Float($0) - 128) / 128 }
         let cpuResult = evaluateGaussianSphericalHarmonics(
             baseColor: simd_float3(baseColor.x, baseColor.y, baseColor.z),
-            higherOrderCoefficients: packed.coefficients.map(Float.init),
+            higherOrderCoefficients: dequantized,
             degree: 3,
             direction: simd_float3(direction.x, direction.y, direction.z)
         )
 
         guard let coefficients = renderInfo.device.makeBuffer(
             bytes: packed.coefficients,
-            length: packed.coefficients.count * MemoryLayout<Float16>.stride,
+            length: packed.coefficients.count * MemoryLayout<UInt8>.stride,
             options: .storageModeShared
         ), let output = renderInfo.device.makeBuffer(
             length: 2 * MemoryLayout<simd_float4>.stride,
@@ -371,11 +632,11 @@ final class GaussianRenderingTest: BaseRenderSetup {
         XCTAssertEqual(metadata.degree, 3)
         XCTAssertEqual(metadata.coefficientsPerChannel, 16)
         XCTAssertEqual(metadata.higherOrderCoefficientsPerSplat, 45)
-        XCTAssertEqual(coefficientBuffer.length, splatCount * 45 * MemoryLayout<Float16>.stride)
+        XCTAssertEqual(coefficientBuffer.length, splatCount * 45 * MemoryLayout<UInt8>.stride)
         XCTAssertEqual(splatBuffer.length, splatCount * MemoryLayout<EncodedGaussianSplat>.stride)
 
         let coefficients = coefficientBuffer.contents().bindMemory(
-            to: Float16.self,
+            to: UInt8.self,
             capacity: splatCount * 45
         )
         let sampledValues = [0, splatCount * 45 / 2, splatCount * 45 - 1].map { coefficients[$0] }
@@ -446,6 +707,314 @@ final class GaussianRenderingTest: BaseRenderSetup {
         let sorted = try topologicalSortGraph(graph: graph)
         XCTAssertEqual(sorted.count, graph.count,
                        "Sorted passes should equal total passes")
+    }
+
+    // MARK: - Depth occlusion against opaque geometry
+
+    //
+    // These tests deliberately avoid assuming which exact screen pixel the splat cloud
+    // projects to (a real .ply point cloud isn't necessarily centered on its entity's
+    // transform origin). Instead, a large cube is used as an occluder, sized and
+    // positioned so its near face covers the entire view frustum near the camera — its
+    // depth is written at *every* pixel, so it occludes the splat wherever it actually
+    // renders, without needing pixel-perfect alignment. "Not occluded" is verified by the
+    // splat's own baseline visibility (maxAlphaAnywhere) with no occluder present at all.
+
+    // A sphere large enough (relative to its distance) to cover the whole frame puts the
+    // camera inside its own volume — its surface then faces away from the camera and gets
+    // back-face culled, i.e. it stops rendering entirely. A cube's flat near face avoids
+    // that: as long as the camera sits in front of that face (not inside the cube), it
+    // fully blocks the view within its angular footprint regardless of size.
+    @discardableResult
+    private func addFullFrameOccludingCube(at position: simd_float3, extent: Float = 8.0) -> EntityID {
+        let entity = createEntity()
+        var meshes = BasicPrimitives.createCube(extent: extent)
+        // BasicPrimitives meshes carry no material (ModelIO primitives don't set one),
+        // and combinedModelLightExecution silently skips any submesh with `material == nil`
+        // (RenderPasses.swift:2262) — no draw call, no depth write. Assign a plain opaque
+        // material so this occluder actually renders instead of being invisibly skipped.
+        let defaultMaterial = Material(runtimeMaterial: RuntimeMaterialSource(), device: renderInfo.device)
+        for meshIndex in meshes.indices {
+            for submeshIndex in meshes[meshIndex].submeshes.indices {
+                meshes[meshIndex].submeshes[submeshIndex].material = defaultMaterial
+            }
+        }
+        if let renderComponent = scene.assign(to: entity, component: RenderComponent.self) {
+            renderComponent.mesh = meshes
+            renderComponent.assetURL = URL(fileURLWithPath: "/dev/null/occluder.untold")
+        }
+        if let local = scene.get(component: LocalTransformComponent.self, for: entity) {
+            local.position = position
+            local.boundingBox = Mesh.computeMeshBoundingBox(for: meshes)
+        }
+        if let world = scene.get(component: WorldTransformComponent.self, for: entity) {
+            var space = matrix_identity_float4x4
+            space.columns.3 = simd_float4(position, 1.0)
+            world.space = space
+        }
+        setVisibleEntities()
+        return entity
+    }
+
+    /// Scans the whole texture for the maximum alpha value found anywhere — a
+    /// registration-independent stand-in for "is the splat visible somewhere in frame."
+    private func maxAlphaAnywhere(in texture: MTLTexture) -> Float {
+        precondition(texture.pixelFormat == .rgba16Float, "Test assumes the Gaussian target is rgba16Float")
+        let width = texture.width
+        let height = texture.height
+        let bytesPerPixel = 8
+        let bytesPerRow = width * bytesPerPixel
+        let dataSize = bytesPerRow * height
+        let rawData = UnsafeMutableRawPointer.allocate(byteCount: dataSize, alignment: 1)
+        defer { rawData.deallocate() }
+        texture.getBytes(rawData, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        let ptr = rawData.bindMemory(to: Float16.self, capacity: width * height * 4)
+        var best: Float = 0
+        for i in 0 ..< (width * height) {
+            let a = Float(ptr[i * 4 + 3])
+            if a > best { best = a }
+        }
+        return best
+    }
+
+    private func renderAndReadMaxAlpha() -> Float {
+        renderer.draw(in: renderer.metalView)
+        let expectation = XCTestExpectation(description: "Gaussian render")
+        var result: Float = -1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            result = self.maxAlphaAnywhere(in: renderInfo.gaussianRenderPassDescriptor.colorAttachments[Int(0)].texture!)
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: TimeInterval(timeoutFactor))
+        return result
+    }
+
+    /// Baseline: the test splat, alone, is visible somewhere in frame. Establishes that
+    /// the occlusion tests below have something real to occlude.
+    func testGaussianOcclusion_splatAloneIsVisible() {
+        let camera = createTestCamera()
+        cameraLookAt(entityId: camera, eye: simd_float3(0, 3, 7), target: simd_float3(0, 0, 0), up: simd_float3(0, 1, 0))
+
+        let alpha = renderAndReadMaxAlpha()
+        XCTAssertGreaterThan(alpha, 0.05, "❌ Splat alone with no occluder should be visible somewhere in frame, got \(alpha)")
+    }
+
+    /// A splat behind a closer opaque object covering the whole frame must be fully
+    /// occluded. Regression test for the depth-read added to `fragmentGaussianTBDRShader`
+    /// (previously the draw pipeline had `depthCompareFunction: .always, depthEnabled: false`
+    /// and never read the opaque depth at all, so splats always rendered on top regardless
+    /// of geometry in front).
+    func testGaussianOcclusion_hiddenBehindCloserOpaqueMesh() {
+        let eye = simd_float3(0, 3, 7)
+        let target = simd_float3(0, 0, 0)
+
+        let camera = createTestCamera()
+        cameraLookAt(entityId: camera, eye: eye, target: target, up: simd_float3(0, 1, 0))
+
+        // Cube center placed so its near face (facing the camera) sits ~1 unit in front
+        // of the camera, well outside the cube itself, with a wide enough face to cover
+        // the frame at that distance.
+        let nearPoint = eye + 0.657 * (target - eye) // distance ≈5.0 from eye; near face ≈1.0
+        addFullFrameOccludingCube(at: nearPoint, extent: 8.0)
+
+        let alpha = renderAndReadMaxAlpha()
+        XCTAssertLessThan(
+            alpha, 0.05,
+            "❌ Splat behind a closer full-frame opaque mesh should be fully occluded, got maxAlpha=\(alpha)"
+        )
+    }
+
+    /// The mirror case: a large opaque object placed *beyond* the splat (farther from
+    /// the camera) must not occlude it, even though it's big enough to otherwise span the
+    /// whole frame — exercises the actual depth comparison, not just "no occluder at all."
+    func testGaussianOcclusion_notOccludedByFartherOpaqueMesh() {
+        let eye = simd_float3(0, 3, 7)
+        let target = simd_float3(0, 0, 0)
+
+        let camera = createTestCamera()
+        cameraLookAt(entityId: camera, eye: eye, target: target, up: simd_float3(0, 1, 0))
+
+        // Well beyond the splat on the same eye→target line (near face still farther
+        // from the camera than the target) — must NOT occlude it, regardless of size.
+        let farPoint = eye + 2.0 * (target - eye)
+        addFullFrameOccludingCube(at: farPoint, extent: 8.0)
+
+        let alpha = renderAndReadMaxAlpha()
+        XCTAssertGreaterThan(
+            alpha, 0.05,
+            "❌ Splat should remain visible when the opaque mesh is farther away, got maxAlpha=\(alpha)"
+        )
+    }
+
+    // MARK: - SceneRootTransform (effective camera) correctness
+
+    /// Runs `executeGaussianFrustumCulling` synchronously on a fresh command buffer and
+    /// reads back the GPU visible-splat counter it writes (`GaussianComponent.gaussianVisibleCount`,
+    /// an `atomic_uint` in `gaussianFrustumCull`, see BitonicSort.metal). The reset pass inside
+    /// `executeGaussianFrustumCulling` zeroes this counter before culling runs, so calling this
+    /// repeatedly with different camera/scene-root state is safe.
+    private func runGaussianFrustumCullingAndReadVisibleCount() -> UInt32 {
+        guard let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() else {
+            XCTFail("Expected to allocate a command buffer")
+            return .max
+        }
+        executeGaussianFrustumCulling(commandBuffer)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertEqual(commandBuffer.status, .completed)
+
+        let transformId = getComponentId(for: WorldTransformComponent.self)
+        let gaussianId = getComponentId(for: GaussianComponent.self)
+        let entities = queryEntitiesWithComponentIds([transformId, gaussianId], in: scene)
+        guard let entity = entities.first,
+              let component = scene.get(component: GaussianComponent.self, for: entity)
+        else {
+            XCTFail("Expected the Gaussian test asset to be loaded")
+            return .max
+        }
+
+        let frameSlot = min(renderInfo.currentInFlightFrameSlot, component.gaussianVisibleCount.count - 1)
+        guard let visibleCountBuffer = component.gaussianVisibleCount[frameSlot] else {
+            XCTFail("Expected a visible-count buffer for the active frame slot")
+            return .max
+        }
+        return visibleCountBuffer.contents().load(as: UInt32.self)
+    }
+
+    /// Regression test for the bugfix in 302e097eb: `executeGaussianFrustumCulling` used to
+    /// build its model-view matrix from the raw `cameraComponent.viewSpace`, ignoring
+    /// `SceneRootTransform`. Per SceneRootTransform.swift's "virtual camera" trick, entity
+    /// transforms are never touched when the scene root moves — only the effective camera —
+    /// so a splat's world position is `rootMatrix * modelMatrix * localPosition`, projected
+    /// through the *unmodified* raw camera view when the bug is present. A large scene-root
+    /// translation therefore has no effect on culling at all under the bug (every splat stays
+    /// visible, exactly as if the root were still identity), while the fix pushes every splat
+    /// out of the frustum. This directly reads the GPU visible-splat counter rather than going
+    /// through a full render + occlusion-cube check, because that path (see the removed
+    /// `testGaussianOcclusion_respectsSceneRootTransformOffset` attempt) turned out to be
+    /// insensitive to this bug: a full-frame occluder covers the frustum regardless of exactly
+    /// where within it the (mis-projected) splat lands.
+    func testGaussianFrustumCulling_offsetSceneRootCullsAllSplats() {
+        let camera = createTestCamera()
+        cameraLookAt(entityId: camera, eye: simd_float3(0, 3, 7), target: simd_float3(0, 0, 0), up: simd_float3(0, 1, 0))
+
+        let baselineVisible = runGaussianFrustumCullingAndReadVisibleCount()
+        XCTAssertGreaterThan(
+            baselineVisible, 0,
+            "Sanity check: the test splat should have visible splats within the frustum before any scene-root offset"
+        )
+
+        SceneRootTransform.shared.position = simd_float3(500, 0, 0)
+        SceneRootTransform.shared.updateIfNeeded()
+        defer {
+            SceneRootTransform.shared.position = .zero
+            SceneRootTransform.shared.rotation = simd_quatf()
+            SceneRootTransform.shared.scale = .one
+            SceneRootTransform.shared.updateIfNeeded()
+        }
+
+        let offsetVisible = runGaussianFrustumCullingAndReadVisibleCount()
+        XCTAssertEqual(
+            offsetVisible, 0,
+            "❌ Every splat should be culled once the scene root is translated far outside the " +
+                "camera frustum. A nonzero count here means Gaussian frustum culling is not tracking " +
+                "SceneRootTransform — it fell back to the raw (unmoved) camera view, got \(offsetVisible) " +
+                "visible splats (baseline was \(baselineVisible))"
+        )
+    }
+
+    // MARK: - HZB occlusion pre-cull (0763066cb)
+
+    /// A 1x1 depth texture — `clamp_to_edge` sampling means every UV the gaussianFrustumCull
+    /// kernel samples reads back this single value, exactly like CullingTest's
+    /// `makeHZBTestTexture` for the equivalent mesh-AABB HZB tests.
+    private func makeHZBTestTexture(depthValue: Float) -> MTLTexture {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Float,
+            width: 1,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
+        let texture = renderInfo.device.makeTexture(descriptor: descriptor)!
+
+        var value = depthValue
+        withUnsafeBytes(of: &value) { bytes in
+            texture.replace(
+                region: MTLRegionMake2D(0, 0, 1, 1),
+                mipmapLevel: 0,
+                withBytes: bytes.baseAddress!,
+                bytesPerRow: MemoryLayout<Float>.stride
+            )
+        }
+        return texture
+    }
+
+    /// Regression coverage for 0763066cb: `gaussianFrustumCull` fuses a coarse per-splat HZB
+    /// occlusion pre-cull into the same dispatch as frustum culling, gated by `hzbValid`
+    /// (`renderInfo.hzbIsValid && textureResources.hzbDepthPyramid != nil`). Existing
+    /// occlusion tests (`testGaussianOcclusion_*`) render a single frame, so `hzbIsValid` is
+    /// still false and this whole code path never runs — it needs the HZB injected directly,
+    /// the same way CullingTest does for the equivalent mesh-AABB HZB pass.
+    func testGaussianFrustumCulling_hzbOccludedSplatIsCulled() {
+        let originalHZBTexture = textureResources.hzbDepthPyramid
+        let originalHZBValid = renderInfo.hzbIsValid
+        defer {
+            textureResources.hzbDepthPyramid = originalHZBTexture
+            renderInfo.hzbIsValid = originalHZBValid
+        }
+
+        let camera = createTestCamera()
+        cameraLookAt(entityId: camera, eye: simd_float3(0, 3, 7), target: simd_float3(0, 0, 0), up: simd_float3(0, 1, 0))
+
+        // "Clear" HZB — nothing occluding, camera sees to the far plane. Sanity baseline:
+        // the splat must actually be visible before an occluder is introduced.
+        let clearDepth: Float = renderInfo.reverseZEnabled ? 0.0 : 1.0
+        textureResources.hzbDepthPyramid = makeHZBTestTexture(depthValue: clearDepth)
+        renderInfo.hzbIsValid = true
+        let clearVisible = runGaussianFrustumCullingAndReadVisibleCount()
+        XCTAssertGreaterThan(clearVisible, 0, "Sanity check: splat should be visible against a clear (far-plane) HZB")
+
+        // "Solid" HZB — an occluder close to the camera sits in front of everything.
+        // Standard-Z: close = small value. Reverse-Z: close = large value.
+        let occluderDepth: Float = renderInfo.reverseZEnabled ? 0.95 : 0.05
+        textureResources.hzbDepthPyramid = makeHZBTestTexture(depthValue: occluderDepth)
+        renderInfo.hzbIsValid = true
+        let occludedVisible = runGaussianFrustumCullingAndReadVisibleCount()
+        XCTAssertEqual(
+            occludedVisible, 0,
+            "❌ Splats behind a full-frame HZB occluder should be pre-culled before preprocess/depth/sort/draw, " +
+                "got \(occludedVisible) visible splats"
+        )
+    }
+
+    /// Companion regression test: the `hzbValid` flag itself must gate the occlusion branch.
+    /// If a stale/first-frame HZB were sampled without checking `hzbIsValid`, an occluding
+    /// depth value left over in the texture would incorrectly cull splats even before the
+    /// HZB pyramid has ever been built for this camera position.
+    func testGaussianFrustumCulling_ignoresHZBWhenInvalid() {
+        let originalHZBTexture = textureResources.hzbDepthPyramid
+        let originalHZBValid = renderInfo.hzbIsValid
+        defer {
+            textureResources.hzbDepthPyramid = originalHZBTexture
+            renderInfo.hzbIsValid = originalHZBValid
+        }
+
+        let camera = createTestCamera()
+        cameraLookAt(entityId: camera, eye: simd_float3(0, 3, 7), target: simd_float3(0, 0, 0), up: simd_float3(0, 1, 0))
+
+        // Same "occluding" HZB texture as the culled case above, but marked invalid.
+        let occluderDepth: Float = renderInfo.reverseZEnabled ? 0.95 : 0.05
+        textureResources.hzbDepthPyramid = makeHZBTestTexture(depthValue: occluderDepth)
+        renderInfo.hzbIsValid = false
+
+        let visible = runGaussianFrustumCullingAndReadVisibleCount()
+        XCTAssertGreaterThan(
+            visible, 0,
+            "❌ hzbIsValid=false should disable the occlusion pre-cull entirely, regardless of what's " +
+                "in the HZB texture — got 0 visible splats"
+        )
     }
 
     // MARK: - Helper Methods

@@ -6,7 +6,6 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from bpy_extras.io_utils import ExportHelper
 
 from . import bridge
-from . import color_management
 from . import material_fidelity
 from . import object_metadata
 from . import viewport_overlay
@@ -89,7 +88,7 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
         name="File Type",
         description="Untold asset file type to emit",
         items=[
-            ("tile", "Tile", "Standard runtime asset/tile payload"),
+            ("tile", "Standard", "Standard runtime asset/tile payload"),
             ("shared", "Shared", "Shared streamed payload"),
             ("lod", "LOD", "LOD payload"),
             ("hlod", "HLOD", "HLOD payload"),
@@ -113,65 +112,16 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
         default="blender-native",
     )
 
-    validate: BoolProperty(
-        name="Write Validation JSON",
-        description="Write a companion validation JSON file for debugging and tests",
-        default=False,
-    )
-
     compress_geometry: BoolProperty(
         name="Compress Geometry",
         description="Compress vertex and index chunks with LZ4 if the lz4 Python package is available",
         default=False,
     )
 
-    bake_materials: BoolProperty(
-        name="Bake Materials",
-        description=(
-            "Bake materials the engine cannot evaluate (Mix, Math, procedural textures, ...) "
-            "into flat textures via Cycles so the export matches Blender. See the material "
-            "fidelity report printed to the console during export"
-        ),
-        default=False,
-    )
-
-    bake_resolution: IntProperty(
-        name="Bake Resolution",
-        description="Square resolution for baked material textures. Override per material via a "
-                    "material['untold_bake_resolution'] custom property",
-        default=1024,
-        min=1,
-        soft_max=4096,
-    )
-
-    bake_cache: BoolProperty(
-        name="Use Bake Cache",
-        description="Skip re-baking materials unchanged since the last export. Disable to force "
-                    "every divergent material to be re-baked",
-        default=True,
-    )
-
-    bake_color_management: BoolProperty(
-        name="Bake Color Management",
-        description=(
-            "Bake the scene's active View Transform/Look/Exposure/Gamma into a color-grading "
-            "RGBA16Float LUT targeting canonical sRGB output so Untold can closely reproduce "
-            "Blender's color management, including Filmic/AgX highlight compression"
-        ),
-        default=False,
-    )
-
-    color_lut_size: IntProperty(
-        name="Color LUT Size",
-        description="Grid size (N) for the NxNxN color-grading LUT",
-        default=32,
-        min=4,
-        soft_max=64,
-    )
-
     bake_textures: BoolProperty(
         name="Compress Textures",
-        description="After export, bake staged textures to engine-native .utex files and patch the .untold references",
+        description="Compress the textures to ASTC compression format to save memory. Converts staged "
+                    "textures to engine-native .utex files and patches the .untold references",
         default=False,
     )
 
@@ -186,6 +136,24 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
             ("exhaustive", "Exhaustive", "Slowest ASTC encode"),
         ],
         default="thorough",
+    )
+
+    color_grade_lut: StringProperty(
+        name="Color Grade LUT",
+        description=(
+            "Path to an externally-authored standard .cube 3D LUT to stage and apply as a "
+            "post-tonemap creative grade. Nothing is rendered from Blender -- the .cube is "
+            "copied as-is and loaded directly by the engine, so any LUT from any grading tool "
+            "works"
+        ),
+        default="",
+        subtype="FILE_PATH",
+    )
+
+    validate: BoolProperty(
+        name="Write Validation JSON",
+        description="Write a companion validation JSON file for debugging and tests",
+        default=False,
     )
 
     keep_texture_temp: BoolProperty(
@@ -204,13 +172,22 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
         output_path = self._asset_output_path(self.filepath)
         compression_summary = {"detail": None}
 
+        wm = context.window_manager
+        workspace = context.workspace
+        wm.progress_begin(0, 100)
+
         def progress(stage: str, done: int, total: int, detail: str) -> None:
             if stage == "Compress geometry" and done >= total:
                 compression_summary["detail"] = detail
-            if total > 1:
-                print(f"[Untold Exporter] {stage} {done}/{total} - {detail}", flush=True)
-            else:
-                print(f"[Untold Exporter] {stage} - {detail}", flush=True)
+            percent = (100.0 * done) / max(total, 1)
+            suffix = f" - {detail}" if detail else ""
+            wm.progress_update(percent)
+            workspace.status_text_set(f"Untold Export: {stage} {percent:5.1f}%{suffix}")
+            print(f"[Untold Exporter] {percent:5.1f}% {stage}{suffix}", flush=True)
+            # Force the status bar to redraw now; the UI does not refresh on
+            # its own while this blocking export operator is running.
+            if not bpy.app.background:
+                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
         try:
             result = exporter_bridge().export_asset(
@@ -222,11 +199,7 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
                 source_orientation=self.source_orientation,
                 validate=self.validate,
                 compress_geometry=self.compress_geometry,
-                bake_materials=self.bake_materials,
-                bake_resolution=self.bake_resolution,
-                bake_cache=self.bake_cache,
-                bake_color_management=self.bake_color_management,
-                color_lut_size=self.color_lut_size,
+                color_grade_lut_path=self.color_grade_lut or None,
                 bake_textures=self.bake_textures,
                 texture_quality=self.texture_quality,
                 keep_texture_temp=self.keep_texture_temp,
@@ -236,15 +209,25 @@ class UNTOLD_OT_export_asset(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, str(exc))
             print(f"[Untold Exporter] Error: {exc}", flush=True)
             return {"CANCELLED"}
+        finally:
+            wm.progress_end()
+            workspace.status_text_set(None)
 
+        if result.get("is_pack"):
+            # The scene had more than one independent model (see
+            # group_export_nodes_by_root), so a <name>.untoldpack manifest plus one
+            # .untold per model were written instead of a single output_path.
+            destination = f"{result['pack_path'].name} ({result['model_count']} model(s))"
+        else:
+            destination = output_path.name
         message = (
             f"Exported {result['mesh_count']} mesh(es), "
-            f"{result['vertex_count']} vertices to {output_path.name}"
+            f"{result['vertex_count']} vertices to {destination}"
         )
         if compression_summary["detail"]:
             message += f" | Geometry: {compression_summary['detail']}"
-        if result.get("baked_material_count"):
-            message += f" | Materials: baked {result['baked_material_count']}"
+        if result.get("hdr_asset_count"):
+            message += f" | HDR: staged {result['hdr_asset_count']}"
         if result.get("texture_bake_status") == "baked":
             message += " | Textures: baked to .utex"
         elif result.get("texture_bake_status") == "no textures":
@@ -259,9 +242,9 @@ class UNTOLD_OT_export_animation(bpy.types.Operator, ExportHelper):
     bl_label = "Export Untold Animation"
     bl_options = {"REGISTER"}
 
-    filename_ext = ".untold"
+    filename_ext = ".untoldanim"
     filter_glob: bpy.props.StringProperty(
-        default="*.untold",
+        default="*.untoldanim",
         options={"HIDDEN"},
     )
 
@@ -305,16 +288,25 @@ class UNTOLD_OT_export_animation(bpy.types.Operator, ExportHelper):
     def _animation_output_path(filepath: str) -> Path:
         selected_path = Path(filepath).expanduser().resolve()
         clip_name = selected_path.stem or "animation"
-        return selected_path.parent / clip_name / f"{clip_name}.untold"
+        return selected_path.parent / clip_name / f"{clip_name}.untoldanim"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         output_path = self._animation_output_path(self.filepath)
 
+        wm = context.window_manager
+        workspace = context.workspace
+        wm.progress_begin(0, 100)
+
         def progress(stage: str, done: int, total: int, detail: str) -> None:
-            if total > 1:
-                print(f"[Untold Exporter] {stage} {done}/{total} - {detail}", flush=True)
-            else:
-                print(f"[Untold Exporter] {stage} - {detail}", flush=True)
+            percent = (100.0 * done) / max(total, 1)
+            suffix = f" - {detail}" if detail else ""
+            wm.progress_update(percent)
+            workspace.status_text_set(f"Untold Export: {stage} {percent:5.1f}%{suffix}")
+            print(f"[Untold Exporter] {percent:5.1f}% {stage}{suffix}", flush=True)
+            # Force the status bar to redraw now; the UI does not refresh on
+            # its own while this blocking export operator is running.
+            if not bpy.app.background:
+                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
         try:
             result = exporter_bridge().export_animation(
@@ -330,6 +322,9 @@ class UNTOLD_OT_export_animation(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, str(exc))
             print(f"[Untold Exporter] Error: {exc}", flush=True)
             return {"CANCELLED"}
+        finally:
+            wm.progress_end()
+            workspace.status_text_set(None)
 
         message = (
             f"Exported {result['clip_count']} clip(s), "
@@ -481,49 +476,15 @@ class UNTOLD_OT_export_tiled_scene(bpy.types.Operator):
         default=False,
     )
 
-    bake_materials: BoolProperty(
-        name="Bake Materials",
+    color_grade_lut: StringProperty(
+        name="Color Grade LUT",
         description=(
-            "Bake materials the engine cannot evaluate (Mix, Math, procedural textures, ...) "
-            "into flat textures via Cycles so the export matches Blender. Applies to full-detail "
-            "tile and shared-bucket payloads only — HLOD/LOD tiles are decimated stand-ins and "
-            "are not separately baked"
+            "Path to an externally-authored standard .cube 3D LUT to stage once for the whole "
+            "scene and reference from the manifest's colorGradeLUT key, applied as a post-tonemap "
+            "creative grade"
         ),
-        default=False,
-    )
-
-    bake_resolution: IntProperty(
-        name="Bake Resolution",
-        description="Square resolution for baked material textures. Override per material via a "
-                    "material['untold_bake_resolution'] custom property",
-        default=1024,
-        min=1,
-        soft_max=4096,
-    )
-
-    bake_cache: BoolProperty(
-        name="Use Bake Cache",
-        description="Skip re-baking materials unchanged since the last export. Disable to force "
-                    "every divergent material to be re-baked",
-        default=True,
-    )
-
-    bake_color_management: BoolProperty(
-        name="Bake Color Management",
-        description=(
-            "Bake the scene's active View Transform/Look/Exposure/Gamma into a scene-wide "
-            "RGBA16Float LUT referenced from the manifest's colorLUT key, targeting "
-            "canonical sRGB output"
-        ),
-        default=False,
-    )
-
-    color_lut_size: IntProperty(
-        name="Color LUT Size",
-        description="Grid size (N) for the NxNxN color-grading LUT",
-        default=32,
-        min=4,
-        soft_max=64,
+        default="",
+        subtype="FILE_PATH",
     )
 
     dry_run: BoolProperty(
@@ -618,11 +579,7 @@ class UNTOLD_OT_export_tiled_scene(bpy.types.Operator):
                 generate_hlod=self.generate_hlod,
                 generate_lod=self.generate_lod,
                 compress_geometry=self.compress_geometry,
-                bake_materials=self.bake_materials,
-                bake_resolution=self.bake_resolution,
-                bake_cache=self.bake_cache,
-                bake_color_management=self.bake_color_management,
-                color_lut_size=self.color_lut_size,
+                color_grade_lut_path=self.color_grade_lut or None,
                 dry_run=self.dry_run,
                 write_manifest_in_dry_run=self.write_manifest_in_dry_run,
                 progress_callback=progress,
@@ -647,7 +604,7 @@ class UNTOLD_OT_export_tiled_scene(bpy.types.Operator):
 
 def menu_func_export(self: bpy.types.Menu, context: bpy.types.Context) -> None:
     self.layout.operator(UNTOLD_OT_export_asset.bl_idname, text="Untold (.untold)")
-    self.layout.operator(UNTOLD_OT_export_animation.bl_idname, text="Untold Animation (.untold)")
+    self.layout.operator(UNTOLD_OT_export_animation.bl_idname, text="Untold Animation (.untoldanim)")
     self.layout.operator(UNTOLD_OT_export_tiled_scene.bl_idname, text="Untold Tiled Scene")
 
 
@@ -665,11 +622,9 @@ def register() -> None:
     object_metadata.register()
     viewport_overlay.register()
     material_fidelity.register()
-    color_management.register()
 
 
 def unregister() -> None:
-    color_management.unregister()
     material_fidelity.unregister()
     viewport_overlay.unregister()
     object_metadata.unregister()

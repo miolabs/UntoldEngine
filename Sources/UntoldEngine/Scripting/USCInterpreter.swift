@@ -45,6 +45,11 @@ public class USCActionRegistry: @unchecked Sendable {
     public func resolve(name: String) -> USCAction? {
         actions[name]
     }
+
+    /// Removes an action, e.g. when the code that provided it is replaced by a reload.
+    public func unregister(name: String) {
+        actions.removeValue(forKey: name)
+    }
 }
 
 // MARK: - USC Interpreter
@@ -309,9 +314,12 @@ public class USCInterpreter: @unchecked Sendable {
                               offsetY: offsetYVal)
             return pc + 1
 
-        case let .playAnimation(entityRef, name, loop):
+        case let .playAnimation(entityRef, name, loop, transitionHalflife):
             let targetEntity = resolveEntity(entityRef, context: context)
-            changeAnimation(entityId: targetEntity, name: name, withPause: !loop)
+            changeAnimation(entityId: targetEntity,
+                            name: name,
+                            transitionHalflife: transitionHalflife ?? defaultAnimationTransitionHalflife,
+                            withPause: !loop)
             return pc + 1
 
         case let .stopAnimation(entityRef):

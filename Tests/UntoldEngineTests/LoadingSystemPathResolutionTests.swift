@@ -1,0 +1,158 @@
+//
+//  LoadingSystemPathResolutionTests.swift
+//  UntoldEngine
+//
+// Copyright (C) Untold Engine Studios
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+
+@testable import UntoldEngine
+import XCTest
+
+final class LoadingSystemPathResolutionTests: XCTestCase {
+    private var previousAssetBasePath: URL?
+    private var tempRoot: URL!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        previousAssetBasePath = assetBasePath
+        tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LoadingSystemPathResolutionTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        assetBasePath = previousAssetBasePath
+        if let tempRoot {
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+        try super.tearDownWithError()
+    }
+
+    func testAbsoluteStalePathFallsBackToCurrentStructuredResourceSuffix() throws {
+        let currentResource = tempRoot
+            .appendingPathComponent("Models/redplayer", isDirectory: true)
+            .appendingPathComponent("redplayer")
+            .appendingPathExtension("usdz")
+        try FileManager.default.createDirectory(at: currentResource.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: currentResource)
+        assetBasePath = tempRoot
+
+        let resolved = getResourceURL(
+            resourceName: "/old/build/GameData/Models/redplayer/redplayer.usdz",
+            ext: "usdz",
+            subName: nil
+        )
+
+        XCTAssertEqual(resolved?.standardizedFileURL, currentResource.standardizedFileURL)
+    }
+
+    func testAbsoluteStalePathFallsBackToFlatResourceWithoutDuplicatingExtension() throws {
+        let currentResource = tempRoot
+            .appendingPathComponent("redplayer")
+            .appendingPathExtension("usdz")
+        try Data().write(to: currentResource)
+        assetBasePath = tempRoot
+
+        let resolved = getResourceURL(
+            resourceName: "/old/build/GameData/Models/redplayer/redplayer.usdz",
+            ext: "usdz",
+            subName: nil
+        )
+
+        XCTAssertEqual(resolved?.standardizedFileURL, currentResource.standardizedFileURL)
+    }
+
+    func testAbsoluteStalePathFallbackUsesBundleResourceDirectory() throws {
+        let bundleURL = tempRoot.appendingPathComponent("GameData.bundle", isDirectory: true)
+        let resourcesURL = bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: resourcesURL, withIntermediateDirectories: true)
+
+        let infoPlistURL = bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Info.plist")
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.untoldengine.tests.gamedata</string>
+            <key>CFBundlePackageType</key>
+            <string>BNDL</string>
+        </dict>
+        </plist>
+        """.write(to: infoPlistURL, atomically: true, encoding: .utf8)
+
+        let currentResource = resourcesURL
+            .appendingPathComponent("redplayer")
+            .appendingPathExtension("usdz")
+        try Data().write(to: currentResource)
+        assetBasePath = bundleURL
+
+        let resolved = getResourceURL(
+            resourceName: "/old/build/GameData/Models/redplayer/redplayer.usdz",
+            ext: "usdz",
+            subName: nil
+        )
+
+        XCTAssertEqual(resolved?.standardizedFileURL, currentResource.standardizedFileURL)
+    }
+
+    func testAbsolutePathSkipsSameNamedDirectoryAndResolvesExtensionedFile() throws {
+        // A stale per-model subfolder from an older .untoldpack export can share its
+        // parent directory's base name with a newer pack manifest at that same stem
+        // (e.g. Assets/model/ left over beside a fresh Assets/model.untoldpack).
+        // FileManager.fileExists(atPath:) alone can't tell a directory from a file,
+        // so resolution must reject the directory match and keep looking for the
+        // extensioned file instead of silently returning the directory.
+        let baseName = tempRoot.appendingPathComponent("model")
+        try FileManager.default.createDirectory(at: baseName, withIntermediateDirectories: true)
+        let packFile = tempRoot.appendingPathComponent("model").appendingPathExtension("untoldpack")
+        try Data().write(to: packFile)
+
+        let resolved = getResourceURL(resourceName: baseName.path, ext: "untoldpack", subName: nil)
+
+        XCTAssertEqual(resolved?.standardizedFileURL, packFile.standardizedFileURL)
+    }
+
+    func testBareResourceNameResolvesUnderTexturesDirectory() throws {
+        // GameData/Textures is a canonical asset directory created by the project
+        // scaffolding (see createGameDataDirectories()), but standalone texture
+        // loads (loadTexture(textureName:)) pass subResource: nil, so this must
+        // resolve through the plain structured search, not the Materials/subName one.
+        let texturesDirectory = tempRoot.appendingPathComponent("Textures", isDirectory: true)
+        try FileManager.default.createDirectory(at: texturesDirectory, withIntermediateDirectories: true)
+        let currentResource = texturesDirectory
+            .appendingPathComponent("icon")
+            .appendingPathExtension("png")
+        try Data().write(to: currentResource)
+        assetBasePath = tempRoot
+
+        let resolved = getResourceURL(resourceName: "icon", ext: "png", subName: nil)
+
+        XCTAssertEqual(resolved?.standardizedFileURL, currentResource.standardizedFileURL)
+    }
+
+    func testBareResourceNameResolvesUnderLUTDirectory() throws {
+        // GameData/LUT is where standalone .cube grade LUTs live (see
+        // createGameDataDirectories() and setColorGradeLUT), resolved the same
+        // way as every other structured asset folder.
+        let lutDirectory = tempRoot.appendingPathComponent("LUT", isDirectory: true)
+        try FileManager.default.createDirectory(at: lutDirectory, withIntermediateDirectories: true)
+        let currentResource = lutDirectory
+            .appendingPathComponent("warm_grade")
+            .appendingPathExtension("cube")
+        try Data().write(to: currentResource)
+        assetBasePath = tempRoot
+
+        let resolved = getResourceURL(resourceName: "warm_grade", ext: "cube", subName: nil)
+
+        XCTAssertEqual(resolved?.standardizedFileURL, currentResource.standardizedFileURL)
+    }
+}

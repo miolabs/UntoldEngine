@@ -832,7 +832,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
         // Verify dependencies
         XCTAssertEqual(graph["model"]?.dependencies, ["shadow"], "Model pass should depend on shadow pass")
         XCTAssertEqual(graph["batchedModel"]?.dependencies, ["model"], "Batched model pass should depend on model pass")
-        XCTAssertEqual(graph["hzbDepthSource"]?.dependencies, ["batchedModel"], "HZB source pass should depend on batched model pass")
+        XCTAssertEqual(graph["meshOccluderShell"]?.dependencies, ["batchedModel"], "Occluder shell pass should follow all opaque colour geometry")
+        XCTAssertEqual(graph["hzbDepthSource"]?.dependencies, ["meshOccluderShell"], "HZB source pass should copy depth after the occluder shells are written")
         XCTAssertNil(graph["wireframeOcclusionDepth"], "Wireframe occlusion depth pass should not exist in the graph")
         XCTAssertEqual(graph["ssao"]?.dependencies, ["hzbDepthSource"], "SSAO pass should depend on the stored opaque depth source")
 
@@ -854,7 +855,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
         assertTopologicalConstraints(order: order, constraints: [
             ("shadow", "model"),
             ("model", "batchedModel"),
-            ("batchedModel", "hzbDepthSource"),
+            ("batchedModel", "meshOccluderShell"),
+            ("meshOccluderShell", "hzbDepthSource"),
             ("hzbDepthSource", "ssao"),
             ("ssao", "lightPass"),
         ])
@@ -955,7 +957,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
 
     func testBuildGameModeGraph_GridMode() throws {
         renderInfo.immersionStyle = .none
-        renderEnvironment = false // Should use grid instead
+        renderEnvironment = false
+        renderSkyBackground = false // sky is the default non-IBL background; opt into grid explicitly
 
         let (graph, _) = try buildGameModeGraph()
 
@@ -1009,6 +1012,7 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
             ("environment", "shadow"),
             ("shadow", "model"),
             ("model", "gaussian"),
+            ("meshOccluderShell", "gaussian"),
             ("model", "lightPass"),
             ("lightPass", "transparency"),
             ("transparency", "wireframe"),
@@ -1317,8 +1321,8 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
 
         let (graph, _) = try buildGameModeGraph()
 
-        XCTAssertEqual(graph["gaussian"]?.dependencies, ["model"],
-                       "Gaussian pass should depend on model pass to access depth buffer")
+        XCTAssertEqual(graph["gaussian"]?.dependencies, ["model", "meshOccluderShell"],
+                       "Gaussian pass should depend on the model pass and the occluder shells to access the depth buffer")
     }
 
     func testBuildGameModeGraph_PreCompDependsOnGaussian() throws {
@@ -1344,23 +1348,24 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
 
     func testBuildGameModeGraph_GaussianInAllRenderModes() throws {
         // Test that gaussian pass exists in all render modes
-        let modes: [(UntoldImmersionMode, Bool, String)] = [
-            (.none, true, "environment"),
-            (.none, false, "grid"),
-            (.full, true, "full immersion"),
-            (.mixed, false, "passthrough"),
+        let modes: [(UntoldImmersionMode, Bool, Bool, String)] = [
+            (.none, true, true, "environment"),
+            (.none, false, false, "grid"),
+            (.full, true, true, "full immersion"),
+            (.mixed, false, true, "passthrough"),
         ]
 
-        for (immersionStyle, useEnvironment, description) in modes {
+        for (immersionStyle, useEnvironment, useSky, description) in modes {
             renderInfo.immersionStyle = immersionStyle
             renderEnvironment = useEnvironment
+            renderSkyBackground = useSky
 
             let (graph, _) = try buildGameModeGraph()
 
             XCTAssertNotNil(graph["gaussian"],
                             "Gaussian pass should exist in \(description) mode")
-            XCTAssertEqual(graph["gaussian"]?.dependencies, ["model"],
-                           "Gaussian should depend on model in \(description) mode")
+            XCTAssertEqual(graph["gaussian"]?.dependencies, ["model", "meshOccluderShell"],
+                           "Gaussian should depend on model and the occluder shells in \(description) mode")
         }
     }
 
@@ -1481,6 +1486,7 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
 
     func testReservedPassIDsCoverEveryGameModeGraphVariant() throws {
         let originalEnvironment = renderEnvironment
+        let originalSkyBackground = renderSkyBackground
         let originalBypass = bypassPostProcessing
         let originalAA = antiAliasingMode
         let originalDebugMode = renderDebugViewMode
@@ -1490,6 +1496,7 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
         let originalDepthOfField = DepthOfFieldParams.shared.enabled
         defer {
             renderEnvironment = originalEnvironment
+            renderSkyBackground = originalSkyBackground
             bypassPostProcessing = originalBypass
             antiAliasingMode = originalAA
             renderDebugViewMode = originalDebugMode
@@ -1519,6 +1526,13 @@ final class RenderGraphBuilderTest: BaseRenderSetup {
                 try captureGraphPassIDs()
             }
         }
+
+        // renderEnvironment=false alone selects the default sky background above; also capture
+        // the grid pass (reachable via the renderSkyBackground opt-out) so it stays reserved.
+        renderEnvironment = false
+        renderSkyBackground = false
+        try captureGraphPassIDs()
+        renderSkyBackground = true
 
         antiAliasingMode = .none
         for mode in [

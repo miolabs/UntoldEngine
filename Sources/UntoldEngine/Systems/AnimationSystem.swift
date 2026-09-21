@@ -210,7 +210,8 @@ private func updateAnimationSystem(deltaTime: Float) {
             skeleton: skeletonComponent.skeleton,
             compiledClip: compiledClip,
             clipDuration: animationClip.duration,
-            clipSpeed: animationClip.speed
+            clipSpeed: animationClip.speed,
+            deltaTime: deltaTime
         )
 
         // Transitions decay in real time, independent of playback speed.
@@ -218,12 +219,26 @@ private func updateAnimationSystem(deltaTime: Float) {
             to: &animationComponent.localPose,
             deltaTime: deltaTime
         )
+        // The override layer (an upper-body posture) and reach IK shape the
+        // displayed pose before the feet are planted.
+        applyPoseLayer(
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            deltaTime: deltaTime
+        )
+        applyReachIK(
+            entityId: entity,
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            deltaTime: deltaTime
+        )
         // Foot IK corrects the final pose: plant feet on real geometry
         // after root motion and transitions have settled the pose.
         applyFootIK(
             entityId: entity,
             animationComponent: animationComponent,
-            skeleton: skeletonComponent.skeleton
+            skeleton: skeletonComponent.skeleton,
+            deltaTime: deltaTime
         )
 
         animationComponent.hasSampledPose = true
@@ -316,6 +331,10 @@ public func isAnimationComponentPaused(entityId: EntityID) -> Bool {
     }
 }
 
+/// Default halflife for inertialized clip switches, shared by every public
+/// entry point (`changeAnimation`, the node builder, USC `.playAnimation`).
+public let defaultAnimationTransitionHalflife: Float = 0.1
+
 /// Switches the entity to the named clip.
 ///
 /// With a positive `transitionHalflife`, the switch is inertialized: the
@@ -323,7 +342,12 @@ public func isAnimationComponentPaused(entityId: EntityID) -> Bool {
 /// decayed to zero with a critically damped spring, so the character eases
 /// into the new clip instead of popping. `transitionHalflife: 0` reproduces
 /// a hard cut. Playback restarts at the beginning of the new clip.
-public func changeAnimation(entityId: EntityID, name: String, transitionHalflife: Float = 0.1, withPause: Bool = false) {
+///
+/// Calling this with the clip that is already playing is a no-op apart from
+/// the `withPause` flag: playback keeps its phase and any in-flight
+/// transition keeps decaying, so callers may reassert the current clip
+/// every frame without restarting it.
+public func changeAnimation(entityId: EntityID, name: String, transitionHalflife: Float = defaultAnimationTransitionHalflife, withPause: Bool = false) {
     guard hasAnyAnimationComponent(entityId: entityId) else {
         handleError(.noAnimationComponent, entityId)
         return
@@ -336,6 +360,10 @@ public func changeAnimation(entityId: EntityID, name: String, transitionHalflife
     }
 
     for (targetEntityId, animationComponent, animationClip) in matchingComponents {
+        guard animationComponent.currentAnimation !== animationClip else {
+            animationComponent.pause = withPause
+            continue
+        }
         beginAnimationTransition(
             entityId: targetEntityId,
             animationComponent: animationComponent,
@@ -345,8 +373,10 @@ public func changeAnimation(entityId: EntityID, name: String, transitionHalflife
         animationComponent.currentAnimation = animationClip
         animationComponent.currentTime = 0
         animationComponent.pause = withPause
-        // Re-baseline root motion on the new clip; the first frame after a
-        // switch contributes no delta.
+        // Re-baseline root motion on the new clip (the first frame after a
+        // switch contributes no delta) and crossfade the applied velocity
+        // with the same halflife the pose blends with.
+        animationComponent.rootMotion.beginVelocityBlend(halflife: transitionHalflife)
         animationComponent.rootMotion.resetHistory()
     }
 }
@@ -357,6 +387,11 @@ public func changeAnimation(entityId: EntityID, name: String, transitionHalflife
 /// pose; vertical motion, pitch, and roll stay in the pose. By default the
 /// skeleton's first parentless joint is the root; pass `rootJointPath` to
 /// designate a different joint.
+///
+/// Modular assets resolve to several animation components; only the first
+/// one drives the anchor's transform, so the deltas apply once no matter
+/// how many skinned parts share the skeleton. Every component still grounds
+/// its own pose.
 public func setRootMotionEnabled(entityId: EntityID, enabled: Bool, rootJointPath: String? = nil) {
     let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
     guard animationComponents.isEmpty == false else {
@@ -364,10 +399,11 @@ public func setRootMotionEnabled(entityId: EntityID, enabled: Bool, rootJointPat
         return
     }
 
-    for (_, animationComponent) in animationComponents {
+    for (index, (_, animationComponent)) in animationComponents.enumerated() {
         animationComponent.rootMotion.isEnabled = enabled
         animationComponent.rootMotion.rootJointPath = rootJointPath
         animationComponent.rootMotion.anchorEntity = entityId
+        animationComponent.rootMotion.drivesAnchor = index == 0
         animationComponent.rootMotion.resolvedRootIndex = nil
         animationComponent.rootMotion.resetHistory()
     }
@@ -385,6 +421,37 @@ public func setFootIKEnabled(entityId: EntityID, enabled: Bool) {
 
     for (_, animationComponent) in animationComponents {
         animationComponent.footIK.isEnabled = enabled
+    }
+}
+
+/// Enables or disables stance locking for the entity's foot IK chains:
+/// while a foot is planted the IK target pins to the world position where
+/// it landed, absorbing slide; the lock releases when the foot lifts, with
+/// a short catch-up decay. `source` says what counts as planted: the
+/// displayed ankle's own speed (the default: catches slide baked into a
+/// clip's root motion), or the playing clip's contact (`.clipContact`: a
+/// foot the clip holds still stays pinned through a transition, the
+/// root-velocity crossfade or the heading warp, and lets go only when the
+/// clip lifts it). Requires foot IK chains to be configured and enabled.
+public func setFootIKStanceLocking(entityId: EntityID, enabled: Bool, source: FootIKStanceLockSource = .displayedFoot) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        if enabled {
+            precondition(
+                animationComponent.footIK.maxLockDistance <= animationComponent.footIK.maxAdjustment,
+                "Foot IK stance lock distance must not exceed maxAdjustment"
+            )
+        }
+        animationComponent.footIK.stanceLockEnabled = enabled
+        animationComponent.footIK.lockSource = source
+        animationComponent.footIK.lockStates = []
+        animationComponent.footIK.rawClip = nil
+        animationComponent.footIK.rawAnkles = []
     }
 }
 
@@ -427,6 +494,126 @@ public func setFootIKGroundQuery(entityId: EntityID, query: FootIKGroundQuery?) 
     }
 }
 
+/// Configures the pose layer's joint subset: every joint at or under the
+/// given paths (both clavicles, for the arms). Reconfiguring keeps the
+/// layer's clip and weight. See `setPoseLayerClip`.
+public func setPoseLayerMask(entityId: EntityID, rootJointPaths: [String]) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.poseLayer.maskRootPaths = rootJointPaths
+        animationComponent.poseLayer.invalidateResolution()
+    }
+}
+
+/// Plays the named clip on the pose layer: it loops on its own clock, and
+/// the local rotations of the masked joints (`setPoseLayerMask`) follow it
+/// by the layer's weight (`setPoseLayerWeight`) on top of whatever the
+/// entity plays or motion-matches. The layer's previous clip fades out
+/// over `transitionHalflife` (zero cuts); restating the current clip is a
+/// no-op. The clip must be loaded on the entity.
+public func setPoseLayerClip(entityId: EntityID, name: String, transitionHalflife: Float = defaultAnimationTransitionHalflife) {
+    guard hasAnyAnimationComponent(entityId: entityId) else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    let matchingComponents = animationComponentsContainingClip(entityId: entityId, name: name)
+    guard matchingComponents.isEmpty == false else {
+        handleError(.noAnimationClip, name, entityId)
+        return
+    }
+
+    for (_, animationComponent, animationClip) in matchingComponents {
+        animationComponent.poseLayer.play(animationClip, halflife: transitionHalflife)
+    }
+}
+
+/// Eases the pose layer's influence to `weight` — 0 leaves the base pose
+/// untouched, 1 replaces the masked joints' rotations — over `halflife`.
+public func setPoseLayerWeight(entityId: EntityID, weight: Float, halflife: Float = 0.2) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.poseLayer.targetWeight = min(max(weight, 0), 1)
+        animationComponent.poseLayer.weightHalflife = max(halflife, 0)
+        if halflife <= 0 {
+            animationComponent.poseLayer.weight = animationComponent.poseLayer.targetWeight
+        }
+    }
+}
+
+/// Configures the arm chains reach IK bends toward a target
+/// (`setReachIKTarget`). Chains whose joint paths do not exist in the
+/// skeleton are ignored.
+public func setReachIKChains(entityId: EntityID, chains: [ReachIKChainDescriptor]) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.reachIK.descriptors = chains
+        animationComponent.reachIK.invalidateResolution()
+    }
+}
+
+/// Points the reach chains at a world position: a hand lands on it within
+/// reach and points at it beyond, the arm extended to `reach` of its
+/// length. The influence eases to `weight` over `halflife`; a nil position
+/// eases it back out.
+public func setReachIKTarget(
+    entityId: EntityID,
+    worldPosition: simd_float3?,
+    weight: Float = 1,
+    halflife: Float = 0.25,
+    reach: Float = 0.95
+) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        if let worldPosition {
+            animationComponent.reachIK.targetWorld = worldPosition
+            animationComponent.reachIK.targetWeight = min(max(weight, 0), 1)
+        } else {
+            animationComponent.reachIK.targetWeight = 0
+        }
+        animationComponent.reachIK.halflife = max(halflife, 0)
+        animationComponent.reachIK.reach = min(max(reach, 0.05), 1)
+        if halflife <= 0 {
+            animationComponent.reachIK.weight = animationComponent.reachIK.targetWeight
+        }
+    }
+}
+
+/// Per-chain multipliers on the reach influence, index-aligned with the
+/// chains: 0 leaves that arm to the pose, 1 gives it the full influence —
+/// one hand lunging while the other holds back.
+public func setReachIKChainWeights(entityId: EntityID, weights: [Float]) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.reachIK.chainWeights = weights
+    }
+}
+
 /// Configures motion matching for the entity (or its descendants that
 /// carry an `AnimationComponent`). The motion database is built lazily on
 /// the first enabled update, from the clips loaded on the entity. Enable
@@ -442,6 +629,32 @@ public func setMotionMatching(entityId: EntityID, descriptor: MotionMatchingDesc
         animationComponent.motionMatching.descriptor = descriptor
         animationComponent.motionMatching.anchorEntity = entityId
         animationComponent.motionMatching.reset()
+    }
+}
+
+/// Builds the motion database now rather than on the first enabled update,
+/// so enabling motion matching later — say, handing a character over from
+/// a scripted idle — does not stall that frame. Needs a descriptor and the
+/// clips already loaded; a no-op once the database exists.
+public func prepareMotionMatching(entityId: EntityID) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (componentEntityId, animationComponent) in animationComponents {
+        guard animationComponent.motionMatching.database == nil,
+              let descriptor = animationComponent.motionMatching.descriptor,
+              let skeletonComponent = scene.get(component: SkeletonComponent.self, for: componentEntityId)
+        else { continue }
+        buildMotionDatabase(
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            descriptor: descriptor
+        )
+        // Search on the first enabled update, as the lazy path does.
+        animationComponent.motionMatching.searchClock = descriptor.searchInterval
     }
 }
 
@@ -563,11 +776,18 @@ func beginAnimationTransition(
     let targetPose = animationComponent.transition.scratchTarget
     let targetNext = animationComponent.transition.scratchTargetNext
 
+    // While playback is frozen (pause or .forceOff) the update loop stops
+    // swapping pose history, so `previousPose`/`lastSampleDeltaTime` describe
+    // motion from before the freeze. The pose actually on screen is static —
+    // treat its velocity as zero instead of the stale history.
+    let isFrozen = animationComponent.pause
+        || animationPolicyAllowsPlayback(animationComponent) == false
+
     animationComponent.transition.begin(
         halflife: halflife,
         sourcePose: animationComponent.localPose,
         sourcePrevious: animationComponent.previousPose,
-        hasSourcePrevious: animationComponent.hasPreviousPose,
+        hasSourcePrevious: animationComponent.hasPreviousPose && !isFrozen,
         sourceDeltaTime: animationComponent.lastSampleDeltaTime,
         targetPose: targetPose,
         targetNext: targetNext,

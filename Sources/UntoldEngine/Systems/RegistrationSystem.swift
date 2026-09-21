@@ -177,8 +177,22 @@ private func registerComponentCleanupHandlers() {
         removeEntityLOD(entityId: entityId)
     }
 
+    ComponentRegistry.register(componentType: GaussianLODComponent.self, handlerId: "gaussianLOD", priority: 30) { entityId in
+        removeEntityGaussianLOD(entityId: entityId)
+    }
+
     ComponentRegistry.register(componentType: GaussianComponent.self, handlerId: "gaussian", priority: 30) { entityId in
         removeEntityGaussian(entityId: entityId)
+    }
+
+    ComponentRegistry.register(componentType: MeshOccluderComponent.self, handlerId: "meshOccluder", priority: 30) { entityId in
+        scene.remove(component: MeshOccluderComponent.self, from: entityId)
+    }
+    ComponentRegistry.register(componentType: MeshFadeComponent.self, handlerId: "meshFade", priority: 30) { entityId in
+        scene.remove(component: MeshFadeComponent.self, from: entityId)
+    }
+    ComponentRegistry.register(componentType: GaussianAssetLinkComponent.self, handlerId: "gaussianAssetLink", priority: 30) { entityId in
+        scene.remove(component: GaussianAssetLinkComponent.self, from: entityId)
     }
 
     ComponentRegistry.register(componentType: CameraComponent.self, handlerId: "camera", priority: 30) { entityId in
@@ -285,6 +299,7 @@ public func destroyAllEntities(completion: (() -> Void)? = nil) {
     enforceRegistrationMainActor()
     SceneAuthoredSourceStore.shared.clear()
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     enqueuePendingDestroyCompletion(completion)
 
     let toDestroy = scene.getAllEntities()
@@ -656,8 +671,26 @@ private func registerUntoldProgressiveStubEntity(
         sc.unloadRadius = Float.greatestFiniteMagnitude
     }
     setDefaultEntitySceneChannels(entityId: childEntityId, channels: defaultSceneChannels(forName: uniqueAssetName))
+    attachGaussianAssetLinkIfPresent(entityId: childEntityId, node: node)
 
     return childEntityId
+}
+
+/// Carries the node's `gaussianAsset` record onto its entity as `GaussianAssetLinkComponent`.
+/// Nothing is loaded here; an application system reads the link and decides.
+private func attachGaussianAssetLinkIfPresent(entityId: EntityID, node: RuntimeAssetNode) {
+    guard let link = node.gaussianAsset else { return }
+    registerComponent(entityId: entityId, componentType: GaussianAssetLinkComponent.self)
+    guard let component = scene.get(component: GaussianAssetLinkComponent.self, for: entityId) else { return }
+    component.payloadURL = link.payloadURL
+    component.flags = link.flags
+    component.lodCount = link.lodCount
+    component.lodSplatCounts = link.lodSplatCounts
+    component.lodSwitchScreenHeights = link.lodSwitchScreenHeights
+    component.occluderShrinkMeters = link.occluderShrinkMeters
+    component.exposureOffsetEV = link.exposureOffsetEV
+    component.swapDistanceMeters = link.swapDistanceMeters
+    component.alignment = link.alignment
 }
 
 /// Register all renderable nodes in a .untold RuntimeAsset as OCC stub entities.
@@ -702,6 +735,7 @@ private func registerUntoldRuntimeAssetOCC(
             let parentEntityId = node.parentID.flatMap { entityByNodeID[$0] } ?? entityId
             setParent(childId: containerEntityId, parentId: parentEntityId)
             entityByNodeID[node.id] = containerEntityId
+            attachGaussianAssetLinkIfPresent(entityId: containerEntityId, node: node)
 
         } else {
             // Renderable node — always a CHILD OCC stub (never the root entity).
@@ -872,6 +906,7 @@ private func registerUntoldRuntimeAsset(
             handleError(.assetDataMissing, "Node '\(assetName)' in '\(filename).\(withExtension)' has no renderable primitives")
             return false
         }
+        attachGaussianAssetLinkIfPresent(entityId: entityId, node: matchedNode)
         return true
     }
 
@@ -929,6 +964,8 @@ private func registerUntoldRuntimeAsset(
                 derived.nodePath = derivedComp.nodePath
             }
         }
+
+        attachGaussianAssetLinkIfPresent(entityId: targetEntityId, node: node)
 
         guard !node.primitives.isEmpty else {
             registerRuntimeSkeletonIfNeeded(
@@ -1138,6 +1175,135 @@ private func loadColorLUTTexture(_ reference: RuntimeTextureReference?) -> MTLTe
     }
 }
 
+/// Loads an externally-authored .cube grade LUT and applies it as global
+/// rendering state, composing with (not replacing) whichever tonemap ran.
+/// Same transactional clear-then-publish contract as replaceColorManagement.
+private func replaceColorGradeLUT(_ colorGradeLUT: RuntimeColorGradeLUT?) {
+    ColorGradeLUTParams.shared.clear()
+
+    guard let colorGradeLUT, let url = colorGradeLUT.lutURL else {
+        return
+    }
+
+    guard (2 ... 129).contains(colorGradeLUT.lutSize),
+          colorGradeLUT.domainMax.x > colorGradeLUT.domainMin.x,
+          colorGradeLUT.domainMax.y > colorGradeLUT.domainMin.y,
+          colorGradeLUT.domainMax.z > colorGradeLUT.domainMin.z
+    else {
+        Logger.log(
+            message: "[UntoldColorGradeLUT] Invalid LUT parameters; skipping the creative grade",
+            category: LogCategory.textureLoading.rawValue
+        )
+        return
+    }
+
+    loadAndInstallColorGradeLUT(from: url, expectedLUTSize: colorGradeLUT.lutSize)
+}
+
+/// Parses a .cube at `url` and installs it into ColorGradeLUTParams, using the
+/// parsed file's own domainMin/domainMax (not a separately-cached copy, so an
+/// artist hand-editing the .cube in place can't drift out of sync with a stale
+/// manifest/record). `expectedLUTSize` is an optional consistency check against
+/// a manifest/record's declared size -- pass nil when loading directly from a
+/// bare URL with no prior expectations (see setColorGradeLUT).
+private func loadAndInstallColorGradeLUT(
+    from url: URL,
+    expectedLUTSize: Int?,
+    sourceFilename: String? = nil,
+    sourceExtension: String? = nil
+) {
+    do {
+        let (texture, lut) = try CubeLUTLoader.loadTexture(device: renderInfo.device, from: url)
+        if let expectedLUTSize, lut.size != expectedLUTSize {
+            Logger.log(
+                message: "[UntoldColorGradeLUT] .cube LUT_3D_SIZE \(lut.size) does not match expected \(expectedLUTSize); skipping the creative grade",
+                category: LogCategory.textureLoading.rawValue
+            )
+            return
+        }
+        ColorGradeLUTParams.shared.replace(
+            texture: texture,
+            domainMin: lut.domainMin,
+            domainMax: lut.domainMax,
+            sourceFilename: sourceFilename,
+            sourceExtension: sourceExtension
+        )
+    } catch {
+        Logger.log(
+            message: "[UntoldColorGradeLUT] Failed to load '\(url.lastPathComponent)': \(error); skipping the creative grade",
+            category: LogCategory.textureLoading.rawValue
+        )
+    }
+}
+
+/// Splits `filename` and an optional explicit `withExtension` into the resource name
+/// and extension actually used to resolve an asset.
+///
+/// When `withExtension` is given, `filename` is returned untouched -- this preserves
+/// every existing two-argument call site's exact behavior, including ones whose
+/// resource name happens to contain a dot (e.g. "level.01"). Only when
+/// `withExtension` is nil is an extension parsed off the end of `filename` itself
+/// (e.g. "model.untold" -> ("model", "untold")), so callers can fold the extension
+/// into a single path string instead of passing it separately. Pure string
+/// splitting (NSString.pathExtension/.deletingPathExtension), not URL(fileURLWithPath:)
+/// -- the latter silently absolutizes a bare relative name against the current
+/// working directory, which would break LoadingSystem's own bare-name-vs-absolute-path
+/// branch.
+///
+/// `fallbackExtension` covers call sites (like setColorGradeLUT) that historically
+/// defaulted to a fixed extension when none was given at all.
+private func resolveAssetFilenameExtension(
+    _ filename: String,
+    _ withExtension: String?,
+    fallbackExtension: String = ""
+) -> (filename: String, withExtension: String) {
+    if let withExtension {
+        return (filename, withExtension)
+    }
+    let embeddedExtension = (filename as NSString).pathExtension
+    guard !embeddedExtension.isEmpty else {
+        return (filename, fallbackExtension)
+    }
+    return ((filename as NSString).deletingPathExtension, embeddedExtension)
+}
+
+/// Loads a standalone .cube color-grade LUT and applies it immediately, fully
+/// independent of any scene/manifest -- unlike the colorGradeLUT reference
+/// installed by loadSceneAuthored, this can point at any .cube file (hand
+/// authored, from a grading tool, downloaded, or shipped with the app) and
+/// takes effect without re-exporting or reloading the scene.
+///
+/// `filename` is resolved the same way every other asset name is (see
+/// LoadingSystem.getResourceURL): a bare name searches the standard
+/// structured folders (a new "LUT" folder alongside Models/Textures/etc.),
+/// while an absolute path is used directly.
+///
+/// `withExtension` may be omitted if `filename` already carries the extension
+/// (e.g. "grade.cube"); it otherwise defaults to "cube" as before.
+public func setColorGradeLUT(filename: String, withExtension: String? = nil) {
+    let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension, fallbackExtension: "cube")
+    guard let url = LoadingSystem.shared.resourceURL(
+        forResource: filename,
+        withExtension: withExtension,
+        subResource: nil
+    ) else {
+        ColorGradeLUTParams.shared.clear()
+        Logger.log(
+            message: "[UntoldColorGradeLUT] '\(filename).\(withExtension)' not found; skipping the creative grade",
+            category: LogCategory.textureLoading.rawValue
+        )
+        return
+    }
+
+    ColorGradeLUTParams.shared.clear()
+    loadAndInstallColorGradeLUT(
+        from: url,
+        expectedLUTSize: nil,
+        sourceFilename: filename,
+        sourceExtension: withExtension
+    )
+}
+
 private func registerUntoldLight(_ light: RuntimeLightSource) {
     let lightEntityId = createEntity()
 
@@ -1165,6 +1331,14 @@ private func registerUntoldLight(_ light: RuntimeLightSource) {
     switch light.kind {
     case .directional:
         scene.get(component: DirectionalLightComponent.self, for: lightEntityId)?.castsShadow = light.castsShadow
+        // A scene only ever has one meaningful "sun". Importing a new directional light
+        // (e.g. re-running Load Scene Authored) should replace the previous one outright
+        // rather than leaving it behind as an orphaned, no-longer-active duplicate.
+        if let previousDirectionalLight = LightingSystem.shared.activeDirectionalLight,
+           previousDirectionalLight != lightEntityId
+        {
+            destroyEntity(entityId: previousDirectionalLight)
+        }
         setDirectionalLight(.active(lightEntityId))
 
     case .point:
@@ -1239,9 +1413,10 @@ private func registerUntoldCamera(_ camera: RuntimeCameraSource) {
 public func setEntityMesh(
     entityId: EntityID,
     filename: String,
-    withExtension: String,
+    withExtension: String? = nil,
     assetName: String? = nil
 ) {
+    let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
     guard let url = LoadingSystem.shared.resourceURL(
         forResource: filename,
         withExtension: withExtension,
@@ -1283,7 +1458,7 @@ public func setEntityMesh(
 public func setEntityMeshAsync(
     entityId: EntityID,
     filename: String,
-    withExtension: String,
+    withExtension: String? = nil,
     assetName: String? = nil,
     flip _: Bool = true,
     coordinateConversion _: CoordinateSystemConversion = .autoDetect,
@@ -1291,6 +1466,7 @@ public func setEntityMeshAsync(
     blockRenderLoop: Bool = true,
     completion: ((Bool) -> Void)? = nil
 ) {
+    let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
     let completionBox = completion.map { BoolCompletionBox(callback: $0) }
 
     Task {
@@ -1317,6 +1493,34 @@ public func setEntityMeshAsync(
             }
             await AssetLoadingState.shared.finishLoading(entityId: entityId)
             completionBox?.call(false)
+            return
+        }
+
+        // .untoldanim is a byte-identical .untold container, but the file has no
+        // renderable primitives (see scripts/untoldexplorer.py's --animation export
+        // mode) -- loading it as a mesh here would just produce an empty entity.
+        // Fail clearly and point at the dedicated animation entry point instead.
+        if url.pathExtension.lowercased() == "untoldanim" {
+            handleError(.assetIsAnimationOnly, filename)
+            withWorldMutationGate {
+                loadFallbackMesh(entityId: entityId, filename: filename)
+            }
+            await AssetLoadingState.shared.finishLoading(entityId: entityId)
+            completionBox?.call(false)
+            return
+        }
+
+        // A .untoldpack is not a single mesh -- it's a manifest referencing several
+        // models, each with its own placement (see scripts/untoldexplorer.py). Route
+        // it through the same entry point as .untold so callers never have to know
+        // ahead of time whether a given asset is one model or many.
+        if url.pathExtension.lowercased() == "untoldpack" {
+            loadEntityFromPack(entityId: entityId, packURL: url) { success in
+                Task {
+                    await AssetLoadingState.shared.finishLoading(entityId: entityId)
+                    completionBox?.call(success)
+                }
+            }
             return
         }
 
@@ -1420,29 +1624,18 @@ public func setEntityMeshAsync(
     }
 }
 
-/// Loads scene-authored lights/cameras and replaces the active scene color
-/// management from a `.untold` asset, separate from any mesh load.
+/// Loads scene-authored lights/cameras from a `.untold` asset, separate from any mesh load.
 ///
 /// Call this alongside `setEntityMeshAsync` when you want to bring scene-authored
 /// lights and cameras from an exported asset into the current scene without coupling
 /// them to the mesh entity's transform.
 public func loadSceneAuthored(
     filename: String,
-    withExtension ext: String,
+    withExtension ext: String? = nil,
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
-    loadSceneAuthored(filename: filename, withExtension: ext, registerEntities: true, completion: completion)
-}
-
-private func loadSceneAuthored(
-    filename: String,
-    withExtension ext: String,
-    registerEntities: Bool,
-    completion: (@Sendable (Bool) -> Void)? = nil
-) {
+    let (filename, ext) = resolveAssetFilenameExtension(filename, ext)
     Task {
-        ColorLUTParams.shared.clear()
-        SceneAuthoredSourceStore.shared.clear()
         guard let url = LoadingSystem.shared.resourceURL(
             forResource: filename, withExtension: ext, subResource: nil
         ) else {
@@ -1457,29 +1650,19 @@ private func loadSceneAuthored(
             return
         }
 
-        let sourceReference = sceneAssetReference(
-            kind: .model,
-            url: url,
-            displayName: url.deletingPathExtension().lastPathComponent
-        )
         guard let runtimeAsset = loadUntoldRuntimeAsset(url: url) else {
             completion?(false)
             return
         }
 
-        replaceColorManagement(runtimeAsset.colorManagement)
-        SceneAuthoredSourceStore.shared.source = sourceReference
-        if registerEntities {
-            withWorldMutationGate {
-                registerUntoldScenePayload(from: runtimeAsset)
-            }
+        withWorldMutationGate {
+            registerUntoldScenePayload(from: runtimeAsset)
         }
         completion?(true)
     }
 }
 
-/// Loads scene-authored lights/cameras and replaces the active scene color
-/// management from a `.json` tile manifest, separate from tile residency.
+/// Loads scene-authored lights/cameras from a `.json` tile manifest, separate from tile residency.
 ///
 /// Call this alongside `setEntityStreamScene` when the manifest contains
 /// `scene_lights` / `scene_cameras` you want imported into the current scene.
@@ -1487,17 +1670,7 @@ public func loadSceneAuthored(
     url manifestURL: URL,
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
-    loadSceneAuthored(url: manifestURL, registerEntities: true, completion: completion)
-}
-
-private func loadSceneAuthored(
-    url manifestURL: URL,
-    registerEntities: Bool,
-    completion: (@Sendable (Bool) -> Void)? = nil
-) {
     Task {
-        ColorLUTParams.shared.clear()
-        SceneAuthoredSourceStore.shared.clear()
         do {
             let localURL: URL
             if manifestURL.scheme?.lowercased() == "https" {
@@ -1516,61 +1689,14 @@ private func loadSceneAuthored(
                 return
             }
 
-            let sourceReference = sceneAssetReference(
-                kind: .streamModel,
-                url: manifestURL,
-                displayName: manifestURL.deletingPathExtension().lastPathComponent
-            )
-            let colorManagement = try await manifestColorManagement(
-                tileManifest.colorLUT,
-                manifestURL: manifestURL,
-                localManifestURL: localURL
-            )
-            replaceColorManagement(colorManagement)
-            SceneAuthoredSourceStore.shared.source = sourceReference
-            if registerEntities {
-                withWorldMutationGate {
-                    registerManifestScenePayload(tileManifest)
-                }
+            withWorldMutationGate {
+                registerManifestScenePayload(tileManifest)
             }
             completion?(true)
         } catch {
             handleError(.manifestNotFound, error.localizedDescription, manifestURL.lastPathComponent)
             completion?(false)
         }
-    }
-}
-
-func loadSceneAuthoredColorManagement(
-    from source: SceneAssetReference,
-    completion: (@Sendable (Bool) -> Void)? = nil
-) {
-    switch source.kind {
-    case .model:
-        guard let url = resolvedSceneAssetURL(source) else {
-            ColorLUTParams.shared.clear()
-            SceneAuthoredSourceStore.shared.clear()
-            completion?(false)
-            return
-        }
-        loadSceneAuthored(
-            filename: url.path,
-            withExtension: url.pathExtension,
-            registerEntities: false,
-            completion: completion
-        )
-    case .streamModel:
-        guard let url = resolvedSceneAssetURL(source) else {
-            ColorLUTParams.shared.clear()
-            SceneAuthoredSourceStore.shared.clear()
-            completion?(false)
-            return
-        }
-        loadSceneAuthored(url: url, registerEntities: false, completion: completion)
-    case .animation, .procedural:
-        ColorLUTParams.shared.clear()
-        SceneAuthoredSourceStore.shared.clear()
-        completion?(false)
     }
 }
 
@@ -1649,6 +1775,7 @@ public func setEntityMeshDirect(entityId: EntityID, meshes: [Mesh], assetName: S
 /// Called by registerTiledScene before registering new tile stubs.
 private func clearScene() {
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     SceneAuthoredSourceStore.shared.clear()
     for entity in scene.getAllEntities() {
         destroyEntity(entityId: entity)
@@ -1696,6 +1823,10 @@ private struct TileManifest: Decodable {
     let sceneLights: [ManifestLightEntry]?
     let sceneCameras: [ManifestCameraEntry]?
     let colorLUT: ManifestColorManagementEntry?
+    /// An externally-authored .cube grade LUT (see stage_color_grade_lut_for_output
+    /// in scripts/untoldexplorer.py) — separate from colorLUT above, which is a
+    /// proprietary baked-.utex whole-transform bake.
+    let colorGradeLUT: ManifestColorGradeLUTEntry?
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -1708,6 +1839,7 @@ private struct TileManifest: Decodable {
         case sceneLights = "scene_lights"
         case sceneCameras = "scene_cameras"
         case colorLUT
+        case colorGradeLUT
     }
 }
 
@@ -1721,6 +1853,13 @@ private struct ManifestColorManagementEntry: Decodable {
     let gamma: Float
     let shaperMinStops: Float
     let shaperMaxStops: Float
+}
+
+private struct ManifestColorGradeLUTEntry: Decodable {
+    let lutUri: String
+    let lutSize: Int
+    let domainMin: [Float]
+    let domainMax: [Float]
 }
 
 private struct ManifestLightEntry: Decodable {
@@ -2036,6 +2175,280 @@ private func decodeMatrix4x4Rows(
     )
 }
 
+// MARK: - Untold Pack Manifest (multi-model .blend exports)
+
+/// One model referenced by a `.untoldpack` manifest: a self-contained `.untold`
+/// file (see scripts/untoldexplorer.py) plus the placement it had in the source
+/// Blender scene, relative to the manifest's own directory.
+public struct UntoldPackModelEntry: Decodable {
+    public let displayName: String?
+    public let path: String
+    public let transform: simd_float4x4
+
+    enum CodingKeys: String, CodingKey {
+        case displayName
+        case path
+        case transform
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        path = try container.decode(String.self, forKey: .path)
+        let rows = try container.decodeIfPresent([[Float]].self, forKey: .transform)
+        transform = decodeMatrix4x4Rows(rows)
+    }
+}
+
+/// Decoded contents of a `.untoldpack` manifest: written by the exporter whenever a
+/// source Blender scene contains more than one independent model, so each model stays
+/// its own reusable `.untold` file instead of being fused into a single asset.
+public struct UntoldPackData: Decodable {
+    public let formatVersion: Int
+    public let sourceAsset: String?
+    public let models: [UntoldPackModelEntry]
+}
+
+/// Reads and decodes a `.untoldpack` manifest from a local file URL.
+public func loadUntoldPack(url: URL) -> UntoldPackData? {
+    guard let data = try? Data(contentsOf: url) else {
+        Logger.logWarning(message: "[loadUntoldPack] Could not read file: \(url.lastPathComponent)")
+        return nil
+    }
+    guard let pack = try? JSONDecoder().decode(UntoldPackData.self, from: data) else {
+        Logger.logWarning(message: "[loadUntoldPack] Could not decode pack manifest: \(url.lastPathComponent)")
+        return nil
+    }
+    return pack
+}
+
+private func decomposeTRS(_ matrix: simd_float4x4) -> (position: simd_float3, rotation: simd_quatf, scale: simd_float3) {
+    let position = simd_make_float3(matrix.columns.3)
+    var col0 = simd_make_float3(matrix.columns.0)
+    let col1 = simd_make_float3(matrix.columns.1)
+    let col2 = simd_make_float3(matrix.columns.2)
+    var scale = simd_float3(simd_length(col0), simd_length(col1), simd_length(col2))
+
+    // Column length alone can't represent a mirrored/reflected transform (e.g. a
+    // Blender object with a negative scale axis) since length is always positive
+    // -- a plain decompose silently turns the mirror into an ordinary positive
+    // scale. A negative determinant is the tell; fold the reflection into the X
+    // scale (and its basis column) so what's left for the rotation matrix below
+    // is a proper (determinant +1) rotation.
+    let determinant = simd_dot(col0, simd_cross(col1, col2))
+    if determinant < 0 {
+        scale.x = -scale.x
+        col0 = -col0
+    }
+
+    let rotationMatrix = simd_float3x3(
+        scale.x != 0 ? col0 / abs(scale.x) : simd_float3(1, 0, 0),
+        scale.y > 0 ? col1 / scale.y : simd_float3(0, 1, 0),
+        scale.z > 0 ? col2 / scale.z : simd_float3(0, 0, 1)
+    )
+    let rotation = simd_normalize(simd_quatf(rotationMatrix))
+    return (position, rotation, scale)
+}
+
+/// Reads a `.untoldpack` manifest and writes a brand-new `.untoldscene` seeded with
+/// one entity per model, each referencing its own `.untold` file and placed using
+/// the manifest's per-model transform.
+///
+/// This is a one-time conversion, not a live link. The resulting `.untoldscene`
+/// is a normal, freely-editable scene file from this point on: re-running the
+/// exporter regenerates the pack and its `.untold` models but never touches
+/// scenes already created from it. This is what keeps `.untoldpack` (exporter-owned,
+/// regenerated every export) and `.untoldscene` (editor-owned, hand-edited) from
+/// fighting over the same file, which is what mixing them into one format used to do.
+@discardableResult
+public func createUntoldScene(fromPackAt packURL: URL, savingTo sceneURL: URL) -> Bool {
+    guard assetBasePath != nil else {
+        Logger.log(message: "❌ createUntoldScene: assetBasePath is not configured. Call setupAssetPaths() first.")
+        return false
+    }
+    guard let pack = loadUntoldPack(url: packURL) else {
+        return false
+    }
+
+    let packDir = packURL.deletingLastPathComponent()
+    var sceneData = SceneData()
+    for model in pack.models {
+        let modelURL = packDir.appendingPathComponent(model.path)
+        let displayName = model.displayName ?? modelURL.deletingPathExtension().lastPathComponent
+
+        var entity = EntityData()
+        entity.name = displayName
+        entity.assetName = displayName
+        entity.hasLocalTransformComponent = true
+        entity.hasRenderingComponent = true
+        entity.assetURL = modelURL
+        entity.asset = sceneAssetReference(kind: .model, url: modelURL, displayName: displayName)
+
+        let (position, rotation, scale) = decomposeTRS(model.transform)
+        entity.position = position
+        entity.rotation = simd_float4(rotation.vector)
+        entity.scale = scale
+
+        sceneData.entities.append(entity)
+    }
+
+    guard let encoded = try? JSONEncoder().encode(sceneData) else {
+        Logger.logWarning(message: "[createUntoldScene] Failed to encode scene for pack: \(packURL.lastPathComponent)")
+        return false
+    }
+
+    do {
+        try encoded.write(to: sceneURL, options: .atomic)
+        return true
+    } catch {
+        Logger.logWarning(message: "[createUntoldScene] Failed to write scene file \(sceneURL.lastPathComponent): \(error.localizedDescription)")
+        return false
+    }
+}
+
+/// Drives loadEntityFromPack's model loads through a bounded concurrency window
+/// instead of firing every model's setEntityMeshAsync at once.
+///
+/// setEntityMeshAsync's Task body eventually takes withWorldMutationGate's
+/// thread-blocking NSRecursiveLock (see AssetLoadingState.swift). Swift's
+/// cooperative thread pool has a fixed size; firing dozens of these Tasks
+/// simultaneously can leave every pool thread parked on that lock with none
+/// free to run the continuation that would release it -- a genuine deadlock,
+/// reproducible even with plain setEntityMeshAsync calls in a tight loop,
+/// independent of anything pack-specific. Keeping at most `maxConcurrentLoads`
+/// in flight at a time keeps this entry point far under that ceiling without
+/// having to change the shared locking primitive itself.
+private final class PackLoadDispatcher: @unchecked Sendable {
+    private let lock = NSLock()
+    private let models: [UntoldPackModelEntry]
+    private let packDir: URL
+    private let rootEntityId: EntityID
+    private let completionBox: BoolCompletionBox?
+    private var nextIndex = 0
+    private var remaining: Int
+    private var overallSuccess = true
+
+    private static let maxConcurrentLoads = 8
+
+    init(models: [UntoldPackModelEntry], packDir: URL, rootEntityId: EntityID, completionBox: BoolCompletionBox?) {
+        self.models = models
+        self.packDir = packDir
+        self.rootEntityId = rootEntityId
+        self.completionBox = completionBox
+        remaining = models.count
+    }
+
+    func start() {
+        let initialCount = min(Self.maxConcurrentLoads, models.count)
+        for _ in 0 ..< initialCount {
+            startNext()
+        }
+    }
+
+    private func startNext() {
+        lock.lock()
+        let index = nextIndex
+        guard index < models.count else {
+            lock.unlock()
+            return
+        }
+        nextIndex += 1
+        lock.unlock()
+
+        let model = models[index]
+        let modelURL = packDir.appendingPathComponent(model.path)
+        let displayName = model.displayName ?? modelURL.deletingPathExtension().lastPathComponent
+        let modelPath = modelURL.deletingPathExtension().path
+        let withExtension = modelURL.pathExtension
+        let (position, rotation, scale) = decomposeTRS(model.transform)
+        let rootEntityId = rootEntityId
+
+        withWorldMutationGate {
+            let childId = createEntity()
+            registerTransformComponent(entityId: childId)
+            registerSceneGraphComponent(entityId: childId)
+            setEntityName(entityId: childId, name: displayName)
+            setParent(childId: childId, parentId: rootEntityId)
+
+            setEntityMeshAsync(entityId: childId, filename: modelPath, withExtension: withExtension) { success in
+                withWorldMutationGate {
+                    translateTo(entityId: childId, position: position)
+                    scaleTo(entityId: childId, scale: scale)
+                    rotateTo(entityId: childId, rotation: rotation)
+                    // Single-node .untold assets rename the entity to the mesh's own internal
+                    // node name on load (see registerUntoldRuntimeAsset), which would otherwise
+                    // stomp the pack's displayName -- most visibly when two pack entries share
+                    // the same underlying .untold (e.g. an instanced prop), which would
+                    // otherwise leave both children with identical, non-descriptive names.
+                    // Failed child loads also keep this placement so fallback cubes mark the
+                    // broken pack model's intended location.
+                    setEntityName(entityId: childId, name: displayName)
+                }
+                self.recordCompletionAndAdvance(success)
+            }
+        }
+    }
+
+    private func recordCompletionAndAdvance(_ success: Bool) {
+        lock.lock()
+        overallSuccess = overallSuccess && success
+        remaining -= 1
+        let isDone = remaining <= 0
+        let result = overallSuccess
+        lock.unlock()
+
+        if isDone {
+            completionBox?.call(result)
+        } else {
+            startNext()
+        }
+    }
+}
+
+/// Loads every model referenced by a `.untoldpack` manifest as a child entity under
+/// `rootEntityId`, placed using each model's manifest transform. Called from
+/// `setEntityMeshAsync` when it resolves a `.untoldpack` path, so callers never have
+/// to know ahead of time whether a given asset is one model (`.untold`) or many
+/// (`.untoldpack`) -- both load through the same entry point.
+///
+/// This is the live, in-scene counterpart to `createUntoldScene(fromPackAt:savingTo:)`,
+/// which instead seeds a new `.untoldscene` file for later editing rather than
+/// populating the running world directly.
+///
+/// Models load through a bounded concurrency window (see `PackLoadDispatcher`) rather
+/// than all at once, since firing dozens of simultaneous loads can exhaust Swift's
+/// cooperative thread pool against `setEntityMeshAsync`'s internal locking.
+private func loadEntityFromPack(
+    entityId rootEntityId: EntityID,
+    packURL: URL,
+    completion: (@Sendable (Bool) -> Void)? = nil
+) {
+    let completionBox = completion.map { BoolCompletionBox(callback: $0) }
+
+    guard let pack = loadUntoldPack(url: packURL) else {
+        completionBox?.call(false)
+        return
+    }
+
+    withWorldMutationGate {
+        if hasComponent(entityId: rootEntityId, componentType: LocalTransformComponent.self) == false {
+            registerTransformComponent(entityId: rootEntityId)
+        }
+        if hasComponent(entityId: rootEntityId, componentType: ScenegraphComponent.self) == false {
+            registerSceneGraphComponent(entityId: rootEntityId)
+        }
+    }
+
+    guard pack.models.isEmpty == false else {
+        completionBox?.call(true)
+        return
+    }
+
+    let packDir = packURL.deletingLastPathComponent()
+    let dispatcher = PackLoadDispatcher(models: pack.models, packDir: packDir, rootEntityId: rootEntityId, completionBox: completionBox)
+    dispatcher.start()
+}
+
 private func registerManifestScenePayload(_ manifest: TileManifest) {
     for light in manifest.sceneLights ?? [] {
         registerUntoldLight(
@@ -2141,6 +2554,58 @@ private func manifestColorManagement(
     )
 }
 
+/// Resolves a manifest `colorGradeLUT` entry into a RuntimeColorGradeLUT,
+/// downloading it first if the manifest is remote. Mirrors
+/// manifestColorManagement's URL resolution, but the target file is a plain
+/// staged .cube (parsed directly by CubeLUTLoader), not a native texture.
+private func manifestColorGradeLUT(
+    _ entry: ManifestColorGradeLUTEntry?,
+    manifestURL: URL,
+    localManifestURL: URL
+) async throws -> RuntimeColorGradeLUT? {
+    guard let entry else { return nil }
+    guard (2 ... 129).contains(entry.lutSize),
+          entry.domainMin.count == 3,
+          entry.domainMax.count == 3,
+          entry.domainMax[0] > entry.domainMin[0],
+          entry.domainMax[1] > entry.domainMin[1],
+          entry.domainMax[2] > entry.domainMin[2]
+    else {
+        throw UntoldValidationError.invalidColorGradeLUTRecord
+    }
+
+    let baseURL = manifestURL.scheme?.lowercased() == "https"
+        ? manifestURL.deletingLastPathComponent()
+        : localManifestURL.deletingLastPathComponent()
+    let resolvedURL: URL
+    if let absolute = URL(string: entry.lutUri), absolute.scheme != nil {
+        resolvedURL = absolute
+    } else if baseURL.isFileURL {
+        resolvedURL = baseURL.appendingPathComponent(entry.lutUri)
+    } else {
+        guard let remoteURL = URL(string: entry.lutUri, relativeTo: baseURL)?.absoluteURL else {
+            throw URLError(.badURL)
+        }
+        resolvedURL = remoteURL
+    }
+
+    let localLUTURL: URL
+    if resolvedURL.scheme?.lowercased() == "https" {
+        localLUTURL = try await RemoteAssetDownloader.shared.localURL(for: resolvedURL)
+    } else if resolvedURL.scheme?.lowercased() == "http" {
+        throw RemoteAssetDownloader.DownloadError.insecureScheme("http")
+    } else {
+        localLUTURL = resolvedURL
+    }
+
+    return RuntimeColorGradeLUT(
+        lutURL: localLUTURL,
+        lutSize: entry.lutSize,
+        domainMin: SIMD3<Float>(entry.domainMin[0], entry.domainMin[1], entry.domainMin[2]),
+        domainMax: SIMD3<Float>(entry.domainMax[0], entry.domainMax[1], entry.domainMax[2])
+    )
+}
+
 // MARK: - setEntityStreamScene / loadTiledScene
 
 /// Attaches a distance-streamed tile scene to `rootEntityId`.
@@ -2194,6 +2659,7 @@ public func setEntityStreamScene(
 
     let completionBox = completion.map { BoolCompletionBox(callback: $0) }
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let colorManagement = try await manifestColorManagement(
@@ -2202,6 +2668,12 @@ public func setEntityStreamScene(
                 localManifestURL: manifestURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: manifestURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             registerTiledScene(
                 rootEntityId: rootEntityId,
                 manifest: tileManifest,
@@ -2254,6 +2726,7 @@ public func loadTiledScene(
 
     let completionBox = completion.map { BoolCompletionBox(callback: $0) }
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let colorManagement = try await manifestColorManagement(
@@ -2262,6 +2735,12 @@ public func loadTiledScene(
                 localManifestURL: manifestURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: manifestURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             let rootEntityId = createEntity()
             setEntityName(entityId: rootEntityId, name: "\(manifest).root")
             registerTiledScene(
@@ -2301,6 +2780,7 @@ public func setEntityStreamScene(
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let localURL: URL
@@ -2331,6 +2811,12 @@ public func setEntityStreamScene(
                 localManifestURL: localURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: localURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             registerTiledScene(
                 rootEntityId: rootEntityId,
                 manifest: tileManifest,
@@ -2363,6 +2849,7 @@ public func loadTiledScene(
     completion: (@Sendable (Bool) -> Void)? = nil
 ) {
     ColorLUTParams.shared.clear()
+    ColorGradeLUTParams.shared.clear()
     Task {
         do {
             let localURL: URL
@@ -2393,6 +2880,12 @@ public func loadTiledScene(
                 localManifestURL: localURL
             )
             replaceColorManagement(colorManagement)
+            let colorGradeLUT = try await manifestColorGradeLUT(
+                tileManifest.colorGradeLUT,
+                manifestURL: manifestURL,
+                localManifestURL: localURL
+            )
+            replaceColorGradeLUT(colorGradeLUT)
             let rootEntityId = createEntity()
             setEntityName(entityId: rootEntityId, name: "\(manifestURL.deletingPathExtension().lastPathComponent).root")
 
@@ -2769,9 +3262,20 @@ func removeEntityMesh(entityId: EntityID) {
     OctreeSystem.shared.unregisterEntity(entityId)
 
     MemoryBudgetManager.shared.unregisterMesh(entityId: entityId)
+
+    // A splat that stays resident after its mesh left becomes the entity's only
+    // representation again: its bytes take over the ledger entry.
+    if let gaussian = scene.get(component: GaussianComponent.self, for: entityId), gaussian.hasResidentSplats {
+        MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: 0)
+        MemoryBudgetManager.shared.registerMesh(entityId: entityId, meshSizeBytes: gaussian.estimatedGPUBytes)
+        if let box = gaussian.localBoundingBox, let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId) {
+            localTransform.boundingBox = gaussianEntityBoundingBox(box, splatToEntity: gaussian.splatToEntity)
+        }
+    }
 }
 
-public func setEntityAnimations(entityId: EntityID, filename: String, withExtension: String, name: String) {
+public func setEntityAnimations(entityId: EntityID, filename: String, withExtension: String? = nil, name: String) {
+    let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
     let targetEntityIds = resolveAnimationBindingTargetEntities(entityId: entityId)
     guard targetEntityIds.contains(where: { scene.get(component: SkeletonComponent.self, for: $0) != nil }) else {
         handleError(.noSkeletonComponent, entityId)
@@ -2991,6 +3495,13 @@ func registerRenderComponent(entityId: EntityID, meshes: [Mesh], url: URL, asset
     OctreeSystem.shared.registerEntity(entityId)
 
     MemoryBudgetManager.shared.registerMesh(entityId: entityId, meshes: resolvedMeshes)
+
+    // A mesh that (re)registers on an entity with a resident splat makes the splat the
+    // secondary representation: its bytes move beside the mesh entry (registerMesh replaced
+    // the entry).
+    if let gaussian = scene.get(component: GaussianComponent.self, for: entityId), gaussian.hasResidentSplats {
+        MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: gaussian.estimatedGPUBytes)
+    }
 }
 
 func associateMeshesToEntity(entityId: EntityID, meshes: [Mesh]) {
@@ -3167,7 +3678,11 @@ public func encodeCustomComponent<T: Component & Codable>(
     customComponentDecoderMap[decKey] = { entityId, data in
         guard let decoded = try? JSONDecoder().decode(T.self, from: data) else { return }
         if var existing = scene.assign(to: entityId, component: T.self) {
-            if let merge { merge(&existing, decoded) } else { existing = decoded }
+            if let merge {
+                merge(&existing, decoded)
+            } else {
+                existing = decoded
+            }
         }
         // (Optional) If you still want editor visibility auto-restored:
         // EditorComponentsState.shared.components[entityId, default: [:]][encKey] = <your editor metadata>
@@ -3195,7 +3710,9 @@ public func loadRawMesh(
        !node.primitives.isEmpty
     {
         let meshes = makeMeshes(from: node)
-        if !meshes.isEmpty { return meshes }
+        if !meshes.isEmpty {
+            return meshes
+        }
     }
 
     // ---- Fallback path: fabricate a safe default mesh ----
@@ -3203,131 +3720,1528 @@ public func loadRawMesh(
     return Mesh.makeDefaultMesh()
 }
 
-public func setEntityGaussian(entityId: EntityID, filename: String, withExtension: String) {
-    guard let url = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
-        handleError(.filenameNotFound, filename)
-        return
+/// Built Metal resources for a parsed Gaussian splat asset, ready to attach to an entity.
+/// Shared by `setEntityGaussian` (synchronous) and `setEntityGaussianAsync` (off-thread) so
+/// there is a single implementation of the PLY-parse/buffer-build/SH-pack pipeline.
+struct GaussianLoadResult {
+    let splatCount: UInt
+    // Whole-buffer entities: one buffer per in-flight frame slot (see the comment on
+    // GaussianComponent's matching fields) — written fresh every frame by the cull, so a single
+    // shared buffer would let an overlapping newer frame's writes clobber data an older
+    // in-flight frame is still reading. Empty for a chunked entity, whose per-slot lists live on
+    // its chunk table. The sort keys and draw records are per frame and shared across entities
+    // (GaussianSharedWorkingSet), not per entity.
+    let gaussianVisibleIndices: [MTLBuffer]
+    let gaussianVisibleCount: [MTLBuffer]
+    /// The whole-buffer entity's `EncodedGaussianSplat` records; nil for a chunked entity.
+    let encodedSplatBuffer: MTLBuffer?
+    /// The chunked entity's resident 16-byte `.untoldgs` records; nil for a whole-buffer entity.
+    let packedSplatBuffer: MTLBuffer?
+    let sphericalHarmonicsBuffer: MTLBuffer?
+    let sphericalHarmonicsMetadata: GaussianSHMetadata?
+    /// Capture exposure and white balance from a `.untoldgs` header (0 and 1 for a `.ply`).
+    var captureExposureEV: Float = 0
+    var captureWhiteBalance = SIMD3<Float>(repeating: 1)
+    /// The `.untoldgs` chunk table kept from the load (see `GaussianChunkTable`); nil for a
+    /// `.ply` or a CPU-decoded asset.
+    let chunkTable: GaussianChunkTable?
+    /// The pager of a `.untoldgs` loaded above the paging threshold (`packedSplatBuffer` is its
+    /// page pool); nil when every record is resident.
+    var pager: GaussianPageManager?
+    /// Sum of all GPU buffer bytes above, for `MemoryBudgetManager` registration — a paged
+    /// entity's pool and tables, not its file. The frame's shared working set is budgeted and
+    /// has its own ledger entry, so no share of it is here.
+    let estimatedGPUBytes: Int
+    /// Local-space bounding box computed from the actual loaded splat positions, for
+    /// `LocalTransformComponent.boundingBox` — see `computeGaussianSplatBoundingBox`.
+    let boundingBox: (min: simd_float3, max: simd_float3)
+}
+
+// `UntoldGSError`, `UntoldGSAsset` and `UntoldGSFormat` live in AssetFormat/UntoldGS*.swift.
+
+/// Builds GPU buffers from already-encoded Gaussian splat data.
+/// Returns `nil` on any failure, calling `handleError` internally — callers just guard-return.
+func buildGaussianLoadResult(
+    encodedSplats: [EncodedGaussianSplat],
+    packedSphericalHarmonics: PackedGaussianSphericalHarmonics?,
+    meanSquaredSplatExtent: Float = 0,
+    sourceDescription: String
+) -> GaussianLoadResult? {
+    // The whole-buffer path costs about 60 bytes per splat resident, so its cap is lower than
+    // the per-chunk path's (GaussianRuntimeLimits).
+    guard encodedSplats.count <= GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity else {
+        handleError(.bufferAllocationFailed, "Too many Gaussian splats: \(encodedSplats.count) exceeds maximum \(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity) for the whole-buffer path")
+        return nil
     }
 
-    // Attempt to read Gaussian splats, handling errors internally
-    let asset: GaussianSplatAsset
-    do {
-        asset = try PLYReader.readGaussianAsset(from: url)
-    } catch {
-        handleError(.assetDataMissing, "Failed to read Gaussian splats from \(filename): \(error.localizedDescription)")
-        return
-    }
-    let splats = asset.splats
-
-    // Check if we exceed the buffer capacity
-    guard splats.count <= Int(maxNumOfGaussians) else {
-        handleError(.bufferAllocationFailed, "Too many Gaussian splats: \(splats.count) exceeds maximum \(maxNumOfGaussians)")
-        return
-    }
-
-    let splatCount = UInt(splats.count)
+    let splatCount = UInt(encodedSplats.count)
     guard splatCount > 0 else {
-        handleError(.assetDataMissing, "Gaussian splat file contains no vertices: \(filename)")
-        return
+        handleError(.assetDataMissing, "Gaussian splat file contains no vertices: \(sourceDescription)")
+        return nil
     }
-
-    guard let gaussianSortedIndices = renderInfo.device.makeBuffer(
-        length: MemoryLayout<UInt64>.stride * Int(splatCount),
-        options: .storageModeShared
-    ) else {
-        handleError(.bufferAllocationFailed, "Gaussian sorted-index buffer is nil")
-        return
-    }
-
-    guard let gaussianVisibleIndices = renderInfo.device.makeBuffer(
-        length: MemoryLayout<UInt32>.stride * Int(splatCount),
-        options: .storageModeShared
-    ) else {
-        handleError(.bufferAllocationFailed, "Gaussian visible-index buffer is nil")
-        return
-    }
-
-    guard let gaussianVisibleCount = renderInfo.device.makeBuffer(
-        length: MemoryLayout<UInt32>.stride,
-        options: .storageModeShared
-    ) else {
-        handleError(.bufferAllocationFailed, "Gaussian visible-count buffer is nil")
-        return
-    }
-    gaussianVisibleCount.contents().storeBytes(of: UInt32(splatCount), as: UInt32.self)
 
     guard let encodedSplatBuffer = renderInfo.device.makeBuffer(length: MemoryLayout<EncodedGaussianSplat>.stride * Int(splatCount), options: .storageModeShared) else {
         handleError(.bufferAllocationFailed, "Encoded Gaussian splat buffer is nil")
-        return
+        return nil
     }
 
-    let encodedPointer = encodedSplatBuffer.contents().bindMemory(
-        to: EncodedGaussianSplat.self,
-        capacity: splats.count
-    )
-
-    for (index, splat) in splats.enumerated() {
-        encodedPointer[index] = encodeGaussianSplatForTBDR(splat)
-    }
-
-    let packedSphericalHarmonics: PackedGaussianSphericalHarmonics?
-    do {
-        packedSphericalHarmonics = try asset.sphericalHarmonics.map {
-            try packGaussianSphericalHarmonics($0, splatCount: splats.count)
-        }
-    } catch {
-        handleError(.assetDataMissing, "Failed to pack spherical harmonics from \(filename): \(error.localizedDescription)")
-        return
+    encodedSplats.withUnsafeBytes { bytes in
+        encodedSplatBuffer.contents().copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
     }
 
     let sphericalHarmonicsBuffer: MTLBuffer?
     if let packedSphericalHarmonics, !packedSphericalHarmonics.coefficients.isEmpty {
         sphericalHarmonicsBuffer = renderInfo.device.makeBuffer(
             bytes: packedSphericalHarmonics.coefficients,
-            length: packedSphericalHarmonics.coefficients.count * MemoryLayout<Float16>.stride,
+            length: packedSphericalHarmonics.coefficients.count * MemoryLayout<UInt8>.stride,
             options: .storageModeShared
         )
         guard sphericalHarmonicsBuffer != nil else {
             handleError(.bufferAllocationFailed, "Gaussian spherical-harmonics buffer is nil")
-            return
+            return nil
         }
         sphericalHarmonicsBuffer?.label = "Gaussian Spherical Harmonics"
     } else {
         sphericalHarmonicsBuffer = nil
     }
 
-    let spaceUniform = (0 ..< totalPerMeshUniformBuffers()).compactMap { _ in
-        renderInfo.device.makeBuffer(length: MemoryLayout<Uniforms>.stride,
-                                     options: [MTLResourceOptions.storageModeShared])
+    return buildGaussianLoadResult(
+        encodedSplatBuffer: encodedSplatBuffer,
+        splatCount: splatCount,
+        sphericalHarmonicsBuffer: sphericalHarmonicsBuffer,
+        sphericalHarmonicsMetadata: packedSphericalHarmonics?.metadata,
+        // Splat centers alone under-size the true silhouette wherever a large-scale splat sits
+        // near the edge — pad uniformly by an approximate per-splat radius derived from the
+        // tier's mean squared extent (sqrt of the mean of major-axis², i.e. an RMS radius),
+        // since only splat centers/positions (not per-splat scale) are available post-encode.
+        boundingBox: computeGaussianSplatPositionBoundingBox(
+            encodedSplats.map(\.position),
+            padding: meanSquaredSplatExtent > 0 ? sqrt(meanSquaredSplatExtent) : 0
+        )
+    )
+}
+
+/// Builds the per-frame buffers around an already GPU-resident encoded splat buffer (from the
+/// CPU encode above, or a `.untoldgs` decoded whole by `GaussianChunkLoader.decodeEncodedSplats`
+/// when the per-chunk kernels are unavailable): the whole-buffer path a `.ply` takes.
+func buildGaussianLoadResult(
+    encodedSplatBuffer: MTLBuffer,
+    splatCount: UInt,
+    sphericalHarmonicsBuffer: MTLBuffer?,
+    sphericalHarmonicsMetadata: GaussianSHMetadata?,
+    boundingBox: (min: simd_float3, max: simd_float3)
+) -> GaussianLoadResult? {
+    var gaussianVisibleIndices: [MTLBuffer] = []
+    var gaussianVisibleCount: [MTLBuffer] = []
+    for _ in 0 ..< maxInFlightCommandBuffers {
+        guard let visibleIndicesSlot = renderInfo.device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride * Int(splatCount),
+            options: .storageModeShared
+        ) else {
+            handleError(.bufferAllocationFailed, "Gaussian visible-index buffer is nil")
+            return nil
+        }
+        gaussianVisibleIndices.append(visibleIndicesSlot)
+
+        // A GaussianVisibleSet: the cull's atomic count at offset 0, followed by the indirect
+        // dispatch and draw arguments derived from it on the GPU (see ShaderTypes.h). Starts
+        // out as "everything visible" until the first cull runs.
+        guard let visibleCountSlot = renderInfo.device.makeBuffer(
+            length: MemoryLayout<GaussianVisibleSet>.stride,
+            options: .storageModeShared
+        ) else {
+            handleError(.bufferAllocationFailed, "Gaussian visible-count buffer is nil")
+            return nil
+        }
+        visibleCountSlot.contents().storeBytes(
+            of: makeGaussianVisibleSet(visibleCount: UInt32(splatCount)),
+            as: GaussianVisibleSet.self
+        )
+        gaussianVisibleCount.append(visibleCountSlot)
     }
 
-    withWorldMutationGate {
-        registerComponent(entityId: entityId, componentType: GaussianComponent.self)
+    var estimatedGPUBytes = 0
+    for buffer in gaussianVisibleIndices {
+        estimatedGPUBytes += buffer.length
+    }
+    for buffer in gaussianVisibleCount {
+        estimatedGPUBytes += buffer.length
+    }
+    estimatedGPUBytes += encodedSplatBuffer.length
+    estimatedGPUBytes += sphericalHarmonicsBuffer?.length ?? 0
 
-        guard let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) else {
-            handleError(.noRenderComponent, entityId)
-            return
-        }
+    return GaussianLoadResult(
+        splatCount: splatCount,
+        gaussianVisibleIndices: gaussianVisibleIndices,
+        gaussianVisibleCount: gaussianVisibleCount,
+        encodedSplatBuffer: encodedSplatBuffer,
+        packedSplatBuffer: nil,
+        sphericalHarmonicsBuffer: sphericalHarmonicsBuffer,
+        sphericalHarmonicsMetadata: sphericalHarmonicsMetadata,
+        chunkTable: nil,
+        estimatedGPUBytes: estimatedGPUBytes,
+        boundingBox: boundingBox
+    )
+}
 
-        gaussianComponent.splatCount = splatCount
-        gaussianComponent.visibleSplatCountForRendering = splatCount
-        gaussianComponent.gaussianSortedIndices = gaussianSortedIndices
-        gaussianComponent.gaussianVisibleIndices = gaussianVisibleIndices
-        gaussianComponent.gaussianVisibleCount = gaussianVisibleCount
-        gaussianComponent.encodedSplatData = encodedSplatBuffer
-        gaussianComponent.sphericalHarmonicsData = sphericalHarmonicsBuffer
-        gaussianComponent.sphericalHarmonicsMetadata = packedSphericalHarmonics?.metadata
-        gaussianComponent.spaceUniform = spaceUniform
+/// Builds the per-frame buffers of a chunked `.untoldgs` entity around its resident packed
+/// records and chunk table (`GaussianChunkLoader.load`): the per-slot visible-chunk list and
+/// record, so the frame can cull whole chunks and decode only the survivors' quotas
+/// (see GaussianChunkCull.swift). No encoded buffer and no per-slot index buffers exist on
+/// this path — per splat, only the 16-byte record and its harmonics stay resident; for a paged
+/// load (`pager`) the packed buffer is the page pool, so the estimate carries the pool and the
+/// per-slot tables, not the file.
+func buildGaussianLoadResult(
+    packedSplatBuffer: MTLBuffer,
+    splatCount: UInt,
+    sphericalHarmonicsBuffer: MTLBuffer?,
+    sphericalHarmonicsMetadata: GaussianSHMetadata?,
+    boundingBox: (min: simd_float3, max: simd_float3),
+    chunkTable: GaussianChunkTable,
+    pager: GaussianPageManager? = nil
+) -> GaussianLoadResult? {
+    guard let allocated = allocateGaussianVisibleChunkBuffers(for: chunkTable) else {
+        handleError(.bufferAllocationFailed, "Gaussian visible-chunk buffers are nil")
+        return nil
+    }
+
+    var estimatedGPUBytes = packedSplatBuffer.length
+    estimatedGPUBytes += sphericalHarmonicsBuffer?.length ?? 0
+    estimatedGPUBytes += allocated.gpuBytes
+
+    return GaussianLoadResult(
+        splatCount: splatCount,
+        gaussianVisibleIndices: [],
+        gaussianVisibleCount: [],
+        encodedSplatBuffer: nil,
+        packedSplatBuffer: packedSplatBuffer,
+        sphericalHarmonicsBuffer: sphericalHarmonicsBuffer,
+        sphericalHarmonicsMetadata: sphericalHarmonicsMetadata,
+        chunkTable: allocated,
+        pager: pager,
+        estimatedGPUBytes: estimatedGPUBytes,
+        boundingBox: boundingBox
+    )
+}
+
+/// Min/max bounding box over a set of local-space splat positions, expanded by `padding` in
+/// every direction (see call site doc for why: splat centers alone under-size the true
+/// silhouette). Mirrors `Mesh.computeMeshBoundingBox`'s shape/purpose for the mesh path.
+func computeGaussianSplatPositionBoundingBox(_ positions: [simd_float3], padding: Float = 0) -> (min: simd_float3, max: simd_float3) {
+    guard !positions.isEmpty else { return (min: .zero, max: .zero) }
+    var boundsMin = simd_float3(repeating: .infinity)
+    var boundsMax = simd_float3(repeating: -.infinity)
+    for position in positions {
+        boundsMin = simd_min(boundsMin, position)
+        boundsMax = simd_max(boundsMax, position)
+    }
+    let paddingVector = simd_float3(repeating: padding)
+    return (min: boundsMin - paddingVector, max: boundsMax + paddingVector)
+}
+
+/// Min/max bounding box over a set of source `GaussianSplat`s (bake-time, pre-encode form),
+/// expanded per-splat by its own major-axis extent (`gaussianMajorAxis`) rather than just its
+/// center — a splat whose center sits near the silhouette boundary but has a large individual
+/// scale visually extends past a centers-only box. Used for the asset-level box in
+/// `bakeGaussianSplatProgressiveTiers`, where the position hasn't been encoded into
+/// `EncodedGaussianSplat` yet and real per-splat scale is still available.
+func computeGaussianSplatBoundingBox(_ splats: [GaussianSplat]) -> (min: simd_float3, max: simd_float3) {
+    guard !splats.isEmpty else { return (min: .zero, max: .zero) }
+    return UntoldGSFormat.expandedBoundingBox(
+        count: splats.count,
+        position: { simd_float3(splats[$0].center.x, splats[$0].center.y, splats[$0].center.z) },
+        radius: { gaussianMajorAxis(splats[$0]) }
+    )
+}
+
+/// Reads a `.ply` or `.untoldgs` Gaussian splat asset from disk and builds its GPU buffers.
+/// Returns `nil` on any failure, calling `handleError` internally — callers just guard-return.
+private func buildGaussianLoadResult(filename: String, withExtension: String) -> GaussianLoadResult? {
+    guard let url = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
+        handleError(.filenameNotFound, filename)
+        return nil
+    }
+
+    if withExtension.lowercased() == "untoldgs" {
+        return buildGaussianLoadResultFromUntoldGS(url: url)
+    }
+
+    do {
+        return try buildGaussianLoadResultFromPLY(url: url, sourceDescription: filename)
+    } catch {
+        handleError(.assetDataMissing, "Failed to read Gaussian splats from \(filename): \(error.localizedDescription)")
+        return nil
     }
 }
 
-struct PackedGaussianSphericalHarmonics {
-    let coefficients: [Float16]
-    let metadata: GaussianSHMetadata
+func buildGaussianLoadResultFromPLY(url: URL, sourceDescription: String) throws -> GaussianLoadResult? {
+    let asset = try PLYReader.readGaussianAsset(from: url)
+    let encodedSplats = asset.splats.map(encodeGaussianSplatForTBDR)
+
+    // Reported here, distinctly from a raw PLY-parse failure (which propagates to the
+    // caller's catch instead), so a debugger sees "failed to pack SH" rather than a generic
+    // "failed to read" message when the file parses fine but has bad SH data (e.g. NaN).
+    let packedSphericalHarmonics: PackedGaussianSphericalHarmonics?
+    do {
+        packedSphericalHarmonics = try asset.sphericalHarmonics.map {
+            try packGaussianSphericalHarmonics($0, splatCount: asset.splats.count)
+        }
+    } catch {
+        handleError(.assetDataMissing, "Failed to pack spherical harmonics from \(sourceDescription): \(error.localizedDescription)")
+        return nil
+    }
+
+    return buildGaussianLoadResult(
+        encodedSplats: encodedSplats,
+        packedSphericalHarmonics: packedSphericalHarmonics,
+        meanSquaredSplatExtent: meanSquaredSplatExtent(asset.splats, keeping: Array(asset.splats.indices)),
+        sourceDescription: sourceDescription
+    )
+}
+
+/// Builds GPU buffers for a `.untoldgs` file. Version-3 chunks are read by byte range into the
+/// resident packed buffer (`GaussianChunkLoader`) and decoded every frame by the fused per-chunk
+/// pass; when those kernels are unavailable but the decode kernel is, the records are expanded
+/// once (`decodeEncodedSplats`) into the whole-buffer path a `.ply` takes; with neither the file
+/// is decoded on the CPU through `UntoldGSFormat.read`.
+/// Returns `nil` on any failure, calling `handleError` internally — callers just guard-return.
+func buildGaussianLoadResultFromUntoldGS(url: URL) -> GaussianLoadResult? {
+    if GaussianChunkLoader.isAvailable {
+        do {
+            // Paging needs the per-chunk kernels: only a chunked entity can read a page pool.
+            let chunkKernels = GaussianChunkCullPipelineStates.current() != nil
+            let loaded = try GaussianChunkLoader.load(url: url, allowPaging: chunkKernels)
+            var result: GaussianLoadResult?
+            if chunkKernels {
+                result = buildGaussianLoadResult(
+                    packedSplatBuffer: loaded.packedSplatBuffer,
+                    splatCount: UInt(loaded.splatCount),
+                    sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
+                    sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
+                    boundingBox: loaded.boundingBox,
+                    chunkTable: loaded.chunkTable,
+                    pager: loaded.pager
+                )
+                if result == nil {
+                    loaded.pager?.shutdown()
+                }
+            } else {
+                // Expanded to 48-byte records plus index buffers: the whole-buffer path's cap.
+                guard loaded.splatCount <= GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity else {
+                    handleError(.bufferAllocationFailed, "Too many Gaussian splats: \(loaded.splatCount) exceeds maximum \(GaussianRuntimeLimits.maxWholeBufferSplatsPerEntity) for the whole-buffer path (\(url.lastPathComponent), per-chunk kernels unavailable)")
+                    return nil
+                }
+                result = try buildGaussianLoadResult(
+                    encodedSplatBuffer: GaussianChunkLoader.decodeEncodedSplats(loaded),
+                    splatCount: UInt(loaded.splatCount),
+                    sphericalHarmonicsBuffer: loaded.sphericalHarmonicsBuffer,
+                    sphericalHarmonicsMetadata: loaded.sphericalHarmonicsMetadata,
+                    boundingBox: loaded.boundingBox
+                )
+            }
+            guard var result else { return nil }
+            result.captureExposureEV = loaded.captureExposureEV
+            result.captureWhiteBalance = loaded.captureWhiteBalance
+            return result
+        } catch {
+            handleError(.assetDataMissing, "Failed to load .untoldgs Gaussian asset \(url.lastPathComponent): \(error)")
+            return nil
+        }
+    }
+
+    let asset: UntoldGSAsset
+    do {
+        asset = try UntoldGSFormat.read(from: url)
+    } catch {
+        handleError(.assetDataMissing, "Failed to read .untoldgs Gaussian tier from \(url.lastPathComponent): \(error)")
+        return nil
+    }
+    let packedSphericalHarmonics = asset.shMetadata.map {
+        PackedGaussianSphericalHarmonics(coefficients: asset.shCoefficients, metadata: $0)
+    }
+    guard var result = buildGaussianLoadResult(
+        encodedSplats: asset.encodedSplats,
+        packedSphericalHarmonics: packedSphericalHarmonics,
+        meanSquaredSplatExtent: asset.meanSquaredSplatExtent,
+        sourceDescription: url.lastPathComponent
+    ) else { return nil }
+    if let header = try? UntoldGSFormat.readHeaderV3(from: url) {
+        result.captureExposureEV = header.captureExposureEV
+        result.captureWhiteBalance = header.captureWhiteBalance
+    }
+    return result
+}
+
+func buildGaussianComponentFromUntoldGS(url: URL) -> (
+    component: GaussianComponent,
+    estimatedGPUBytes: Int,
+    meanSquaredSplatExtent: Float,
+    boundingBox: (min: simd_float3, max: simd_float3)
+)? {
+    let meanSquaredSplatExtent: Float
+    do {
+        meanSquaredSplatExtent = try UntoldGSFormat.readHeaderV3(from: url).meanSquaredSplatExtent
+    } catch {
+        handleError(.assetDataMissing, "Failed to read .untoldgs Gaussian tier header from \(url.lastPathComponent): \(error)")
+        return nil
+    }
+    guard let result = buildGaussianLoadResultFromUntoldGS(url: url) else {
+        return nil
+    }
+
+    let component = GaussianComponent()
+    copyGaussianLoadResult(result, to: component)
+    return (component, result.estimatedGPUBytes, meanSquaredSplatExtent, result.boundingBox)
+}
+
+/// Registers `GaussianComponent` on `entityId` from a built `GaussianLoadResult` and records
+/// its GPU footprint with `MemoryBudgetManager`. Must be called from within a world-mutation
+/// gate (`withWorldMutationGate`).
+///
+/// An entity may carry a mesh and a splat at once (a captured twin standing in for its mesh).
+/// The mesh then stays the primary representation: the splat's bytes ride beside the mesh's
+/// ledger entry (`setAuxiliaryMeshBytes`) rather than replacing it, and the mesh keeps its own
+/// bounding box (the splat pass culls per splat on the GPU and never consults the entity box;
+/// the splat's box is kept on `GaussianComponent.localBoundingBox`). `registerRenderComponent`
+/// and `removeEntityMesh` keep that arrangement when the mesh arrives or leaves later.
+private func applyGaussianLoadResult(_ result: GaussianLoadResult, to entityId: EntityID, opacityScale: Float = 1) {
+    // Release a splat already on the entity first: re-assigning the component slot would
+    // leave the old instance and its Metal buffers alive (see `copyGaussianComponentBuffers`).
+    // Its alignment is the entity's, not the payload's, and carries over to the reload — from
+    // the resident component, or from the stash a streaming eviction left behind.
+    var splatToEntity = matrix_identity_float4x4
+    if let previous = scene.get(component: GaussianComponent.self, for: entityId) {
+        splatToEntity = previous.splatToEntity
+        removeEntityGaussian(entityId: entityId)
+    } else if let streaming = scene.get(component: StreamingComponent.self, for: entityId),
+              let retained = streaming.retainedSplatToEntity
+    {
+        splatToEntity = retained
+        streaming.retainedSplatToEntity = nil
+    }
+    registerComponent(entityId: entityId, componentType: GaussianComponent.self)
+
+    guard let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) else {
+        handleError(.noRenderComponent, entityId)
+        return
+    }
+
+    copyGaussianLoadResult(result, to: gaussianComponent)
+    gaussianComponent.opacityScale = max(0, opacityScale)
+    gaussianComponent.splatToEntity = splatToEntity
+
+    if entityHasMesh(entityId) {
+        MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: result.estimatedGPUBytes)
+        return
+    }
+
+    MemoryBudgetManager.shared.registerMesh(entityId: entityId, meshSizeBytes: result.estimatedGPUBytes)
+
+    if let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId) {
+        localTransform.boundingBox = gaussianEntityBoundingBox(result.boundingBox, splatToEntity: gaussianComponent.splatToEntity)
+    }
+}
+
+/// Places the entity's splat inside the entity: `GaussianComponent.splatToEntity` becomes
+/// `splatToEntity` (`GaussianSplatAlignment.matrix` for a scene link's alignment; identity puts
+/// the splat back where the payload has it). When the splat is the entity's only representation
+/// its bounding box is carried through the new value as well, so the LOD selection and the
+/// bounds tools see the splat where it is drawn; a twin entity keeps its mesh's box, and a
+/// progressive entity whose box the caller supplied keeps that one. Cheap to call every tick
+/// with the same value: an unchanged matrix does nothing. Nothing happens on an entity
+/// without a splat.
+public func setGaussianSplatToEntity(entityId: EntityID, _ splatToEntity: simd_float4x4) {
+    guard let gaussian = scene.get(component: GaussianComponent.self, for: entityId),
+          gaussian.splatToEntity != splatToEntity
+    else { return }
+    gaussian.splatToEntity = splatToEntity
+
+    guard !entityHasMesh(entityId),
+          let box = gaussian.localBoundingBox,
+          let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId),
+          scene.get(component: GaussianLODComponent.self, for: entityId)?.hasExplicitBoundingBox != true
+    else { return }
+    localTransform.boundingBox = gaussianEntityBoundingBox(box, splatToEntity: splatToEntity)
+}
+
+/// The splat's own box carried into the entity's local space through `splatToEntity`: the box
+/// of its eight transformed corners. What the entity's bounding box becomes when the splat is
+/// the entity's only representation.
+func gaussianEntityBoundingBox(
+    _ box: (min: simd_float3, max: simd_float3),
+    splatToEntity: simd_float4x4
+) -> (min: simd_float3, max: simd_float3) {
+    if splatToEntity == matrix_identity_float4x4 {
+        return box
+    }
+    var result = (min: simd_float3(repeating: .greatestFiniteMagnitude), max: simd_float3(repeating: -.greatestFiniteMagnitude))
+    for corner in 0 ..< 8 {
+        let local = simd_float3(
+            corner & 1 == 0 ? box.min.x : box.max.x,
+            corner & 2 == 0 ? box.min.y : box.max.y,
+            corner & 4 == 0 ? box.min.z : box.max.z
+        )
+        let transformed = simd_mul(splatToEntity, simd_float4(local, 1))
+        let point = simd_float3(transformed.x, transformed.y, transformed.z)
+        result.min = simd_min(result.min, point)
+        result.max = simd_max(result.max, point)
+    }
+    return result
+}
+
+/// Whether the entity draws a mesh (a `RenderComponent` with geometry) — the splat on such an
+/// entity is the secondary representation for the ledger and the bounding box.
+func entityHasMesh(_ entityId: EntityID) -> Bool {
+    scene.get(component: RenderComponent.self, for: entityId)?.mesh.isEmpty == false
+}
+
+/// Builds the GPU buffers for a splat file by URL — `.untoldgs` through `GaussianChunkLoader`,
+/// anything else as a `.ply`. `nil` on failure, reported through `handleError` like the other
+/// Gaussian load paths.
+func buildGaussianLoadResult(url: URL) -> GaussianLoadResult? {
+    if url.pathExtension.lowercased() == "untoldgs" {
+        return buildGaussianLoadResultFromUntoldGS(url: url)
+    }
+    do {
+        return try buildGaussianLoadResultFromPLY(url: url, sourceDescription: url.lastPathComponent)
+    } catch {
+        handleError(.assetDataMissing, "Failed to read Gaussian splats from \(url.lastPathComponent): \(error.localizedDescription)")
+        return nil
+    }
+}
+
+/// A splat read and encoded to GPU buffers but not yet attached to an entity: the result of
+/// `loadGaussianSplatPayload(url:)`, handed to `setEntityGaussian(entityId:payload:opacityScale:)`.
+/// Lets a caller load off the main thread and decide under its own world-mutation gate whether
+/// the load is still wanted (an entity relinked meanwhile, a superseded request).
+public struct GaussianSplatPayload: @unchecked Sendable {
+    let result: GaussianLoadResult
+
+    public var splatCount: Int {
+        Int(result.splatCount)
+    }
+
+    public var estimatedGPUBytes: Int {
+        result.estimatedGPUBytes
+    }
+
+    public var boundingBox: (min: simd_float3, max: simd_float3) {
+        result.boundingBox
+    }
+}
+
+/// Reads and encodes the splat at `url` (`.untoldgs` or `.ply`) off the caller's actor. `nil` on
+/// failure, reported through `handleError` like the other Gaussian load paths.
+public func loadGaussianSplatPayload(url: URL) async -> GaussianSplatPayload? {
+    guard let result = buildGaussianLoadResult(url: url) else { return nil }
+    return GaussianSplatPayload(result: result)
+}
+
+/// Attaches a loaded payload to `entityId` under the world-mutation gate. `opacityScale` is the
+/// weight the splat starts with — 0 keeps it resident but hidden until a cross-fade brings it in.
+/// The entity may already carry a mesh; see `applyGaussianLoadResult` for how the two share the
+/// ledger and the bounding box. Returns false if the entity is gone.
+@discardableResult
+public func setEntityGaussian(entityId: EntityID, payload: GaussianSplatPayload, opacityScale: Float = 1) -> Bool {
+    withWorldMutationGate {
+        guard scene.exists(entityId) else { return false }
+        applyGaussianLoadResult(payload.result, to: entityId, opacityScale: opacityScale)
+        return scene.get(component: GaussianComponent.self, for: entityId) != nil
+    }
+}
+
+/// `loadGaussianSplatPayload` followed by `setEntityGaussian(entityId:payload:opacityScale:)`, like
+/// `setEntityGaussianAsync(entityId:filename:withExtension:)` but for a payload the caller already
+/// located (a `GaussianAssetLinkComponent.payloadURL`, a file picked at runtime).
+@discardableResult
+public func setEntityGaussianAsync(entityId: EntityID, url: URL, opacityScale: Float = 1) async -> Bool {
+    guard let payload = await loadGaussianSplatPayload(url: url) else {
+        return false
+    }
+    let didAttach = setEntityGaussian(entityId: entityId, payload: payload, opacityScale: opacityScale)
+    if didAttach {
+        withWorldMutationGate {
+            scene.get(component: GaussianComponent.self, for: entityId)?.sourceURL = url
+        }
+    }
+    return didAttach
+}
+
+func copyGaussianLoadResult(_ result: GaussianLoadResult, to gaussianComponent: GaussianComponent) {
+    gaussianComponent.splatCount = result.splatCount
+    gaussianComponent.visibleSplatCountForRendering = result.splatCount
+    gaussianComponent.gaussianVisibleIndices = result.gaussianVisibleIndices.map { $0 as MTLBuffer? }
+    gaussianComponent.gaussianVisibleCount = result.gaussianVisibleCount.map { $0 as MTLBuffer? }
+    gaussianComponent.chunkTable = result.chunkTable
+    gaussianComponent.pager = result.pager
+    gaussianComponent.encodedSplatData = result.encodedSplatBuffer
+    gaussianComponent.packedSplatData = result.packedSplatBuffer
+    gaussianComponent.sphericalHarmonicsData = result.sphericalHarmonicsBuffer
+    gaussianComponent.sphericalHarmonicsMetadata = result.sphericalHarmonicsMetadata
+    gaussianComponent.captureExposureEV = result.captureExposureEV
+    gaussianComponent.captureWhiteBalance = result.captureWhiteBalance
+    gaussianComponent.estimatedGPUBytes = result.estimatedGPUBytes
+    gaussianComponent.localBoundingBox = result.boundingBox
+}
+
+public enum GaussianSource {
+    case single(filename: String, withExtension: String)
+    /// No `boundingBoxHalfExtent` here: both `setEntityGaussian(source:)` and
+    /// `setEntityGaussianTileStreaming(source:options:)` can read a real box baked into the
+    /// `.untoldgs` header itself (see `UntoldGSFormat.readHeader`) — an explicit override, when
+    /// one is genuinely needed, is a parameter on the underlying registration path instead
+    /// (`GaussianStreamingOptions.boundingBoxHalfExtent` for streaming). Overdraw-aware LOD
+    /// stats (`meanSquaredSplatExtent`) are baked directly into each `.untoldgs` tier by
+    /// `bakeGaussianSplatProgressiveTiers` and read automatically when a tier loads — nothing to
+    /// pass here either.
+    case progressive(
+        baseFilename: String,
+        withExtension: String = "untoldgs",
+        levelCount: Int,
+        maxDistances: [Float]
+    )
+}
+
+public typealias GaussianStreamingSource = GaussianSource
+
+public func setEntityGaussian(entityId: EntityID, filename: String, withExtension: String? = nil) {
+    let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
+    guard let result = buildGaussianLoadResult(filename: filename, withExtension: withExtension) else {
+        return
+    }
+    let sourceURL = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil)
+
+    withWorldMutationGate {
+        applyGaussianLoadResult(result, to: entityId)
+        scene.get(component: GaussianComponent.self, for: entityId)?.sourceURL = sourceURL
+    }
+}
+
+/// Registers a Gaussian splat entity that is always present, either as one whole asset or
+/// as a progressive multi-tier `.untoldgs` asset. Progressive entities do not require a
+/// streamed tile scene: the coarsest tier is loaded immediately, then `GaussianLODSystem`
+/// requests finer tiers based on camera distance.
+public func setEntityGaussian(entityId: EntityID, source: GaussianSource) {
+    switch source {
+    case let .single(filename, ext):
+        setEntityGaussian(entityId: entityId, filename: filename, withExtension: ext)
+    case let .progressive(baseFilename, ext, levelCount, maxDistances):
+        setEntityGaussianProgressive(
+            entityId: entityId,
+            baseFilename: baseFilename,
+            withExtension: ext,
+            levelCount: levelCount,
+            maxDistances: maxDistances
+        )
+    }
+}
+
+/// Asynchronously reads and encodes a `.ply` Gaussian splat asset and attaches it to
+/// `entityId` without blocking the main thread. Parsing, per-splat encoding, and spherical-
+/// harmonics packing all run before the world-mutation gate is acquired; only the final
+/// component registration runs under `withWorldMutationGate`, mirroring `setEntityMeshAsync`'s
+/// pattern of keeping GPU resource work outside the gate.
+///
+/// `async -> Bool` (rather than `setEntityMeshAsync`'s fire-and-forget/completion shape) so
+/// `GeometryStreamingSystem.loadMesh` can `await` it directly from its own dispatch `Task`,
+/// the same way it awaits the mesh path. Used both by direct callers that want a non-blocking
+/// one-off load, and internally by the streaming system for distance-streamed splat props —
+/// gaussians have no cache/OCC layer analogous to `MeshResourceManager`, so unlike mesh
+/// streaming there is no separate streaming-only loader.
+@discardableResult
+public func setEntityGaussianAsync(
+    entityId: EntityID,
+    filename: String,
+    withExtension: String,
+    completion: (@Sendable (Bool) -> Void)? = nil
+) async -> Bool {
+    guard let result = buildGaussianLoadResult(filename: filename, withExtension: withExtension) else {
+        completion?(false)
+        return false
+    }
+
+    withWorldMutationGate {
+        applyGaussianLoadResult(result, to: entityId)
+        scene.get(component: GaussianComponent.self, for: entityId)?.sourceURL =
+            LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil)
+    }
+
+    completion?(true)
+    return true
+}
+
+public struct GaussianStreamingOptions {
+    public var streamingRadius: Float
+    public var unloadRadius: Float
+    /// Explicit override for the entity's local-space bounding box. Optional: `.untoldgs`
+    /// sources (single-file or progressive) can read a real box baked into the file itself —
+    /// see `UntoldGSFormat.readHeader` — so this is only required for a raw `.ply` `.single`
+    /// source, which has no baked box to fall back to.
+    public var boundingBoxHalfExtent: simd_float3?
+    public var priority: Int
+
+    public init(
+        streamingRadius: Float = 100.0,
+        unloadRadius: Float = 150.0,
+        boundingBoxHalfExtent: simd_float3? = nil,
+        priority: Int = 0
+    ) {
+        self.streamingRadius = streamingRadius
+        self.unloadRadius = unloadRadius
+        self.boundingBoxHalfExtent = boundingBoxHalfExtent
+        self.priority = priority
+    }
+}
+
+/// Registers a Gaussian splat entity to load/unload with the entity's containing tile, either
+/// as one whole asset or as a progressive multi-tier asset. Each call streams one whole asset
+/// (or tier set) as a unit — there is no support for paging pieces of a single splat that is
+/// itself too large to hold in memory. Prefer this API for new call sites.
+public func setEntityGaussianTileStreaming(
+    entityId: EntityID,
+    source: GaussianSource,
+    options: GaussianStreamingOptions
+) {
+    switch source {
+    case let .single(filename, ext):
+        setEntityGaussianStreamable(
+            entityId: entityId,
+            filename: filename,
+            withExtension: ext,
+            streamingRadius: options.streamingRadius,
+            unloadRadius: options.unloadRadius,
+            boundingBoxHalfExtent: options.boundingBoxHalfExtent,
+            priority: options.priority
+        )
+    case let .progressive(baseFilename, ext, levelCount, maxDistances):
+        setEntityGaussianProgressiveStreamable(
+            entityId: entityId,
+            baseFilename: baseFilename,
+            withExtension: ext,
+            levelCount: levelCount,
+            maxDistances: maxDistances,
+            streamingRadius: options.streamingRadius,
+            unloadRadius: options.unloadRadius,
+            boundingBoxHalfExtent: options.boundingBoxHalfExtent,
+            priority: options.priority
+        )
+    }
+}
+
+/// Registers a tile-independent progressive Gaussian splat entity. Not part of the public API
+/// — reached only through `setEntityGaussian(entityId:source:)`'s `.progressive` case, which is
+/// the entry point callers should use.
+///
+/// The expected files are `<baseFilename>_lod0.untoldgs`, `<baseFilename>_lod1.untoldgs`,
+/// etc. LOD0 is full detail; the highest index is the coarsest tier and is loaded
+/// immediately so the entity can become visible before finer tiers finish loading.
+func setEntityGaussianProgressive(
+    entityId: EntityID,
+    baseFilename: String,
+    withExtension ext: String = "untoldgs",
+    levelCount: Int,
+    maxDistances: [Float]
+) {
+    guard configureEntityGaussianProgressiveLOD(
+        entityId: entityId,
+        baseFilename: baseFilename,
+        withExtension: ext,
+        levelCount: levelCount,
+        maxDistances: maxDistances,
+        errorPrefix: "setEntityGaussianProgressive"
+    ) else { return }
+
+    // Read the box baked into the coarsest tier's header (cheap, synchronous) so the entity has
+    // a real box from frame 1 instead of waiting on the async coarsest-tier load below to
+    // populate one via GeometryStreamingSystem+GaussianStreaming.swift's hasExplicitBoundingBox
+    // fallback. If unavailable (e.g. a pre-v2 .untoldgs file), that fallback still applies
+    // unchanged. No caller-supplied override here — GaussianSource.progressive has no
+    // boundingBoxHalfExtent of its own to forward (see its doc comment).
+    let coarsestTierURL = gaussianProgressiveTierURL(baseFilename: baseFilename, withExtension: ext, levelCount: levelCount, tierIndex: levelCount - 1)
+    if let box = resolveGaussianBoundingBox(override: nil, untoldgsURL: coarsestTierURL),
+       let local = scene.get(component: LocalTransformComponent.self, for: entityId)
+    {
+        local.boundingBox = box
+        scene.get(component: GaussianLODComponent.self, for: entityId)?.hasExplicitBoundingBox = true
+    }
+
+    // Store the load on the coarsest tier's loadTask, mirroring requestGaussianLODLevelLoad's
+    // pattern, so removeEntityGaussianLOD can cancel it if entityId is destroyed while this is
+    // still in flight. The assignment happens inside the same gate that spawns the Task: since
+    // the Task's own body needs this same lock to touch scene state, it can't run ahead and
+    // clear loadTask before this closure finishes assigning it.
+    withWorldMutationGate {
+        guard let lod = scene.get(component: GaussianLODComponent.self, for: entityId),
+              !lod.lodLevels.isEmpty
+        else { return }
+
+        let coarsestIndex = lod.lodLevels.count - 1
+        let task = Task {
+            _ = await GeometryStreamingSystem.shared.loadInitialGaussianProgressiveTier(entityId: entityId)
+        }
+        lod.lodLevels[coarsestIndex].loadTask = task
+    }
+}
+
+/// Registers `entityId` as a distance-streamed Gaussian-splat prop, so
+/// `GeometryStreamingSystem` loads/unloads it based on camera distance the same way it
+/// does the surrounding tile geometry — rather than loading it immediately the way
+/// `setEntityGaussian`/`setEntityGaussianAsync` do.
+///
+/// `entityId` should already be positioned (e.g. via `translateTo`/`rotateTo`) before
+/// calling this — the entity's current `LocalTransformComponent.position` is used to find
+/// which tile it belongs to, via `findTileEntity(containing:)`. If no tile is found there,
+/// this logs a warning and leaves `entityId` as a plain, non-streaming entity.
+///
+/// `boundingBoxHalfExtent` is optional: a `.untoldgs` source has a real box baked into its
+/// header (see `UntoldGSFormat.readHeader`), read synchronously here since
+/// `GeometryStreamingSystem`'s frustum gate needs a real local-space volume on the entity
+/// before it ever loads. A raw `.ply` source has no baked box, so an explicit value is still
+/// required there — omitting it leaves the entity non-streaming rather than registering a
+/// zero-size placeholder, which would collapse the gate to a single exact point and make
+/// re-streaming unreliable once the camera moves away and back.
+///
+/// Not part of the public API — reached only through
+/// `setEntityGaussianTileStreaming(entityId:source:options:)`'s `.single` case, which forwards
+/// `GaussianStreamingOptions.boundingBoxHalfExtent` here; that's the entry point callers should
+/// use.
+func setEntityGaussianStreamable(
+    entityId: EntityID,
+    filename: String,
+    withExtension ext: String,
+    streamingRadius: Float = 100.0,
+    unloadRadius: Float = 150.0,
+    boundingBoxHalfExtent: simd_float3? = nil,
+    priority: Int = 0
+) {
+    guard let local = scene.get(component: LocalTransformComponent.self, for: entityId) else {
+        handleError(.noLocalTransformComponent, entityId)
+        return
+    }
+
+    guard let tileEntity = findTileEntity(containing: local.position) else {
+        Logger.logWarning(message: "[RegistrationSystem] setEntityGaussianStreamable: no tile found containing position \(local.position) for entity \(entityId) — entity left non-streaming.")
+        return
+    }
+
+    let untoldgsURL = ext.lowercased() == "untoldgs"
+        ? LoadingSystem.shared.resourceURL(forResource: filename, withExtension: ext, subResource: nil)
+        : nil
+    guard let box = resolveGaussianBoundingBox(override: boundingBoxHalfExtent, untoldgsURL: untoldgsURL) else {
+        Logger.logWarning(message: "[RegistrationSystem] setEntityGaussianStreamable: no boundingBoxHalfExtent supplied and no baked box available for '\(filename).\(ext)' — entity left non-streaming. A raw .ply source requires an explicit boundingBoxHalfExtent.")
+        return
+    }
+    local.boundingBox = box
+
+    setParent(childId: entityId, parentId: tileEntity)
+    OctreeSystem.shared.registerEntity(entityId)
+
+    if let streaming = scene.assign(to: entityId, component: StreamingComponent.self) {
+        streaming.assetKind = .gaussianSplat
+        streaming.assetFilename = filename
+        streaming.assetExtension = ext
+        streaming.streamingRadius = streamingRadius
+        streaming.unloadRadius = unloadRadius
+        streaming.priority = priority
+    }
+}
+
+/// Registers `entityId` as a distance-streamed progressive Gaussian splat prop.
+///
+/// The expected files are `<baseFilename>_lod0.untoldgs`, `<baseFilename>_lod1.untoldgs`,
+/// etc. LOD0 is full detail; the highest index is the coarsest tier and is loaded first
+/// when the prop enters streaming range. Finer tiers are requested later by
+/// `GaussianLODSystem` based on camera distance.
+///
+/// Not part of the public API — reached only through
+/// `setEntityGaussianTileStreaming(entityId:source:options:)`'s `.progressive` case, which forwards
+/// `GaussianStreamingOptions.boundingBoxHalfExtent` here; that's the entry point callers should
+/// use.
+func setEntityGaussianProgressiveStreamable(
+    entityId: EntityID,
+    baseFilename: String,
+    withExtension ext: String = "untoldgs",
+    levelCount: Int,
+    maxDistances: [Float],
+    streamingRadius: Float = 100.0,
+    unloadRadius: Float = 150.0,
+    boundingBoxHalfExtent: simd_float3? = nil,
+    priority: Int = 0
+) {
+    guard let local = scene.get(component: LocalTransformComponent.self, for: entityId) else {
+        handleError(.noLocalTransformComponent, entityId)
+        return
+    }
+    guard let tileEntity = findTileEntity(containing: local.position) else {
+        Logger.logWarning(message: "[RegistrationSystem] setEntityGaussianProgressiveStreamable: no tile found containing position \(local.position) for entity \(entityId) — entity left non-streaming.")
+        return
+    }
+
+    // Resolve LOD levels (and validate levelCount/maxDistances/tier files) before touching
+    // parent/octree/box state, so a validation failure here leaves the entity exactly as it
+    // was before this call — no half-registered state to clean up.
+    guard configureEntityGaussianProgressiveLOD(
+        entityId: entityId,
+        baseFilename: baseFilename,
+        withExtension: ext,
+        levelCount: levelCount,
+        maxDistances: maxDistances,
+        errorPrefix: "setEntityGaussianProgressiveStreamable"
+    ) else { return }
+
+    // configureEntityGaussianProgressiveLOD already confirmed every tier's file exists (it
+    // resolves and validates each URL, including the coarsest), so this is a header-parse
+    // concern only, not a file-lookup one.
+    let coarsestTierURL = scene.get(component: GaussianLODComponent.self, for: entityId)?.lodLevels.last?.url
+    guard let box = resolveGaussianBoundingBox(override: boundingBoxHalfExtent, untoldgsURL: coarsestTierURL) else {
+        Logger.logWarning(message: "[RegistrationSystem] setEntityGaussianProgressiveStreamable: no boundingBoxHalfExtent supplied and no baked box available for '\(baseFilename)' — entity left non-streaming.")
+        removeEntityGaussianLOD(entityId: entityId)
+        return
+    }
+    local.boundingBox = box
+    // boundingBoxHalfExtent may come from either an explicit override or the baked header —
+    // mark it explicit either way so loadGaussianLODLevel never overwrites it with a redundant
+    // auto-computed one once the first tier actually loads.
+    scene.get(component: GaussianLODComponent.self, for: entityId)?.hasExplicitBoundingBox = true
+
+    setParent(childId: entityId, parentId: tileEntity)
+    OctreeSystem.shared.registerEntity(entityId)
+
+    if let streaming = scene.assign(to: entityId, component: StreamingComponent.self) {
+        streaming.assetKind = .gaussianSplat
+        streaming.assetFilename = baseFilename
+        streaming.assetExtension = ext
+        streaming.streamingRadius = streamingRadius
+        streaming.unloadRadius = unloadRadius
+        streaming.priority = priority
+    }
+}
+
+/// Resolves the on-disk URL for one progressive tier, given the same `<baseFilename>_lod<N>`
+/// naming `configureEntityGaussianProgressiveLOD` uses (or just `baseFilename` when
+/// `levelCount == 1`, matching `bakeGaussianSplatProgressiveTiers`'s single-tier output).
+/// Factored out so callers can resolve a specific tier's URL (typically the coarsest, for a
+/// bounding-box header read) without going through full LOD-component setup first.
+private func gaussianProgressiveTierURL(
+    baseFilename: String,
+    withExtension ext: String,
+    levelCount: Int,
+    tierIndex: Int
+) -> URL? {
+    let filename = levelCount == 1 ? baseFilename : "\(baseFilename)_lod\(tierIndex)"
+    return LoadingSystem.shared.resourceURL(forResource: filename, withExtension: ext, subResource: nil)
+}
+
+/// Resolves a local-space bounding box for Gaussian entity registration: an explicit
+/// caller-supplied `override` always wins; otherwise, if `untoldgsURL` points at a real,
+/// header-readable `.untoldgs` file, reads its baked box (see `UntoldGSFormat.readHeader`) —
+/// cheap enough to call synchronously at registration time. Returns `nil` when neither is
+/// available (e.g. a raw `.ply` source with no override) — callers decide how to handle that.
+private func resolveGaussianBoundingBox(
+    override: simd_float3?,
+    untoldgsURL: URL?
+) -> (min: simd_float3, max: simd_float3)? {
+    if let override {
+        return (min: -override, max: override)
+    }
+    guard let untoldgsURL, let header = try? UntoldGSFormat.readHeader(from: untoldgsURL) else {
+        return nil
+    }
+    return (min: header.boundingBoxMin, max: header.boundingBoxMax)
+}
+
+@discardableResult
+private func configureEntityGaussianProgressiveLOD(
+    entityId: EntityID,
+    baseFilename: String,
+    withExtension ext: String,
+    levelCount: Int,
+    maxDistances: [Float],
+    errorPrefix: String
+) -> Bool {
+    guard levelCount > 0 else {
+        handleError(.assetDataMissing, "\(errorPrefix): levelCount must be at least 1, got \(levelCount)")
+        return false
+    }
+    guard maxDistances.count == levelCount else {
+        handleError(.assetDataMissing, "\(errorPrefix): maxDistances must have \(levelCount) entries, got \(maxDistances.count)")
+        return false
+    }
+
+    var levels: [GaussianLODLevel] = []
+    for index in 0 ..< levelCount {
+        guard let url = gaussianProgressiveTierURL(baseFilename: baseFilename, withExtension: ext, levelCount: levelCount, tierIndex: index) else {
+            let filename = levelCount == 1 ? baseFilename : "\(baseFilename)_lod\(index)"
+            handleError(.filenameNotFound, filename)
+            return false
+        }
+        // meanSquaredSplatExtent is populated automatically by loadGaussianLODLevel when this
+        // tier's .untoldgs file is actually read — it's baked into the file, not caller-supplied.
+        levels.append(GaussianLODLevel(maxDistance: maxDistances[index], url: url))
+    }
+
+    guard let lodComponent = scene.assign(to: entityId, component: GaussianLODComponent.self) else {
+        return false
+    }
+    lodComponent.lodLevels = levels
+    lodComponent.currentLOD = -1
+    lodComponent.desiredLOD = levelCount - 1
+    lodComponent.isUsingFallback = false
+    return true
+}
+
+/// Largest per-axis scale magnitude of a splat, used both as the size term in
+/// `gaussianImportanceScore` and, aggregated across a tier, as
+/// `GaussianLODTier.meanSquaredSplatExtent` for overdraw estimation.
+func gaussianMajorAxis(_ splat: GaussianSplat) -> Float {
+    max(abs(splat.scale.x), max(abs(splat.scale.y), abs(splat.scale.z)))
+}
+
+private func gaussianImportanceScore(_ splat: GaussianSplat) -> Float {
+    let majorAxis = gaussianMajorAxis(splat)
+    return splat.opacity * majorAxis * majorAxis
+}
+
+private struct GaussianSpatialBucketKey: Hashable {
+    let x: Int
+    let y: Int
+    let z: Int
+}
+
+func spatiallyInterleavedGaussianRanking(_ splats: [GaussianSplat]) throws -> [Int] {
+    try spatiallyInterleavedGaussianRanking(
+        count: splats.count,
+        center: { simd_float3(splats[$0].center.x, splats[$0].center.y, splats[$0].center.z) },
+        importance: { gaussianImportanceScore(splats[$0]) }
+    )
+}
+
+/// The progressive ranking over `count` splats given by their centre and importance
+/// (`gaussianImportanceScore`: opacity × major axis²): spatial buckets, each sorted by
+/// importance, visited round-robin from the most important bucket outward.
+///
+/// `poll` is called with the ranking's own progress (0…1) between its passes — every so many
+/// splats of the fills and the drain, between the bucket sorts — and may throw to stop it. It
+/// never changes a comparison or a result: the ranking of 10 M splats runs for seconds, and a
+/// bake has to be able to report and cancel across it.
+func spatiallyInterleavedGaussianRanking(
+    count: Int,
+    center: (Int) -> simd_float3,
+    importance: (Int) -> Float,
+    poll: (Double) throws -> Void = { _ in }
+) throws -> [Int] {
+    guard count > 1 else { return Array(0 ..< count) }
+    let splats = 0 ..< count
+    // Between polls of a pass over every splat: 64 polls of a large ranking, none within a
+    // pass over a small one.
+    let pollStride = max(1 << 16, count / 64)
+    /// Polls at `from` plus the pass's share of `done` out of `count`.
+    func pollPass(_ done: Int, from: Double, to: Double) throws {
+        try poll(from + (to - from) * Double(done) / Double(count))
+    }
+
+    var importanceScores = [Float](repeating: 0, count: count)
+    for index in splats {
+        importanceScores[index] = importance(index)
+        if (index + 1) % pollStride == 0 {
+            try pollPass(index + 1, from: 0, to: 0.1)
+        }
+    }
+    try poll(0.1)
+    func gaussianImportanceScore(_ index: Int) -> Float {
+        importanceScores[index]
+    }
+
+    var minBounds = simd_float3(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+    var maxBounds = simd_float3(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude)
+    for index in splats {
+        let center = center(index)
+        minBounds = simd_min(minBounds, center)
+        maxBounds = simd_max(maxBounds, center)
+        if (index + 1) % pollStride == 0 {
+            try pollPass(index + 1, from: 0.1, to: 0.2)
+        }
+    }
+    try poll(0.2)
+
+    let extent = maxBounds - minBounds
+    let occupiedAxisCount = [extent.x, extent.y, extent.z].filter { $0 > 0.0001 }.count
+    guard occupiedAxisCount > 0 else {
+        return splats.sorted {
+            gaussianImportanceScore($0) > gaussianImportanceScore($1)
+        }
+    }
+
+    let targetCellCount = max(8, min(512, splats.count / 24))
+    let cellsPerAxis = max(1, Int(ceil(pow(Double(targetCellCount), 1.0 / Double(occupiedAxisCount)))))
+    let safeExtent = simd_float3(
+        max(extent.x, 0.0001),
+        max(extent.y, 0.0001),
+        max(extent.z, 0.0001)
+    )
+
+    var buckets: [GaussianSpatialBucketKey: [Int]] = [:]
+    for index in splats {
+        let center = center(index)
+        let normalized = (center - minBounds) / safeExtent
+        let maxCellIndex = cellsPerAxis - 1
+        let cellX = min(maxCellIndex, max(0, Int(normalized.x * Float(cellsPerAxis))))
+        let cellY = min(maxCellIndex, max(0, Int(normalized.y * Float(cellsPerAxis))))
+        let cellZ = min(maxCellIndex, max(0, Int(normalized.z * Float(cellsPerAxis))))
+        let key = GaussianSpatialBucketKey(x: cellX, y: cellY, z: cellZ)
+        buckets[key, default: []].append(index)
+        if (index + 1) % pollStride == 0 {
+            try pollPass(index + 1, from: 0.2, to: 0.5)
+        }
+    }
+    try poll(0.5)
+
+    // `mapValues` keeps the dictionary's layout, so the keys come out in the order they always
+    // did; the poll between two buckets' sorts changes nothing about either sort.
+    var sortedBucketCount = 0
+    let sortedBuckets = try buckets.mapValues { indices in
+        try poll(0.5 + 0.15 * Double(sortedBucketCount) / Double(buckets.count))
+        sortedBucketCount += 1
+        return indices.sorted {
+            gaussianImportanceScore($0) > gaussianImportanceScore($1)
+        }
+    }
+    try poll(0.65)
+
+    let bucketCenters = sortedBuckets.mapValues { indices in
+        var sum = simd_float3.zero
+        for index in indices {
+            sum += center(index)
+        }
+        return sum / Float(max(1, indices.count))
+    }
+
+    // The bucket order breaks ties — equal importances, equal distances — by the position of
+    // the buckets in this array, and a dictionary's iteration order is seeded from the address
+    // of its storage: without the sort, two rankings of the same splats disagree on their ties,
+    // and a capture whose splats share one importance bakes a different _lod1 every run.
+    var remainingBuckets = Array(sortedBuckets.keys).sorted { lhs, rhs in
+        (lhs.x, lhs.y, lhs.z) < (rhs.x, rhs.y, rhs.z)
+    }
+    var bucketOrder: [GaussianSpatialBucketKey] = []
+    if let first = remainingBuckets.max(by: { lhs, rhs in
+        guard let lhsIndex = sortedBuckets[lhs]?.first,
+              let rhsIndex = sortedBuckets[rhs]?.first
+        else { return false }
+        return gaussianImportanceScore(lhsIndex) < gaussianImportanceScore(rhsIndex)
+    }) {
+        bucketOrder.append(first)
+        remainingBuckets.removeAll { $0 == first }
+    }
+
+    while !remainingBuckets.isEmpty {
+        let next = remainingBuckets.max { lhs, rhs in
+            let lhsDistance = nearestSelectedBucketDistanceSquared(lhs, centers: bucketCenters, selected: bucketOrder)
+            let rhsDistance = nearestSelectedBucketDistanceSquared(rhs, centers: bucketCenters, selected: bucketOrder)
+            if lhsDistance == rhsDistance {
+                let lhsIndex = sortedBuckets[lhs]?.first ?? 0
+                let rhsIndex = sortedBuckets[rhs]?.first ?? 0
+                return gaussianImportanceScore(lhsIndex) < gaussianImportanceScore(rhsIndex)
+            }
+            return lhsDistance < rhsDistance
+        }!
+        bucketOrder.append(next)
+        remainingBuckets.removeAll { $0 == next }
+        if bucketOrder.count % 32 == 0 {
+            try poll(0.65 + 0.05 * Double(bucketOrder.count) / Double(sortedBuckets.count))
+        }
+    }
+    try poll(0.7)
+
+    var ranking: [Int] = []
+    ranking.reserveCapacity(count)
+    var depth = 0
+    var nextPoll = pollStride
+    while ranking.count < count {
+        var appendedThisRound = false
+        for key in bucketOrder {
+            guard let indices = sortedBuckets[key], depth < indices.count else { continue }
+            ranking.append(indices[depth])
+            appendedThisRound = true
+        }
+        guard appendedThisRound else { break }
+        depth += 1
+        if ranking.count >= nextPoll {
+            try pollPass(ranking.count, from: 0.7, to: 1)
+            nextPoll += pollStride
+        }
+    }
+    try poll(1)
+
+    return ranking
+}
+
+private func nearestSelectedBucketDistanceSquared(
+    _ key: GaussianSpatialBucketKey,
+    centers: [GaussianSpatialBucketKey: simd_float3],
+    selected: [GaussianSpatialBucketKey]
+) -> Float {
+    guard let center = centers[key], !selected.isEmpty else { return Float.greatestFiniteMagnitude }
+    var best = Float.greatestFiniteMagnitude
+    for selectedKey in selected {
+        guard let selectedCenter = centers[selectedKey] else { continue }
+        best = min(best, simd_distance_squared(center, selectedCenter))
+    }
+    return best
+}
+
+/// Write options shared by every tier of one bake: the source SH degree, the asset-level
+/// bounding box (so it stays stable across LOD switches), this tier's overdraw statistic and the
+/// coarse-level policy (resolved per tier by the writer, so each `_lodN` file decides on its own
+/// chunk count).
+func gaussianTierWriteOptions(
+    shDegree: UInt8,
+    boundingBox: (min: simd_float3, max: simd_float3),
+    meanSquaredSplatExtent: Float,
+    cookOptions: UntoldGSCookOptions
+) -> UntoldGSWriteOptions {
+    var options = UntoldGSCooker.writeOptions(for: cookOptions)
+    options.shDegree = shDegree
+    options.boundingBoxMin = boundingBox.min
+    options.boundingBoxMax = boundingBox.max
+    options.meanSquaredSplatExtent = meanSquaredSplatExtent
+    // What the importer knows about the source: its colours are the display-referred SH DC
+    // mapping (`UntoldGSSplat.color`), and the geometry is stored as read. The coordinate
+    // system and anti-aliasing flags become explicit cook options in the export command's
+    // cooking flags; until a source format carries them, the header keeps the defaults.
+    options.colorSpace = .sRGBDisplayReferred
+    return options
+}
+
+/// One baked `.untoldgs` tier plus the bake-time statistic needed for overdraw estimation —
+/// see `estimatedGaussianOverdraw` — and the per-chunk coarse section it carries, if any.
+public struct GaussianLODTier: Sendable {
+    public let url: URL
+    public let meanSquaredSplatExtent: Float
+    public let coarseReport: UntoldGSCoarseLevelReport?
+
+    public init(url: URL, meanSquaredSplatExtent: Float, coarseReport: UntoldGSCoarseLevelReport? = nil) {
+        self.url = url
+        self.meanSquaredSplatExtent = meanSquaredSplatExtent
+        self.coarseReport = coarseReport
+    }
+}
+
+/// Result of `bakeGaussianSplatProgressiveTiers`: the baked tiers plus a single asset-level
+/// bounding box (from the full, unsubsetted source splats) shared by all tiers so it stays
+/// stable across LOD switches.
+public struct GaussianProgressiveBakeResult: Sendable {
+    public let tiers: [GaussianLODTier]
+    public let boundingBoxMin: simd_float3
+    public let boundingBoxMax: simd_float3
+    /// What the cook step (`UntoldGSCooker`) kept and pruned before ranking and tiering.
+    public let cookReport: UntoldGSCookReport
+    /// Bounds of the cooked splat centres (every tier's finest, in the output space): what a
+    /// "recenter" needs, from the bake's own pass rather than a second parse of the source.
+    public let centerBoundsMin: simd_float3
+    public let centerBoundsMax: simd_float3
+
+    public init(
+        tiers: [GaussianLODTier],
+        boundingBoxMin: simd_float3,
+        boundingBoxMax: simd_float3,
+        cookReport: UntoldGSCookReport,
+        centerBoundsMin: simd_float3 = .zero,
+        centerBoundsMax: simd_float3 = .zero
+    ) {
+        self.tiers = tiers
+        self.boundingBoxMin = boundingBoxMin
+        self.boundingBoxMax = boundingBoxMax
+        self.cookReport = cookReport
+        self.centerBoundsMin = centerBoundsMin
+        self.centerBoundsMax = centerBoundsMax
+    }
+}
+
+func meanSquaredSplatExtent(_ splats: [GaussianSplat], keeping indices: [Int]) -> Float {
+    guard !indices.isEmpty else { return 0 }
+    let sumOfSquares = indices.reduce(Float(0)) { partial, index in
+        let majorAxis = gaussianMajorAxis(splats[index])
+        return partial + majorAxis * majorAxis
+    }
+    return sumOfSquares / Float(indices.count)
+}
+
+/// Bakes progressive `.untoldgs` Gaussian tiers from a source `.ply`.
+///
+/// `lodFractions` are ordered finest to coarsest. With `[1.0, 0.5, 0.25]`, output files are
+/// `<base>_lod0.untoldgs`, `<base>_lod1.untoldgs`, and `<base>_lod2.untoldgs`.
+///
+/// Throws `UntoldGSError.sizeMismatch` if `plyURL` contains no splats, regardless of
+/// `lodFractions` — including the single-tier (`[1.0]`) case, which needs the same guard since
+/// it now also computes an asset-level bounding box that's meaningless for zero splats.
+public func bakeGaussianSplatProgressiveTiers(
+    plyURL: URL,
+    outputBaseURL: URL,
+    lodFractions: [Float],
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions()
+) throws -> GaussianProgressiveBakeResult {
+    try bakeGaussianSplatProgressiveTiers(plyURL: plyURL, outputBaseURL: outputBaseURL, lodFractions: lodFractions, cookOptions: cookOptions, control: nil)
+}
+
+/// `bakeGaussianSplatProgressiveTiers(plyURL:outputBaseURL:lodFractions:cookOptions:)` with
+/// progress and cancellation (`UntoldGSCookControl`): the source is streamed in windows and
+/// every tier is written to a temporary file, the set renamed into place only once the last
+/// tier is complete, so a cancelled or failed bake leaves no file of its own behind and the
+/// tiers of a previous bake exactly as they were.
+public func bakeGaussianSplatProgressiveTiers(
+    plyURL: URL,
+    outputBaseURL: URL,
+    lodFractions: [Float],
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions(),
+    control: UntoldGSCookControl?
+) throws -> GaussianProgressiveBakeResult {
+    try bakeGaussianSplatProgressiveTiers(
+        source: PLYGaussianSource(url: plyURL), outputBaseURL: outputBaseURL, lodFractions: lodFractions, cookOptions: cookOptions, control: control
+    )
+}
+
+/// The `.ply` bake over a source already open — the seam through which tests stream a small
+/// fixture in windows far below production's.
+func bakeGaussianSplatProgressiveTiers(
+    source: PLYGaussianSource,
+    outputBaseURL: URL,
+    lodFractions: [Float],
+    cookOptions: UntoldGSCookOptions,
+    control: UntoldGSCookControl?
+) throws -> GaussianProgressiveBakeResult {
+    let progress = UntoldGSCookProgressSink(control: control, tierCount: lodFractions.count)
+    guard !lodFractions.isEmpty else {
+        throw UntoldGSError.sizeMismatch("lodFractions must contain at least one entry")
+    }
+    let cooked = try UntoldGSCooker.cookStore(
+        from: source, options: cookOptions, emptySourceDescription: "source .ply contains no splats", progress: progress
+    )
+    return try bakeGaussianSplatProgressiveTiers(cooked: cooked, outputBaseURL: outputBaseURL, lodFractions: lodFractions, cookOptions: cookOptions, progress: progress)
+}
+
+/// Bakes progressive `.untoldgs` Gaussian tiers from a source `.spz` (legacy gzip versions 2-3
+/// only -- see `SPZReader`). Same tiering behavior as the `.ply` overload above; `SPZReader`
+/// produces the same format-neutral `GaussianSplatAsset` shape `PLYReader` does, so cooking and
+/// writing are identical from here on.
+public func bakeGaussianSplatProgressiveTiers(
+    spzURL: URL,
+    outputBaseURL: URL,
+    lodFractions: [Float],
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions()
+) throws -> GaussianProgressiveBakeResult {
+    try bakeGaussianSplatProgressiveTiers(spzURL: spzURL, outputBaseURL: outputBaseURL, lodFractions: lodFractions, cookOptions: cookOptions, control: nil)
+}
+
+/// The `.spz` overload with progress and cancellation. The `.spz` is decoded whole (its reader
+/// is not streamed), so `read` reports once; the cook and every tier report as for a `.ply`.
+public func bakeGaussianSplatProgressiveTiers(
+    spzURL: URL,
+    outputBaseURL: URL,
+    lodFractions: [Float],
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions(),
+    control: UntoldGSCookControl?
+) throws -> GaussianProgressiveBakeResult {
+    let progress = UntoldGSCookProgressSink(control: control, tierCount: lodFractions.count)
+    let sourceAsset = try SPZReader.readGaussianAsset(from: spzURL)
+    guard !lodFractions.isEmpty else {
+        throw UntoldGSError.sizeMismatch("lodFractions must contain at least one entry")
+    }
+    let cooked = try UntoldGSCooker.cookStore(
+        from: sourceAsset, options: cookOptions, emptySourceDescription: "source .spz contains no splats", progress: progress
+    )
+    return try bakeGaussianSplatProgressiveTiers(cooked: cooked, outputBaseURL: outputBaseURL, lodFractions: lodFractions, cookOptions: cookOptions, progress: progress)
+}
+
+/// Shared tiering core behind the `.ply` and `.spz` overloads above, over the cooked store: the
+/// finest tier is the store in cooked order; the `_lodN` tiers are prefixes of the progressive
+/// ranking. Each tier is written to a temporary file beside its destination and the whole set
+/// is renamed into place only after the last tier is complete: a bake that fails or is cancelled
+/// in its third tier discards three temporaries and leaves the `_lod0`/`_lod1` of the previous
+/// bake untouched, where renaming each tier as it finished would have replaced them and then
+/// had to remove them, breaking an asset that loaded before the cook began.
+private func bakeGaussianSplatProgressiveTiers(
+    cooked: UntoldGSCookedStore,
+    outputBaseURL: URL,
+    lodFractions: [Float],
+    cookOptions: UntoldGSCookOptions,
+    progress: UntoldGSCookProgressSink
+) throws -> GaussianProgressiveBakeResult {
+    let store = cooked.store
+    let assetBoundingBox = cooked.boundingBox
+    let nonFinite = Set(cooked.nonFiniteIndices)
+
+    /// The writer's refusal of a non-finite splat, naming it by its index in the tier.
+    func refuseNonFinite(tierIndices: some Sequence<Int>) throws {
+        guard !nonFinite.isEmpty else { return }
+        for (position, index) in tierIndices.enumerated() where nonFinite.contains(index) {
+            throw UntoldGSError.invalidInput("splat \(position) has non-finite data or a non-positive scale")
+        }
+    }
+
+    func result(_ tiers: [GaussianLODTier]) -> GaussianProgressiveBakeResult {
+        GaussianProgressiveBakeResult(
+            tiers: tiers,
+            boundingBoxMin: assetBoundingBox.min,
+            boundingBoxMax: assetBoundingBox.max,
+            cookReport: cooked.report,
+            centerBoundsMin: cooked.centerBounds.min,
+            centerBoundsMax: cooked.centerBounds.max
+        )
+    }
+
+    if lodFractions == [1.0] {
+        try progress.report(.cook, fraction: 1)
+        progress.beginTier(0)
+        try refuseNonFinite(tierIndices: 0 ..< store.count)
+        try progress.checkCancelled()
+        let tierExtent = store.meanSquaredSplatExtent(over: 0 ..< store.count, count: store.count)
+        let written = try UntoldGSFormat.writeStore(
+            UntoldGSStoreView(store: store),
+            options: gaussianTierWriteOptions(shDegree: store.shDegree, boundingBox: assetBoundingBox, meanSquaredSplatExtent: tierExtent, cookOptions: cookOptions),
+            to: outputBaseURL,
+            progress: progress
+        )
+        return result([GaussianLODTier(url: outputBaseURL, meanSquaredSplatExtent: tierExtent, coarseReport: written.coarse)])
+    }
+
+    // The ranking is the second half of the cook phase, reported and cancellable as it runs.
+    let rankedIndices = try spatiallyInterleavedGaussianRanking(
+        count: store.count,
+        center: { store.position($0) },
+        importance: { index in
+            let majorAxis = store.majorAxis(index)
+            return store.opacity(index) * majorAxis * majorAxis
+        },
+        poll: { fraction in try progress.report(.cook, fraction: 0.5 + 0.5 * fraction) }
+    )
+    try progress.report(.cook, fraction: 1)
+
+    let baseWithoutExtension = outputBaseURL.deletingPathExtension()
+    let baseName = baseWithoutExtension.lastPathComponent
+    let baseDirectory = baseWithoutExtension.deletingLastPathComponent()
+
+    var staged: [UntoldGSStagedTier] = []
+    var tiers: [GaussianLODTier] = []
+    do {
+        for (tierIndex, fraction) in lodFractions.enumerated() {
+            progress.beginTier(tierIndex)
+            let clampedFraction = min(max(fraction, 0), 1)
+            let keepCount = max(1, Int((Float(store.count) * clampedFraction).rounded(.up)))
+            let keptIndices = Array(rankedIndices.prefix(keepCount))
+            try refuseNonFinite(tierIndices: keptIndices)
+            try progress.checkCancelled()
+            let tierURL = baseDirectory
+                .appendingPathComponent("\(baseName)_lod\(tierIndex)")
+                .appendingPathExtension("untoldgs")
+            let tierExtent = store.meanSquaredSplatExtent(over: keptIndices, count: keptIndices.count)
+            let written = try UntoldGSFormat.stageStore(
+                UntoldGSStoreView(store: store, indices: keptIndices),
+                options: gaussianTierWriteOptions(shDegree: store.shDegree, boundingBox: assetBoundingBox, meanSquaredSplatExtent: tierExtent, cookOptions: cookOptions),
+                to: tierURL,
+                progress: progress
+            )
+            staged.append(written)
+            tiers.append(GaussianLODTier(url: tierURL, meanSquaredSplatExtent: tierExtent, coarseReport: written.report.coarse))
+        }
+        // Every tier is complete: the set goes into place finest first, in one tight loop.
+        for tier in staged {
+            try tier.publish()
+        }
+    } catch {
+        // The temporaries of the tiers not yet published; a published tier's is already gone.
+        for tier in staged {
+            tier.discard()
+        }
+        throw error
+    }
+    return result(tiers)
+}
+
+public func bakeGaussianSplatProgressiveTiers(
+    plyURL: URL,
+    outputBaseURL: URL,
+    levelCount: Int,
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions()
+) throws -> GaussianProgressiveBakeResult {
+    try bakeGaussianSplatProgressiveTiers(plyURL: plyURL, outputBaseURL: outputBaseURL, levelCount: levelCount, cookOptions: cookOptions, control: nil)
+}
+
+/// The `levelCount` overload with progress and cancellation — what an editor's cook job calls.
+public func bakeGaussianSplatProgressiveTiers(
+    plyURL: URL,
+    outputBaseURL: URL,
+    levelCount: Int,
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions(),
+    control: UntoldGSCookControl?
+) throws -> GaussianProgressiveBakeResult {
+    let fractions = try progressiveLODFractions(levelCount: levelCount)
+    return try bakeGaussianSplatProgressiveTiers(
+        plyURL: plyURL,
+        outputBaseURL: outputBaseURL,
+        lodFractions: fractions,
+        cookOptions: cookOptions,
+        control: control
+    )
+}
+
+/// `.spz` counterpart of the `.ply` `levelCount` overload above.
+public func bakeGaussianSplatProgressiveTiers(
+    spzURL: URL,
+    outputBaseURL: URL,
+    levelCount: Int,
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions()
+) throws -> GaussianProgressiveBakeResult {
+    try bakeGaussianSplatProgressiveTiers(spzURL: spzURL, outputBaseURL: outputBaseURL, levelCount: levelCount, cookOptions: cookOptions, control: nil)
+}
+
+/// The `.spz` `levelCount` overload with progress and cancellation.
+public func bakeGaussianSplatProgressiveTiers(
+    spzURL: URL,
+    outputBaseURL: URL,
+    levelCount: Int,
+    cookOptions: UntoldGSCookOptions = UntoldGSCookOptions(),
+    control: UntoldGSCookControl?
+) throws -> GaussianProgressiveBakeResult {
+    let fractions = try progressiveLODFractions(levelCount: levelCount)
+    return try bakeGaussianSplatProgressiveTiers(
+        spzURL: spzURL,
+        outputBaseURL: outputBaseURL,
+        lodFractions: fractions,
+        cookOptions: cookOptions,
+        control: control
+    )
+}
+
+private func progressiveLODFractions(levelCount: Int) throws -> [Float] {
+    guard levelCount > 0 else {
+        throw UntoldGSError.sizeMismatch("levelCount must be at least 1, got \(levelCount)")
+    }
+    return (0 ..< levelCount).map { Float(1.0) / Float(1 << $0) }
+}
+
+public struct PackedGaussianSphericalHarmonics {
+    public let coefficients: [UInt8]
+    public let metadata: GaussianSHMetadata
+}
+
+/// Quantizes a higher-order SH coefficient into the GPU's fixed [-1, 1] byte
+/// contract. Mirrors `loadGaussianSHCoefficient`'s dequantization in
+/// Gaussians.metal: `(byte - 128) / 128`. Values outside [-1, 1] are clamped
+/// rather than rejected — real trained assets occasionally have rare
+/// higher-order outliers (e.g. strong specular splats), and clamping only
+/// caps the affected highlight rather than discarding the whole asset.
+func quantizeGaussianSHCoefficient(_ value: Float) -> UInt8 {
+    // NaN would reach `Int(_:)` and trap (Swift's min/max propagate it); it quantises to 0.
+    guard value.isFinite else { return 128 }
+    let clamped = min(max(value, -1), 1)
+    return UInt8(clamping: Int(clamped * 127) + 128)
 }
 
 /// Packs higher-order SH coefficients to the GPU contract while leaving DC
 /// color in `EncodedGaussianSplat`. Input and output are both channel-major.
+/// Higher-order coefficients are quantized to one byte each; see
+/// `quantizeGaussianSHCoefficient`.
 func packGaussianSphericalHarmonics(
     _ sphericalHarmonics: GaussianSphericalHarmonics,
     splatCount: Int
@@ -3345,7 +5259,7 @@ func packGaussianSphericalHarmonics(
     }
 
     let outputPerSplat = higherOrderPerChannel * 3
-    var packed: [Float16] = []
+    var packed: [UInt8] = []
     packed.reserveCapacity(splatCount * outputPerSplat)
 
     for splatIndex in 0 ..< splatCount {
@@ -3353,11 +5267,11 @@ func packGaussianSphericalHarmonics(
         for channel in 0 ..< 3 {
             let channelBase = splatBase + channel * coefficientsPerChannel
             for coefficient in 1 ..< coefficientsPerChannel {
-                let value = Float16(sphericalHarmonics.coefficients[channelBase + coefficient])
+                let value = sphericalHarmonics.coefficients[channelBase + coefficient]
                 guard value.isFinite else {
-                    throw PLYError.invalidData("Spherical-harmonic coefficient cannot be represented as Float16")
+                    throw PLYError.invalidData("Spherical-harmonic coefficient is not finite")
                 }
-                packed.append(value)
+                packed.append(quantizeGaussianSHCoefficient(value))
             }
         }
     }
@@ -3373,27 +5287,10 @@ func packGaussianSphericalHarmonics(
     )
 }
 
-private func encodeGaussianSplatForTBDR(_ splat: GaussianSplat) -> EncodedGaussianSplat {
-    let scale = simd_float3(splat.scale.x, splat.scale.y, splat.scale.z)
-    let rotation = simd_quatf(
-        ix: splat.quat.y,
-        iy: splat.quat.z,
-        iz: splat.quat.w,
-        r: splat.quat.x
-    ).normalized
-    let transform = simd_float3x3(rotation) * simd_float3x3(diagonal: scale)
-    let covariance = transform * transform.transpose
-
-    return EncodedGaussianSplat(
-        position: simd_float3(splat.center.x, splat.center.y, splat.center.z),
-        opacity: splat.opacity,
-        color: simd_float3(splat.color.x, splat.color.y, splat.color.z),
-        _pad0: 0.0,
-        covA: simd_float3(covariance[0, 0], covariance[0, 1], covariance[0, 2]),
-        _pad1: 0.0,
-        covB: simd_float3(covariance[1, 1], covariance[1, 2], covariance[2, 2]),
-        _pad2: 0.0
-    )
+/// The raw `.ply` path shares the rotation-to-covariance math with the v3 decoder
+/// (`UntoldGSSplat.encodedForTBDR`).
+func encodeGaussianSplatForTBDR(_ splat: GaussianSplat) -> EncodedGaussianSplat {
+    UntoldGSSplat(splat).encodedForTBDR()
 }
 
 // MARK: Static Batching
@@ -3531,19 +5428,55 @@ func removeEntityLOD(entityId: EntityID) {
     }
 }
 
-func removeEntityGaussian(entityId: EntityID) {
+func removeEntityGaussianLOD(entityId: EntityID) {
+    if let lodComponent = scene.get(component: GaussianLODComponent.self, for: entityId) {
+        lodComponent.releaseAllLevelResources()
+        lodComponent.lodLevels.removeAll()
+        scene.remove(component: GaussianLODComponent.self, from: entityId)
+    }
+}
+
+/// Drops the entity's splat and its GPU buffers, and the resident tiers of a progressive splat
+/// (`GaussianLODComponent`) with it. On an entity that also draws a mesh only the splat's share
+/// of the memory ledger goes; the mesh keeps its entry. Also the `GaussianComponent` cleanup
+/// handler.
+public func removeEntityGaussian(entityId: EntityID) {
+    removeEntityGaussianLOD(entityId: entityId)
     if let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId) {
+        // Stop the pager first: no read is issued after this, the ones in flight are dropped
+        // when they land, and the pools stay alive through the in-flight frames' command
+        // buffers and the requests themselves.
+        gaussianComponent.pager?.shutdown()
+        gaussianComponent.pager = nil
         // Release Metal buffers
         gaussianComponent.encodedSplatData = nil
+        gaussianComponent.packedSplatData = nil
         gaussianComponent.sphericalHarmonicsData = nil
         gaussianComponent.sphericalHarmonicsMetadata = nil
-        gaussianComponent.gaussianSortedIndices = nil
-        gaussianComponent.gaussianVisibleIndices = nil
-        gaussianComponent.gaussianVisibleCount = nil
+        gaussianComponent.gaussianVisibleIndices.removeAll()
+        gaussianComponent.gaussianVisibleCount.removeAll()
+        gaussianComponent.chunkTable = nil
         gaussianComponent.visibleSplatCountForRendering = 0
-        gaussianComponent.spaceUniform.removeAll()
+        gaussianComponent.estimatedGPUBytes = 0
+        gaussianComponent.localBoundingBox = nil
         scene.remove(component: GaussianComponent.self, from: entityId)
+        if entityHasMesh(entityId) {
+            MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: 0)
+            return
+        }
+        MemoryBudgetManager.shared.setAuxiliaryMeshBytes(entityId: entityId, bytes: 0)
+        // Idempotent — safe to call again if `unloadGaussian` already unregistered this
+        // entity as part of a streaming unload. Keeps MemoryBudgetManager's ledger accurate
+        // for entities destroyed directly (e.g. a non-streamed setEntityGaussian caller).
+        MemoryBudgetManager.shared.unregisterMesh(entityId: entityId)
     }
+}
+
+/// The paging state of a splat entity loaded above the paging threshold — the pool, what is
+/// resident, what is in flight, what was evicted and faulted — for the editor's inspector and
+/// the profile; nil for an entity whose records are all resident.
+public func gaussianPagingStats(entityId: EntityID) -> GaussianPagingStats? {
+    scene.get(component: GaussianComponent.self, for: entityId)?.pager?.stats
 }
 
 func removeEntityCamera(entityId: EntityID) {
@@ -3771,7 +5704,9 @@ public func addLODLevels(
             maxDistance: level.maxDistance,
             screenPercentage: level.screenPercentage
         ) { success in
-            if !success { allSuccess = false }
+            if !success {
+                allSuccess = false
+            }
             group.leave()
         }
     }

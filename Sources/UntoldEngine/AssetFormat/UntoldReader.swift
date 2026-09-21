@@ -13,7 +13,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Compression
-import CryptoKit
 import Foundation
 
 public final class UntoldReader: @unchecked Sendable {
@@ -46,11 +45,10 @@ public final class UntoldReader: @unchecked Sendable {
             from: data,
             entries: chunks
         )
-        let materials = try decodeTableIfPresent(
-            UntoldMaterialRecordV1.self,
-            chunkType: .materialTable,
+        let materials = try decodeMaterialTable(
             from: data,
-            entries: chunks
+            entries: chunks,
+            formatVersion: header.formatVersion
         )
         let textures = try decodeTableIfPresent(
             UntoldTextureRefRecordV1.self,
@@ -73,6 +71,12 @@ public final class UntoldReader: @unchecked Sendable {
         let colorManagement = try decodeSingleIfPresent(
             UntoldColorManagementRecordV1.self,
             chunkType: .colorManagementTable,
+            from: data,
+            entries: chunks
+        )
+        let colorGradeLUT = try decodeSingleIfPresent(
+            UntoldColorGradeLUTRecordV1.self,
+            chunkType: .colorGradeLUTTable,
             from: data,
             entries: chunks
         )
@@ -136,6 +140,12 @@ public final class UntoldReader: @unchecked Sendable {
             from: data,
             entries: chunks
         )
+        let gaussianAssets = try decodeTableIfPresent(
+            UntoldGaussianAssetRecordV1.self,
+            chunkType: .gaussianAssetTable,
+            from: data,
+            entries: chunks
+        )
         let pluginChunks = try decodePluginChunks(from: data, entries: chunks)
 
         let decoded = UntoldDecodedAsset(
@@ -149,6 +159,7 @@ public final class UntoldReader: @unchecked Sendable {
             lights: lights,
             cameras: cameras,
             colorManagement: colorManagement,
+            colorGradeLUT: colorGradeLUT,
             skeletons: skeletons,
             skeletonJoints: skeletonJoints,
             skins: skins,
@@ -159,8 +170,10 @@ public final class UntoldReader: @unchecked Sendable {
             rotationKeyframes: rotationKeyframes,
             morphTargets: morphTargets,
             morphDrivers: morphDrivers,
+            gaussianAssets: gaussianAssets,
             pluginChunks: pluginChunks
         )
+        try validateGaussianAssets(decoded)
         try validateDecodedAsset(decoded)
         return decoded
     }
@@ -170,7 +183,9 @@ public final class UntoldReader: @unchecked Sendable {
         guard header.magic == expectedMagic else {
             throw UntoldValidationError.invalidMagic
         }
-        guard header.formatVersion == UntoldFormat.version else {
+        guard header.formatVersion >= UntoldFormat.minSupportedVersion,
+              header.formatVersion <= UntoldFormat.version
+        else {
             throw UntoldValidationError.unsupportedVersion(header.formatVersion)
         }
     }
@@ -219,25 +234,41 @@ public final class UntoldReader: @unchecked Sendable {
         // fixtures built in Swift). Skip validation so those files continue to load.
         guard header.contentHash.contains(where: { $0 != 0 }) else { return }
 
-        // The exporter hashes raw chunk payloads concatenated in ascending chunk-type
-        // order. Alignment padding between payloads in the file is NOT included.
-        var hashInput = Data()
-        for chunk in chunks.sorted(by: { $0.chunkType.rawValue < $1.chunkType.rawValue }) {
-            let start = Int(chunk.fileOffset)
-            let end = start + Int(chunk.compressedSize)
-            guard start >= 0, end <= fileData.count else {
-                throw UntoldBinaryDecodingError.outOfBounds(
-                    offset: start,
-                    requested: Int(chunk.compressedSize),
-                    available: fileData.count
-                )
-            }
-            hashInput.append(fileData.subdata(in: start ..< end))
-        }
-
-        let computed = Array(SHA256.hash(data: hashInput))
+        let computed = try Array(UntoldFormat.contentHash(of: chunks, in: fileData))
         guard computed == header.contentHash else {
             throw UntoldValidationError.contentHashMismatch
+        }
+    }
+
+    /// Gaussian asset records must reference an entity of this file and a readable
+    /// payload path. Checked before the mesh validation because a splat-only tile
+    /// may carry no vertex or index chunk at all.
+    private func validateGaussianAssets(_ asset: UntoldDecodedAsset) throws {
+        for (index, record) in asset.gaussianAssets.enumerated() {
+            guard asset.entities.contains(where: { $0.entityId == record.entityId }) else {
+                throw UntoldValidationError.invalidGaussianAssetRecord(
+                    index: index,
+                    reason: "entity \(record.entityId) is not in the entity table"
+                )
+            }
+            guard let path = try asset.string(at: record.payloadPathOffset), !path.isEmpty else {
+                throw UntoldValidationError.invalidGaussianAssetRecord(index: index, reason: "missing payload path")
+            }
+            guard record.lodCount <= UInt32(UntoldGaussianAssetRecordV1.maxLODLevels) else {
+                throw UntoldValidationError.invalidGaussianAssetRecord(
+                    index: index,
+                    reason: "lodCount \(record.lodCount) exceeds \(UntoldGaussianAssetRecordV1.maxLODLevels)"
+                )
+            }
+            guard record.occluderShrinkMeters >= 0, record.swapDistanceMeters >= 0 else {
+                throw UntoldValidationError.invalidGaussianAssetRecord(index: index, reason: "negative distance")
+            }
+            if let alignment = record.alignment, !alignment.isValid {
+                throw UntoldValidationError.invalidGaussianAssetRecord(
+                    index: index,
+                    reason: "alignment must be finite with a scale greater than zero"
+                )
+            }
         }
     }
 
@@ -406,6 +437,42 @@ public final class UntoldReader: @unchecked Sendable {
         return records
     }
 
+    /// The material record's on-disk layout grew height-map fields at
+    /// `UntoldFormat.minHeightMapVersion`. Files written before that version don't have
+    /// those bytes at all — reading them unconditionally via the generic decode path would
+    /// misalign every record after the first in the MATERIAL_TABLE chunk. This dedicated
+    /// path picks the correct decoder for the whole chunk based on the file's header version
+    /// (all records in one file share one exporter run, hence one layout).
+    private func decodeMaterialTable(
+        from fileData: Data,
+        entries: [UntoldChunkEntryV1],
+        formatVersion: UInt32
+    ) throws -> [UntoldMaterialRecordV1] {
+        guard entries.contains(where: { $0.chunkType == .materialTable }) else {
+            return []
+        }
+        let chunkData = try loadRequiredChunk(.materialTable, from: fileData, entries: entries)
+        let chunkReader = UntoldBinaryReader(data: chunkData)
+        guard let entry = entries.first(where: { $0.chunkType == .materialTable }) else {
+            throw UntoldValidationError.missingRequiredChunk(.materialTable)
+        }
+
+        var records: [UntoldMaterialRecordV1] = []
+        records.reserveCapacity(Int(entry.elementCount))
+        let decodeRecord: (UntoldBinaryReader) throws -> UntoldMaterialRecordV1
+        if formatVersion >= UntoldFormat.minHeightRemapVersion {
+            decodeRecord = UntoldMaterialRecordV1.decode
+        } else if formatVersion >= UntoldFormat.minHeightMapVersion {
+            decodeRecord = UntoldMaterialRecordV1.decodeLegacyWithHeightNoRemap
+        } else {
+            decodeRecord = UntoldMaterialRecordV1.decodeLegacyWithoutHeight
+        }
+        for _ in 0 ..< entry.elementCount {
+            try records.append(decodeRecord(chunkReader))
+        }
+        return records
+    }
+
     private func decodeTableIfPresent<T: UntoldBinaryDecodable>(
         _: T.Type,
         chunkType: UntoldChunkType,
@@ -535,6 +602,7 @@ public struct UntoldDecodedAsset: Sendable {
     public let lights: [UntoldLightRecordV1]
     public let cameras: [UntoldCameraRecordV1]
     public let colorManagement: UntoldColorManagementRecordV1?
+    public let colorGradeLUT: UntoldColorGradeLUTRecordV1?
     public let skeletons: [UntoldSkeletonRecordV1]
     public let skeletonJoints: [UntoldSkeletonJointRecordV1]
     public let skins: [UntoldSkinRecordV1]
@@ -545,6 +613,7 @@ public struct UntoldDecodedAsset: Sendable {
     public let rotationKeyframes: [UntoldRotationKeyframeRecordV1]
     public let morphTargets: [UntoldMorphTargetRecordV1]
     public let morphDrivers: [UntoldMorphDriverRecordV1]
+    public let gaussianAssets: [UntoldGaussianAssetRecordV1]
     public let pluginChunks: [UntoldPluginChunk]
 
     public init(
@@ -558,6 +627,7 @@ public struct UntoldDecodedAsset: Sendable {
         lights: [UntoldLightRecordV1] = [],
         cameras: [UntoldCameraRecordV1] = [],
         colorManagement: UntoldColorManagementRecordV1? = nil,
+        colorGradeLUT: UntoldColorGradeLUTRecordV1? = nil,
         skeletons: [UntoldSkeletonRecordV1],
         skeletonJoints: [UntoldSkeletonJointRecordV1],
         skins: [UntoldSkinRecordV1],
@@ -568,6 +638,7 @@ public struct UntoldDecodedAsset: Sendable {
         rotationKeyframes: [UntoldRotationKeyframeRecordV1],
         morphTargets: [UntoldMorphTargetRecordV1] = [],
         morphDrivers: [UntoldMorphDriverRecordV1] = [],
+        gaussianAssets: [UntoldGaussianAssetRecordV1] = [],
         pluginChunks: [UntoldPluginChunk] = []
     ) {
         self.header = header
@@ -580,6 +651,7 @@ public struct UntoldDecodedAsset: Sendable {
         self.lights = lights
         self.cameras = cameras
         self.colorManagement = colorManagement
+        self.colorGradeLUT = colorGradeLUT
         self.skeletons = skeletons
         self.skeletonJoints = skeletonJoints
         self.skins = skins
@@ -590,6 +662,7 @@ public struct UntoldDecodedAsset: Sendable {
         self.rotationKeyframes = rotationKeyframes
         self.morphTargets = morphTargets
         self.morphDrivers = morphDrivers
+        self.gaussianAssets = gaussianAssets
         self.pluginChunks = pluginChunks
     }
 

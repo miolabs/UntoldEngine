@@ -276,14 +276,34 @@ metallicTextureIndex              UInt32
 roughnessTextureIndex             UInt32
 emissiveTextureIndex              UInt32
 occlusionTextureIndex             UInt32
+heightTextureIndex                UInt32
+heightScale                       Float32
+heightMidlevel                    Float32
+heightRemapMin                    Float32
+heightRemapMax                    Float32
 reserved0                         UInt32 x 2
 ```
+
+`heightTextureIndex`/`heightScale`/`heightMidlevel` were added at `formatVersion = 3`
+(`UntoldFormat.minHeightMapVersion`) and drive Parallax Occlusion Mapping.
+`heightRemapMin`/`heightRemapMax` were added at `formatVersion = 4`
+(`UntoldFormat.minHeightRemapVersion`) — a contrast-stretch applied to the raw height sample
+before `heightMidlevel`, needed because many real-world displacement maps only use a narrow slice
+of `[0,1]`. Files older than `minHeightMapVersion` have none of these bytes on disk; files
+between `minHeightMapVersion` and `minHeightRemapVersion` have the height fields but not the
+remap fields. The reader picks one of three version-gated decode paths accordingly
+(`UntoldMaterialRecordV1.decode` / `.decodeLegacyWithHeightNoRemap` /
+`.decodeLegacyWithoutHeight`) so older files still load correctly, defaulting
+`heightRemapMin/Max` to the identity `(0.0, 1.0)` when absent.
 
 Rules:
 
 - texture indices point into `TEXTURE_TABLE`
 - any texture index may be `UInt32.max`
-- `flags` holds alpha mode, double-sided, transparent, and similar runtime bits
+- `flags` holds alpha mode, double-sided, transparent, and similar runtime bits — not yet
+  populated by the exporter as of this writing; the whole 32-bit field is currently `0`
+- of the two `reserved0` words, the first packs the roughness/metallic texture-channel
+  selector (`UntoldMaterialRecordV1.packTextureChannels`); only the second is genuinely spare
 
 ## Texture Reference Encoding
 
@@ -471,6 +491,51 @@ value.y                      Float32
 value.z                      Float32
 value.w                      Float32
 ```
+
+## Gaussian Asset Record Encoding
+
+Chunk type `25` (`gaussianAssetTable`) links an entity to a cooked Gaussian splat
+payload stored in a separate `.untoldgs` file (see
+[`untoldgsFormat.md`](untoldgsFormat.md)), the way texture references point at
+`.utex` files. One record per splat entity; `elementCount` is the record count.
+Types 22–24 are reserved for the morph-target channel.
+
+```text
+entityId                     UInt32
+payloadPathOffset            UInt32   // string table, path relative to this file
+flags                        UInt32   // 1 = meshTwin, 2 = environment, 4 = windowWorld, 8 = alignment
+lodCount                     UInt32   // valid LOD entries, 0...4 (0 means one level)
+lodSplatCounts               UInt32 x 4   // per level, coarsest first
+lodSwitchScreenHeights       Float32 x 4  // pixels above which the next finer level is preferred
+occluderShrinkMeters         Float32  // mesh twin depth-only shell shrink along normals
+exposureOffsetEV             Float32  // editor offset on top of the payload's capture exposure
+swapDistanceMeters           Float32  // 0 = always armed
+alignmentTranslation         Float32 x 3  // splat offset in entity space, metres (flag 8)
+alignmentYawDegrees          Float32  // splat rotation about entity +Y, degrees (flag 8)
+alignmentScale               Float32  // uniform splat scale, > 0 (flag 8)
+```
+
+The alignment fields were the record's five reserved words: they are read only when
+`flags` has the `alignment` bit (8) and are written as zero otherwise, so a file from
+before the bit existed decodes as no alignment (identity). The runtime draws the splat with
+`entityWorld × T(translation) · R_y(yaw) · S(scale)` (`GaussianComponent.splatToEntity`);
+the cook transform in the `.untoldgs` header (`splatToMesh`) is untouched by it.
+
+Rules:
+
+- `entityId` must be present in the entity table
+- `payloadPathOffset` must resolve to a non-empty string
+- `lodCount <= 4`; `occluderShrinkMeters` and `swapDistanceMeters` are non-negative
+- with the `alignment` bit set, the three alignment fields are finite and `alignmentScale > 0`
+- registration onto the mesh twin and capture exposure live in the `.untoldgs` header,
+  not here; this record holds what the scene author tunes
+- a file whose only geometry is a splat may omit the vertex and index chunks
+
+The exporter does not write this chunk; a link is authored after the export by
+`UntoldAssetPatcher` (Sources/UntoldEngine/AssetFormat/UntoldAssetPatcher.swift) or
+`untoldengine gaussian-link`, which re-emit only the string table (append-only) and this
+table, copy every other chunk's stored bytes, re-lay out the chunk offsets on the file
+alignment and recompute the content hash (`UntoldFormat.contentHash(of:in:)`).
 
 ## Compression Rules
 

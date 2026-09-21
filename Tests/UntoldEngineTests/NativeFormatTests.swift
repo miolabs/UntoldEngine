@@ -180,9 +180,10 @@ final class NativeFormatTests: XCTestCase {
         let fixture = makeScenePayloadFixture()
         let decoded = try UntoldReader().readAsset(from: fixture.fileData)
 
-        XCTAssertEqual(decoded.lights, [fixture.light])
+        XCTAssertEqual(decoded.lights, [fixture.light, fixture.sunLight])
         XCTAssertEqual(decoded.cameras, [fixture.camera])
         XCTAssertEqual(try decoded.string(at: fixture.light.nameOffset), "Authored Spot")
+        XCTAssertEqual(try decoded.string(at: fixture.sunLight.nameOffset), "Authored Sun")
         XCTAssertEqual(try decoded.string(at: fixture.camera.nameOffset), "Authored Camera")
 
         let loaded = try NativeFormatLoader().loadAssetSync(from: writeFixtureToTemporaryFile(fixture.fileData))
@@ -197,6 +198,13 @@ final class NativeFormatTests: XCTestCase {
         XCTAssertTrue(runtimeLight.usesRadiometricUnits)
         XCTAssertEqual(runtimeLight.innerCone, 12.0, accuracy: 0.0001)
         XCTAssertEqual(runtimeLight.outerCone, 34.0, accuracy: 0.0001)
+
+        let runtimeSun = try XCTUnwrap(loaded.lights.first(where: { $0.kind == .directional }))
+        XCTAssertEqual(runtimeSun.name, "Authored Sun")
+        XCTAssertEqual(runtimeSun.color, SIMD3<Float>(1.0, 0.95, 0.8))
+        XCTAssertEqual(runtimeSun.intensity, 1000.0, accuracy: 0.0001, "sun strength (W/m\u{b2}) should round-trip unchanged")
+        XCTAssertTrue(runtimeSun.castsShadow)
+        XCTAssertTrue(runtimeSun.usesRadiometricUnits)
 
         let runtimeCamera = try XCTUnwrap(loaded.cameras.first)
         XCTAssertEqual(runtimeCamera.name, "Authored Camera")
@@ -363,6 +371,211 @@ final class NativeFormatTests: XCTestCase {
         XCTAssertEqual(decoded.entities.count, 1)
     }
 
+    // MARK: - Gaussian asset table
+
+    func testGaussianAssetRecordEncodesEightyBytes() throws {
+        let record = UntoldGaussianAssetRecordV1(
+            entityId: 3,
+            payloadPathOffset: 25,
+            flags: UntoldGaussianAssetFlags.meshTwin,
+            lodCount: 3,
+            lodSplatCounts: [20000, 60000, 180_000],
+            lodSwitchScreenHeights: [120, 360, 1080],
+            occluderShrinkMeters: 0.015,
+            exposureOffsetEV: -0.3,
+            swapDistanceMeters: 4
+        )
+        XCTAssertEqual(record.lodSplatCounts, [20000, 60000, 180_000, 0])
+        XCTAssertEqual(record.lodSwitchScreenHeights, [120, 360, 1080, 0])
+        XCTAssertNil(record.alignment)
+        XCTAssertEqual(record.alignmentScale, 0, "no alignment: the former reserved words stay zero")
+
+        let writer = UntoldBinaryWriter()
+        record.encode(to: writer)
+        XCTAssertEqual(writer.count, UntoldGaussianAssetRecordV1.encodedSize)
+        XCTAssertEqual(try UntoldGaussianAssetRecordV1.decode(from: UntoldBinaryReader(data: writer.data)), record)
+    }
+
+    func testGaussianAssetTableRoundtrip() throws {
+        var probe = makeTinyFixture()
+        let record = UntoldGaussianAssetRecordV1(
+            entityId: probe.entity.entityId,
+            payloadPathOffset: probe.texture.uriOffset,
+            flags: UntoldGaussianAssetFlags.meshTwin,
+            lodCount: 1,
+            lodSplatCounts: [150_000],
+            occluderShrinkMeters: 0.02
+        )
+        let writer = UntoldBinaryWriter()
+        record.encode(to: writer)
+        probe = makeTinyFixture(pluginChunks: [(.gaussianAssetTable, writer.data, 1)])
+
+        let decoded = try UntoldReader().readAsset(from: probe.fileData)
+        XCTAssertEqual(decoded.gaussianAssets, [record])
+        XCTAssertEqual(try decoded.string(at: decoded.gaussianAssets[0].payloadPathOffset), "albedo.ktx2")
+        XCTAssertTrue(decoded.pluginChunks.isEmpty)
+        XCTAssertEqual(decoded.meshes.count, 1)
+    }
+
+    func testGaussianAssetAlignmentRoundTripsInTheFormerReservedWords() throws {
+        let alignment = GaussianSplatAlignment(translation: SIMD3<Float>(0.5, -0.25, 2), yawDegrees: 37.5, scale: 1.25)
+        let record = UntoldGaussianAssetRecordV1(
+            entityId: 3,
+            payloadPathOffset: 25,
+            flags: UntoldGaussianAssetFlags.meshTwin,
+            swapDistanceMeters: 4,
+            alignment: alignment
+        )
+        XCTAssertEqual(record.flags, UntoldGaussianAssetFlags.meshTwin | UntoldGaussianAssetFlags.alignment, "a non-nil alignment sets the flag")
+        XCTAssertEqual(record.alignment, alignment)
+        XCTAssertEqual(record.alignmentTranslation, alignment.translation)
+        XCTAssertEqual(record.alignmentYawDegrees, 37.5)
+        XCTAssertEqual(record.alignmentScale, 1.25)
+
+        let writer = UntoldBinaryWriter()
+        record.encode(to: writer)
+        XCTAssertEqual(writer.count, UntoldGaussianAssetRecordV1.encodedSize, "the record keeps its 80 bytes")
+        let decoded = try UntoldGaussianAssetRecordV1.decode(from: UntoldBinaryReader(data: writer.data))
+        XCTAssertEqual(decoded, record)
+        XCTAssertEqual(decoded.alignment, alignment)
+
+        // The words sit where the reserved words were: bytes 60...79, translation, yaw, scale.
+        let tail = writer.data.subdata(in: 60 ..< 80).withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        XCTAssertEqual(tail, [0.5, -0.25, 2, 37.5, 1.25])
+
+        // Clearing drops the flag and zeroes the words, so the bytes match a pre-alignment record.
+        var cleared = record
+        cleared.alignment = nil
+        XCTAssertEqual(cleared.flags, UntoldGaussianAssetFlags.meshTwin)
+        XCTAssertNil(cleared.alignment)
+        XCTAssertEqual(cleared, UntoldGaussianAssetRecordV1(entityId: 3, payloadPathOffset: 25, flags: UntoldGaussianAssetFlags.meshTwin, swapDistanceMeters: 4))
+    }
+
+    func testGaussianAssetRecordWithoutTheFlagHasNoAlignmentWhateverTheWordsHold() throws {
+        // A file written before the alignment existed: flag clear, words zero.
+        let old = UntoldGaussianAssetRecordV1(entityId: 1, payloadPathOffset: 25, flags: UntoldGaussianAssetFlags.meshTwin)
+        let writer = UntoldBinaryWriter()
+        old.encode(to: writer)
+        XCTAssertEqual(Array(writer.data.suffix(20)), Array(repeating: 0, count: 20))
+        XCTAssertNil(try UntoldGaussianAssetRecordV1.decode(from: UntoldBinaryReader(data: writer.data)).alignment)
+
+        // Words without the flag are kept as read (a byte-for-byte round trip) but mean nothing.
+        var stale = old
+        stale.alignmentScale = 3
+        let staleWriter = UntoldBinaryWriter()
+        stale.encode(to: staleWriter)
+        let decoded = try UntoldGaussianAssetRecordV1.decode(from: UntoldBinaryReader(data: staleWriter.data))
+        XCTAssertEqual(decoded, stale)
+        XCTAssertNil(decoded.alignment)
+    }
+
+    func testGaussianAssetAlignmentMatrixIsTranslationYawScale() {
+        XCTAssertEqual(GaussianSplatAlignment.identity.matrix, matrix_identity_float4x4)
+        XCTAssertTrue(GaussianSplatAlignment.identity.isValid)
+
+        let alignment = GaussianSplatAlignment(translation: SIMD3<Float>(1, 2, 3), yawDegrees: 90, scale: 2)
+        let matrix = alignment.matrix
+        // A point on the splat's +X axis turns about +Y (right-handed) onto -Z, doubled, then offset.
+        let point = simd_mul(matrix, SIMD4<Float>(1, 0, 0, 1))
+        XCTAssertEqual(point.x, 1, accuracy: 1e-5)
+        XCTAssertEqual(point.y, 2, accuracy: 1e-5)
+        XCTAssertEqual(point.z, 3 - 2, accuracy: 1e-5)
+        XCTAssertEqual(point.w, 1)
+        // Same as the engine's own rotation helper composed T · R · S.
+        let expected = simd_mul(
+            matrix4x4Translation(1, 2, 3),
+            simd_mul(matrix4x4Rotation(radians: .pi / 2, axis: SIMD3<Float>(0, 1, 0)), matrix4x4Scale(2, 2, 2))
+        )
+        for column in 0 ..< 4 {
+            for row in 0 ..< 4 {
+                XCTAssertEqual(matrix[column][row], expected[column][row], accuracy: 1e-5, "[\(column)][\(row)]")
+            }
+        }
+
+        XCTAssertFalse(GaussianSplatAlignment(scale: 0).isValid)
+        XCTAssertFalse(GaussianSplatAlignment(scale: -1).isValid)
+        XCTAssertFalse(GaussianSplatAlignment(yawDegrees: .nan).isValid)
+        XCTAssertFalse(GaussianSplatAlignment(translation: SIMD3<Float>(0, .infinity, 0)).isValid)
+    }
+
+    func testGaussianAssetRejectsAnInvalidAlignmentOnlyWhenFlagged() throws {
+        let probe = makeTinyFixture()
+        func fixture(_ record: UntoldGaussianAssetRecordV1) -> Data {
+            let writer = UntoldBinaryWriter()
+            record.encode(to: writer)
+            return makeTinyFixture(pluginChunks: [(.gaussianAssetTable, writer.data, 1)]).fileData
+        }
+        let base = UntoldGaussianAssetRecordV1(entityId: probe.entity.entityId, payloadPathOffset: probe.texture.uriOffset)
+
+        for bad in [
+            GaussianSplatAlignment(scale: 0),
+            GaussianSplatAlignment(scale: -0.5),
+            GaussianSplatAlignment(scale: .infinity),
+            GaussianSplatAlignment(yawDegrees: .nan),
+            GaussianSplatAlignment(translation: SIMD3<Float>(.nan, 0, 0)),
+        ] {
+            var record = base
+            record.alignment = bad
+            XCTAssertThrowsError(try UntoldReader().readAsset(from: fixture(record)), "\(bad)") { error in
+                guard case .invalidGaussianAssetRecord? = error as? UntoldValidationError else {
+                    return XCTFail("unexpected error \(error)")
+                }
+            }
+        }
+
+        var good = base
+        good.alignment = GaussianSplatAlignment(translation: SIMD3<Float>(0, 0.02, 0), yawDegrees: -180, scale: 0.01)
+        XCTAssertEqual(try UntoldReader().readAsset(from: fixture(good)).gaussianAssets, [good])
+
+        // The same words without the flag are not looked at.
+        var unflagged = good
+        unflagged.flags &= ~UntoldGaussianAssetFlags.alignment
+        unflagged.alignmentScale = 0
+        XCTAssertNil(try UntoldReader().readAsset(from: fixture(unflagged)).gaussianAssets.first?.alignment)
+    }
+
+    func testGaussianAssetWithoutTableDecodesEmpty() throws {
+        let decoded = try UntoldReader().readAsset(from: makeTinyFixture().fileData)
+        XCTAssertTrue(decoded.gaussianAssets.isEmpty)
+    }
+
+    func testGaussianAssetRejectsUnknownEntity() throws {
+        let probe = makeTinyFixture()
+        let record = UntoldGaussianAssetRecordV1(entityId: 42, payloadPathOffset: probe.texture.uriOffset)
+        let writer = UntoldBinaryWriter()
+        record.encode(to: writer)
+        let fixture = makeTinyFixture(pluginChunks: [(.gaussianAssetTable, writer.data, 1)])
+
+        XCTAssertThrowsError(try UntoldReader().readAsset(from: fixture.fileData)) { error in
+            guard case let .invalidGaussianAssetRecord(index, _)? = error as? UntoldValidationError else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertEqual(index, 0)
+        }
+    }
+
+    func testGaussianAssetRejectsMissingPathAndTooManyLevels() throws {
+        let probe = makeTinyFixture()
+
+        let noPath = UntoldGaussianAssetRecordV1(entityId: probe.entity.entityId, payloadPathOffset: UntoldFormat.invalidIndex)
+        var writer = UntoldBinaryWriter()
+        noPath.encode(to: writer)
+        XCTAssertThrowsError(try UntoldReader().readAsset(from: makeTinyFixture(pluginChunks: [(.gaussianAssetTable, writer.data, 1)]).fileData)) { error in
+            guard case .invalidGaussianAssetRecord? = error as? UntoldValidationError else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+
+        let tooManyLevels = UntoldGaussianAssetRecordV1(entityId: probe.entity.entityId, payloadPathOffset: probe.texture.uriOffset, lodCount: 5)
+        writer = UntoldBinaryWriter()
+        tooManyLevels.encode(to: writer)
+        XCTAssertThrowsError(try UntoldReader().readAsset(from: makeTinyFixture(pluginChunks: [(.gaussianAssetTable, writer.data, 1)]).fileData)) { error in
+            guard case .invalidGaussianAssetRecord? = error as? UntoldValidationError else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+
     func testColorManagementRoundtripsThroughRuntimeLoader() throws {
         // Reuses the tiny fixture's existing texture (index 0, "albedo.ktx2")
         // as the LUT reference, to exercise the same index -> URL resolution
@@ -515,6 +728,135 @@ final class NativeFormatTests: XCTestCase {
         XCTAssertEqual(material.metallicTextureChannel, .b)
     }
 
+    func testMaterialHeightAndRemapFieldsRoundtripThroughRuntimeLoader() throws {
+        // Regression coverage: the height/remap fields (added for Parallax Occlusion
+        // Mapping) previously flowed through every test only at their struct defaults —
+        // nothing exercised the actual encode/decode of non-default values through the
+        // current (>= minHeightRemapVersion) on-disk layout, nor NativeFormatLoader's
+        // UntoldMaterialRecordV1 -> RuntimeMaterialSource wiring for them.
+        let fixture = makeTinyFixture(mutator: { _, _, _, material, _, _, _ in
+            material = UntoldMaterialRecordV1(
+                nameOffset: material.nameOffset,
+                flags: material.flags,
+                baseColorFactor: material.baseColorFactor,
+                emissiveFactor: material.emissiveFactor,
+                normalScale: material.normalScale,
+                metallicFactor: material.metallicFactor,
+                roughnessFactor: material.roughnessFactor,
+                occlusionStrength: material.occlusionStrength,
+                alphaCutoff: material.alphaCutoff,
+                baseColorTextureIndex: material.baseColorTextureIndex,
+                normalTextureIndex: material.normalTextureIndex,
+                metallicTextureIndex: material.metallicTextureIndex,
+                roughnessTextureIndex: material.roughnessTextureIndex,
+                emissiveTextureIndex: material.emissiveTextureIndex,
+                occlusionTextureIndex: material.occlusionTextureIndex,
+                heightTextureIndex: 0, // reuse the fixture's one texture record; only its
+                // presence (resolving to a non-nil reference) matters for this test.
+                heightScale: 0.08,
+                heightMidlevel: 0.65,
+                heightRemapMin: 0.1,
+                heightRemapMax: 0.9
+            )
+        })
+
+        let decoded = try UntoldReader().readAsset(from: fixture.fileData)
+        let decodedMaterial = try XCTUnwrap(decoded.materials.first)
+        XCTAssertEqual(decodedMaterial.heightTextureIndex, 0)
+        XCTAssertEqual(decodedMaterial.heightScale, 0.08, accuracy: 0.0001)
+        XCTAssertEqual(decodedMaterial.heightMidlevel, 0.65, accuracy: 0.0001)
+        XCTAssertEqual(decodedMaterial.heightRemapMin, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(decodedMaterial.heightRemapMax, 0.9, accuracy: 0.0001)
+
+        let loaded = try NativeFormatLoader().loadAssetSync(from: writeFixtureToTemporaryFile(fixture.fileData))
+        let material = try XCTUnwrap(loaded.nodes.first?.primitives.first?.material)
+        XCTAssertNotNil(material.heightTexture, "heightTextureIndex should resolve to a texture reference")
+        XCTAssertEqual(material.heightScale, 0.08, accuracy: 0.0001)
+        XCTAssertEqual(material.heightMidlevel, 0.65, accuracy: 0.0001)
+        XCTAssertEqual(material.heightRemapMin, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(material.heightRemapMax, 0.9, accuracy: 0.0001)
+    }
+
+    func testDecodeLegacyWithHeightNoRemapDefaultsRemapFields() throws {
+        // formatVersion in [minHeightMapVersion, minHeightRemapVersion) — height-map fields
+        // are on disk, but height-remap fields were added later and are NOT: they must come
+        // back at their identity defaults rather than reading garbage from adjacent bytes.
+        let writer = UntoldBinaryWriter()
+        writer.writeUInt32LE(7) // nameOffset
+        writer.writeUInt32LE(0) // flags
+        writer.writeFloat32LE(1) // baseColorFactor.x
+        writer.writeFloat32LE(1) // baseColorFactor.y
+        writer.writeFloat32LE(1) // baseColorFactor.z
+        writer.writeFloat32LE(1) // baseColorFactor.w
+        writer.writeFloat32LE(0) // emissiveFactor.x
+        writer.writeFloat32LE(0) // emissiveFactor.y
+        writer.writeFloat32LE(0) // emissiveFactor.z
+        writer.writeFloat32LE(1) // normalScale
+        writer.writeFloat32LE(0.9) // metallicFactor
+        writer.writeFloat32LE(0.4) // roughnessFactor
+        writer.writeFloat32LE(1) // occlusionStrength
+        writer.writeFloat32LE(0.5) // alphaCutoff
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // baseColorTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // normalTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // metallicTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // roughnessTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // emissiveTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // occlusionTextureIndex
+        writer.writeUInt32LE(3) // heightTextureIndex
+        writer.writeFloat32LE(0.12) // heightScale
+        writer.writeFloat32LE(0.42) // heightMidlevel
+        // No heightRemapMin/Max on disk at this version.
+        writer.writeUInt32LE(0) // reserved0[0]
+        writer.writeUInt32LE(0) // reserved0[1]
+
+        let reader = UntoldBinaryReader(data: writer.data)
+        let record = try UntoldMaterialRecordV1.decodeLegacyWithHeightNoRemap(from: reader)
+
+        XCTAssertEqual(record.heightTextureIndex, 3)
+        XCTAssertEqual(record.heightScale, 0.12, accuracy: 0.0001)
+        XCTAssertEqual(record.heightMidlevel, 0.42, accuracy: 0.0001)
+        XCTAssertEqual(record.heightRemapMin, 0.0, "must default to identity, not read adjacent bytes")
+        XCTAssertEqual(record.heightRemapMax, 1.0, "must default to identity, not read adjacent bytes")
+    }
+
+    func testDecodeLegacyWithoutHeightDefaultsAllHeightFields() throws {
+        // formatVersion < minHeightMapVersion — no height-map or height-remap fields exist
+        // on disk at all for these files, predating the whole feature.
+        let writer = UntoldBinaryWriter()
+        writer.writeUInt32LE(7) // nameOffset
+        writer.writeUInt32LE(0) // flags
+        writer.writeFloat32LE(1) // baseColorFactor.x
+        writer.writeFloat32LE(1) // baseColorFactor.y
+        writer.writeFloat32LE(1) // baseColorFactor.z
+        writer.writeFloat32LE(1) // baseColorFactor.w
+        writer.writeFloat32LE(0) // emissiveFactor.x
+        writer.writeFloat32LE(0) // emissiveFactor.y
+        writer.writeFloat32LE(0) // emissiveFactor.z
+        writer.writeFloat32LE(1) // normalScale
+        writer.writeFloat32LE(0.9) // metallicFactor
+        writer.writeFloat32LE(0.4) // roughnessFactor
+        writer.writeFloat32LE(1) // occlusionStrength
+        writer.writeFloat32LE(0.5) // alphaCutoff
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // baseColorTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // normalTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // metallicTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // roughnessTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // emissiveTextureIndex
+        writer.writeUInt32LE(UntoldFormat.invalidIndex) // occlusionTextureIndex
+        // No height fields on disk at all at this version.
+        writer.writeUInt32LE(0) // reserved0[0]
+        writer.writeUInt32LE(0) // reserved0[1]
+
+        let reader = UntoldBinaryReader(data: writer.data)
+        let record = try UntoldMaterialRecordV1.decodeLegacyWithoutHeight(from: reader)
+
+        XCTAssertEqual(record.heightTextureIndex, UntoldFormat.invalidIndex, "hasHeightMap-equivalent should be false")
+        XCTAssertEqual(record.heightScale, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(record.heightMidlevel, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(record.heightRemapMin, 0.0)
+        XCTAssertEqual(record.heightRemapMax, 1.0)
+    }
+
     private func encodeChunk(_ records: [some UntoldBinaryEncodable]) -> Data {
         let writer = UntoldBinaryWriter()
         for record in records {
@@ -553,6 +895,7 @@ final class NativeFormatTests: XCTestCase {
     private struct ScenePayloadFixture {
         var fileData: Data
         var light: UntoldLightRecordV1
+        var sunLight: UntoldLightRecordV1
         var camera: UntoldCameraRecordV1
     }
 
@@ -796,7 +1139,7 @@ final class NativeFormatTests: XCTestCase {
 
     private func makeScenePayloadFixture() -> ScenePayloadFixture {
         let fixture = makeTinyFixture()
-        let stringTable = makeStringTable(["root_entity", "mesh_0", "mat_0", "albedo.ktx2", "Authored Spot", "Authored Camera"])
+        let stringTable = makeStringTable(["root_entity", "mesh_0", "mat_0", "albedo.ktx2", "Authored Spot", "Authored Sun", "Authored Camera"])
         var lightTransform = matrix_identity_float4x4
         lightTransform.columns.3 = SIMD4<Float>(2.0, 3.0, 4.0, 1.0)
         let light = UntoldLightRecordV1(
@@ -813,6 +1156,18 @@ final class NativeFormatTests: XCTestCase {
             innerCone: 12.0,
             outerCone: 34.0,
             localTransform: lightTransform
+        )
+        var sunTransform = matrix_identity_float4x4
+        sunTransform.columns.3 = SIMD4<Float>(0.0, 10.0, 0.0, 1.0)
+        let sunLight = UntoldLightRecordV1(
+            entityId: 12,
+            nameOffset: stringTable.offsets["Authored Sun"]!,
+            lightType: .directional,
+            flags: UntoldLightFlags.castsShadow | UntoldLightFlags.radiometric,
+            color: SIMD3<Float>(1.0, 0.95, 0.8),
+            intensity: 1000.0,
+            direction: SIMD3<Float>(0.0, -1.0, 0.0),
+            localTransform: sunTransform
         )
         var cameraTransform = matrix_identity_float4x4
         cameraTransform.columns.3 = SIMD4<Float>(0.0, 1.0, 6.0, 1.0)
@@ -845,12 +1200,12 @@ final class NativeFormatTests: XCTestCase {
             textures: [fixture.texture],
             vertexData: fixture.chunkPayloads.first(where: { $0.type == .vertexData })!.data,
             indexData: fixture.chunkPayloads.first(where: { $0.type == .indexData })!.data,
-            lights: [light],
+            lights: [light, sunLight],
             cameras: [camera]
         )
         header.chunkCount = UInt32(chunkPayloads.count)
         let (fileData, _) = buildFileData(header: header, chunkPayloads: chunkPayloads)
-        return ScenePayloadFixture(fileData: fileData, light: light, camera: camera)
+        return ScenePayloadFixture(fileData: fileData, light: light, sunLight: sunLight, camera: camera)
     }
 
     private func buildChunkPayloads(

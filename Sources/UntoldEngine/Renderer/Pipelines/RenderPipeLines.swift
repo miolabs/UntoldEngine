@@ -238,6 +238,23 @@ public func InitGridPipeline() -> RenderPipeline? {
     )
 }
 
+// MARK: Sky pipeline
+
+public func InitSkyPipeline() -> RenderPipeline? {
+    let wf = renderInfo.colorPipeline.working
+    return CreatePipeline(
+        vertexShader: "vertexSkyShader",
+        fragmentShader: "fragmentSkyShader",
+        vertexDescriptor: createGridVertexDescriptor(),
+        colorFormats: [wf.environment],
+        depthFormat: renderInfo.depthPixelFormat,
+        depthCompareFunction: MTLCompareFunction.lessEqual,
+        depthEnabled: false,
+        blendMode: .none,
+        name: "Sky Pipeline"
+    )
+}
+
 // MARK: Shadow pipeline
 
 public func InitShadowPipeline() -> RenderPipeline? {
@@ -974,6 +991,23 @@ public func InitWireframeOcclusionDepthPipeline() -> RenderPipeline? {
     )
 }
 
+/// Depth-only draw of a mesh carrying a `MeshOccluderComponent`, pushed along its normals away
+/// from the camera by the component's margin (`vertexMeshOccluderShellShader`). Runs in its own
+/// encoder on the resolved opaque depth after the G-buffer pass, before the HZB copy and the
+/// splat pass snapshot it, so both see the shell.
+public func InitMeshOccluderShellPipeline() -> RenderPipeline? {
+    CreatePipeline(
+        vertexShader: "vertexMeshOccluderShellShader",
+        fragmentShader: nil,
+        vertexDescriptor: createModelVertexDescriptor(),
+        colorFormats: [.invalid],
+        depthFormat: renderInfo.depthPixelFormat,
+        depthCompareFunction: .lessEqual,
+        depthEnabled: true,
+        name: "Mesh Occluder Shell Pipeline"
+    )
+}
+
 public func InitSpatialDebugPipeline() -> RenderPipeline? {
     CreatePipeline(
         vertexShader: "vertexSpatialDebugShader",
@@ -990,6 +1024,7 @@ public func InitSpatialDebugPipeline() -> RenderPipeline? {
 public func DefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)] {
     [
         (.grid, InitGridPipeline),
+        (.sky, InitSkyPipeline),
         (.shadow, InitShadowPipeline),
         (.model, InitModelPipeline),
         (.light, InitLightPipeline),
@@ -1031,6 +1066,7 @@ public func DefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)
         (.debug, InitDebugPipeline),
         (.transparency, InitTransparencyPipeline),
         (.wireframe, InitWireframePipeline),
+        (.meshOccluderShell, InitMeshOccluderShellPipeline),
     ]
 }
 

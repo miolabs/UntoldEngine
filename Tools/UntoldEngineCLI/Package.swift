@@ -30,7 +30,9 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
 
         // Local dependency on UntoldEngine (two directories up from Tools/UntoldEngineCLI)
-        .package(path: "../../"),
+        // `name:` pins the package identity so the CLI also builds from a checkout
+        // whose directory is not called UntoldEngine (git worktrees, forks).
+        .package(name: "UntoldEngine", path: "../../"),
     ],
     targets: [
         .executableTarget(
@@ -40,6 +42,12 @@ let package = Package(
                 .product(name: "UntoldEngine", package: "UntoldEngine"),
             ],
             resources: [.process("Resources")],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "UntoldEngineCLITests",
+            dependencies: ["UntoldEngineCLI"],
+            path: "Tests/UntoldEngineCLITests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

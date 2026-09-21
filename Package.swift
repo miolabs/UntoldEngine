@@ -60,6 +60,10 @@ let package = Package(
 
         .library(name: "UntoldEngineAR", targets: ["UntoldEngineAR"]),
 
+        // Components and editor extensions authored in code: base classes, @UntoldAttribute,
+        // @UntoldMenu, reflection, scene storage and the per-frame system. Platform neutral.
+        .library(name: "UntoldComponentKit", targets: ["UntoldComponentKit"]),
+
         // NOTE: Demo executables are intentionally NOT declared as products so they
         // stay hidden from consumers of the package. SwiftPM creates implicit
         // products for executable targets in the root package, so they remain
@@ -88,7 +92,11 @@ let package = Package(
             name: "UntoldEngine",
             dependencies: ["CShaderTypes"],
             path: "Sources/UntoldEngine",
-            exclude: ["Shaders"],
+            exclude: [
+                "Shaders",
+                // Kernel source; only the prebuilt .metallib resources below are shipped.
+                "UntoldEngineKernels/UntoldEngineKernels.metal",
+            ],
 
             // 📦 Ship prebuilt metallibs for each platform; pick at runtime.
             resources: engineResources,
@@ -102,6 +110,8 @@ let package = Package(
                 // Common
                 .linkedFramework("Metal"),
                 .linkedFramework("QuartzCore", .when(platforms: [.macOS, .iOS /* , .visionOS */ ])),
+                // The .untoldgs CRC-32 (UntoldGSCRC32) runs on the system zlib.
+                .linkedLibrary("z"),
 
                 // macOS UI stack
                 .linkedFramework("AppKit", .when(platforms: [.macOS])),
@@ -249,6 +259,18 @@ let package = Package(
             ]
         ),
         // Test target for unit tests
+        .target(
+            name: "UntoldComponentKit",
+            dependencies: ["UntoldEngine"],
+            path: "Sources/UntoldComponentKit",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "UntoldComponentKitTests",
+            dependencies: ["UntoldComponentKit", "UntoldEngine"],
+            path: "Tests/UntoldComponentKitTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .testTarget(
             name: "UntoldEngineTests",
             dependencies: ["UntoldEngine", "UntoldEngineShaderSupport"],

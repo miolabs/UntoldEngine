@@ -179,6 +179,47 @@ final class MemoryBudgetManagerTests: XCTestCase {
         XCTAssertTrue(candidates.contains(2))
     }
 
+    func testGetEvictionCandidatesCorrectAtScale() {
+        // Verify LRU-selection correctness holds with many entries and
+        // randomized recency, not just the small hand-ordered fixtures above.
+        // Registration order determines recency (each beginFrame() advances
+        // lastUsedFrame), so shuffling the order entities are registered in
+        // shuffles their staleness ranking independent of entityId.
+        var entityIds = (1 ... 400).map { EntityID($0) }
+        entityIds.shuffle()
+
+        var registrationRank: [EntityID: Int] = [:]
+        for (rank, id) in entityIds.enumerated() {
+            manager.beginFrame()
+            manager.registerMesh(entityId: id, meshSizeBytes: 1024)
+            registrationRank[id] = rank
+        }
+
+        // The 5 oldest entities are the first 5 registered.
+        let expectedOldest = Set(entityIds.prefix(5))
+
+        let candidates = manager.getEvictionCandidates(count: 5)
+        XCTAssertEqual(candidates.count, 5)
+        XCTAssertEqual(Set(candidates), expectedOldest)
+
+        // getEvictionCandidatesToTarget should also only ever return the
+        // stalest entries first, never something newer while something
+        // older remains unselected.
+        manager.meshBudget = entityIds.count * 1024 // full utilization at 100%
+        manager.lowWaterMark = 0.10 // force freeing ~90% of tracked memory
+
+        let toTargetCandidates = manager.getEvictionCandidatesToTarget()
+        let selectedRanks = toTargetCandidates.map { registrationRank[$0]! }
+        let unselectedRanks = Set(entityIds).subtracting(toTargetCandidates).map { registrationRank[$0]! }
+
+        if let maxSelectedRank = selectedRanks.max(), let minUnselectedRank = unselectedRanks.min() {
+            XCTAssertLessThan(
+                maxSelectedRank, minUnselectedRank,
+                "every selected entry must be older than every entry left behind"
+            )
+        }
+    }
+
     func testGetStaleEntities() {
         manager.beginFrame() // Frame 1
         manager.registerMesh(entityId: 1, meshSizeBytes: 1024)
@@ -208,6 +249,36 @@ final class MemoryBudgetManagerTests: XCTestCase {
         XCTAssertEqual(manager.entityCount, 0)
         XCTAssertEqual(manager.totalMeshMemoryUsed, 0)
         XCTAssertFalse(manager.isTracked(entityId: 1))
+    }
+
+    // MARK: - Gaussian working set
+
+    /// The Gaussian splat frame's shared working set is one ledger entry beside the entities',
+    /// replaced on every call, counted with the geometry and cleared with everything else.
+    func testGaussianWorkingSetBytesAreOneReplaceableGeometryEntry() {
+        manager.registerMesh(entityId: 1, meshSizeBytes: 1000)
+
+        manager.setGaussianWorkingSetBytes(5000)
+        XCTAssertEqual(manager.gaussianWorkingSetBytesTracked, 5000)
+        XCTAssertEqual(manager.totalMeshMemoryUsed, 6000)
+        XCTAssertEqual(manager.getMemorySize(for: 1), 1000, "the set is not any entity's")
+        XCTAssertEqual(manager.entityCount, 1)
+
+        manager.setGaussianWorkingSetBytes(2000)
+        XCTAssertEqual(manager.gaussianWorkingSetBytesTracked, 2000, "replaced, not accumulated")
+        XCTAssertEqual(manager.totalMeshMemoryUsed, 3000)
+
+        manager.setGaussianWorkingSetBytes(-1)
+        XCTAssertEqual(manager.gaussianWorkingSetBytesTracked, 0, "clamped at zero")
+        XCTAssertEqual(manager.totalMeshMemoryUsed, 1000)
+
+        manager.setGaussianWorkingSetBytes(4000)
+        XCTAssertFalse(manager.canAcceptMesh(sizeBytes: manager.geometryBudget - 4000), "it counts against the geometry budget")
+        XCTAssertTrue(manager.canAcceptMesh(sizeBytes: manager.geometryBudget - 5000))
+
+        manager.clear()
+        XCTAssertEqual(manager.gaussianWorkingSetBytesTracked, 0)
+        XCTAssertEqual(manager.totalMeshMemoryUsed, 0)
     }
 
     // MARK: - Disabled State Tests

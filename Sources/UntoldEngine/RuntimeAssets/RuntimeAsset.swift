@@ -196,6 +196,31 @@ public struct RuntimeColorManagement: Sendable, Equatable {
     }
 }
 
+/// An externally-authored .cube grade LUT resolved from an asset's
+/// `UntoldColorGradeLUTRecordV1`. At most one per `RuntimeAsset` — applied
+/// by the scene-authored payload loader, not by individual mesh loads.
+/// Unlike RuntimeColorManagement above, `lutURL` points at a plain staged
+/// .cube file (parsed/uploaded directly by CubeLUTLoader), not a native
+/// texture-table entry.
+public struct RuntimeColorGradeLUT: Sendable, Equatable {
+    public var lutURL: URL?
+    public var lutSize: Int
+    public var domainMin: SIMD3<Float>
+    public var domainMax: SIMD3<Float>
+
+    public init(
+        lutURL: URL? = nil,
+        lutSize: Int = 0,
+        domainMin: SIMD3<Float> = SIMD3<Float>(0, 0, 0),
+        domainMax: SIMD3<Float> = SIMD3<Float>(1, 1, 1)
+    ) {
+        self.lutURL = lutURL
+        self.lutSize = lutSize
+        self.domainMin = domainMin
+        self.domainMax = domainMax
+    }
+}
+
 public struct RuntimeMaterialSource: Sendable, Equatable {
     public var name: String?
     public var baseColorFactor: SIMD4<Float>
@@ -214,6 +239,11 @@ public struct RuntimeMaterialSource: Sendable, Equatable {
     public var roughnessTexture: RuntimeTextureReference?
     public var emissiveTexture: RuntimeTextureReference?
     public var occlusionTexture: RuntimeTextureReference?
+    public var heightTexture: RuntimeTextureReference?
+    public var heightScale: Float
+    public var heightMidlevel: Float
+    public var heightRemapMin: Float
+    public var heightRemapMax: Float
 
     public init(
         name: String? = nil,
@@ -232,7 +262,12 @@ public struct RuntimeMaterialSource: Sendable, Equatable {
         metallicTexture: RuntimeTextureReference? = nil,
         roughnessTexture: RuntimeTextureReference? = nil,
         emissiveTexture: RuntimeTextureReference? = nil,
-        occlusionTexture: RuntimeTextureReference? = nil
+        occlusionTexture: RuntimeTextureReference? = nil,
+        heightTexture: RuntimeTextureReference? = nil,
+        heightScale: Float = 0.05,
+        heightMidlevel: Float = 0.5,
+        heightRemapMin: Float = 0.0,
+        heightRemapMax: Float = 1.0
     ) {
         self.name = name
         self.baseColorFactor = baseColorFactor
@@ -251,6 +286,11 @@ public struct RuntimeMaterialSource: Sendable, Equatable {
         self.roughnessTexture = roughnessTexture
         self.emissiveTexture = emissiveTexture
         self.occlusionTexture = occlusionTexture
+        self.heightTexture = heightTexture
+        self.heightScale = heightScale
+        self.heightMidlevel = heightMidlevel
+        self.heightRemapMin = heightRemapMin
+        self.heightRemapMax = heightRemapMax
     }
 }
 
@@ -365,6 +405,45 @@ public struct RuntimeAnimationClip: Sendable, Equatable {
     }
 }
 
+/// A `gaussianAsset` record of a `.untold` scene resolved for one of its nodes: the payload to
+/// load and the settings the cook baked. Carried as data (see `GaussianAssetLinkComponent`).
+public struct RuntimeGaussianAssetLink: Sendable, Equatable {
+    public var payloadURL: URL
+    /// See `UntoldGaussianAssetFlags`.
+    public var flags: UInt32
+    public var lodCount: Int
+    public var lodSplatCounts: [UInt32]
+    public var lodSwitchScreenHeights: [Float]
+    public var occluderShrinkMeters: Float
+    public var exposureOffsetEV: Float
+    public var swapDistanceMeters: Float
+    /// How the splat sits in the entity's local space (`GaussianComponent.splatToEntity`); nil
+    /// when the record carries none, which is identity.
+    public var alignment: GaussianSplatAlignment?
+
+    public init(
+        payloadURL: URL,
+        flags: UInt32 = 0,
+        lodCount: Int = 0,
+        lodSplatCounts: [UInt32] = [],
+        lodSwitchScreenHeights: [Float] = [],
+        occluderShrinkMeters: Float = 0.02,
+        exposureOffsetEV: Float = 0,
+        swapDistanceMeters: Float = 0,
+        alignment: GaussianSplatAlignment? = nil
+    ) {
+        self.payloadURL = payloadURL
+        self.flags = flags
+        self.lodCount = lodCount
+        self.lodSplatCounts = lodSplatCounts
+        self.lodSwitchScreenHeights = lodSwitchScreenHeights
+        self.occluderShrinkMeters = occluderShrinkMeters
+        self.exposureOffsetEV = exposureOffsetEV
+        self.swapDistanceMeters = swapDistanceMeters
+        self.alignment = alignment
+    }
+}
+
 public struct RuntimeAssetNode: Sendable, Equatable {
     public var id: UInt32
     public var parentID: UInt32?
@@ -375,6 +454,8 @@ public struct RuntimeAssetNode: Sendable, Equatable {
     public var worldBounds: RuntimeAABB
     public var skeleton: RuntimeSkeleton?
     public var primitives: [RuntimeMeshPrimitive]
+    /// The `gaussianAsset` record the scene attached to this node, if any.
+    public var gaussianAsset: RuntimeGaussianAssetLink?
 
     public init(
         id: UInt32,
@@ -385,7 +466,8 @@ public struct RuntimeAssetNode: Sendable, Equatable {
         localBounds: RuntimeAABB,
         worldBounds: RuntimeAABB,
         skeleton: RuntimeSkeleton? = nil,
-        primitives: [RuntimeMeshPrimitive]
+        primitives: [RuntimeMeshPrimitive],
+        gaussianAsset: RuntimeGaussianAssetLink? = nil
     ) {
         self.id = id
         self.parentID = parentID
@@ -396,6 +478,7 @@ public struct RuntimeAssetNode: Sendable, Equatable {
         self.worldBounds = worldBounds
         self.skeleton = skeleton
         self.primitives = primitives
+        self.gaussianAsset = gaussianAsset
     }
 }
 
@@ -535,6 +618,7 @@ public struct RuntimeAsset: Sendable, Equatable {
     public var lights: [RuntimeLightSource]
     public var cameras: [RuntimeCameraSource]
     public var colorManagement: RuntimeColorManagement?
+    public var colorGradeLUT: RuntimeColorGradeLUT?
     public var animationClips: [RuntimeAnimationClip]
     public var meshGroups: [RuntimeMeshGroup]
 
@@ -548,6 +632,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         lights: [RuntimeLightSource] = [],
         cameras: [RuntimeCameraSource] = [],
         colorManagement: RuntimeColorManagement? = nil,
+        colorGradeLUT: RuntimeColorGradeLUT? = nil,
         animationClips: [RuntimeAnimationClip] = [],
         meshGroups: [RuntimeMeshGroup]
     ) {
@@ -560,6 +645,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         self.lights = lights
         self.cameras = cameras
         self.colorManagement = colorManagement
+        self.colorGradeLUT = colorGradeLUT
         self.animationClips = animationClips
         self.meshGroups = meshGroups
     }
@@ -574,6 +660,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         lights: [RuntimeLightSource] = [],
         cameras: [RuntimeCameraSource] = [],
         colorManagement: RuntimeColorManagement? = nil,
+        colorGradeLUT: RuntimeColorGradeLUT? = nil,
         animationClips: [RuntimeAnimationClip] = []
     ) {
         self.sourceURL = sourceURL
@@ -585,6 +672,7 @@ public struct RuntimeAsset: Sendable, Equatable {
         self.lights = lights
         self.cameras = cameras
         self.colorManagement = colorManagement
+        self.colorGradeLUT = colorGradeLUT
         self.animationClips = animationClips
         meshGroups = nodes.compactMap { node in
             guard !node.primitives.isEmpty else { return nil }

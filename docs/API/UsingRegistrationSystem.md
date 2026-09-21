@@ -28,10 +28,13 @@ registerComponent(entityId: entity, componentType: RenderComponent.self)
 ```
 Example:
 
-When you load a mesh for rendering, the system automatically registers the required components:
+When you load a mesh for rendering, the system automatically registers the required components. For normal runtime code, use the async path:
 
 ```swift
-setEntityMesh(entityId: entity, filename: "model", withExtension: "untold")
+setEntityMeshAsync(entityId: entity, filename: "model", withExtension: "untold") { success in
+    guard success else { return }
+    // RenderComponent, TransformComponent, material data, and mesh resources are ready.
+}
 ```
 
 This function:
@@ -39,15 +42,23 @@ This function:
 - Loads the mesh from the specified `.untold` file.
 - Associates the mesh with the entity.
 - Registers default components like RenderComponent and TransformComponent.
-- Uses the immediate path; the mesh is GPU-resident when the function returns.
+- Calls the completion handler when the mesh has been registered.
 
-For asynchronous always-resident loading, use:
+`withExtension` is optional — fold the extension into `filename` instead if you prefer:
 
 ```swift
-setEntityMeshAsync(entityId: entity, filename: "model", withExtension: "untold") { success in
-    // Mesh is registered on success.
-}
+setEntityMeshAsync(entityId: entity, filename: "model.untold") { success in ... }
 ```
+
+Passing `withExtension` explicitly (as above) still works exactly as before and takes priority if both are given; this applies to every `filename`/`withExtension` pair in the engine (`setEntityMesh`, `setEntityMeshAsync`, `setEntityAnimations`, `setEntityGaussian`, `loadSceneAuthored`, `setColorGradeLUT`).
+
+For immediate loading, use:
+
+```swift
+setEntityMesh(entityId: entity, filename: "model", withExtension: "untold")
+```
+
+The immediate path is useful for tools and tests that need the mesh to be GPU-resident when the function returns.
 
 For large streamed scenes, use `setEntityStreamScene(...)`. The streaming/OCC path is owned by the tile manifest pipeline, not by direct `StreamingComponent` authoring.
 
@@ -117,37 +128,43 @@ public func playSceneAt(url: URL, completion: (() -> Void)? = nil) {
 
 ### Loading Scene-Authored Data
 
-Some data exported from Blender is scene-wide rather than per-mesh: scene-authored
-lights/cameras, and a baked color-grading LUT (from `--bake-color-management`,
-see [Using the Exporter](UsingTheExporter.md)). None of this is registered by a
-normal mesh load — `setEntityMesh`/`setEntityMeshAsync` only bring in geometry
-and materials. Use `loadSceneAuthored` alongside your mesh load to bring in the
-rest:
+Some data exported from Blender is scene-wide rather than per-mesh:
+scene-authored lights/cameras, and a `.cube` creative grade LUT (from
+`--color-grade-lut`, see [Using the Exporter](UsingTheExporter.md)). None
+of this is registered by a normal mesh load — `setEntityMesh`/
+`setEntityMeshAsync` only bring in geometry and materials. Use
+`loadSceneAuthored` alongside your mesh load to bring in the rest:
 
 ```swift
 // From a single .untold asset (file-type: shared)
 loadSceneAuthored(filename: "office", withExtension: "untold") { success in
-    // Scene-authored lights/cameras and any baked color-grading LUT are now registered.
+    // Scene-authored lights/cameras and any .cube grade are now registered.
 }
 
 // From a tile manifest
 loadSceneAuthored(url: manifestURL) { success in
-    // Same, sourced from the manifest's scene_lights/scene_cameras/colorLUT keys.
+    // Same, sourced from the manifest's scene_lights/scene_cameras/colorGradeLUT keys.
 }
 ```
 
 Important behavior:
 
-- Calling either overload clears any previously-loaded color-grading LUT
-  first (`ColorLUTParams.shared.clear()`), then re-populates it only if the
-  asset/manifest actually has one baked in.
-- If the source wasn't exported with `--bake-color-management`, the engine
-  silently falls back to its default ACES Filmic tonemap — this is not an
-  error.
-- The color-grading LUT can be toggled off at runtime (e.g. to compare
-  against the default tonemap) with `setPostFX(.colorLUT(.enabled(false)))`.
+- Calling either overload clears any previously-loaded `.cube` grade first
+  (`ColorGradeLUTParams.shared.clear()`), then re-populates it only if the
+  asset/manifest actually has one staged.
+- If the source has no `.cube` staged, the engine applies no creative
+  grade — this is not an error.
+- The `.cube` grade can be toggled off at runtime (e.g. to compare against
+  the tonemap operator alone) with `setPostFX(.colorGradeLUT(.enabled(false)))`.
   See [Using Post-Effects](UsingPostFX.md).
+- A `.cube` can also be applied without any scene export, via
+  `setColorGradeLUT(filename:withExtension:)`, resolved the same way
+  `getResourceURL` resolves any other asset (a `LUT/` folder under
+  `assetBasePath`, or the app bundle).
+- Assets exported before `--bake-color-management` was removed may still
+  carry a legacy `colorLUT` baked whole-transform LUT; `loadSceneAuthored`
+  still loads and clears it (`ColorLUTParams.shared.clear()`) for backward
+  compatibility.
 
 See [Using Color Management](UsingColorManagement.md) for the full export +
-load workflow, and [Using Bake Materials](UsingBakeMaterials.md) for the
-related but separate per-material bake (`--bake-materials`).
+load workflow.

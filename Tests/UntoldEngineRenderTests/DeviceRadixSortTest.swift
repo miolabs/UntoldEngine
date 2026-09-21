@@ -18,7 +18,7 @@ import XCTest
 private enum HistogramBuffer: Int {
     case keysIn = 0
     case output = 1
-    case numElems = 2
+    case visibleSet = 2 // GaussianVisibleSet: element count read by the kernel
     case passIndex = 3
 }
 
@@ -31,7 +31,7 @@ private enum ScatterBuffer: Int {
     case keysIn = 0
     case keysOut = 1
     case offsets = 2
-    case numElems = 3
+    case visibleSet = 3 // GaussianVisibleSet: element count read by the kernel
     case passIdx = 4
     case perTGStart = 5 // zero buffer for single-TG unit tests
 }
@@ -148,6 +148,33 @@ extension DeviceRadixSortTest {
         return hist
     }
 
+    /// The frame slot's shared sort keys, the buffer `executeRadixSort` sorted in place.
+    private func readSharedKeys(count: Int) -> [UInt64] {
+        guard let buffer = GaussianSharedWorkingSet.shared.keys(slot: renderInfo.currentInFlightFrameSlot) else {
+            XCTFail("Expected the shared key buffer")
+            return []
+        }
+        return readU64(buffer, count: count)
+    }
+
+    private func readSharedVisibleSet(slot: Int) -> GaussianVisibleSet {
+        guard let buffer = GaussianSharedWorkingSet.shared.visibleSet(slot: slot) else {
+            XCTFail("Expected the shared visible set")
+            return GaussianVisibleSet()
+        }
+        return buffer.contents().load(as: GaussianVisibleSet.self)
+    }
+
+    /// Zeroes the shared set's append counter the way the preprocess pass does at the start of
+    /// a frame, for tests that run the preprocess without the cull.
+    private func resetSharedVisibleSet(slot: Int) {
+        guard let buffer = GaussianSharedWorkingSet.shared.visibleSet(slot: slot) else {
+            XCTFail("Expected the shared visible set")
+            return
+        }
+        buffer.contents().storeBytes(of: makeGaussianVisibleSet(visibleCount: 0), as: GaussianVisibleSet.self)
+    }
+
     /// CPU reference: one scatter pass (stable).
     private func referenceScatter(keys: [UInt64], offsets: [UInt32], pass: Int) -> [UInt64] {
         var out = [UInt64](repeating: 0, count: keys.count)
@@ -203,7 +230,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         dispatch(pipeline, threadCount: n) { enc in
             enc.setBuffer(keyBuf, offset: 0, index: HistogramBuffer.keysIn.rawValue)
             enc.setBuffer(histBuf, offset: 0, index: HistogramBuffer.output.rawValue)
-            enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.numElems.rawValue)
+            var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+            enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: HistogramBuffer.visibleSet.rawValue)
             enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.passIndex.rawValue)
         }
 
@@ -240,7 +268,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         dispatch(pipeline, threadCount: kRadixBuckets) { enc in
             enc.setBuffer(keyBuf, offset: 0, index: HistogramBuffer.keysIn.rawValue)
             enc.setBuffer(histBuf, offset: 0, index: HistogramBuffer.output.rawValue)
-            enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.numElems.rawValue)
+            var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+            enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: HistogramBuffer.visibleSet.rawValue)
             enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.passIndex.rawValue)
         }
 
@@ -272,7 +301,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         dispatch(pipeline, threadCount: 1) { enc in
             enc.setBuffer(keyBuf, offset: 0, index: HistogramBuffer.keysIn.rawValue)
             enc.setBuffer(histBuf, offset: 0, index: HistogramBuffer.output.rawValue)
-            enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.numElems.rawValue)
+            var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+            enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: HistogramBuffer.visibleSet.rawValue)
             enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.passIndex.rawValue)
         }
 
@@ -309,7 +339,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
             dispatch(pipeline, threadCount: n) { enc in
                 enc.setBuffer(keyBuf, offset: 0, index: HistogramBuffer.keysIn.rawValue)
                 enc.setBuffer(histBuf, offset: 0, index: HistogramBuffer.output.rawValue)
-                enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.numElems.rawValue)
+                var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+                enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: HistogramBuffer.visibleSet.rawValue)
                 enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.passIndex.rawValue)
             }
 
@@ -343,7 +374,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
             dispatch(pipeline, threadCount: n) { enc in
                 enc.setBuffer(keyBuf, offset: 0, index: HistogramBuffer.keysIn.rawValue)
                 enc.setBuffer(histBuf, offset: 0, index: HistogramBuffer.output.rawValue)
-                enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.numElems.rawValue)
+                var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+                enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: HistogramBuffer.visibleSet.rawValue)
                 enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: HistogramBuffer.passIndex.rawValue)
             }
 
@@ -555,7 +587,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
             enc.setBuffer(keyInBuf, offset: 0, index: ScatterBuffer.keysIn.rawValue)
             enc.setBuffer(keyOutBuf, offset: 0, index: ScatterBuffer.keysOut.rawValue)
             enc.setBuffer(offsetBuf, offset: 0, index: ScatterBuffer.offsets.rawValue)
-            enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: ScatterBuffer.numElems.rawValue)
+            var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+            enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: ScatterBuffer.visibleSet.rawValue)
             enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: ScatterBuffer.passIdx.rawValue)
             enc.setBuffer(zeroBuf, offset: 0, index: ScatterBuffer.perTGStart.rawValue)
         }
@@ -600,7 +633,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
             enc.setBuffer(keyInBuf, offset: 0, index: ScatterBuffer.keysIn.rawValue)
             enc.setBuffer(keyOutBuf, offset: 0, index: ScatterBuffer.keysOut.rawValue)
             enc.setBuffer(offsetBuf, offset: 0, index: ScatterBuffer.offsets.rawValue)
-            enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: ScatterBuffer.numElems.rawValue)
+            var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+            enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: ScatterBuffer.visibleSet.rawValue)
             enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: ScatterBuffer.passIdx.rawValue)
             enc.setBuffer(zeroBuf, offset: 0, index: ScatterBuffer.perTGStart.rawValue)
         }
@@ -647,7 +681,8 @@ final class DeviceRadixSortTest: BaseRenderSetup {
             enc.setBuffer(keyInBuf, offset: 0, index: ScatterBuffer.keysIn.rawValue)
             enc.setBuffer(keyOutBuf, offset: 0, index: ScatterBuffer.keysOut.rawValue)
             enc.setBuffer(offsetBuf, offset: 0, index: ScatterBuffer.offsets.rawValue)
-            enc.setBytes(&numElems, length: MemoryLayout<UInt32>.stride, index: ScatterBuffer.numElems.rawValue)
+            var visibleSet = makeGaussianVisibleSet(visibleCount: numElems)
+            enc.setBytes(&visibleSet, length: MemoryLayout<GaussianVisibleSet>.stride, index: ScatterBuffer.visibleSet.rawValue)
             enc.setBytes(&passIndex, length: MemoryLayout<UInt32>.stride, index: ScatterBuffer.passIdx.rawValue)
             enc.setBuffer(zeroBuf, offset: 0, index: ScatterBuffer.perTGStart.rawValue)
         }
@@ -706,7 +741,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         wt.space = matrix_identity_float4x4
 
         guard let keyBuf = makeBuffer(inputKeys) else { XCTFail("Buffer allocation failed"); return }
-        gc.gaussianSortedIndices = keyBuf
+        XCTAssertTrue(GaussianSharedWorkingSet.shared.seedForTesting(keys: readU64(keyBuf, count: keyBuf.length / MemoryLayout<UInt64>.stride), slot: renderInfo.currentInFlightFrameSlot, device: renderInfo.device))
         gc.splatCount = UInt(n)
         gc.visibleSplatCountForRendering = UInt(n)
 
@@ -719,7 +754,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let result = readU64(keyBuf, count: n)
+        let result = readSharedKeys(count: n)
 
         for i in 1 ..< n {
             let prev = UInt32((result[i - 1] >> 32) & 0xFFFF_FFFF)
@@ -762,7 +797,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         wt.space = matrix_identity_float4x4
 
         guard let keyBuf = makeBuffer(inputKeys) else { XCTFail("Buffer allocation failed"); return }
-        gc.gaussianSortedIndices = keyBuf
+        XCTAssertTrue(GaussianSharedWorkingSet.shared.seedForTesting(keys: readU64(keyBuf, count: keyBuf.length / MemoryLayout<UInt64>.stride), slot: renderInfo.currentInFlightFrameSlot, device: renderInfo.device))
         gc.splatCount = UInt(n)
         gc.visibleSplatCountForRendering = UInt(n)
 
@@ -775,7 +810,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let result = readU64(keyBuf, count: n)
+        let result = readSharedKeys(count: n)
 
         for i in 0 ..< n {
             XCTAssertEqual(result[i], expectedSorted[i],
@@ -814,7 +849,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         else { XCTFail("Setup failed"); return }
 
         wt1.space = matrix_identity_float4x4
-        gc1.gaussianSortedIndices = buf1
+        XCTAssertTrue(GaussianSharedWorkingSet.shared.seedForTesting(keys: readU64(buf1, count: buf1.length / MemoryLayout<UInt64>.stride), slot: renderInfo.currentInFlightFrameSlot, device: renderInfo.device))
         gc1.splatCount = UInt(n)
         gc1.visibleSplatCountForRendering = UInt(n)
 
@@ -826,7 +861,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         cmd1.commit()
         cmd1.waitUntilCompleted()
 
-        let result1 = readU64(buf1, count: n)
+        let result1 = readSharedKeys(count: n)
 
         for i in 0 ..< n {
             XCTAssertEqual(result1[i], expectedSorted[i],
@@ -861,13 +896,9 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         let splats = positions.map { pos in
             EncodedGaussianSplat(
                 position: pos,
-                opacity: 1.0,
-                color: simd_float3(1, 0, 0),
-                _pad0: 0.0,
-                covA: simd_float3(1, 0, 0),
-                _pad1: 0.0,
-                covB: simd_float3(1, 0, 1),
-                _pad2: 0.0
+                covA: simd_half3(1, 0, 0),
+                covB: simd_half3(1, 0, 1),
+                colorAndOpacity: simd_half4(1, 0, 0, 1)
             )
         }
 
@@ -902,36 +933,42 @@ final class DeviceRadixSortTest: BaseRenderSetup {
                 options: .storageModeShared
             ),
             let visibleCountBuf = renderInfo.device.makeBuffer(
-                length: MemoryLayout<UInt32>.stride,
+                length: MemoryLayout<GaussianVisibleSet>.stride,
                 options: .storageModeShared
             )
         else { XCTFail("Buffer allocation failed"); return }
 
-        visibleCountBuf.contents().storeBytes(of: UInt32(numSplats), as: UInt32.self)
+        visibleCountBuf.contents().storeBytes(
+            of: makeGaussianVisibleSet(visibleCount: UInt32(numSplats)),
+            as: GaussianVisibleSet.self
+        )
         gc.encodedSplatData = splatBuf
-        gc.gaussianSortedIndices = keyBuf
-        gc.gaussianVisibleIndices = visibleIndexBuf
-        gc.gaussianVisibleCount = visibleCountBuf
+        gc.gaussianVisibleIndices = Array(repeating: visibleIndexBuf, count: maxInFlightCommandBuffers)
+        gc.gaussianVisibleCount = Array(repeating: visibleCountBuf, count: maxInFlightCommandBuffers)
         gc.splatCount = UInt(numSplats)
         gc.visibleSplatCountForRendering = UInt(numSplats)
-        gc.spaceUniform = (0 ..< 2).compactMap { _ in
-            renderInfo.device.makeBuffer(
-                length: MemoryLayout<Uniforms>.stride,
-                options: .storageModeShared
-            )
-        }
+        _ = keyBuf
+
+        // No cull in this test: size the shared set by hand and zero its append counter, as the
+        // cull would, then let the preprocess compact and key every splat and the sort order them.
+        let slot = renderInfo.currentInFlightFrameSlot
+        XCTAssertTrue(GaussianSharedWorkingSet.shared.ensureCapacity(numSplats, device: renderInfo.device))
+        resetSharedVisibleSet(slot: slot)
 
         guard let queue = renderInfo.device.makeCommandQueue(),
               let cmd = queue.makeCommandBuffer()
         else { XCTFail("Command queue failed"); return }
 
-        executeGaussianDepth(cmd)
+        executeGaussianPreprocess(cmd)
         executeRadixSort(cmd)
 
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let result = readU64(keyBuf, count: numSplats)
+        let sharedSet = readSharedVisibleSet(slot: slot)
+        XCTAssertEqual(Int(sharedSet.visibleCount), numSplats, "every splat was compacted into the shared set")
+        XCTAssertEqual(sharedSet.overflowCount, 0)
+        let result = readSharedKeys(count: numSplats)
 
         // Verify ascending depth key order (front-to-back)
         for i in 1 ..< numSplats {
@@ -944,7 +981,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         // Verify all indices are in valid range
         for i in 0 ..< numSplats {
             let idx = UInt32(result[i] & 0xFFFF_FFFF)
-            XCTAssertLessThan(idx, UInt32(numSplats), "Index \(idx) out of range at position \(i)")
+            XCTAssertLessThan(idx, UInt32(numSplats), "Slot \(idx) out of range at position \(i)")
         }
 
         print("✅ test_radixSort_depthOrdering_withCamera passed")
@@ -979,7 +1016,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         else { XCTFail("Setup failed"); return }
 
         wt.space = matrix_identity_float4x4
-        gc.gaussianSortedIndices = keyBuf
+        XCTAssertTrue(GaussianSharedWorkingSet.shared.seedForTesting(keys: readU64(keyBuf, count: keyBuf.length / MemoryLayout<UInt64>.stride), slot: renderInfo.currentInFlightFrameSlot, device: renderInfo.device))
         gc.splatCount = UInt(n)
         gc.visibleSplatCountForRendering = UInt(n)
 
@@ -992,7 +1029,7 @@ final class DeviceRadixSortTest: BaseRenderSetup {
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        let result = readU64(keyBuf, count: n)
+        let result = readSharedKeys(count: n)
 
         // Check monotonically sorted
         for i in 1 ..< n {

@@ -27,18 +27,21 @@ Use `File > Export > Untold (.untold)` for model assets.
 Options:
 
 - `Scope`: export the visible scene or selected objects.
-- `File Type`: choose the `.untold` file type marker.
+- `File Type`: choose the `.untold` file type marker. `Standard` is the
+  default runtime asset marker; use `Shared` to mark a non-tiled export as a
+  scene-wide asset so `loadSceneAuthored` picks up its lights/cameras/color
+  grade LUT (see
+  [Using Color Management](../../docs/API/UsingColorManagement.md)). `LOD`/
+  `HLOD` are for manually producing distance-asset payloads outside the
+  tiled scene exporter.
 - `Convert Orientation`: convert Blender native coordinates into engine space.
 - `Write Validation JSON`: write a companion validation file.
 - `Compress Geometry`: use LZ4 compression for geometry chunks.
-- `Bake Materials`: evaluate Blender shader nodes the exporter
-  can't read directly (Mix, Math, procedural textures, ...) into flat
-  textures via Cycles, so the export matches Blender. See
-  [Material Node Baking](../../docs/API/UsingBlenderAddon.md#material-node-baking).
-- `Bake Resolution`: square resolution for baked material textures.
-  Override per material with a `untold_bake_resolution` custom property.
-- `Use Bake Cache`: skip re-baking materials unchanged since the last
-  export; disable to force a full re-bake.
+- `Color Grade LUT`: path to an externally-authored standard `.cube` 3D LUT
+  to stage and apply as a post-tonemap creative grade. Nothing is rendered
+  from Blender — the `.cube` is copied as-is and loaded directly by the
+  engine, composing with (not replacing) the engine's native tonemap
+  operator.
 - `Compress Textures`: convert staged textures to engine-native `.utex`
   files and patch the exported `.untold` references.
 
@@ -51,7 +54,7 @@ then set `ASTCENC_BIN=/full/path/to/astcenc` before launching Blender.
 Ensure the downloaded binary is executable with
 `chmod +x /full/path/to/astcenc`.
 
-Use `File > Export > Untold Animation (.untold)` for animation clips.
+Use `File > Export > Untold Animation (.untoldanim)` for animation clips.
 
 Animation options:
 
@@ -71,18 +74,26 @@ Tiled scene options:
 - `Uniform Grid: Auto Tile Size`: let the uniform-grid exporter choose tile
   dimensions from scene complexity.
 - `Uniform Grid: Tile Size X/Y/Z`: manual uniform-grid tile dimensions.
-- `Quadtree: Floor Count`: optional floor count override. Use `0` for auto.
-- `Quadtree: Floor Band Height`: optional per-floor height override. Use `0`
+- `Tree: Floor Count`: optional floor count override for quadtree/KD-tree
+  partitioning. Use `0` for auto.
+- `Tree: Floor Band Height`: optional per-floor height override. Use `0`
   for auto.
 - `Scene Profile`: auto, indoor, or outdoor streaming radius profile.
+- `Untagged Semantic`: semantic tier (`Auto`, `Exterior Shell`,
+  `Structural Interior`, `Room Contents`, `Fine Props`) applied to meshes
+  without an explicit Untold semantic override.
+- `Custom Tier Radii`: override the profile-derived streaming/unload
+  radii and priority for each semantic tier.
 - `Generate HLOD` / `Generate LOD`: create simplified distance assets.
-  Not separately re-baked even when `Bake Materials` is on —
-  they reuse the full-detail tile's export, which is baked.
+  They reuse the full-detail tile's export rather than re-baking anything.
+- `Custom Rep Ranges`: override the normalized LOD1/LOD2/HLOD switch
+  distances and reduction ratios instead of the scene-profile defaults.
 - `Compress Geometry`: LZ4-compress tile vertex/index chunks.
-- `Bake Materials` / `Bake Resolution` / `Use Bake Cache`: same
-  as the model exporter, above. Applies to full-detail tile and
-  shared-bucket payloads only.
+- `Color Grade LUT`: same as the model exporter, above; staged once for the
+  whole scene and referenced from the manifest's `colorGradeLUT` key.
 - `Dry Run`: plan the partition without writing payload files.
+- `Write Manifest In Dry Run`: write the manifest JSON even when `Dry Run`
+  is enabled.
 
 The plugin runs tiled export in sequential mode. Use
 `scripts/export-untold-tiles` for parallel worker exports.
@@ -91,6 +102,8 @@ Partitioning rules:
 
 - `Uniform Grid` uses the auto/manual tile-size controls.
 - `Quadtree` uses the floor controls and ignores uniform-grid tile sizing.
+- `KD-Tree` uses the floor controls and gives better balance than Quadtree
+  in scenes with clustered geometry.
 - Only one partitioning algorithm is active for a given export.
 
 Example tiled scene layout:

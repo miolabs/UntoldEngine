@@ -43,12 +43,36 @@ markdown_extensions:
 
 nav:
   - Introduction: index.md
+  - Getting Started: API/GettingStarted.md
+  - Tutorials:
+    - Overview: Tutorials/index.md
+    - Starter Demo: Tutorials/StarterDemo.md
+    - Lighting Demo: Tutorials/LightingDemo.md
+    - Rendering Quality Demo: Tutorials/RenderingQualityDemo.md
+    - Exporter Pipeline Demo: Tutorials/ExporterPipelineDemo.md
+    - Interaction / Gameplay Demo: Tutorials/InteractionGameplayDemo.md
+    - Large Scene Streaming Demo: Tutorials/LargeSceneStreamingDemo.md
+    - Showcase Demo: Tutorials/ShowcaseDemo.md
+    - Create A New Xcode Project: Tutorials/CreateXcodeProjectTutorial.md
+    - Export Assets With The CLI: Tutorials/CLIExporterTutorial.md
+    - Scene Channels And Passthrough Rendering: Tutorials/SceneChannelsTutorial.md
+    - Light Portals: Tutorials/LightPortalsTutorial.md
+    - Blender Add-On Workflow: Tutorials/BlenderAddonTutorial.md
+    - Materials, Textures, And Color Management: Tutorials/MaterialsPipelineTutorial.md
+    - XR App Basics: Tutorials/XRTutorial.md
+    - Spatial Input And Manipulation: Tutorials/SpatialInputTutorial.md
+    - Performance Diagnostics: Tutorials/PerformanceDiagnosticsTutorial.md
+  - Learning Paths:
+    - Overview: LearningPaths/index.md
+    - Archviz To Vision Pro: LearningPaths/ArchvizToVisionPro.md
+    - Bedroom Digital Twin: LearningPaths/BedroomDigitalTwin.md
+    - City Streaming On Vision Pro: LearningPaths/CityStreamingOnVisionPro.md
   - API:
-    - Getting Started: API/GettingStarted.md
     - Untold Engine CLI: API/UsingUntoldEngineCLI.md
     - Usage Examples: API/UsageExamples.md
     - Engine Settings: API/UsingEngineAPI.md
     - Registration System: API/UsingRegistrationSystem.md
+    - Plugins in Swift: API/UsingCodeComponents.md
     - Transform System: API/UsingTransformSystem.md
     - Scene Graph: API/UsingScenegraph.md
     - Camera System: API/UsingCameraSystem.md
@@ -57,8 +81,11 @@ nav:
     - Materials: API/UsingMaterials.md
     - Lighting System: API/UsingLightingSystem.md
     - Animation System: API/UsingAnimationSystem.md
+    - Animation Transitions: API/UsingAnimationTransitions.md
+    - Root Motion: API/UsingRootMotion.md
     - Physics System: API/UsingPhysicsSystem.md
     - Steering System: API/UsingSteeringSystem.md
+    - Scripting System: API/UsingScriptingSystem.md
     - Post Effects: API/UsingPostFX.md
     - Scene Channels: API/UsingSceneChannels.md
     - LOD System: API/UsingLODSystem.md
@@ -76,15 +103,18 @@ nav:
     - Spatial Debugger: API/SpatialDebugger.md
     - Logger: API/UsingTheLogger.md
     - Exporter: API/UsingTheExporter.md
-    - Bake Materials: API/UsingBakeMaterials.md
     - Color Management: API/UsingColorManagement.md
     - Blender Add-on: API/UsingBlenderAddon.md
     - Optimizations: API/Optimizations.md
+    - Scene Builder / UntoldView: API/UsingSceneBuilder.md
+    - Asset Paths: API/UsingAssetPaths.md
   - Architecture:
     - Rendering System: Architecture/renderingSystem.md
     - Rendering Extensions: Architecture/RenderingExtensions.md
     - XR Rendering System: Architecture/xrRenderingSystem.md
+    - Animation Pose Layer: Architecture/animationPoseLayer.md
     - Asset Format: Architecture/assetFormat.md
+    - Gaussian Splat Format (.untoldgs): Architecture/untoldgsFormat.md
     - Scene Channels: Architecture/sceneChannels.md
     - Tile-Based Streaming: Architecture/tilebasedstreaming.md
     - Out-of-Core Geometry: Architecture/outOfCore.md
@@ -103,6 +133,7 @@ nav:
     - Plugin Authoring Guidelines: Extensions/PluginAuthoringGuidelines.md
     - Creating a Rendering Extension Plugin: Extensions/CreatingRenderingExtensionPlugin.md
     - Creating an Engine Extension Plugin: Extensions/CreatingAnEngineExtensionPlugin.md
+    - Creating a Physics Backend Plugin: Extensions/CreatingAPhysicsBackendPlugin.md
   - Contributing:
     - Guidelines: Contributor/ContributionGuidelines.md
     - Versioning: Contributor/versioning.md

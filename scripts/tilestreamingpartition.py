@@ -64,18 +64,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from untoldexplorer import (
-    ColorManagementBake,
     ProgressCallback,
     ProgressReporter,
-    bake_color_management_lut,
     clear_scene,
     export_objects_to_untold,
     extract_scene_payload_from_objects,
     import_usd_asset,
     load_blend_scene,
+    stage_color_grade_lut_for_output,
     stage_hdr_assets_for_output,
-    validate_bake_resolution,
-    validate_lut_size,
 )
 
 
@@ -150,25 +147,18 @@ def _manifest_camera_payload(camera):
     }
 
 
-def _manifest_color_management_payload(bake, manifest_dir=None):
-    if bake is None:
+def _manifest_color_grade_lut_payload(staged, manifest_dir=None):
+    """Externally-authored .cube grade LUT (see stage_color_grade_lut_for_output)."""
+    if staged is None:
         return None
-    lut_uri = bake.lut_texture.uri
-    if manifest_dir is not None and bake.lut_texture.source_path is not None:
-        lut_uri = os.path.relpath(
-            bake.lut_texture.source_path,
-            Path(manifest_dir),
-        ).replace(os.sep, "/")
+    lut_uri = staged.uri
+    if manifest_dir is not None:
+        lut_uri = os.path.relpath(staged.source_path, Path(manifest_dir)).replace(os.sep, "/")
     return {
         "lutUri": lut_uri,
-        "lutSize": bake.lut_size,
-        "viewTransform": bake.view_transform,
-        "look": bake.look,
-        "displayDevice": bake.display_device,
-        "exposure": float(bake.exposure),
-        "gamma": float(bake.gamma),
-        "shaperMinStops": float(bake.shaper_min_stops),
-        "shaperMaxStops": float(bake.shaper_max_stops),
+        "lutSize": staged.lut_size,
+        "domainMin": list(staged.domain_min),
+        "domainMax": list(staged.domain_max),
     }
 
 
@@ -208,14 +198,7 @@ EXPORT_FORMAT = "untold"        # Runtime payload format emitted for tiles.
 CONVERT_ORIENTATION = True      # Convert Blender scene data into engine space (+Z forward, +Y up).
 SOURCE_ORIENTATION = "blender-native"
 COMPRESS_GEOMETRY = False       # Compress vertex/index chunks with LZ4 (requires: pip install lz4).
-BAKE_MATERIALS = False          # Bake node-graph materials the engine can't evaluate (see --bake-materials).
-BAKE_RESOLUTION = 1024          # Square resolution for baked material textures.
-BAKE_CACHE = True                # Skip re-baking materials unchanged since the last export (see --no-bake-cache).
-                                  # Cache location follows source_asset_path (shared across all tiles from one
-                                  # --input source); falls back to being scoped per-tile-output when no --input
-                                  # source path is known (e.g. addon exports operating on an already-open scene).
-BAKE_COLOR_MANAGEMENT = False   # Bake the scene's View Transform/Look/Exposure/Gamma into a LUT (see --bake-color-management).
-COLOR_LUT_SIZE = 32             # Grid size (N) for the NxNxN color-grading LUT.
+COLOR_GRADE_LUT_PATH = None     # Path to an externally-authored .cube LUT to stage (see --color-grade-lut).
 
 # Tile footprint in Blender world units.
 # Start at 10 and tune with DRY_RUN=True.  Rule of thumb: set to 2–3× the
@@ -269,6 +252,15 @@ FUTURE_SPLIT_TILE_THRESHOLD = 15
 # to the shared bucket to avoid thousands of clip+export iterations for truly
 # scene-spanning meshes (ground planes, terrain slabs).
 #
+# This routing is only honored when CLIP_LOCAL_MESHES is also True (see below).
+# Without clipping, "routed to tiles" means the *entire* spanning mesh is
+# duplicated whole into every overlapping tile instead of being cut into
+# per-tile pieces — for an object that already overlaps dozens of tiles, that
+# is dozens of full-size coplanar copies at the same world position, which
+# z-fights and pops in/out independently as each tile streams. With
+# CLIP_LOCAL_MESHES == False, spanning objects always stay in the shared
+# bucket regardless of SPLIT_MAX_TILES.
+#
 # Rule of thumb for SPLIT_MAX_TILES: (max_building_width / TILE_SIZE)²
 # At TILE_SIZE=25, default 400 allows objects up to 500 m × 500 m to be split.
 SPLIT_SPANNING_OBJECTS = True
@@ -298,6 +290,16 @@ MERGE_BY_MATERIAL = True
 # retain their original name in the .untold file.  Set to "" to disable.
 # Example: name an object "NM_Pipe_001" in Blender to keep it separate.
 NO_MERGE_PREFIX = "NM_"
+
+# The exporter always writes uv_layers[0] as a merged mesh's texture coordinates
+# (see untoldexplorer.py).  Source assets combined into one scene often name their
+# primary UV layer differently ("UVMap", "UVChannel_1", "UVW", ...).  When objects
+# with different primary-layer names are joined by merge_objects_by_material(),
+# bmesh unifies layers *by name*, so only the objects whose layer name landed at
+# index 0 keep real UVs — everyone else's merged-in faces get all-zero UVs and
+# render untextured.  Renaming every object's active layer to this canonical name
+# before merging keeps the primary UV channel unified across the whole tile.
+MERGE_CANONICAL_UV_LAYER_NAME = "UVMap"
 
 # Clip tolerance at tile boundaries.
 # for objects at large world coordinates (e.g. buildings at x=1500).
@@ -540,7 +542,6 @@ PARALLEL_WORKERS = 0
 # Explicit --parallel-workers N always bypasses it.
 AUTO_WORKER_RAM_SAFETY_FRACTION = 0.6       # fraction of total RAM the auto cap may plan to use
 AUTO_WORKER_SCENE_MEMORY_MULTIPLIER = 6.0   # estimated in-memory expansion vs on-disk file size
-AUTO_WORKER_BAKE_MEMORY_MULTIPLIER = 1.5    # extra multiplier when --bake-materials is enabled
 AUTO_WORKER_MIN_ESTIMATE_BYTES = 512 * 1024 * 1024  # floor per-worker estimate
 
 
@@ -2420,6 +2421,7 @@ def build_assignments(objects, object_bounds, origin_x, origin_y, origin_z,
             result["policy"] == "local_overlap"
             or (
                 SPLIT_SPANNING_OBJECTS
+                and CLIP_LOCAL_MESHES
                 and result["policy"] in ("shared_bucket", "future_split_candidate")
                 and result["xz_overlap_count"] <= SPLIT_MAX_TILES
             )
@@ -3034,6 +3036,53 @@ def split_objects_by_material(objects, temp_scene):
     return result
 
 
+def normalize_primary_uv_layer(obj):
+    """Rename obj's active UV layer to MERGE_CANONICAL_UV_LAYER_NAME and move it to index 0.
+
+    See the comment on MERGE_CANONICAL_UV_LAYER_NAME for why this matters: bmesh
+    merges UV layers by name, and the exporter always reads index 0, so every
+    object about to be joined with others must agree on the primary layer's name.
+    Other (secondary) UV layers are preserved under their original names.
+    No-op if the mesh has no UV layers, or already satisfies both conditions.
+    """
+    mesh = obj.data
+    uv_layers = getattr(mesh, "uv_layers", None)
+    if not uv_layers or len(uv_layers) == 0:
+        return
+
+    # Compare by name, not identity: each attribute access on uv_layers.active /
+    # uv_layers[i] returns a fresh RNA wrapper, so `is` can be False even when
+    # both refer to the same underlying layer.
+    active_name = (uv_layers.active or uv_layers[0]).name
+    if uv_layers[0].name == active_name and active_name == MERGE_CANONICAL_UV_LAYER_NAME:
+        return
+
+    loop_count = len(mesh.loops)
+    saved = []
+    for layer in uv_layers:
+        data = [0.0] * (loop_count * 2)
+        layer.data.foreach_get("uv", data)
+        saved.append((layer.name, data, layer.name == active_name))
+
+    for layer in list(uv_layers):
+        uv_layers.remove(layer)
+
+    active_entry = next(entry for entry in saved if entry[2])
+    new_active = uv_layers.new(name=MERGE_CANONICAL_UV_LAYER_NAME)
+    new_active.data.foreach_set("uv", active_entry[1])
+
+    for name, data, was_active in saved:
+        if was_active:
+            continue
+        # Avoid a name collision with the canonical layer we just created
+        # (e.g. a mesh that already had a secondary layer literally named "UVMap").
+        restored_name = name if name != MERGE_CANONICAL_UV_LAYER_NAME else f"{name}.orig"
+        layer = uv_layers.new(name=restored_name)
+        layer.data.foreach_set("uv", data)
+
+    uv_layers.active = new_active
+
+
 def merge_objects_by_material(objects, temp_scene):
     """Join objects that share identical material(s) into single meshes.
 
@@ -3073,6 +3122,8 @@ def merge_objects_by_material(objects, temp_scene):
             continue
 
         try:
+            for obj in group:
+                normalize_primary_uv_layer(obj)
             merged = _merge_objects_in_scene(group, temp_scene)
             total_merged_away += len(group) - 1
             result.append(merged)
@@ -3206,9 +3257,6 @@ def export_local_tile(filepath, objects, tile_bounds, source_scene_path):
                 convert_orientation=CONVERT_ORIENTATION,
                 source_orientation=SOURCE_ORIENTATION,
                 compress_geometry=COMPRESS_GEOMETRY,
-                bake_materials=BAKE_MATERIALS,
-                bake_resolution=BAKE_RESOLUTION,
-                bake_cache=BAKE_CACHE,
                 progress_callback=make_untold_progress_callback(os.path.basename(filepath)),
             )
     finally:
@@ -3248,9 +3296,6 @@ def export_shared_bucket(filepath, objects, source_scene_path):
                     convert_orientation=CONVERT_ORIENTATION,
                     source_orientation=SOURCE_ORIENTATION,
                     compress_geometry=COMPRESS_GEOMETRY,
-                    bake_materials=BAKE_MATERIALS,
-                    bake_resolution=BAKE_RESOLUTION,
-                    bake_cache=BAKE_CACHE,
                     progress_callback=make_untold_progress_callback(os.path.basename(filepath)),
                 )
         finally:
@@ -3266,9 +3311,6 @@ def export_shared_bucket(filepath, objects, source_scene_path):
                 convert_orientation=CONVERT_ORIENTATION,
                 source_orientation=SOURCE_ORIENTATION,
                 compress_geometry=COMPRESS_GEOMETRY,
-                bake_materials=BAKE_MATERIALS,
-                bake_resolution=BAKE_RESOLUTION,
-                bake_cache=BAKE_CACHE,
                 progress_callback=make_untold_progress_callback(os.path.basename(filepath)),
             )
 
@@ -3276,15 +3318,7 @@ def export_shared_bucket(filepath, objects, source_scene_path):
 
 
 def export_hlod_tile(filepath, objects, tile_bounds, reduction_ratio, source_scene_path, file_type_name):
-    """Export one simplified HLOD asset for a tile-local geometry set.
-
-    Deliberately does not pass BAKE_MATERIALS/BAKE_RESOLUTION through to
-    export_objects_to_untold(): HLOD/LOD tiles are decimated stand-ins for
-    geometry already exported (and, if requested, baked) at full detail in
-    export_local_tile()/export_shared_bucket(). Baking them again would
-    duplicate work and risk a different-looking bake, since decimation
-    changes UV layout/topology.
-    """
+    """Export one simplified HLOD asset for a tile-local geometry set."""
     if not objects:
         return False, "No objects assigned to tile"
     if not BAKE_WORLD_TRANSFORMS:
@@ -3940,8 +3974,6 @@ def _ram_based_worker_cap(source_scene_path: str) -> int:
         file_size * AUTO_WORKER_SCENE_MEMORY_MULTIPLIER,
         AUTO_WORKER_MIN_ESTIMATE_BYTES,
     )
-    if BAKE_MATERIALS:
-        per_worker_estimate *= AUTO_WORKER_BAKE_MEMORY_MULTIPLIER
 
     budget = _total_system_memory_bytes() * AUTO_WORKER_RAM_SAFETY_FRACTION
     return max(1, int(budget // per_worker_estimate))
@@ -3991,9 +4023,6 @@ def _config_snapshot() -> dict:
         "SPLIT_CLIP_EPSILON":  SPLIT_CLIP_EPSILON,
         "DEBUG_AABB_ONLY":     DEBUG_AABB_ONLY,
         "COMPRESS_GEOMETRY":   COMPRESS_GEOMETRY,
-        "BAKE_MATERIALS":      BAKE_MATERIALS,
-        "BAKE_RESOLUTION":     BAKE_RESOLUTION,
-        "BAKE_CACHE":          BAKE_CACHE,
     }
 
 
@@ -4002,7 +4031,6 @@ def _apply_bundle_config(cfg: dict) -> None:
     global EXPORT_FORMAT, CONVERT_ORIENTATION, SOURCE_ORIENTATION
     global CLIP_LOCAL_MESHES, MERGE_BY_MATERIAL, NO_MERGE_PREFIX, BAKE_WORLD_TRANSFORMS
     global SPLIT_CLIP_EPSILON, DEBUG_AABB_ONLY, COMPRESS_GEOMETRY
-    global BAKE_MATERIALS, BAKE_RESOLUTION, BAKE_CACHE
     EXPORT_FORMAT         = cfg.get("EXPORT_FORMAT",         EXPORT_FORMAT)
     CONVERT_ORIENTATION   = cfg.get("CONVERT_ORIENTATION",   CONVERT_ORIENTATION)
     SOURCE_ORIENTATION    = cfg.get("SOURCE_ORIENTATION",    SOURCE_ORIENTATION)
@@ -4013,9 +4041,6 @@ def _apply_bundle_config(cfg: dict) -> None:
     SPLIT_CLIP_EPSILON    = cfg.get("SPLIT_CLIP_EPSILON",    SPLIT_CLIP_EPSILON)
     DEBUG_AABB_ONLY       = cfg.get("DEBUG_AABB_ONLY",       DEBUG_AABB_ONLY)
     COMPRESS_GEOMETRY     = cfg.get("COMPRESS_GEOMETRY",     COMPRESS_GEOMETRY)
-    BAKE_MATERIALS        = cfg.get("BAKE_MATERIALS",        BAKE_MATERIALS)
-    BAKE_RESOLUTION       = cfg.get("BAKE_RESOLUTION",       BAKE_RESOLUTION)
-    BAKE_CACHE            = cfg.get("BAKE_CACHE",            BAKE_CACHE)
 
 
 def _run_worker_mode(work_bundle_path: str, result_file_path: str) -> None:
@@ -4685,19 +4710,28 @@ def run():
     else:
         print("DRY_RUN enabled: no files will be written.")
 
-    # Color management is scene-wide (one View Transform per Blender scene), so
-    # bake it once here rather than per-tile.
-    color_management_bake = None
-    if BAKE_COLOR_MANAGEMENT and (not DRY_RUN or DRY_RUN_WRITE_MANIFEST):
-        print_export_stage("Bake color management")
-        color_management_bake = bake_color_management_lut(COLOR_LUT_SIZE, Path(output_dir) / "Textures")
+    # Color grade LUT is scene-wide (one .cube grade per Blender scene), so stage
+    # it once here rather than per-tile.
+    color_grade_lut = None
+    if COLOR_GRADE_LUT_PATH and (not DRY_RUN or DRY_RUN_WRITE_MANIFEST):
+        print_export_stage("Stage color grade LUT", os.path.basename(COLOR_GRADE_LUT_PATH))
+        color_grade_lut = stage_color_grade_lut_for_output(Path(COLOR_GRADE_LUT_PATH), Path(output_dir))
 
     # The world/studio-light HDR environment is scene-wide too, so stage it
     # once here rather than per-tile -- same reasoning as color management.
     staged_hdr_assets: list[Path] = []
     if not DRY_RUN or DRY_RUN_WRITE_MANIFEST:
         print_export_stage("Stage HDR environment")
-        hdr_asset_path = Path(source_scene_path) if source_scene_path else Path(output_dir)
+        if source_scene_path:
+            hdr_asset_path = Path(source_scene_path)
+        elif bpy.data.filepath:
+            # The add-on forces source_scene_path to "" to skip re-importing
+            # the already-open scene, but the .blend may still be saved --
+            # use its real path so relative ("//") HDR image references
+            # resolve correctly, same as the single-asset export flow.
+            hdr_asset_path = Path(bpy.data.filepath)
+        else:
+            hdr_asset_path = Path(output_dir)
         staged_hdr_assets = stage_hdr_assets_for_output(Path(output_dir), hdr_asset_path)
 
     # ------------------------------------------------------------------
@@ -4854,24 +4888,33 @@ def run():
     if PERIMETER_MODE:
         tile_assignments = filter_tile_assignments_perimeter(tile_assignments, depth=PERIMETER_DEPTH)
 
+    # Spanning objects are only ever routed to per-tile local export when
+    # CLIP_LOCAL_MESHES is also on — see the comment on SPLIT_SPANNING_OBJECTS.
+    split_spanning_active = SPLIT_SPANNING_OBJECTS and CLIP_LOCAL_MESHES
     local_count   = sum(1 for r in classification_map.values() if r["policy"] == "local_overlap")
     spanning_routed = sum(
         1 for r in classification_map.values()
-        if SPLIT_SPANNING_OBJECTS
+        if split_spanning_active
         and r["policy"] in ("shared_bucket", "future_split_candidate")
         and r["xz_overlap_count"] <= SPLIT_MAX_TILES
     )
     capped_count = sum(
         1 for r in classification_map.values()
         if r["policy"] in ("shared_bucket", "future_split_candidate")
-        and (not SPLIT_SPANNING_OBJECTS or r["xz_overlap_count"] > SPLIT_MAX_TILES)
+        and (not split_spanning_active or r["xz_overlap_count"] > SPLIT_MAX_TILES)
     )
+    if SPLIT_SPANNING_OBJECTS and not CLIP_LOCAL_MESHES and capped_count:
+        print(
+            "  Note: SPLIT_SPANNING_OBJECTS is on but CLIP_LOCAL_MESHES is off — "
+            "spanning objects stay in the shared bucket rather than being "
+            "duplicated whole into every overlapping tile."
+        )
     print(
         f"Classification: {len(objects)} objects → "
         f"{local_count} local"
         + (f", {spanning_routed} spanning→tiles, {capped_count} spanning→shared bucket"
            f" (SPLIT_MAX_TILES={SPLIT_MAX_TILES})"
-           if SPLIT_SPANNING_OBJECTS else f", {capped_count} spanning→shared bucket")
+           if split_spanning_active else f", {capped_count} spanning→shared bucket")
     )
 
     # ------------------------------------------------------------------
@@ -4961,7 +5004,7 @@ def run():
         "scene_bounds": {"min": list(sb_usd["min"]), "max": list(sb_usd["max"])},
         "scene_lights": scene_lights,
         "scene_cameras": scene_cameras,
-        "colorLUT": _manifest_color_management_payload(color_management_bake, model_dir),
+        "colorGradeLUT": _manifest_color_grade_lut_payload(color_grade_lut, model_dir),
         "streaming_profile": {
             "requested": SCENE_STREAMING_PROFILE,
             "resolved": resolved_profile,
@@ -5808,40 +5851,14 @@ def parse_args(argv):
         help="Compress vertex and index chunks with LZ4 in every exported tile payload (requires: pip install lz4).",
     )
     parser.add_argument(
-        "--bake-materials",
-        action="store_true",
-        help=(
-            "Bake node-graph materials the engine can't evaluate (Mix, Math, procedural textures, ...) "
-            "into flat textures via Cycles. Applies to full-detail tile and shared-bucket exports only — "
-            "HLOD/LOD tiles are decimated stand-ins and are not separately baked."
-        ),
-    )
-    parser.add_argument(
-        "--bake-resolution",
-        type=int,
+        "--color-grade-lut",
         default=None,
-        help="Square resolution for baked material textures (default: 1024). "
-             "Override per material via a material['untold_bake_resolution'] custom property.",
-    )
-    parser.add_argument(
-        "--no-bake-cache",
-        action="store_true",
-        help="Disable the persistent bake cache and force every divergent material to be re-baked.",
-    )
-    parser.add_argument(
-        "--bake-color-management",
-        action="store_true",
         help=(
-            "Bake the scene's active View Transform/Look/Exposure/Gamma into a scene-wide "
-            "RGBA16Float LUT referenced from the manifest's colorLUT key so Untold can "
-            "closely reproduce Blender's canonical sRGB display transform."
+            "Path to an externally-authored standard .cube 3D LUT to stage once for the whole "
+            "scene and reference from the manifest's colorGradeLUT key, applied as a post-tonemap "
+            "creative grade. Nothing is rendered from Blender -- the .cube is copied as-is and "
+            "loaded directly by the engine."
         ),
-    )
-    parser.add_argument(
-        "--color-lut-size",
-        type=int,
-        default=None,
-        help="Grid size (N) for the NxNxN color-grading LUT (default: 32).",
     )
     parser.add_argument(
         "--quadtree",
@@ -5952,11 +5969,7 @@ def apply_cli_overrides(args):
     global AUTO_TILE_SIZE
     global PARALLEL_WORKERS
     global COMPRESS_GEOMETRY
-    global BAKE_MATERIALS
-    global BAKE_RESOLUTION
-    global BAKE_CACHE
-    global BAKE_COLOR_MANAGEMENT
-    global COLOR_LUT_SIZE
+    global COLOR_GRADE_LUT_PATH
     global SAMPLE_MODE
     global SAMPLE_FRACTION
     global PERIMETER_MODE
@@ -6021,16 +6034,8 @@ def apply_cli_overrides(args):
         PARALLEL_WORKERS = args.parallel_workers
     if getattr(args, "compress_geometry", False):
         COMPRESS_GEOMETRY = True
-    if getattr(args, "bake_materials", False):
-        BAKE_MATERIALS = True
-    if getattr(args, "bake_resolution", None) is not None:
-        BAKE_RESOLUTION = validate_bake_resolution(args.bake_resolution)
-    if getattr(args, "no_bake_cache", False):
-        BAKE_CACHE = False
-    if getattr(args, "bake_color_management", False):
-        BAKE_COLOR_MANAGEMENT = True
-    if getattr(args, "color_lut_size", None) is not None:
-        COLOR_LUT_SIZE = validate_lut_size(args.color_lut_size)
+    if getattr(args, "color_grade_lut", None):
+        COLOR_GRADE_LUT_PATH = args.color_grade_lut
     if getattr(args, "sample", False):
         SAMPLE_MODE = True
     if getattr(args, "sample_fraction", None) is not None:

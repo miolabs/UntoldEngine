@@ -70,9 +70,15 @@ func UpdateRenderingSystem(in view: MTKView) {
                 }
             #endif
 
+            EngineProfiler.shared.beginScope(.gaussianCull)
             executeGaussianFrustumCulling(commandBuffer)
-            executeGaussianDepth(commandBuffer)
+            EngineProfiler.shared.endScope(.gaussianCull)
+
+            executeGaussianPreprocess(commandBuffer)
+
+            EngineProfiler.shared.beginScope(.gaussianSort)
             executeRadixSort(commandBuffer)
+            EngineProfiler.shared.endScope(.gaussianSort)
             EngineProfiler.shared.endScope(.renderPrep)
             #if ENGINE_STATS_ENABLED
                 let renderPrepMs = (CACurrentMediaTime() - renderPrepStart) * 1000.0
@@ -213,6 +219,7 @@ private typealias CompiledRenderGraphResult = (
 
 let gameModeReservedPassIDs: Set<String> = [
     "environment",
+    "sky",
     "grid",
     "deformation",
     "shadow",
@@ -221,6 +228,7 @@ let gameModeReservedPassIDs: Set<String> = [
     "pointShadow",
     "model",
     "batchedModel",
+    "meshOccluderShell",
     "hzbDepthSource",
     "ssao",
     "lightPass",
@@ -256,6 +264,7 @@ let gameModeReservedPassIDs: Set<String> = [
 
 enum BasePassMode {
     case environment
+    case sky
     case grid
     case ar
     case none
@@ -272,6 +281,13 @@ func addSceneBackgroundPass(
         )
         graph[environmentPass.id] = environmentPass
         return environmentPass.id
+    case .sky:
+        // Sky pass with the reference grid overlaid on top of its ground fill.
+        let skyPass = RenderPass(
+            id: "sky", dependencies: [], execute: RenderPasses.skyGridExecution
+        )
+        graph[skyPass.id] = skyPass
+        return skyPass.id
     case .grid:
         let gridPass = RenderPass(
             id: "grid", dependencies: [], execute: RenderPasses.gridExecution
@@ -295,8 +311,9 @@ private func buildGameModeGraphWithCompilation() throws -> CompiledRenderGraphRe
     let mode: BasePassMode
     switch renderInfo.immersionStyle {
     case .none:
-        // macOS/iOS path: use environment or grid
-        mode = renderEnvironment ? .environment : .grid
+        // macOS/iOS path: environment (IBL) takes precedence when enabled, otherwise the
+        // procedural sky is the default background, falling back to the grid if requested.
+        mode = renderEnvironment ? .environment : (renderSkyBackground ? .sky : .grid)
     case .mixed:
         // XR passthrough: no base pass needed
         mode = .none
@@ -306,7 +323,7 @@ private func buildGameModeGraphWithCompilation() throws -> CompiledRenderGraphRe
     case .ar:
         mode = .ar
     @unknown default:
-        mode = renderEnvironment ? .environment : .grid
+        mode = renderEnvironment ? .environment : (renderSkyBackground ? .sky : .grid)
     }
 
     let frameStartID = builder.resolveStage(.frameStart, after: nil)
@@ -393,8 +410,9 @@ private func buildGameModeGraphWithCompilation() throws -> CompiledRenderGraphRe
     )
     builder.addPass(spatialDebugPass)
 
-    // Gaussian pass depends on model pass - needs depth buffer from 3D models
-    let gaussianPass = RenderPass(id: "gaussian", dependencies: ["model"], execute: RenderPasses.gaussianExecution)
+    // Gaussian pass depends on the model pass and the occluder shells - it snapshots the opaque
+    // depth they wrote to occlude splats.
+    let gaussianPass = RenderPass(id: "gaussian", dependencies: ["model", "meshOccluderShell"], execute: RenderPasses.gaussianExecution)
     builder.addPass(gaussianPass)
 
     let beforePostProcessID = builder.resolveStage(.beforePostProcess, after: spatialDebugPass.id) ?? spatialDebugPass.id
@@ -574,10 +592,19 @@ func gBufferPass(graph: inout [String: RenderPass], shadowPass: RenderPass) {
     let batchedModelPass = RenderPass(id: "batchedModel", dependencies: [modelPass.id], execute: nil)
     graph[batchedModelPass.id] = batchedModelPass
 
+    // Depth-only occluder shells (MeshOccluderComponent), written into the resolved opaque
+    // depth after all colour geometry so the HZB copy, SSAO and the splat snapshot see them.
+    let meshOccluderShellPass = RenderPass(
+        id: "meshOccluderShell",
+        dependencies: [batchedModelPass.id],
+        execute: RenderPasses.meshOccluderShellExecution
+    )
+    graph[meshOccluderShellPass.id] = meshOccluderShellPass
+
     // HZB depth copy must happen after all opaque geometry is drawn.
     let hzbDepthSourcePass = RenderPass(
         id: "hzbDepthSource",
-        dependencies: [batchedModelPass.id],
+        dependencies: [meshOccluderShellPass.id],
         execute: RenderPasses.copyOpaqueDepthForHZBExecution
     )
     graph[hzbDepthSourcePass.id] = hzbDepthSourcePass
@@ -815,6 +842,49 @@ func colorGradingCustomization(encoder: MTLRenderCommandEncoder) {
         length: MemoryLayout<Int32>.stride,
         index: Int(colorLUTSizeIndex.rawValue)
     )
+
+    let colorGradeLUT = ColorGradeLUTParams.shared.snapshot()
+    encoder.setFragmentTexture(colorGradeLUT.lutTexture, index: Int(colorGradeLUTTextureIndex.rawValue))
+
+    var colorGradeLUTEnabled = colorGradeLUT.enabled && colorGradeLUT.lutTexture != nil
+    encoder.setFragmentBytes(
+        &colorGradeLUTEnabled,
+        length: MemoryLayout<Bool>.stride,
+        index: Int(colorGradeLUTEnabledIndex.rawValue)
+    )
+
+    var colorGradeLUTDomainMin = colorGradeLUT.domainMin
+    encoder.setFragmentBytes(
+        &colorGradeLUTDomainMin,
+        length: MemoryLayout<simd_float3>.stride,
+        index: Int(colorGradeLUTDomainMinIndex.rawValue)
+    )
+
+    var colorGradeLUTDomainMax = colorGradeLUT.domainMax
+    encoder.setFragmentBytes(
+        &colorGradeLUTDomainMax,
+        length: MemoryLayout<simd_float3>.stride,
+        index: Int(colorGradeLUTDomainMaxIndex.rawValue)
+    )
+
+    var tonemapOperator = TonemapParams.shared.operator.shaderValue
+    encoder.setFragmentBytes(
+        &tonemapOperator,
+        length: MemoryLayout<Int32>.stride,
+        index: Int(tonemapOperatorSelectIndex.rawValue)
+    )
+
+    // The Gaussian pass's layer keeps splat pixels out of the grade and the tone map: they are
+    // display-referred already, and a partly covered pixel has only the scene behind the splats
+    // graded (see LookShader.metal). A frame the pass skipped leaves it off. The gizmo layer the
+    // pre-composite lets override pixels in the editor goes along, so those pixels are graded
+    // whole.
+    var splatMask = Int32(renderInfo.gaussianCoverageWritten && textureResources.gaussianColorMap != nil && !GaussianDebugOptions.shared.toneMapSplatPixels ? 1 : 0)
+    encoder.setFragmentTexture(textureResources.gaussianColorMap, index: Int(lookPassSplatCoverageTextureIndex.rawValue))
+    encoder.setFragmentBytes(&splatMask, length: MemoryLayout<Int32>.stride, index: Int(lookPassSplatMaskIndex.rawValue))
+    var gizmoOverrides = !gameMode
+    encoder.setFragmentTexture(renderInfo.gizmoRenderPassDescriptor?.colorAttachments[0].texture, index: Int(lookPassGizmoTextureIndex.rawValue))
+    encoder.setFragmentBytes(&gizmoOverrides, length: MemoryLayout<Bool>.stride, index: Int(lookPassGizmoOverrideIndex.rawValue))
 }
 
 func makeBlurCustomization(direction: simd_float2, radius: Float) -> (MTLRenderCommandEncoder) -> Void {
@@ -1176,6 +1246,14 @@ func fxaaCustomization(encoder: MTLRenderCommandEncoder) {
     var edgeThresholdMin = FXAAParams.shared.edgeThresholdMin
     encoder.setFragmentBytes(&edgeThresholdMin, length: MemoryLayout<Float>.stride,
                              index: Int(fxaaPassEdgeThresholdMinIndex.rawValue))
+
+    // The Gaussian pass's coverage (the alpha of its colour map, cleared and drawn by the
+    // pass) keeps splat pixels un-filtered: their fine structure is not aliasing. A frame the
+    // pass skipped (the simulator, no camera) leaves the map alone and the mask off.
+    var splatMask = Int32(renderInfo.gaussianCoverageWritten && textureResources.gaussianColorMap != nil && !GaussianDebugOptions.shared.antiAliasSplatPixels ? 1 : 0)
+    encoder.setFragmentTexture(textureResources.gaussianColorMap, index: Int(fxaaPassSplatCoverageTextureIndex.rawValue))
+    encoder.setFragmentBytes(&splatMask, length: MemoryLayout<Int32>.stride,
+                             index: Int(fxaaPassSplatMaskIndex.rawValue))
 }
 
 func smaaEdgesCustomization(encoder: MTLRenderCommandEncoder) {
@@ -1228,6 +1306,12 @@ func smaaNeighborhoodCustomization(
     )
 
     encoder.setFragmentTexture(blendTexture, index: 1)
+
+    // As in fxaaCustomization: splat pixels keep their blended colour.
+    var splatMask = Int32(renderInfo.gaussianCoverageWritten && textureResources.gaussianColorMap != nil && !GaussianDebugOptions.shared.antiAliasSplatPixels ? 1 : 0)
+    encoder.setFragmentTexture(textureResources.gaussianColorMap, index: Int(smaaNeighborhoodSplatCoverageTextureIndex.rawValue))
+    encoder.setFragmentBytes(&splatMask, length: MemoryLayout<Int32>.stride,
+                             index: Int(smaaPassSplatMaskIndex.rawValue))
 }
 
 func outputTransformCustomization(encoder: MTLRenderCommandEncoder) {
@@ -1250,7 +1334,7 @@ private func debugSourceTexture(for mode: RenderDebugViewMode) -> MTLTexture? {
         return textureResources.normalMap
     case .position:
         return textureResources.positionMap
-    case .roughness, .metallic:
+    case .roughness, .metallic, .heightDebug, .pomOffsetDebug:
         return textureResources.materialMap
     case .ssaoBlurred:
         return textureResources.ssaoBlurTexture
@@ -1279,7 +1363,8 @@ private func lookPassShouldRenderLitOutput(for mode: RenderDebugViewMode) -> Boo
     switch mode {
     case .lit, .fxaaEdgeDebug, .smaaEdges, .smaaBlend, .smaaDifference, .occlusionDebug, .postTonemapOutput:
         return true
-    case .albedo, .normal, .position, .roughness, .metallic, .ssaoBlurred, .depth, .preTonemapHDRLuminance:
+    case .albedo, .normal, .position, .roughness, .metallic, .ssaoBlurred, .depth, .preTonemapHDRLuminance,
+         .heightDebug, .pomOffsetDebug:
         return false
     }
 }

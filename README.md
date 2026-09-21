@@ -12,6 +12,8 @@
   <a href="https://github.com/untoldengine/UntoldEngine/issues/new?assignees=&labels=enhancement&template=02_FEATURE_REQUEST.md&title=feat%3A+">Request a Feature</a>
   ·
   <a href="https://github.com/untoldengine/UntoldEngine/issues/new?assignees=&labels=question&template=04_SUPPORT_QUESTION.md&title=support%3A+">Ask a Question</a>
+  ·
+  <a href="https://discord.gg/pSckCPFxj">Join Our Discord</a>
 </div>
 
 <div align="center">
@@ -45,7 +47,7 @@ Untold Engine is built for developers and teams who:
 Creator & Lead Developer:  
 https://www.haroldserrano.com
 
-![untoldengine-image](/docs/images/engine-highlight-5.png)
+![archviz-demo](docs/images/gifs/archviz-demo.gif)
 
 ---
 
@@ -56,9 +58,6 @@ software on Apple platforms, including:
 
 - Vision Pro and spatial computing apps
 - Architectural walkthroughs and large-scene visualizers
-- Product configurators and digital showrooms
-- Industrial visualization and digital twin viewers
-- Training simulators and interactive 3D tools
 - Custom rendering pipelines and research prototypes
 
 The engine owns the rendering and XR foundation. Your app owns the vertical
@@ -68,18 +67,25 @@ workflow, product experience, and customer-specific behavior.
 
 ## Watch It in Action — Apple Vision Pro Demos
 
-<table>
-  <tr>
-    <td><a href="https://vimeo.com/1186637984?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1186637984.jpg" width="280"></a></td>
-    <td><a href="https://vimeo.com/1186592834?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1186592834.jpg" width="280"></a></td>
-    <td><a href="https://vimeo.com/1176823067?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1176823067.jpg" width="280"></a></td>
-  </tr>
-  <tr>
-    <td><a href="https://vimeo.com/1176823994?share=copy&fl=sv&fe=ci"><img src="https://vumbnail.com/1176823994.jpg" width="280"></a></td>
-    <td><a href="https://vimeo.com/1176995991?fl=ip&fe=ec"><img src="https://vumbnail.com/1176995991.jpg" width="280"></a></td>
-    <td></td>
-  </tr>
-</table>
+| Demo | Description |
+| --- | --- |
+| [CoolSaber](https://github.com/untoldengine/UntoldArcade/tree/main/CoolSaber) | PSVR2-driven lightsaber duels, blades clashing over SharePlay |
+| [CoolWater](https://github.com/untoldengine/UntoldArcade/tree/main/CoolWater) | Real-time animated water with reflection, refraction, and ripples |
+| [CoolCloth](https://github.com/untoldengine/UntoldArcade/tree/main/CoolCloth) | GPU cloth simulation (XPBD) you can punch a ball through |
+| [Archviz Viewer](https://untoldengine.github.io/UntoldEngine/LearningPaths/ArchvizToVisionPro/) | Blender-authored architectural scene walked through in mixed reality |
+| [Bedroom Digital Twin](https://untoldengine.github.io/UntoldEngine/LearningPaths/BedroomDigitalTwin/) | Tap-to-inspect digital twin bedroom with live mock status data |
+| [City Streaming](https://untoldengine.github.io/UntoldEngine/LearningPaths/CityStreamingOnVisionPro/) | City-scale scene streamed in tile by tile with LOD/HLOD |
+
+Full source for every demo above lives in the [UntoldArcade](https://github.com/untoldengine/UntoldArcade) repo.
+
+## Requirements
+
+- macOS 26 or newer
+- Swift 6 / Xcode 26 or newer
+- Apple Silicon Mac
+- Supported platforms: macOS, iOS, and visionOS
+
+![coolsaber-demo](docs/images/gifs/coolsaber-demo.gif)
 
 ## Try the Engine Right Now
 
@@ -96,7 +102,7 @@ Clone the repository and launch the Starter Demo:
 ```bash
 git clone https://github.com/untoldengine/UntoldEngine.git
 cd UntoldEngine
-git checkout v0.14.3
+git checkout v0.19.1
 swift run StarterDemo
 ```
 
@@ -116,14 +122,44 @@ The demos live under `Sources/Demos`. They are runnable when working inside the
 engine repository, but are not exposed as products to apps that add Untold
 Engine as a package dependency.
 
-![untoldengine-image-2](/docs/images/engine-highlight-6.png)
+---
+
+## Try the Untold Editor
+
+The Untold Editor is a companion app for building scenes visually — placing
+entities, setting up lighting and cameras, and authoring `.untoldscene` files
+that load straight into your app with `loadUntoldScene(named:)`. It's
+optional — nothing in Untold Engine requires it — but it's the fastest way to
+get a scene on screen without hand-writing setup code.
+
+The Editor is now stable enough for regular use. Grab the latest build from
+the [Releases page](https://github.com/untoldengine/UntoldEditor/releases).
+
+![untold-editor](docs/images/editor-main-highlight.png)
 
 ---
 
 ## Getting Started
 
-To create your own XR, 3D, or spatial visualization app using Untold Engine, see
-[Getting Started](https://untoldengine.github.io/UntoldEngine/API/GettingStarted/).
+To create your own XR, 3D, or spatial visualization app using Untold Engine,
+start with the documentation path that matches where you are:
+
+- **Build a complete Vision Pro app:** follow the
+  [Archviz To Vision Pro learning path](https://untoldengine.github.io/UntoldEngine/LearningPaths/ArchvizToVisionPro/)
+  to take a Blender archviz model into a standalone visionOS project.
+- **Learn the engine API through focused demos:** use the
+  [Tutorials](https://untoldengine.github.io/UntoldEngine/Tutorials/)
+  to understand Starter Demo, lighting, rendering quality, exporter workflows,
+  scene channels, light portals, XR input, and performance diagnostics.
+- **Create your own project from scratch:** see
+  [Getting Started](https://untoldengine.github.io/UntoldEngine/API/GettingStarted/)
+  and [Create A New Xcode Project](https://untoldengine.github.io/UntoldEngine/Tutorials/CreateXcodeProjectTutorial/).
+- **Build scenes visually:** download the
+  [Untold Editor](https://github.com/untoldengine/UntoldEditor/releases) to
+  arrange entities, lighting, and cameras without writing scene-setup code.
+
+If your team is evaluating Untold Engine and needs an engine capability that is
+not currently available, see [Commercial Use, Sponsored Features, and Support](COMMERCIAL.md).
 
 ## Core Direction
 
@@ -137,17 +173,12 @@ Untold Engine is built around three focused goals:
 
 ---
 
-![untoldengine-image-2](/docs/images/engine-highlight-7.png)
-
 ## Example Use Cases
 
 Untold Engine is well-suited for:
 
 - Vision Pro and ARKit-based visualization apps
 - Large-scale scene visualization: interiors, archviz, cities, datasets
-- Product configurators and digital showrooms
-- Industrial visualization and digital twin viewers
-- Simulation tools and training applications
 - Custom rendering pipelines and graphics experiments
 
 ---
@@ -170,22 +201,7 @@ Untold Engine is well-suited for:
 
 ---
 
-# Commercial Use, Sponsored Features, and Support
 
-Untold Engine is open source under MPL-2.0 and can be used in commercial apps.
-Paid commercial options are available for teams that need private engine
-modifications, sponsored engine features, priority support, or custom terms.
-
-- **Sponsored open-source features** — fund roadmap-aligned engine work that is
-  released into the public MPL engine.
-- **Commercial license** — keep private modifications to engine internals closed
-  under commercial terms.
-- **Priority support / retainers** — get focused help with engine integration,
-  rendering issues, performance, and production use.
-
-See [COMMERCIAL.md](COMMERCIAL.md) for commercial licensing details.
-
----
 
 # Engine API
 
@@ -218,7 +234,6 @@ See [COMMERCIAL.md](COMMERCIAL.md) for commercial licensing details.
 - [Profiler](docs/API/UsingProfiler.md)
 - [Spatial Debugger](docs/API/SpatialDebugger.md)
 - [Asset Exporter](docs/API/UsingTheExporter.md)
-- [Bake Materials](docs/API/UsingBakeMaterials.md)
 - [Color Management](docs/API/UsingColorManagement.md)
 - [Optimizations](docs/API/Optimizations.md)
 
@@ -304,13 +319,33 @@ Full license: https://www.mozilla.org/MPL/2.0/
 
 ---
 
+# Commercial Use, Sponsored Features, and Support
+
+Untold Engine is open source under MPL-2.0 and can be used in commercial apps.
+Paid commercial options are available for teams that need private engine
+modifications, sponsored engine features, priority support, or custom terms.
+
+- **Sponsored open-source features** — fund roadmap-aligned engine work that is
+  released into the public MPL engine.
+- **Commercial license** — keep private modifications to engine internals closed
+  under commercial terms.
+- **Priority support / retainers** — get focused help with engine integration,
+  rendering issues, performance, and production use.
+
+If your team needs an engine feature that is not currently available, contact 
+[Harold Serrano](https://www.haroldserrano.com/contact) to discuss sponsored feature development, private engine work, commercial licensing, or ongoing support. 
+
+See [COMMERCIAL.md](COMMERCIAL.md) for commercial licensing details.
+
+---
+
 # Trademark
 
 "Untold Engine" and the Untold Engine logo are trademarks of **Untold Engine Studios**. Forks may not use the name in a way that implies official endorsement. See [TRADEMARKS.md](TRADEMARKS.md).
 
 ---
 
-# Questions & Discussions
+# Community
 
 - [GitHub Discussions](https://github.com/untoldengine/UntoldEngine/discussions) — ideas and questions
 - [GitHub Issues](https://github.com/untoldengine/UntoldEngine/issues) — bugs and tasks

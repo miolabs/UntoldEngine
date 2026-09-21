@@ -130,7 +130,7 @@ and installs the `Pillow`/`lz4` Python packages, so `untoldengine export
 ## Exporting Assets
 
 Run the exporter from the game project or any other directory. Input can be a
-USD/USDZ asset or a `.blend` file:
+USD/USDZ asset, a `.blend` file, or a Gaussian `.ply`/`.spz` splat capture:
 
 ```bash
 untoldengine export \
@@ -148,6 +148,188 @@ followed by `untoldengine texbake --dir` and `--patch-refs`. See
 Use `--blender /path/to/Blender` when Blender is not installed in its standard
 macOS location and is not available on `PATH`.
 
+### Multi-model `.blend` scenes → `.untoldpack`
+
+If the source `.blend` scene contains more than one independent model (more
+than one object with no parent among the exported objects), the exporter
+writes a `<name>.untoldpack` manifest next to `--output` instead of a single
+`.untold` file, plus one self-contained `.untold` per model under its own
+subfolder:
+
+```bash
+untoldengine export \
+  --input warehouse.blend \
+  --output warehouse.untold \
+  --convert-orientation --optimize
+# → warehouse.untoldpack, Shelf/Shelf.untold, Forklift/Forklift.untold, ...
+```
+
+`--optimize` bakes textures for every model in the pack. Load the result with
+`setEntityMeshAsync(entityId:filename:withExtension:)` using `"untoldpack"` —
+the engine loads a pack the same way it loads a single `.untold`, placing
+each model as a child entity. See [Using the Registration
+System](UsingRegistrationSystem.md).
+
+Re-exporting the same `--output` path after the scene's model count changes
+(single ↔ multiple) automatically removes the previous run's now-stale
+`.untold`/`.untoldpack` output, and any model subfolders a shrunk pack no
+longer references, so a caller never picks up a leftover file from an older
+export by accident.
+
+### Animation-only exports → `.untoldanim`
+
+`--animation` exports clip data only (no mesh geometry) and requires a
+`.untoldanim` `--output` path:
+
+```bash
+untoldengine export \
+  --input running.usdz \
+  --output running.untoldanim \
+  --convert-orientation --animation
+```
+
+`.untoldanim` is a plain `.untold` container under the hood, named distinctly
+so it's never mistaken for a mesh — `setEntityMeshAsync` rejects it; load it
+with `setEntityAnimations(entityId:filename:withExtension:name:)` instead.
+
+### Gaussian splats → `.untoldgs`
+
+Gaussian `.ply` or `.spz` inputs skip Blender entirely and export straight to
+`.untoldgs`:
+
+```bash
+# Single tier
+untoldengine export --input splats.ply --output splats.untoldgs
+untoldengine export --input splats.spz --output splats.untoldgs
+
+# Progressive LOD tiers (splats_lod0.untoldgs, splats_lod1.untoldgs, ...)
+untoldengine export --input splats.ply --output splats.untoldgs --lod-levels 4
+```
+
+`.spz` support covers legacy gzip versions 2 and 3 only. Newer v4 files (the
+NGSP/ZSTD container) are rejected with a clear error rather than a crash —
+re-export from the source tool as v2/v3, or convert through `.ply` instead.
+
+### Other export flags
+
+| Flag | Description |
+|---|---|
+| `--mesh-name <name>` | Export only one mesh from a multi-mesh asset |
+| `--file-type <tile\|lod\|hlod\|shared\|animation>` | Untold file type (default `tile`) |
+| `--source-orientation <blender-native\|engine-oriented>` | Input orientation |
+| `--compress-geometry` | LZ4-compress vertex/index chunks |
+| `--validate` | Write a companion validation JSON file |
+| `--color-grade-lut <path>` | Stage an externally-authored `.cube` 3D LUT and apply it as a post-tonemap creative grade (no Blender render, no conversion) — see [Using Color Management](UsingColorManagement.md) |
+
+Run `untoldengine export --help` for the full, current flag list.
+
+---
+
+### Gaussian splat captures
+
+A Gaussian splat `.ply` or `.spz` exports directly to `.untoldgs` (see [Gaussian Splat
+Format](../Architecture/untoldgsFormat.md)); `--lod-levels N` writes progressive tiers.
+The `--splat-*` flags cook the capture on the way: register it onto its mesh twin, crop
+away floaters and the captured floor, drop near-transparent splats, and choose the
+spherical-harmonics degree and chunk size. They apply identically regardless of which
+source format was used: a `.ply` is streamed through the cook in windows, a `.spz` is
+decoded whole (its container is not streamable), and both feed the same cook and writer.
+
+```bash
+untoldengine export --input sofa.ply --output Gaussians/sofa.untoldgs \
+  --splat-up-axis z --splat-scale 0.5 --splat-yaw-degrees 90 --splat-translate 0,0.4,0 \
+  --splat-crop=-1,0,-1,1,1.2,1 --splat-crop-margin 0.05 --splat-sh-degree 2
+
+untoldengine export --input sofa.spz --output Gaussians/sofa.untoldgs \
+  --splat-up-axis z --splat-scale 0.5 --splat-sh-degree 2
+```
+
+`--splat-up-axis` names the capture's up axis (`y` is the engine convention and the default,
+`z` for scanner and CAD exports, `-y` for the 3DGS training convention); the rotation to
+Y-up is applied before scale, yaw and translation, and the whole transform is baked into
+every splat and recorded in the file header.
+`--splat-min-opacity` (default 0.005) drops near-transparent splats; `--splat-chunk-splats`
+sets the chunk size (1024 for objects, 4096 with `--splat-environment` for rooms and
+larger). Values that start with a minus sign must use the `--option=value` form. The
+command prints how many splats were kept and pruned per reason.
+
+The cook streams the `.ply` in bounded windows, parses and cooks them in parallel, and
+writes every tier through a temporary file in the output directory that is renamed into
+place when complete — a 10 M-splat degree-3 capture (2.4 GB) cooks in about two seconds
+with a peak of about 1.4 GB of memory, where reading the file whole took 35 s and 10 GB. While
+it runs the command reports progress on stderr — one line rewritten in place on a terminal
+(`read      42 %  overall  15 %`, then `cook`, `chunk`, `coarsen`, `write`, with the tier for a
+`--lod-levels` export), a line per phase when stderr is a file — and Ctrl-C cancels it between
+windows or chunk batches: the temporary file and any tier already written are removed, so an
+interrupted export never leaves a partial `.untoldgs` behind (the command exits with
+"Gaussian splat cook cancelled; no file was written").
+
+`--splat-coarse-levels auto|0|1|2` (default `auto`) bakes per-chunk coarse levels into the
+file — one or two importance-sorted merged versions of every chunk (a merged splat per 8 and
+per 64 fine splats at the default `--splat-coarse-ratio-log2 3,6`), which a runtime can draw in
+place of a far or not-yet-loaded chunk. `auto` bakes the levels for tiers of at least 64 chunks
+and nothing below (small assets bake byte-identically to a file without the section); `0` never,
+`1` and `2` always. The ratios must increase strictly; asked for with `1` or `2` they must lie
+within 1…log2 of `--splat-chunk-splats`, under `auto` the writer clamps them to the chunk size;
+`4,7` halves the section's size. Two levels at the defaults add about
+14 % to the records of a 1024-splat-chunk file. The command prints, per tier, `coarse levels: 2
+(128 + 16 per 1024-chunk), 2,812,608 records, 45.0 MB` (or `none`). A runtime that predates the
+section ignores it and draws the fine records.
+
+`--splat-max-count N` keeps at most N splats, dropping the least important first (opacity
+times the geometric mean of the scales). The runtime refuses to load an entity above its
+per-platform cap — 20,000,000 splats on Apple Vision Pro, iPhone, iPad and Apple TV,
+40,000,000 on the Mac (`GaussianRuntimeLimits`; a `.untoldgs` splat keeps 16 bytes plus its
+harmonics resident) — so a large capture that has to load everywhere is cooked with
+`--splat-max-count 20000000`; one that only has to run on a Mac can go up to the Mac figure.
+A `.ply`, which keeps about 60 bytes per splat resident, is capped lower: 5,242,880 splats on
+the mobile platforms, 16,777,216 on the Mac (`maxWholeBufferSplatsPerEntity`).
+What the frame draws is bounded separately by the working-set budget
+(`GaussianRuntimeLimits.workingSetSplats`), which fits the visible chunks by quota. Captures
+beyond the cap belong to the streamed environment path (part 6 of the series).
+
+### Linking a splat twin
+
+`untoldengine gaussian-link` attaches a cooked `.untoldgs` to an entity of a `.untold`
+asset after the export: it writes the asset's `gaussianAsset` record (chunk 25, flag
+`meshTwin`) through `UntoldAssetPatcher`, copying every other chunk unchanged. The payload
+path is stored relative to the directory of the file that is written (the input with
+`--in-place`, the `--output` file otherwise), which is where the runtime resolves it, so
+keep the payload inside or beside that file. The `.untoldgs` header fills the record's
+single LOD level with the payload's splat count. See [Writing the
+link](UsingGaussianSystem.md#a-splat-standing-in-for-a-mesh-shells-fades-and-scene-links) for the
+patcher API.
+
+```bash
+untoldengine gaussian-link --untold Chair/chair.untold --entity 0 \
+  --payload Chair/chair.untoldgs --swap-distance 8 --occluder-shrink 0.02 --in-place
+untoldengine gaussian-link --untold Chair/chair.untold --entity 0 \
+  --payload Chair/chair.untoldgs --align-translate 0,0.02,-0.1 \
+  --align-yaw-degrees 90 --align-scale 1.02 --in-place
+untoldengine gaussian-link --untold Chair/chair.untold --entity 0 \
+  --payload Chair/chair.untoldgs --clear-alignment --in-place
+untoldengine gaussian-link --untold Chair/chair.untold --entity 0 \
+  --remove --output Chair/chair_plain.untold
+untoldengine gaussian-link --untold Chair/chair.untold --list
+```
+
+`--entity` is the entity table's `entityId` (`--list` prints the ids that already carry a
+link); a `meshTwin` link on an entity without a mesh — the root of a multi-node asset —
+is written with a warning that names the mesh-bearing entities. Negative values are
+accepted as they are (`--exposure-offset -0.5`, `--align-translate -1,0,0`).
+
+The alignment options place the splat inside the entity without a re-cook (see [Aligning a
+twin](UsingGaussianSystem.md#aligning-a-twin)): `--align-translate x,y,z` in metres,
+`--align-yaw-degrees` about the entity's +Y axis, `--align-scale` uniform and greater than
+zero. Each option left out keeps the value the entity's existing link stores (identity when
+there is none and at least one is given); `--clear-alignment` drops the alignment; with no
+alignment option at all the stored alignment is carried over unchanged — also when
+`--payload` names a different capture than the link had, with a warning that names the old
+payload: an alignment registers one capture to one mesh, so pass `--clear-alignment` or the
+new capture's `--align-*` values then (the other tunables go back to their option defaults
+on every re-link). `--list` prints it after the exposure (`align (x, y, z) m, yaw d°,
+scale s`).
+
 ---
 
 ## Partitioning Scenes into Streaming Tiles
@@ -161,18 +343,18 @@ untoldengine export-tiles \
   --input scene.usdz \
   --output-dir tile_exports \
   --tile-size-x 25 --tile-size-z 25 \
-  --optimize --bake-materials
+  --optimize
 ```
 
 `--optimize` compresses geometry and, if the export produced a shared
 `Textures` directory, bakes those textures to `.utex` and patches every
 tile's `.untold` references. Grid, quadtree, and KD-tree partitioning modes
 are available (`--quadtree`, `--kdtree`); run `untoldengine export-tiles
---help` for the full flag list, including material-baking (`--bake-materials`,
-`--bake-resolution`, `--no-bake-cache`), color management
-(`--bake-color-management`, `--color-lut-size` — only applied via an explicit
-`loadSceneAuthored(url:)` call, see [Using the Registration
-System](UsingRegistrationSystem.md#loading-scene-authored-data)), tiering
+--help` for the full flag list, including color management
+(`--color-grade-lut` — only applied via an explicit `loadSceneAuthored(url:)`
+call, see [Using the
+Registration System](UsingRegistrationSystem.md#loading-scene-authored-data)),
+tiering
 (`--min-objects-per-tile-tier`,
 `--untagged-semantic-tier`), LOD/HLOD (`--lod-level`, `--hlod-level`), and
 sampling (`--sample`, `--sample-fraction`, `--perimeter`, `--perimeter-depth`)

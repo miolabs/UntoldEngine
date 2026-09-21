@@ -14,6 +14,21 @@ import simd
 
 /// Generates basic primitive meshes using ModelIO
 public enum BasicPrimitives {
+    /// Turns geometry built in code into engine meshes, the same way the primitives below are
+    /// made. This is how a plugin adds a shape the engine does not ship: build an `MDLMesh`
+    /// (allocate its buffers with `MTKMeshBufferAllocator(device: renderInfo.device)`), name it,
+    /// and hand it over. Positions, normals and texture coordinates under their standard ModelIO
+    /// attribute names are enough; tangents are derived and the layout is converted.
+    public static func createMesh(from mdlMesh: MDLMesh) -> [Mesh] {
+        Mesh.makeMeshes(
+            object: mdlMesh,
+            vertexDescriptor: vertexDescriptor.model,
+            textureLoader: TextureLoader(device: renderInfo.device),
+            device: renderInfo.device,
+            flip: true
+        )
+    }
+
     /// Creates a cube mesh with the specified size
     /// - Parameters:
     ///   - extent: The size of the cube in each dimension (default: 1.0)
@@ -42,17 +57,22 @@ public enum BasicPrimitives {
         )
     }
 
-    /// Creates a sphere mesh with the specified radius
+    /// Creates a sphere mesh with the specified diameter
     /// - Parameters:
-    ///   - extent: The diameter of the sphere in each dimension (default: 1.0)
+    ///   - extent: The diameter of the sphere in each dimension (default: 0.25)
     ///   - segments: Horizontal and vertical segments [horizontal, vertical] (default: [32, 16])
     /// - Returns: Array of Mesh objects representing the sphere
     public static func createSphere(extent: Float = 0.25, segments: [UInt32] = [32, 16]) -> [Mesh] {
         let bufferAllocator = MTKMeshBufferAllocator(device: renderInfo.device)
         let textureLoader = TextureLoader(device: renderInfo.device)
 
+        // Unlike `boxWithExtent`, ModelIO's `sphereWithExtent` takes the
+        // sphere's radii, not its full size: the generated mesh spans
+        // -extent...+extent per axis. Halve it so `extent` is the diameter
+        // here as documented and as every other primitive treats it.
+        let radius = extent * 0.5
         let mdlMesh = MDLMesh(
-            sphereWithExtent: [extent, extent, extent],
+            sphereWithExtent: [radius, radius, radius],
             segments: [segments[0], segments[1]],
             inwardNormals: false,
             geometryType: .triangles,

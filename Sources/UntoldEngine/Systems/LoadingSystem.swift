@@ -50,15 +50,45 @@ public func getResourceURL(resourceName: String, ext: String, subName: String?) 
         let expandedPath = NSString(string: resourceName).expandingTildeInPath
         let absoluteURL = URL(fileURLWithPath: expandedPath)
 
-        // If extension is provided in the path, use it directly
-        if fm.fileExists(atPath: absoluteURL.path) {
+        // If extension is provided in the path, use it directly -- but only when it's
+        // actually a file. A same-named directory can legitimately sit beside it (e.g.
+        // a stale per-model subfolder from an older .untoldpack export at this same
+        // base name), and fileExists(atPath:) alone can't tell the two apart, so an
+        // ext-less lookup would silently resolve to the directory and never even try
+        // the extension the caller actually asked for.
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: absoluteURL.path, isDirectory: &isDirectory), !isDirectory.boolValue {
             return absoluteURL
         }
 
-        // Otherwise, try appending the extension
-        let urlWithExt = absoluteURL.appendingPathExtension(ext)
+        // Otherwise, try appending the extension. Built from the path string rather
+        // than absoluteURL.appendingPathExtension(ext) -- URL(fileURLWithPath:) stats
+        // the filesystem to set hasDirectoryPath when the bare path exists (as it does
+        // here, since absoluteURL just failed the file check above by being a
+        // directory), and appendingPathExtension would carry that stale directory
+        // flag onto a URL that actually names a regular file.
+        let urlWithExt = URL(fileURLWithPath: "\(absoluteURL.path).\(ext)")
         if fm.fileExists(atPath: urlWithExt.path) {
             return urlWithExt
+        }
+
+        if let assetBasePath {
+            let base = effectiveAssetBaseURL(assetBasePath)
+            // If a scene stores an absolute path from another machine, preserve any
+            // known GameData suffix first, then fall back to flattened SwiftPM resources.
+            let requestedURL = absoluteURL.pathExtension.isEmpty ? urlWithExt : absoluteURL
+            if let relativeComponents = resourceSuffixComponents(from: requestedURL) {
+                let structuredCandidate = relativeComponents.reduce(base) { $0.appendingPathComponent($1) }
+                if fm.fileExists(atPath: structuredCandidate.path) {
+                    return structuredCandidate
+                }
+            }
+
+            let flatName = requestedURL.deletingPathExtension().lastPathComponent
+            let flatCandidate = base.appendingPathComponent(flatName).appendingPathExtension(ext)
+            if fm.fileExists(atPath: flatCandidate.path) {
+                return flatCandidate
+            }
         }
     }
 
@@ -71,6 +101,8 @@ public func getResourceURL(resourceName: String, ext: String, subName: String?) 
         ["Gaussians", "\(resourceName).\(ext)"],
         ["Scripts", "\(resourceName).\(ext)"],
         ["Scenes", "\(resourceName).\(ext)"],
+        ["Textures", "\(resourceName).\(ext)"],
+        ["LUT", "\(resourceName).\(ext)"],
     ]
     if let subName {
         searchPaths.append(["Materials", subName, "\(resourceName).\(ext)"])
@@ -78,16 +110,7 @@ public func getResourceURL(resourceName: String, ext: String, subName: String?) 
 
     // 1) External base path (folder OR .bundle OR already a Resources dir)
     if let basePath = assetBasePath {
-        // If .bundle, hop into Contents/Resources on macOS
-        let base: URL = {
-            if basePath.pathExtension == "bundle",
-               let bundle = Bundle(url: basePath),
-               let res = bundle.resourceURL
-            {
-                return res
-            }
-            return basePath
-        }()
+        let base = effectiveAssetBaseURL(basePath)
 
         // Try FLAT root first (handles your current packaging)
         let flat = base.appendingPathComponent("\(resourceName).\(ext)")
@@ -102,6 +125,8 @@ public func getResourceURL(resourceName: String, ext: String, subName: String?) 
             ["Gaussians", "\(resourceName).\(ext)"],
             ["Scripts", "\(resourceName).\(ext)"],
             ["Scenes", "\(resourceName).\(ext)"],
+            ["Textures", "\(resourceName).\(ext)"],
+            ["LUT", "\(resourceName).\(ext)"],
         ] + (subName.map { [["Materials", $0, "\(resourceName).\(ext)"]] } ?? [])
 
         for components in searchPaths {
@@ -122,8 +147,46 @@ public func getResourceURL(resourceName: String, ext: String, subName: String?) 
         }
     }
 
-    // 4) Module bundle (UNCHANGED: top-level only, for engine-internal content)
-    return Bundle.module.url(forResource: resourceName, withExtension: ext)
+    // 4) Module bundle (top-level only, for engine-internal content). Goes through
+    // Bundle.untoldEngineModuleResourceURL rather than Bundle.module directly -- the
+    // SwiftPM-generated Bundle.module accessor calls Swift.fatalError() when it can't locate its
+    // resource bundle (e.g. a signed/notarized macOS .app that flattened resources away, where
+    // step 2 above already would have found them), which would crash the whole app for what
+    // should just be "resource not found" here. See Bundle+ResourceFallback.swift.
+    return Bundle.untoldEngineModuleResourceURL(forResource: resourceName, withExtension: ext)
+}
+
+private func effectiveAssetBaseURL(_ basePath: URL) -> URL {
+    if basePath.pathExtension == "bundle",
+       let bundle = Bundle(url: basePath),
+       let resourceURL = bundle.resourceURL
+    {
+        return resourceURL
+    }
+
+    return basePath
+}
+
+private func resourceSuffixComponents(from url: URL) -> [String]? {
+    let knownResourceDirectories: Set = [
+        "Models",
+        "StreamModels",
+        "Animations",
+        "HDR",
+        "Gaussians",
+        "Scripts",
+        "Scenes",
+        "Materials",
+        "Textures",
+        "Shaders",
+    ]
+    let components = url.pathComponents
+
+    guard let resourceDirectoryIndex = components.firstIndex(where: { knownResourceDirectories.contains($0) }) else {
+        return nil
+    }
+
+    return Array(components[resourceDirectoryIndex...])
 }
 
 private func urlInBundle(_ bundle: Bundle, components: [String]) -> URL? {
@@ -155,9 +218,9 @@ public func playSceneAt(url: URL, completion: (() -> Void)? = nil) {
     }
 
     destroyAllEntities {
-        deserializeScene(sceneData: scene) {
+        deserializeScene(sceneData: scene, completion: {
             completion?()
-        }
+        })
 
         // Rebind as soon as authored entities are created to avoid referencing a destroyed
         // startup camera while async mesh loads are still finishing.

@@ -13,15 +13,71 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import CryptoKit
 import Foundation
 import simd
 
 public enum UntoldFormat {
     public static let magic = "UNTOLD\0"
-    public static let version: UInt32 = 1
+    /// Current format version written by the exporter. Bumped to 2 when the
+    /// Blender exporter started multiplying emissive_factor by Emission
+    /// Strength — files below `minTrustedEmissiveVersion` were written before
+    /// that fix and can carry a bogus (1,1,1) emissiveFactor left over from
+    /// Blender's default Emission Color, so readers must not trust it.
+    /// Bumped to 3 when the material record grew height-map fields
+    /// (`heightTextureIndex`, `heightScale`, `heightMidlevel`) — see
+    /// `minHeightMapVersion`. Files below that version don't have these bytes
+    /// on disk at all, so the reader must not attempt to decode them.
+    /// Bumped to 4 when the material record grew height-remap fields
+    /// (`heightRemapMin`, `heightRemapMax`) — see `minHeightRemapVersion`.
+    public static let version: UInt32 = 4
+    /// Oldest format version this reader will still load.
+    public static let minSupportedVersion: UInt32 = 1
+    /// First format version whose emissiveFactor is safe to use as authored.
+    public static let minTrustedEmissiveVersion: UInt32 = 2
+    /// First format version whose material record includes height-map fields.
+    /// Files older than this must be decoded with the legacy (pre-height) material
+    /// record layout, or the reader will misalign every subsequent record in the
+    /// MATERIAL_TABLE chunk.
+    public static let minHeightMapVersion: UInt32 = 3
+    /// First format version whose material record includes height-remap fields
+    /// (heightRemapMin/heightRemapMax). Files between minHeightMapVersion and this
+    /// version have height fields but not remap fields on disk.
+    public static let minHeightRemapVersion: UInt32 = 4
     public static let fileAlignment: UInt64 = 16
     public static let invalidIndex: UInt32 = .max
     public static let hashByteCount = 32
+}
+
+public extension UntoldFormat {
+    /// The content hash of a `.untold` file: SHA-256 over the stored (compressed, when the
+    /// chunk is) payload bytes of every chunk, concatenated in ascending `chunkType` order.
+    /// Alignment padding between payloads is not hashed, and neither are the header or the
+    /// chunk table, so a writer can lay the chunks out first and fill the header in last.
+    /// This is what the exporter writes into `UntoldFileHeaderV1.contentHash`, what
+    /// `UntoldReader` checks on load (an all-zero header hash skips the check), and what
+    /// `UntoldAssetPatcher` recomputes after rewriting a file. Throws
+    /// `UntoldBinaryDecodingError.outOfBounds` when an entry points outside `fileData`.
+    static func contentHash(of chunks: [UntoldChunkEntryV1], in fileData: Data) throws -> Data {
+        var hasher = SHA256()
+        for chunk in chunks.sorted(by: { $0.chunkType.rawValue < $1.chunkType.rawValue }) {
+            // Compared in UInt64 before converting so an entry whose offset or size does not
+            // fit an Int throws instead of trapping.
+            guard chunk.fileOffset <= UInt64(fileData.count),
+                  chunk.compressedSize <= UInt64(fileData.count) - chunk.fileOffset
+            else {
+                throw UntoldBinaryDecodingError.outOfBounds(
+                    offset: Int(clamping: chunk.fileOffset),
+                    requested: Int(clamping: chunk.compressedSize),
+                    available: fileData.count
+                )
+            }
+            let start = Int(chunk.fileOffset)
+            let end = start + Int(chunk.compressedSize)
+            hasher.update(data: fileData.subdata(in: start ..< end))
+        }
+        return Data(hasher.finalize())
+    }
 }
 
 public enum UntoldFileType: UInt32, Sendable {
@@ -60,9 +116,11 @@ public struct UntoldChunkType: RawRepresentable, Hashable, Sendable, Equatable {
     public static let lightTable = UntoldChunkType(rawValue: 19)
     public static let cameraTable = UntoldChunkType(rawValue: 20)
     public static let colorManagementTable = UntoldChunkType(rawValue: 21)
-    public static let morphTargetTable = UntoldChunkType(rawValue: 22)
-    public static let morphTargetData = UntoldChunkType(rawValue: 23)
-    public static let morphDriverTable = UntoldChunkType(rawValue: 24)
+    public static let colorGradeLUTTable = UntoldChunkType(rawValue: 22)
+    public static let morphTargetTable = UntoldChunkType(rawValue: 23)
+    public static let morphTargetData = UntoldChunkType(rawValue: 24)
+    public static let gaussianAssetTable = UntoldChunkType(rawValue: 25)
+    public static let morphDriverTable = UntoldChunkType(rawValue: 26)
 
     public static let firstPluginChunkRawValue: UInt32 = 0x8000
 
@@ -96,6 +154,9 @@ public enum UntoldTextureFormat: UInt32, Sendable {
     case astc6x6 = 6
     case astc8x8 = 7
     case rgba16Float = 8
+    /// Single-channel, 16-bit, linear, uncompressed — height/displacement map data.
+    /// Bypasses ASTC deliberately; see NativeTexFormat.r16UnormPixelFormat.
+    case r16Unorm = 9
 
     /// True for formats stored in the engine-native .utex container and uploaded
     /// directly to Metal without passing through MTKTextureLoader or CGImage.
@@ -108,7 +169,7 @@ public enum UntoldTextureFormat: UInt32, Sendable {
 
     /// True when the referenced file is an engine-native `.utex` container.
     public var isNativeContainer: Bool {
-        isASTCNative || self == .rgba16Float
+        isASTCNative || self == .rgba16Float || self == .r16Unorm
     }
 }
 
@@ -354,6 +415,15 @@ public struct UntoldMaterialRecordV1: Sendable, Equatable {
     public var roughnessTextureIndex: UInt32
     public var emissiveTextureIndex: UInt32
     public var occlusionTextureIndex: UInt32
+    /// Total Parallax Occlusion Mapping ray-march depth, in UV-normalized units.
+    public var heightScale: Float
+    /// Height-sample offset, matching Blender's Displacement node "Midlevel" input.
+    public var heightMidlevel: Float
+    public var heightTextureIndex: UInt32
+    /// Contrast-stretch bounds applied to the raw height sample before heightMidlevel.
+    /// Identity is (0.0, 1.0).
+    public var heightRemapMin: Float
+    public var heightRemapMax: Float
     /// Reserved fixed-length 2-word field for forward compatibility.
     public var reserved0: [UInt32]
     public var roughnessTextureChannel: UntoldTextureChannel {
@@ -390,6 +460,11 @@ public struct UntoldMaterialRecordV1: Sendable, Equatable {
         roughnessTextureIndex: UInt32 = UntoldFormat.invalidIndex,
         emissiveTextureIndex: UInt32 = UntoldFormat.invalidIndex,
         occlusionTextureIndex: UInt32 = UntoldFormat.invalidIndex,
+        heightTextureIndex: UInt32 = UntoldFormat.invalidIndex,
+        heightScale: Float = 0.05,
+        heightMidlevel: Float = 0.5,
+        heightRemapMin: Float = 0.0,
+        heightRemapMax: Float = 1.0,
         roughnessTextureChannel: UntoldTextureChannel = .r,
         metallicTextureChannel: UntoldTextureChannel = .r
     ) {
@@ -408,6 +483,11 @@ public struct UntoldMaterialRecordV1: Sendable, Equatable {
         self.roughnessTextureIndex = roughnessTextureIndex
         self.emissiveTextureIndex = emissiveTextureIndex
         self.occlusionTextureIndex = occlusionTextureIndex
+        self.heightTextureIndex = heightTextureIndex
+        self.heightScale = heightScale
+        self.heightMidlevel = heightMidlevel
+        self.heightRemapMin = heightRemapMin
+        self.heightRemapMax = heightRemapMax
         reserved0 = [
             Self.packTextureChannels(
                 roughness: roughnessTextureChannel,
@@ -588,6 +668,181 @@ public struct UntoldColorManagementRecordV1: Sendable, Equatable {
         self.shaperMinStops = shaperMinStops
         self.shaperMaxStops = shaperMaxStops
         self.lutSize = lutSize
+    }
+}
+
+/// An externally-authored standard .cube 3D LUT staged alongside the export
+/// (see ColorGradeLUTRecord in scripts/untoldexplorer.py), applied as a
+/// post-tonemap creative grade. At most one per file. Unlike
+/// UntoldColorManagementRecordV1 above, this references a plain staged file
+/// via a string-table URI, not a native texture-table entry -- the engine
+/// parses/uploads the .cube directly (see CubeLUTLoader) rather than going
+/// through the native texture pipeline.
+public struct UntoldColorGradeLUTRecordV1: Sendable, Equatable {
+    public var lutUriOffset: UInt32
+    public var lutSize: UInt32
+    public var domainMin: SIMD3<Float>
+    public var domainMax: SIMD3<Float>
+
+    public init(
+        lutUriOffset: UInt32 = UntoldFormat.invalidIndex,
+        lutSize: UInt32 = 0,
+        domainMin: SIMD3<Float> = SIMD3<Float>(0, 0, 0),
+        domainMax: SIMD3<Float> = SIMD3<Float>(1, 1, 1)
+    ) {
+        self.lutUriOffset = lutUriOffset
+        self.lutSize = lutSize
+        self.domainMin = domainMin
+        self.domainMax = domainMax
+    }
+}
+
+public enum UntoldGaussianAssetFlags {
+    /// The entity also carries a mesh that acts as the splat's twin: it is the
+    /// depth-only occluder, shadow caster and collider while the splat is shown.
+    public static let meshTwin: UInt32 = 1 << 0
+    /// The payload is an environment streamed by visibility rather than an object.
+    public static let environment: UInt32 = 1 << 1
+    /// The payload is a world seen through a window from a fixed view cell.
+    public static let windowWorld: UInt32 = 1 << 2
+    /// The record's `alignmentTranslation`, `alignmentYawDegrees` and `alignmentScale` are
+    /// valid: the splat is drawn with that transform composed onto the entity's. Clear (the
+    /// words are zero) in files written before the alignment existed, which means identity.
+    public static let alignment: UInt32 = 1 << 3
+}
+
+/// How a splat sits in its entity's local space without a re-cook: `matrix` is
+/// `T(translation) · R_y(yawDegrees) · S(scale)`, applied to the splat positions before the
+/// entity's world transform (`GaussianComponent.splatToEntity`). Yaw turns about the entity's
+/// +Y axis (right-handed, like `rotateTo(entityId:angle:axis:)`); the scale is uniform. Stored
+/// in the scene's `gaussianAsset` record (`UntoldGaussianAssetRecordV1`, flag
+/// `UntoldGaussianAssetFlags.alignment`), so the cook transform baked into the `.untoldgs`
+/// header (`splatToMesh`) stays what it is and this is an edit on top of it.
+public struct GaussianSplatAlignment: Sendable, Equatable, Codable {
+    public static let identity = GaussianSplatAlignment()
+
+    /// Offset in the entity's local space, metres.
+    public var translation: SIMD3<Float>
+    /// Rotation about the entity's +Y axis, degrees.
+    public var yawDegrees: Float
+    /// Uniform scale; must be greater than zero.
+    public var scale: Float
+
+    public init(translation: SIMD3<Float> = .zero, yawDegrees: Float = 0, scale: Float = 1) {
+        self.translation = translation
+        self.yawDegrees = yawDegrees
+        self.scale = scale
+    }
+
+    /// `T · R_y · S` as the splat-to-entity matrix.
+    public var matrix: simd_float4x4 {
+        let radians = yawDegrees * .pi / 180
+        var result = simd_float4x4(simd_quatf(angle: radians, axis: SIMD3<Float>(0, 1, 0)))
+        result.columns.0 *= scale
+        result.columns.1 *= scale
+        result.columns.2 *= scale
+        result.columns.3 = SIMD4<Float>(translation.x, translation.y, translation.z, 1)
+        return result
+    }
+
+    /// Every field finite and the scale positive: what `UntoldReader` and the patcher accept.
+    public var isValid: Bool {
+        translation.x.isFinite && translation.y.isFinite && translation.z.isFinite
+            && yawDegrees.isFinite && scale.isFinite && scale > 0
+    }
+}
+
+/// Links an entity to a cooked Gaussian splat payload (`.untoldgs`, see
+/// docs/Architecture/untoldgsFormat.md) and carries the scene-side facts the
+/// runtime needs to place, budget and swap it. One record per splat entity.
+/// Registration onto the mesh twin and capture exposure live in the payload
+/// header; this record holds what the scene author tunes.
+public struct UntoldGaussianAssetRecordV1: Sendable, Equatable {
+    public static let maxLODLevels = 4
+
+    public var entityId: UInt32
+    /// String-table offset of the payload path, relative to this asset's directory.
+    public var payloadPathOffset: UInt32
+    /// See `UntoldGaussianAssetFlags`.
+    public var flags: UInt32
+    /// Valid entries in `lodSplatCounts` / `lodSwitchScreenHeights`, 0...4. Zero means one level.
+    public var lodCount: UInt32
+    /// Splat count per LOD level, coarsest first. Always 4 entries; unused are zero.
+    public var lodSplatCounts: [UInt32]
+    /// Screen height in pixels above which the next finer level is preferred. Always 4 entries.
+    public var lodSwitchScreenHeights: [Float]
+    /// Metres the mesh twin's depth-only occluder shell is shrunk along its normals.
+    public var occluderShrinkMeters: Float
+    /// Editor exposure offset in EV, applied on top of the payload's capture exposure.
+    public var exposureOffsetEV: Float
+    /// Camera distance at which the swap and its prefetch arm. Zero means always.
+    public var swapDistanceMeters: Float
+    /// Offset of the splat in the entity's local space, metres. Valid only with
+    /// `UntoldGaussianAssetFlags.alignment`; written as zero otherwise (these three fields were
+    /// the record's reserved words, so a file written before them reads as no alignment).
+    public var alignmentTranslation: SIMD3<Float>
+    /// Rotation of the splat about the entity's +Y axis, degrees. Valid with the `alignment` flag.
+    public var alignmentYawDegrees: Float
+    /// Uniform scale of the splat, greater than zero. Valid with the `alignment` flag.
+    public var alignmentScale: Float
+
+    /// `alignment` non-nil sets `UntoldGaussianAssetFlags.alignment` in `flags` and fills the
+    /// alignment fields; nil leaves `flags` as given and the fields zero.
+    public init(
+        entityId: UInt32,
+        payloadPathOffset: UInt32,
+        flags: UInt32 = 0,
+        lodCount: UInt32 = 0,
+        lodSplatCounts: [UInt32] = [],
+        lodSwitchScreenHeights: [Float] = [],
+        occluderShrinkMeters: Float = 0.02,
+        exposureOffsetEV: Float = 0,
+        swapDistanceMeters: Float = 0,
+        alignment: GaussianSplatAlignment? = nil
+    ) {
+        self.entityId = entityId
+        self.payloadPathOffset = payloadPathOffset
+        self.flags = alignment == nil ? flags : flags | UntoldGaussianAssetFlags.alignment
+        self.lodCount = lodCount
+        self.lodSplatCounts = Self.fixed(lodSplatCounts, count: Self.maxLODLevels, fill: 0)
+        self.lodSwitchScreenHeights = Self.fixed(lodSwitchScreenHeights, count: Self.maxLODLevels, fill: 0)
+        self.occluderShrinkMeters = occluderShrinkMeters
+        self.exposureOffsetEV = exposureOffsetEV
+        self.swapDistanceMeters = swapDistanceMeters
+        alignmentTranslation = alignment?.translation ?? .zero
+        alignmentYawDegrees = alignment?.yawDegrees ?? 0
+        alignmentScale = alignment?.scale ?? 0
+    }
+
+    /// The alignment the record carries: the three fields when `flags` has
+    /// `UntoldGaussianAssetFlags.alignment`, nil otherwise. Setting it sets or clears the flag
+    /// and, when cleared, zeroes the fields.
+    public var alignment: GaussianSplatAlignment? {
+        get {
+            guard flags & UntoldGaussianAssetFlags.alignment != 0 else { return nil }
+            return GaussianSplatAlignment(translation: alignmentTranslation, yawDegrees: alignmentYawDegrees, scale: alignmentScale)
+        }
+        set {
+            if let newValue {
+                flags |= UntoldGaussianAssetFlags.alignment
+                alignmentTranslation = newValue.translation
+                alignmentYawDegrees = newValue.yawDegrees
+                alignmentScale = newValue.scale
+            } else {
+                flags &= ~UntoldGaussianAssetFlags.alignment
+                alignmentTranslation = .zero
+                alignmentYawDegrees = 0
+                alignmentScale = 0
+            }
+        }
+    }
+
+    private static func fixed<T>(_ values: [T], count: Int, fill: T) -> [T] {
+        var result = Array(values.prefix(count))
+        while result.count < count {
+            result.append(fill)
+        }
+        return result
     }
 }
 

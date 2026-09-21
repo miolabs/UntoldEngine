@@ -55,6 +55,11 @@ public enum NativeTexFormat {
     /// Required byte alignment for the payload start and each mip boundary.
     public static let payloadAlignment: Int = 16
     public static let rgba16FloatPixelFormat: UInt32 = 115
+    /// MTLPixelFormatR16Unorm. Used for height/displacement map data: single-channel,
+    /// 16-bit, linear (not sRGB), uncompressed. Bypasses ASTC deliberately — block
+    /// compression's stepping artifacts are especially visible when the height field is
+    /// ray-marched per-pixel (POM). See docs/proposals/HeightMapParallaxOcclusionMapping.md.
+    public static let r16UnormPixelFormat: UInt32 = 20
 
     /// Compute the payload start offset for a file with the given mip count.
     /// Result is always 16-byte aligned because headerSize (64) and mipCount × mipEntrySize (16N)
@@ -71,6 +76,9 @@ public enum NativeTexFormat {
         if pixelFormat == rgba16FloatPixelFormat {
             return 8
         }
+        if pixelFormat == r16UnormPixelFormat {
+            return 2
+        }
         return nil
     }
 }
@@ -83,6 +91,12 @@ public enum NativeTexFlags {
     public static let hasAlpha: UInt32 = 1 << 0
     /// Alpha channel is premultiplied into the RGB channels.
     public static let premultipliedAlpha: UInt32 = 1 << 1
+    /// Normal map was baked with astcenc's `-normal` mode: stored as a 2-component
+    /// X+Y map (RGB=X, A=Y) instead of a direct 3-component tangent-space normal.
+    /// Consumers must reconstruct Z: `z = sqrt(saturate(1 - dot(xy, xy)))`.
+    /// Set by scripts/texbake.py (FLAG_NORMAL_PACKED_XY); read by Mesh.swift and
+    /// decoded in modelShader.metal / TransparencyShader.metal.
+    public static let normalPackedXY: UInt32 = 1 << 2
 }
 
 // MARK: - Header
@@ -295,7 +309,9 @@ public struct NativeTexReader {
         guard NativeTexFormat.bytesPerBlock(pixelFormat: header.pixelFormat) != nil else {
             throw NativeTexValidationError.unsupportedPixelFormat(header.pixelFormat)
         }
-        if header.pixelFormat == NativeTexFormat.rgba16FloatPixelFormat,
+        let isUncompressed = header.pixelFormat == NativeTexFormat.rgba16FloatPixelFormat
+            || header.pixelFormat == NativeTexFormat.r16UnormPixelFormat
+        if isUncompressed,
            header.blockWidth != 1 || header.blockHeight != 1
         {
             throw NativeTexValidationError.invalidBlockDimensions(
@@ -320,7 +336,9 @@ public struct NativeTexReader {
                     payloadSize: header.totalPayloadSize
                 )
             }
-            if header.pixelFormat == NativeTexFormat.rgba16FloatPixelFormat {
+            let isUncompressed = header.pixelFormat == NativeTexFormat.rgba16FloatPixelFormat
+                || header.pixelFormat == NativeTexFormat.r16UnormPixelFormat
+            if isUncompressed {
                 let blocksWide = (UInt64(mip.widthPx) + UInt64(header.blockWidth) - 1) / UInt64(header.blockWidth)
                 let blocksHigh = (UInt64(mip.heightPx) + UInt64(header.blockHeight) - 1) / UInt64(header.blockHeight)
                 let expectedSize = blocksWide * blocksHigh * UInt64(bytesPerBlock)

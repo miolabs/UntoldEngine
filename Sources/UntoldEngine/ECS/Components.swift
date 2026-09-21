@@ -94,15 +94,187 @@ public class EntitySceneChannelsComponent: Component {
 }
 
 public class GaussianComponent: Component {
+    /// A whole-buffer (legacy) entity's splats — `.ply`, or a `.untoldgs` decoded on the CPU —
+    /// as `EncodedGaussianSplat` records; nil for a chunked entity.
     var encodedSplatData: MTLBuffer?
+    /// A chunked (`.untoldgs`) entity's splats as the file's 16-byte core records, decoded every
+    /// frame by the fused per-chunk pass; nil for a whole-buffer entity.
+    var packedSplatData: MTLBuffer?
     var sphericalHarmonicsData: MTLBuffer?
     var sphericalHarmonicsMetadata: GaussianSHMetadata?
-    var gaussianSortedIndices: MTLBuffer?
-    var gaussianVisibleIndices: MTLBuffer?
-    var gaussianVisibleCount: MTLBuffer?
+    // Whole-buffer entities only: written every frame by the cull and read the same frame by the
+    // preprocess, the indices of the splats that survived, and a GaussianVisibleSet record with
+    // the count and the indirect arguments derived from it. Slotted per in-flight frame
+    // (renderInfo.currentInFlightFrameSlot) so an overlapping newer frame cannot clobber data an
+    // older frame is still reading. A chunked entity keeps its per-slot visible-chunk lists on
+    // its chunk table instead. The per-frame sort keys and draw records live in the shared
+    // GaussianSharedWorkingSet.
+    var gaussianVisibleIndices: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
+    var gaussianVisibleCount: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
     var visibleSplatCountForRendering: UInt = 0
-    public var spaceUniform: [MTLBuffer?] = Array(repeating: nil, count: totalPerMeshUniformBuffers())
     var splatCount: UInt = 0
+    /// The `.untoldgs` chunk table (decode constants on the GPU, index on the CPU), kept from
+    /// the load so the frame can cull whole chunks before it looks at their splats. nil for a
+    /// `.ply` or a CPU-decoded asset, which keep the per-splat cull over the whole buffer.
+    var chunkTable: GaussianChunkTable?
+    /// The pager of a `.untoldgs` loaded above the paging threshold: `packedSplatData` is then
+    /// its page pool and the pager fills it from the cull's demand every frame. nil when every
+    /// record is resident. Shut down with the entity (`removeEntityGaussian`).
+    var pager: GaussianPageManager?
+
+    /// Whether the entity holds splat data on the GPU, on either path.
+    var hasResidentSplats: Bool {
+        encodedSplatData != nil || packedSplatData != nil
+    }
+
+    /// Whether the frame decodes this entity's splats from its chunk table (the fused per-chunk
+    /// pass) rather than culling its encoded buffer whole.
+    var isChunked: Bool {
+        chunkTable != nil && packedSplatData != nil
+    }
+
+    /// Whether the records live in a page pool.
+    var isPaged: Bool {
+        pager != nil
+    }
+
+    /// The most splats the frame can ever draw of this entity: the pool's records for a paged
+    /// entity, the whole asset otherwise, plus the coarse records of its per-chunk levels (a
+    /// fading chunk draws its outgoing window beside the incoming one) — what the working set is
+    /// sized against.
+    var residentSplatCount: Int {
+        let coarse = chunkTable?.coarse?.recordCount ?? 0
+        guard let pager else { return Int(splatCount) + coarse }
+        return min(Int(splatCount), pager.slotCount * pager.ranksPerPage) + coarse
+    }
+
+    /// Multiplier on every splat's opacity this frame: 1 draws the asset as captured, 0 hides
+    /// it without unloading (nothing is compacted into the frame; its cull is skipped), values
+    /// between cross-fade. An application system that swaps a mesh for its splat drives it.
+    public var opacityScale: Float = 1
+    /// Exposure the capture was recorded at, from the `.untoldgs` header (0 for `.ply`), and
+    /// its white balance as an RGB multiplier (1 for none). Baked by the cook, read on load.
+    public internal(set) var captureExposureEV: Float = 0
+    public internal(set) var captureWhiteBalance = SIMD3<Float>(repeating: 1)
+    /// Per-asset exposure offset in EV on top of the capture exposure (the editor's slider,
+    /// `UntoldGaussianAssetRecordV1.exposureOffsetEV` in a scene).
+    public var exposureOffsetEV: Float = 0
+    /// In XR, multiply the colour by the real-world lighting estimate's tint
+    /// (`RuntimeEnvironmentLightingStore`, while its mode is `.realWorldEstimate` and the
+    /// latest estimate is valid), so a capture made under neutral light takes on the colour of
+    /// the room it is shown in. Off by default.
+    public var useRealWorldTint = false
+
+    /// The gain in linear light the preprocess applies to this asset's colour: the capture white
+    /// balance and 2^(offset − capture exposure), which brings a capture recorded at +1 EV back to
+    /// the scene's neutral exposure and lets the per-asset offset push it either way. The
+    /// real-world tint is applied on top by the preprocess when `useRealWorldTint` is set. A
+    /// record's colour stays in the capture's display-referred space (the splats blend there), so
+    /// the preprocess decodes it, applies the gain and re-encodes it per splat. Splats are unlit
+    /// emissive surfaces the look pass's grade and tone map leave alone, so this is the only place
+    /// the capture is calibrated to the scene (proposal §4.5, Lighting).
+    public var colorGain: SIMD3<Float> {
+        captureWhiteBalance * pow(2, exposureOffsetEV - captureExposureEV)
+    }
+
+    /// GPU bytes of the resident splat and its local-space box, set by every load path
+    /// (single file, progressive tier, streamed). On an entity that also draws a mesh the splat
+    /// is the secondary representation: its bytes ride beside the mesh's `MemoryBudgetManager`
+    /// entry and the entity keeps the mesh's bounding box; this box is the splat's own.
+    public internal(set) var estimatedGPUBytes = 0
+    public internal(set) var localBoundingBox: (min: simd_float3, max: simd_float3)?
+    /// Where the splat sits in the entity's local space: the splat is drawn with
+    /// `worldTransform × splatToEntity`, so moving, turning or scaling this is the same as
+    /// moving the entity, without touching the mesh a twin stands in for. Identity by default;
+    /// `GaussianSplatAlignment.matrix` builds it from a scene link's alignment. Set through
+    /// `setGaussianSplatToEntity(entityId:_:)`, which also carries a splat-only entity's
+    /// bounding box through the new value. Survives tier swaps, reloads of the same entity and
+    /// a streaming eviction (`StreamingComponent` keeps it while the splat is out).
+    public internal(set) var splatToEntity: simd_float4x4 = matrix_identity_float4x4
+
+    /// The file this splat was loaded from, when the load path knows it. Scene serialization
+    /// uses this to save resident splats as asset references instead of embedding payload bytes.
+    public internal(set) var sourceURL: URL?
+
+    public required init() {}
+}
+
+/// Draws the mesh as a depth-only occluder shell as well: after the opaque colour geometry, the
+/// `meshOccluderShell` pass draws it again with depth only, every vertex pushed `shrinkMeters`
+/// along its normal away from the camera, into the opaque depth the HZB copy, SSAO,
+/// transparency and the splat pass read. Whatever stands in for the mesh on screen (a captured
+/// splat twin) is then hidden behind the object's far side but never by the surface it sits on.
+/// With `drawsColor` off the mesh contributes nothing but that depth: shadows, physics and
+/// picking keep using it because `RenderComponent.isVisible` is untouched. Blend-mode submeshes
+/// are left out of the shell and stop drawing with the colour. The policy that drives this
+/// (when, how fast, from what distance) belongs to the application system that owns the
+/// component. Adding or removing it takes the entity out of, or back into, static batching the
+/// next time the batcher evaluates it, and a batch-eligible mesh then casts its shadow on its
+/// own: the owning system calls `BatchingSystem.notifyEntityMaterialChanged` and
+/// `RenderPasses.invalidateShadowEntityCache()` when it adds or removes the component.
+public class MeshOccluderComponent: Component {
+    /// Metres the shell moves away from the camera along the normals.
+    public var shrinkMeters: Float = 0.02
+    /// Whether the mesh still draws its colour in the opaque pass (dithered when a
+    /// `MeshFadeComponent` is present). Off once the stand-in is fully shown.
+    public var drawsColor = true
+
+    public required init() {}
+}
+
+/// Screen-door cross-fade of a mesh's colour, the 8x8 Bayer dither the LOD and tile fades use:
+/// `.fadeOut` discards more pixels as `progress` rises, `.fadeIn` keeps more. Applied after the
+/// LOD and tile fades, so the app system that owns the component wins over them. While present
+/// the entity draws on its own, outside static batching, once the batcher re-evaluates it
+/// (`BatchingSystem.notifyEntityMaterialChanged`; also `RenderPasses.invalidateShadowEntityCache()`
+/// so a batch-eligible mesh keeps casting its shadow on its own meanwhile).
+public class MeshFadeComponent: Component {
+    public enum Direction: Sendable, Equatable {
+        case fadeIn
+        case fadeOut
+    }
+
+    /// 0...1 progress of the fade.
+    public var progress: Float = 0
+    public var direction: Direction = .fadeOut
+
+    public required init() {}
+}
+
+/// The `gaussianAsset` record a `.untold` scene attached to this entity
+/// (`UntoldGaussianAssetRecordV1`), carried as data by the loader and nothing more: an
+/// application system decides what to do with it (a mesh twin swap, a window world, an
+/// environment). The payload path is resolved next to the scene file when the scene loads.
+public class GaussianAssetLinkComponent: Component {
+    public var payloadURL: URL?
+    /// See `UntoldGaussianAssetFlags`.
+    public var flags: UInt32 = 0
+    /// The record's LOD table: number of levels (0 means one), splat count per level coarsest
+    /// first, and the screen height in pixels above which the next finer level is preferred.
+    public var lodCount: Int = 0
+    public var lodSplatCounts: [UInt32] = []
+    public var lodSwitchScreenHeights: [Float] = []
+    /// Metres the mesh twin's depth-only occluder shell is shrunk (`MeshOccluderComponent`).
+    public var occluderShrinkMeters: Float = 0.02
+    /// Editor exposure offset in EV (`GaussianComponent.exposureOffsetEV`).
+    public var exposureOffsetEV: Float = 0
+    /// Camera distance at which a twin swap arms; 0 means always.
+    public var swapDistanceMeters: Float = 0
+    /// How the splat sits in the entity's local space, to be applied as
+    /// `GaussianComponent.splatToEntity` by whoever loads the payload; nil means identity.
+    public var alignment: GaussianSplatAlignment?
+
+    public var isMeshTwin: Bool {
+        flags & UntoldGaussianAssetFlags.meshTwin != 0
+    }
+
+    public var isEnvironment: Bool {
+        flags & UntoldGaussianAssetFlags.environment != 0
+    }
+
+    public var isWindowWorld: Bool {
+        flags & UntoldGaussianAssetFlags.windowWorld != 0
+    }
 
     public required init() {}
 }
@@ -270,6 +442,8 @@ public class AnimationComponent: Component {
     var rootMotion = RootMotionState()
     var footIK = FootIKState()
     var motionMatching = MotionMatchingState()
+    var poseLayer = PoseLayerState()
+    var reachIK = ReachIKState()
 
     public required init() {}
 
@@ -288,6 +462,8 @@ public class AnimationComponent: Component {
         rootMotion = RootMotionState()
         footIK = FootIKState()
         motionMatching = MotionMatchingState()
+        poseLayer = PoseLayerState()
+        reachIK = ReachIKState()
     }
 
     func getAllAnimationClips() -> [String] {
@@ -338,6 +514,11 @@ public class LightComponent: Component {
     public required init() {}
 }
 
+/// When the shared `LightComponent.usesRadiometricUnits` is true, this
+/// light's `intensity` is perpendicular irradiance in W/m² (Blender Sun
+/// "Strength"), consumed directly by the Lambertian/specular BRDF with no
+/// additional conversion — unlike point/spot/area, which divide watts by an
+/// emitter shape factor (solid angle or area) before use.
 public class DirectionalLightComponent: Component {
     public var castsShadow: Bool = true
     public required init() {}
@@ -470,6 +651,23 @@ public enum LODResidencyState {
     case loading // Mesh is being loaded
 }
 
+/// Shared by `LODLevel` and `GaussianLODLevel` so `isLODLevelResident`/`findFallbackLODLevel`
+/// (`LODSystem.swift`) can implement residency/fallback selection once for both mesh and
+/// Gaussian LOD instead of each component re-declaring the same algorithm.
+protocol LODResidencyLevel {
+    var residencyState: LODResidencyState { get }
+    /// Whether this level actually has a usable payload — `residencyState` alone isn't
+    /// trusted, mirroring the double-check both components already made before this was shared.
+    var isPopulated: Bool { get }
+}
+
+/// Shared by `LODLevel` and `GaussianLODLevel` so `selectLODIndex` (`LODSystem.swift`) can pick
+/// a distance-based tier once for both mesh and Gaussian LOD instead of each system
+/// re-declaring the same threshold/hysteresis algorithm.
+protocol LODDistanceLevel {
+    var maxDistance: Float { get }
+}
+
 public struct LODLevel {
     public var mesh: [Mesh] // Meshes for this lod
     public var maxDistance: Float // Switch to next LOD beyond this
@@ -488,6 +686,14 @@ public struct LODLevel {
         residencyState = mesh.isEmpty ? .notResident : .resident
     }
 }
+
+extension LODLevel: LODResidencyLevel {
+    var isPopulated: Bool {
+        !mesh.isEmpty
+    }
+}
+
+extension LODLevel: LODDistanceLevel {}
 
 public class LODComponent: Component {
     public var lodLevels: [LODLevel] = [] // Sorted by distance (LOD0 first)
@@ -509,26 +715,132 @@ public class LODComponent: Component {
 
     /// Check if the desired LOD level has a resident mesh
     public func isLODResident(_ lodIndex: Int) -> Bool {
-        guard lodIndex >= 0, lodIndex < lodLevels.count else { return false }
-        let level = lodLevels[lodIndex]
-        return level.residencyState == .resident && !level.mesh.isEmpty
+        isLODLevelResident(lodLevels, lodIndex)
     }
 
     /// Find the best available fallback LOD (coarser than desired)
     public func findFallbackLOD(from desiredIndex: Int) -> Int? {
-        // Try coarser LODs first (higher index = lower detail)
-        for i in (desiredIndex + 1) ..< lodLevels.count {
-            if isLODResident(i) {
-                return i
-            }
+        findFallbackLODLevel(lodLevels, from: desiredIndex)
+    }
+}
+
+// MARK: - Progressive Gaussian LOD Component
+
+/// One pre-baked quality tier for a progressive Gaussian splat asset.
+/// LOD0 is expected to be the full-resolution tier; later indices are progressively coarser.
+public struct GaussianLODLevel {
+    /// The tier's resident buffers, or nil while it is not loaded. A whole-resident tier
+    /// (below the paging threshold) stays here after the LOD system switches away from it, so
+    /// the switch back is instant and reads nothing; a paged tier (`buffers.pager` set) does
+    /// not — `GaussianLODSystem.applyLOD` releases every paged tier the selection just left
+    /// (`GaussianLODComponent.releaseLevelResources(at:)`), since each holds a fixed pool of
+    /// tens to hundreds of MiB, and the normal request path loads it again, with a fresh pool
+    /// that warms before the next switch, when the selection returns to it.
+    public var buffers: GaussianComponent?
+    public var maxDistance: Float
+    public var url: URL?
+    public var residencyState: LODResidencyState = .unknown
+    var loadTask: Task<Void, Never>?
+    /// Bake-time mean of this tier's kept splats' squared major-axis extent — see
+    /// `estimatedGaussianOverdraw`. Baked into the `.untoldgs` file itself
+    /// (`UntoldGSFormat`/`bakeGaussianSplatProgressiveTiers`) and populated automatically by
+    /// `loadGaussianLODLevel` once this tier's file is actually read. `nil` only before that —
+    /// i.e. this tier hasn't loaded yet — in which case `clampGaussianLODForOverdraw` falls
+    /// back to distance-only LOD selection for it.
+    public var meanSquaredSplatExtent: Float?
+    /// This tier's splat count, read from the file the first time the tier loads and kept —
+    /// like `meanSquaredSplatExtent` — when `GaussianLODComponent.releaseLevelResources(at:)`
+    /// lets its buffers go, so `clampGaussianLODForOverdraw` still walks past a released tier
+    /// rather than bailing out at it. `nil` only before the tier has ever loaded.
+    public var splatCount: Int?
+
+    public init(maxDistance: Float, url: URL? = nil) {
+        self.maxDistance = maxDistance
+        self.url = url
+    }
+}
+
+extension GaussianLODLevel: LODResidencyLevel {
+    var isPopulated: Bool {
+        buffers != nil
+    }
+}
+
+extension GaussianLODLevel: LODDistanceLevel {}
+
+/// Runtime state for a progressively streamed Gaussian splat prop.
+/// The renderer still consumes a normal `GaussianComponent`; this component owns the
+/// per-tier residency and `GaussianLODSystem` copies the selected tier onto the live
+/// `GaussianComponent`.
+public class GaussianLODComponent: Component {
+    public var lodLevels: [GaussianLODLevel] = []
+    public var currentLOD: Int = -1
+    public var desiredLOD: Int = 0
+    public var forcedLOD: Int?
+    public var isUsingFallback: Bool = false
+
+    /// The LOD index pure distance+hysteresis selection last landed on, before the
+    /// overdraw-aware clamp is applied — see `GaussianLODSystem.selectDesiredLOD`. Kept
+    /// separate from `desiredLOD` (the final, possibly overdraw-forced-coarser target used for
+    /// residency/streaming/`applyLOD`) so an overdraw-forced tier doesn't retroactively bias
+    /// the hysteresis anchor `selectLODIndex` uses next frame — otherwise a frame where overdraw
+    /// forces LOD 3 would make LOD 3 "the tier we're logically at" for the *next* frame's
+    /// distance-only hysteresis math too, even though distance alone would have picked LOD 1.
+    var distanceSelectedLOD: Int = 0
+
+    /// Distance to camera the last time this entity's LOD was fully re-evaluated — see
+    /// `GaussianLODSystem.update`'s per-entity fast path, which forces a refresh when this
+    /// entity (not just the camera) has moved enough to plausibly cross a LOD threshold,
+    /// independent of the camera-movement/frame-interval throttle. `nil` forces an evaluation
+    /// the first time this entity is seen.
+    var lastEvaluatedDistance: Float?
+
+    /// `true` when the caller explicitly supplied a `boundingBoxHalfExtent` (always the case
+    /// for the streaming path, optional for the non-streaming path). When `false`,
+    /// `loadGaussianLODLevel` auto-populates `LocalTransformComponent.boundingBox` from the
+    /// first (coarsest) tier's real splat data once it loads, instead of leaving the entity on
+    /// its default placeholder box forever.
+    var hasExplicitBoundingBox: Bool = false
+
+    /// Last state GaussianLODSystem's diagnostic log reported for this entity — used only to
+    /// dedup consecutive identical log lines (log on change, not every evaluation).
+    var lastLoggedDesiredLOD: Int = -2
+    var lastLoggedActualLOD: Int = -2
+
+    public required init() {}
+
+    public func isLODResident(_ lodIndex: Int) -> Bool {
+        isLODLevelResident(lodLevels, lodIndex)
+    }
+
+    public func findFallbackLOD(from desiredIndex: Int) -> Int? {
+        findFallbackLODLevel(lodLevels, from: desiredIndex)
+    }
+
+    /// Cancels in-flight loads and drops residency for every tier. Does not touch
+    /// currentLOD/desiredLOD — callers decide those based on whether this is a
+    /// stream-out (reset to coarsest) or full teardown (component removed right after).
+    func releaseAllLevelResources() {
+        for index in lodLevels.indices {
+            lodLevels[index].loadTask?.cancel()
+            lodLevels[index].loadTask = nil
+            releaseLevelResources(at: index)
         }
-        // Then try finer LODs (lower index = higher detail)
-        for i in (0 ..< desiredIndex).reversed() {
-            if isLODResident(i) {
-                return i
-            }
-        }
-        return nil
+    }
+
+    /// Drops one tier's residency: its pager is shut down (the pool leaves
+    /// `GaussianPagePoolRegistry` at once, the reads in flight are dropped when they land) and
+    /// its buffers are let go — the Metal buffers themselves go once the in-flight frames that
+    /// reference them complete, since committed command buffers retain them. The tier reads
+    /// `.notResident`, so `GaussianLODSystem` requests it again through the normal path when
+    /// the selection wants it. Safe on a tier already released (nil buffers, a closed pager).
+    /// Does not touch a load in flight; `releaseAllLevelResources` cancels those. The tier's
+    /// bake-time stats (`splatCount`, `meanSquaredSplatExtent`) stay known for the overdraw
+    /// clamp.
+    func releaseLevelResources(at index: Int) {
+        lodLevels[index].buffers?.pager?.shutdown()
+        lodLevels[index].buffers = nil
+        lodLevels[index].residencyState = .notResident
     }
 }
 
@@ -850,6 +1162,18 @@ public enum MeshStreamingState: String {
     case unloading // Being unloaded
 }
 
+/// Kind of asset a StreamingComponent loads/unloads.
+///
+/// Determines which loader `GeometryStreamingSystem.loadMesh`/`unloadMesh` dispatch to.
+/// `.mesh` goes through the existing `.untold`/OCC mesh pipeline; `.gaussianSplat` goes
+/// through `setEntityGaussianAsync`/`unloadGaussian`. The distance/radius scheduling,
+/// concurrency, and memory-budget eviction logic in `GeometryStreamingSystem` is shared
+/// across both kinds.
+public enum StreamingAssetKind {
+    case mesh
+    case gaussianSplat
+}
+
 /// Component that marks an entity for geometry streaming
 public class StreamingComponent: Component {
     /// Distance from camera at which mesh starts loading
@@ -864,11 +1188,14 @@ public class StreamingComponent: Component {
     /// Filename of the asset (without extension)
     public var assetFilename: String = ""
 
-    /// File extension (e.g., "usdz")
+    /// File extension (e.g., "usdz", or "ply" for gaussian splats)
     public var assetExtension: String = ""
 
     /// Optional: specific mesh name within the asset
     public var assetName: String?
+
+    /// Which loader this entity streams through. See `StreamingAssetKind`.
+    public var assetKind: StreamingAssetKind = .mesh
 
     /// Current streaming state
     public var state: MeshStreamingState = .unloaded
@@ -876,8 +1203,20 @@ public class StreamingComponent: Component {
     /// Frame when entity was last visible (for LRU eviction)
     public var lastVisibleFrame: Int = 0
 
+    /// How many loads the streaming system has dispatched for this entity. Counted the moment
+    /// a load is dispatched, before its outcome is known, and never reset by the outcome, so a
+    /// caller can tell "the gates let this entity load" from "it loaded" (a load that fails at
+    /// once puts `state` back to `.unloaded` asynchronously).
+    public internal(set) var loadDispatchCount: Int = 0
+
     /// Task handle for cancellation
     var loadTask: Task<Void, Never>?
+
+    /// A streamed splat's `GaussianComponent.splatToEntity` while it is evicted: stashed by
+    /// `unloadGaussian` before the component goes and put back on the component the reload
+    /// builds, so the entity's alignment outlives the residency cycle like it does a reload of
+    /// a resident entity. Nil until a splat with one has been evicted.
+    var retainedSplatToEntity: simd_float4x4?
 
     public required init() {}
 
@@ -887,7 +1226,8 @@ public class StreamingComponent: Component {
         withExtension ext: String,
         streamingRadius: Float = 100.0,
         unloadRadius: Float = 150.0,
-        priority: Int = 0
+        priority: Int = 0,
+        assetKind: StreamingAssetKind = .mesh
     ) {
         self.init()
         assetFilename = filename
@@ -895,6 +1235,7 @@ public class StreamingComponent: Component {
         self.streamingRadius = streamingRadius
         self.unloadRadius = unloadRadius
         self.priority = priority
+        self.assetKind = assetKind
     }
 }
 

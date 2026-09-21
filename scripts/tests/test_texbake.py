@@ -73,20 +73,18 @@ def _build_minimal_untold_file(tmpdir: Path) -> Path:
         ),
     )
 
+    # untoldexplorer no longer bakes color management (write_color_management_record
+    # and ColorManagementRecord were removed), but the color_management_table chunk
+    # format is still patched by texbake.patch_refs() for legacy .untold files, so
+    # the record bytes are packed directly here using the same layout
+    # (_UNTOLD_COLOR_MANAGEMENT_FMT in texbake.py): lut_texture_index(I),
+    # view_transform_name_offset(I), look_name_offset(I), exposure(f), gamma(f),
+    # shaper_min_stops(f), shaper_max_stops(f), lut_size(I).
     color_writer = u.BinaryWriter()
-    u.write_color_management_record(
-        color_writer,
-        u.ColorManagementRecord(
-            lut_texture_index=0,
-            view_transform_name_offset=view_name_off,
-            look_name_offset=look_name_off,
-            exposure=0.0,
-            gamma=1.0,
-            shaper_min_stops=-10.0,
-            shaper_max_stops=6.0,
-            lut_size=32,
-        ),
-    )
+    color_writer.write_bytes(struct.pack(
+        "<IIIffffI",
+        0, view_name_off, look_name_off, 0.0, 1.0, -10.0, 6.0, 32,
+    ))
 
     chunk_payloads = [
         (u.CHUNK_TYPES["string_table"], strings.data, 0),
@@ -187,6 +185,33 @@ class TexbakePatchRefsTests(unittest.TestCase):
         self.assertEqual(config.encoding, "rgba16f")
         self.assertEqual(config.pixel_format, t.MTL_RGBA16_FLOAT)
         self.assertEqual(t._untold_format_for_config(config), t._UNTOLD_FORMAT_RGBA16_FLOAT)
+
+    def test_height_slot_maps_to_uncompressed_r16unorm(self) -> None:
+        config = t._SLOT_CONFIG["height"]
+        self.assertEqual(config.encoding, "r16")
+        self.assertEqual(config.pixel_format, t.MTL_R16_UNORM)
+        self.assertEqual(t._untold_format_for_config(config), t._UNTOLD_FORMAT_R16_UNORM)
+
+
+class TexbakeSlotDetectionTests(unittest.TestCase):
+    def test_detect_slot_routes_displacement_keywords_to_height(self) -> None:
+        for name in ("Poliigon_BrickWallThin_11512_Displacement", "wall_height", "height_map", "rock_disp"):
+            with self.subTest(name=name):
+                self.assertEqual(t.detect_slot(Path(f"{name}.tiff")), "height")
+
+    def test_detect_slot_routes_bump_keywords_to_height_not_normal(self) -> None:
+        for name in ("metal_bump", "bump_metal"):
+            with self.subTest(name=name):
+                self.assertEqual(t.detect_slot(Path(f"{name}.png")), "height")
+
+    def test_detect_slot_still_routes_normal_keywords_to_normal(self) -> None:
+        self.assertEqual(t.detect_slot(Path("wall_normal.png")), "normal")
+
+    def test_slot_from_texture_flags_routes_height_flag(self) -> None:
+        self.assertEqual(t._slot_from_texture_flags(t._UNTOLD_TEX_FLAG_HEIGHT), "height")
+
+    def test_slot_from_texture_flags_returns_none_when_no_flag_set(self) -> None:
+        self.assertIsNone(t._slot_from_texture_flags(0))
 
 
 if __name__ == "__main__":

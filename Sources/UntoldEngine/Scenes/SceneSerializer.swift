@@ -17,6 +17,16 @@ public struct SceneData: Codable {
     var sceneAuthoredSource: SceneAssetReference? = nil
     var environment: EnvironmentData? = nil
     var toneMapping: ToneMappingData? = nil
+    /// The native Look-pass tonemap operator (see TonemapParams/setPostFX(.tonemapOperator(_))
+    /// -- ACES/AgX). Distinct from the legacy `toneMapping` field above, which
+    /// backs an older, currently-unused RTX tonemap pass.
+    var tonemapOperator: TonemapOperator? = nil
+    /// A standalone .cube color-grade LUT set via setColorGradeLUT(filename:),
+    /// independent of any scene-authored asset. nil when the active grade LUT
+    /// (if any) instead came from sceneAuthoredSource's colorGradeLUT, which is
+    /// already restorable via that reference alone.
+    var colorGradeLUTFilename: String? = nil
+    var colorGradeLUTExtension: String? = nil
     var colorGrading: ColorGradingData? = nil
     var colorCorrection: ColorCorrectionData? = nil
     var bloom: BloomThresholdData? = nil
@@ -166,6 +176,18 @@ struct MaterialData: Codable {
     var roughnessURL: URL? = nil
     var metallicURL: URL? = nil
     var normalURL: URL? = nil
+    var heightURL: URL? = nil
+    var stScale: Float? = nil
+    var baseColorWrapMode: Int? = nil // WrapMode rawValue
+    var roughnessWrapMode: Int? = nil // WrapMode rawValue
+    var metallicWrapMode: Int? = nil // WrapMode rawValue
+    var normalWrapMode: Int? = nil // WrapMode rawValue
+    var heightWrapMode: Int? = nil // WrapMode rawValue
+    var heightScale: Float? = nil
+    var heightMidlevel: Float? = nil
+    var heightEnabled: Bool? = nil
+    var heightRemapMin: Float? = nil
+    var heightRemapMax: Float? = nil
 }
 
 // MARK: - Asset Instance Data
@@ -226,6 +248,41 @@ struct StreamingData: Codable {
     var assetName: String?
 }
 
+struct GaussianSceneData: Codable {
+    /// Portable identifier for a non-progressive source: a bare filename (no directories),
+    /// searched at load time through `LoadingSystem`'s asset folders the same way
+    /// `StreamingData.assetFilename` already is, or — only for a source outside the project
+    /// (e.g. a file loaded at runtime via `setEntityGaussianAsync(entityId:url:)`) — a resolved
+    /// absolute path, matching how `sceneAssetReference` falls back for non-project assets.
+    /// Deliberately not a machine-specific absolute path for project assets: that would bake
+    /// the current developer's filesystem layout into the scene file (see `legacyAssetURL`'s
+    /// comment on why every other asset kind here avoids that). nil when `isProgressive` —
+    /// `baseFilename` carries the identifier instead.
+    var sourcePath: String? = nil
+    var isProgressive: Bool = false
+    var baseFilename: String? = nil
+    var fileExtension: String
+    var levelCount: Int? = nil
+    var maxDistances: [Float]? = nil
+    var isStreaming: Bool = false
+    var streamingRadius: Float? = nil
+    var unloadRadius: Float? = nil
+    var priority: Int? = nil
+}
+
+public struct GaussianSceneRestoreInfo {
+    public let sourceURL: URL
+    public let isProgressive: Bool
+    public let baseFilename: String?
+    public let fileExtension: String
+    public let levelCount: Int?
+    public let maxDistances: [Float]?
+    public let isStreaming: Bool
+    public let streamingRadius: Float?
+    public let unloadRadius: Float?
+    public let priority: Int?
+}
+
 struct EntityData: Codable {
     var uuid: UUID = .init() // Unique identifier for this entity
     var parentUUID: UUID? = nil // UUID of the parent entity, if any
@@ -272,6 +329,9 @@ struct EntityData: Codable {
 
     /// Geometry Streaming system
     var streamingData: StreamingData? = nil
+
+    /// Gaussian splat asset reference
+    var gaussianData: GaussianSceneData? = nil
 }
 
 private func isProceduralAssetURL(_ url: URL) -> Bool {
@@ -311,6 +371,171 @@ func sceneAssetReference(kind: SceneAssetKind, url: URL, displayName: String? = 
     }
 
     return SceneAssetReference(kind: kind, path: relativePath, displayName: displayName)
+}
+
+/// A portable identifier for a Gaussian asset URL: the full project-relative path, including
+/// subdirectories — Gaussian assets are baked one-per-folder (e.g.
+/// "Gaussians/robot/robot_lod0.untoldgs", "Gaussians/Lego Hulkbuster/Lego Hulkbuster.ply"), the
+/// same layout `sceneAssetReference` already preserves for every other asset kind — when the URL
+/// lives inside the project. A bare filename would lose that subdirectory and only resolve
+/// through `LoadingSystem`'s flat `Gaussians/<name>.<ext>` search, which doesn't match this
+/// layout. Falls back to the resolved absolute path for a source outside the project (e.g. a
+/// file loaded at runtime via `setEntityGaussianAsync(entityId:url:)`), matching how
+/// `sceneAssetReference` treats non-project assets.
+private func gaussianPortableName(for url: URL) -> String {
+    let noExtension = url.deletingPathExtension()
+    return projectRelativeAssetPath(for: noExtension) ?? noExtension.path
+}
+
+/// Resolves a portable Gaussian identifier (from `gaussianPortableName`/
+/// `gaussianProgressiveBaseFilename`) back into a path `setEntityGaussian`/
+/// `setEntityGaussianProgressive` can load directly: an absolute path joined against this
+/// machine's `assetBasePath` when the identifier is project-relative (mirrors
+/// `resolvedSceneAssetURL`'s handling of `SceneAssetReference.path`), or the identifier
+/// unchanged when it's already absolute or no `assetBasePath` is configured — `LoadingSystem`'s
+/// own search then gets a shot at it, same as any other filename.
+private func resolvedGaussianAssetPath(_ portableName: String) -> String {
+    if portableName.hasPrefix("/") {
+        return portableName
+    }
+    if portableName.hasPrefix("~") {
+        return NSString(string: portableName).expandingTildeInPath
+    }
+    guard let assetBasePath else {
+        return portableName
+    }
+    return assetBasePath.appendingPathComponent(portableName).path
+}
+
+private func gaussianSceneData(for entityId: EntityID) -> GaussianSceneData? {
+    let streamingComponent = scene.get(component: StreamingComponent.self, for: entityId)
+    let isGaussianStreaming = streamingComponent?.assetKind == .gaussianSplat
+
+    if let lodComponent = scene.get(component: GaussianLODComponent.self, for: entityId),
+       let firstURL = lodComponent.lodLevels.first?.url
+    {
+        let baseFilename = gaussianProgressiveBaseFilename(from: firstURL, levelCount: lodComponent.lodLevels.count)
+        return GaussianSceneData(
+            isProgressive: true,
+            baseFilename: baseFilename,
+            fileExtension: firstURL.pathExtension,
+            levelCount: lodComponent.lodLevels.count,
+            maxDistances: lodComponent.lodLevels.map(\.maxDistance),
+            isStreaming: isGaussianStreaming,
+            streamingRadius: streamingComponent?.streamingRadius,
+            unloadRadius: streamingComponent?.unloadRadius,
+            priority: streamingComponent?.priority
+        )
+    }
+
+    if let streamingComponent, isGaussianStreaming {
+        // Already a bare, portable resource name — no need to resolve to a URL and back.
+        return GaussianSceneData(
+            sourcePath: streamingComponent.assetFilename,
+            fileExtension: streamingComponent.assetExtension,
+            isStreaming: true,
+            streamingRadius: streamingComponent.streamingRadius,
+            unloadRadius: streamingComponent.unloadRadius,
+            priority: streamingComponent.priority
+        )
+    }
+
+    guard let gaussianComponent = scene.get(component: GaussianComponent.self, for: entityId),
+          let sourceURL = gaussianComponent.sourceURL
+    else {
+        return nil
+    }
+
+    return GaussianSceneData(
+        sourcePath: gaussianPortableName(for: sourceURL),
+        fileExtension: sourceURL.pathExtension
+    )
+}
+
+private func gaussianProgressiveBaseFilename(from firstTierURL: URL, levelCount: Int) -> String {
+    let portableName = gaussianPortableName(for: firstTierURL)
+    guard levelCount > 1, portableName.hasSuffix("_lod0") else {
+        return portableName
+    }
+    return String(portableName.dropLast("_lod0".count))
+}
+
+private func restoreInfo(from data: GaussianSceneData) -> GaussianSceneRestoreInfo {
+    // `baseFilename`/`sourcePath` are project-relative (from `gaussianPortableName`) and need
+    // `resolvedGaussianAssetPath` to become loadable — except a streaming source's `sourcePath`,
+    // which is already the bare `StreamingComponent.assetFilename` resource name and is used
+    // as-is, same as `restoreGaussianSceneData` below.
+    let tierZeroName: String
+    if data.isProgressive, let baseFilename = data.baseFilename {
+        let resolvedBase = resolvedGaussianAssetPath(baseFilename)
+        tierZeroName = (data.levelCount ?? 1) > 1 ? "\(resolvedBase)_lod0" : resolvedBase
+    } else {
+        let sourcePath = data.sourcePath ?? ""
+        tierZeroName = data.isStreaming ? sourcePath : resolvedGaussianAssetPath(sourcePath)
+    }
+    let resolvedURL = LoadingSystem.shared.resourceURL(
+        forResource: tierZeroName,
+        withExtension: data.fileExtension,
+        subResource: nil
+    ) ?? URL(fileURLWithPath: tierZeroName).appendingPathExtension(data.fileExtension)
+
+    return GaussianSceneRestoreInfo(
+        sourceURL: resolvedURL,
+        isProgressive: data.isProgressive,
+        baseFilename: data.baseFilename,
+        fileExtension: data.fileExtension,
+        levelCount: data.levelCount,
+        maxDistances: data.maxDistances,
+        isStreaming: data.isStreaming,
+        streamingRadius: data.streamingRadius,
+        unloadRadius: data.unloadRadius,
+        priority: data.priority
+    )
+}
+
+private func restoreGaussianSceneData(
+    _ data: GaussianSceneData,
+    entityId: EntityID,
+    onGaussianEntityRestored: ((EntityID, GaussianSceneRestoreInfo) -> Void)?
+) {
+    let source: GaussianSource
+    if data.isProgressive,
+       let baseFilename = data.baseFilename,
+       let levelCount = data.levelCount,
+       let maxDistances = data.maxDistances
+    {
+        source = .progressive(
+            baseFilename: resolvedGaussianAssetPath(baseFilename),
+            withExtension: data.fileExtension,
+            levelCount: levelCount,
+            maxDistances: maxDistances
+        )
+    } else if let sourcePath = data.sourcePath {
+        // A streaming source's `sourcePath` is already the bare `assetFilename` resource name
+        // (see `gaussianSceneData(for:)`) — passed through as-is, not project-relative like the
+        // resident single-file case, so it doesn't go through `resolvedGaussianAssetPath`.
+        let filename = data.isStreaming ? sourcePath : resolvedGaussianAssetPath(sourcePath)
+        source = .single(filename: filename, withExtension: data.fileExtension)
+    } else {
+        Logger.logWarning(message: "[SceneSerializer] Gaussian scene data for entity \(entityId) has neither a progressive base filename nor a source path — skipping.")
+        return
+    }
+
+    if data.isStreaming {
+        setEntityGaussianTileStreaming(
+            entityId: entityId,
+            source: source,
+            options: GaussianStreamingOptions(
+                streamingRadius: data.streamingRadius ?? 100.0,
+                unloadRadius: data.unloadRadius ?? 150.0,
+                priority: data.priority ?? 0
+            )
+        )
+    } else {
+        setEntityGaussian(entityId: entityId, source: source)
+    }
+
+    onGaussianEntityRestored?(entityId, restoreInfo(from: data))
 }
 
 /// Value stored in the legacy (pre-`SceneAssetReference`) `assetURL`/`animations` fields.
@@ -358,7 +583,7 @@ private func animationURLs(for entityData: EntityData) -> [URL] {
         return animationAssets.compactMap { resolvedSceneAssetURL($0) }
     }
 
-    return entityData.animations.filter { $0.pathExtension.lowercased() == "untold" }
+    return entityData.animations.filter { ["untold", "untoldanim"].contains($0.pathExtension.lowercased()) }
 }
 
 private func applyDeserializedAnimations(entityId: EntityID, entityData: EntityData) {
@@ -487,6 +712,109 @@ private func applyDeserializedRenderProperties(entityId: EntityID, entityData: E
     }
 }
 
+/// Applies saved material overrides (colors, scalars, texture URLs, wrap modes) to an entity.
+/// Must run only once the entity's mesh/submeshes actually exist — updateMaterial's material-slot
+/// lookup silently no-ops otherwise, which previously dropped every texture reassignment made
+/// through the Inspector because this ran before setEntityMeshAsync's completion fired.
+private func applyDeserializedMaterialData(entityId: EntityID, entityData: EntityData) {
+    guard let materialData = entityData.materialData else { return }
+
+    let baseColorValue: simd_float4 = materialData.baseColorValue
+    let roughnessValue: Float = materialData.roughnessValue
+    let metallicValue: Float = materialData.metallicValue
+    let emissiveValue: simd_float3 = materialData.emissiveValue
+
+    updateMaterialColor(entityId: entityId, color: colorFromSimd(baseColorValue))
+    updateMaterialRoughness(entityId: entityId, roughness: roughnessValue)
+    updateMaterialMetallic(entityId: entityId, metallic: metallicValue)
+    updateMaterialEmmisive(entityId: entityId, emmissive: emissiveValue)
+    if let opacity = materialData.opacity {
+        updateMaterialOpacity(entityId: entityId, opacity: opacity)
+    }
+    if let alphaCutoff = materialData.alphaCutoff {
+        updateMaterialAlphaCutoff(entityId: entityId, cutoff: alphaCutoff)
+    }
+    if let alphaModeRawValue = materialData.alphaMode,
+       let alphaMode = MaterialAlphaMode(rawValue: alphaModeRawValue)
+    {
+        updateMaterialAlphaMode(entityId: entityId, mode: alphaMode)
+    }
+
+    if let baseColorURL = materialData.baseColorURL {
+        updateMaterialTexture(entityId: entityId, textureType: .baseColor, path: baseColorURL)
+    }
+
+    if let roughnessURL = materialData.roughnessURL {
+        updateMaterialTexture(entityId: entityId, textureType: .roughness, path: roughnessURL)
+    }
+
+    if let metallicURL = materialData.metallicURL {
+        updateMaterialTexture(entityId: entityId, textureType: .metallic, path: metallicURL)
+    }
+
+    if let normalURL = materialData.normalURL {
+        updateMaterialTexture(entityId: entityId, textureType: .normal, path: normalURL)
+    }
+
+    if let heightURL = materialData.heightURL {
+        updateMaterialTexture(entityId: entityId, textureType: .height, path: heightURL)
+    }
+
+    if let stScale = materialData.stScale {
+        updateMaterialSTScale(entityId: entityId, stScale: stScale)
+    }
+
+    if let heightScale = materialData.heightScale {
+        updateMaterialHeightScale(entityId: entityId, heightScale: heightScale)
+    }
+
+    if let heightMidlevel = materialData.heightMidlevel {
+        updateMaterialHeightMidlevel(entityId: entityId, heightMidlevel: heightMidlevel)
+    }
+
+    if let heightEnabled = materialData.heightEnabled {
+        updateMaterialHeightEnabled(entityId: entityId, heightEnabled: heightEnabled)
+    }
+
+    if let heightRemapMin = materialData.heightRemapMin {
+        updateMaterialHeightRemapMin(entityId: entityId, heightRemapMin: heightRemapMin)
+    }
+
+    if let heightRemapMax = materialData.heightRemapMax {
+        updateMaterialHeightRemapMax(entityId: entityId, heightRemapMax: heightRemapMax)
+    }
+
+    if let baseColorWrapModeRawValue = materialData.baseColorWrapMode,
+       let wrapMode = WrapMode(rawValue: baseColorWrapModeRawValue)
+    {
+        updateTextureSampler(entityId: entityId, textureType: .baseColor, wrapMode: wrapMode)
+    }
+
+    if let roughnessWrapModeRawValue = materialData.roughnessWrapMode,
+       let wrapMode = WrapMode(rawValue: roughnessWrapModeRawValue)
+    {
+        updateTextureSampler(entityId: entityId, textureType: .roughness, wrapMode: wrapMode)
+    }
+
+    if let metallicWrapModeRawValue = materialData.metallicWrapMode,
+       let wrapMode = WrapMode(rawValue: metallicWrapModeRawValue)
+    {
+        updateTextureSampler(entityId: entityId, textureType: .metallic, wrapMode: wrapMode)
+    }
+
+    if let normalWrapModeRawValue = materialData.normalWrapMode,
+       let wrapMode = WrapMode(rawValue: normalWrapModeRawValue)
+    {
+        updateTextureSampler(entityId: entityId, textureType: .normal, wrapMode: wrapMode)
+    }
+
+    if let heightWrapModeRawValue = materialData.heightWrapMode,
+       let wrapMode = WrapMode(rawValue: heightWrapModeRawValue)
+    {
+        updateTextureSampler(entityId: entityId, textureType: .height, wrapMode: wrapMode)
+    }
+}
+
 public func serializeScene() -> SceneData {
     var sceneData = SceneData()
     sceneData.sceneAuthoredSource = SceneAuthoredSourceStore.shared.source
@@ -557,31 +885,39 @@ public func serializeScene() -> SceneData {
             var roughnessURL: URL?
             var metallicURL: URL?
             var normalURL: URL?
-            let shouldSerializeMaterialTextureURLs = entityData.asset?.kind != .model
+            var heightURL: URL?
 
-            if shouldSerializeMaterialTextureURLs,
-               let baseColorTexture: URL = getMaterialTextureURL(entityId: entityId, type: .baseColor)
-            {
+            if let baseColorTexture: URL = getMaterialTextureURL(entityId: entityId, type: .baseColor) {
                 baseColorURL = baseColorTexture
             }
 
-            if shouldSerializeMaterialTextureURLs,
-               let roughnessTexture: URL = getMaterialTextureURL(entityId: entityId, type: .roughness)
-            {
+            if let roughnessTexture: URL = getMaterialTextureURL(entityId: entityId, type: .roughness) {
                 roughnessURL = roughnessTexture
             }
 
-            if shouldSerializeMaterialTextureURLs,
-               let metallicTexture: URL = getMaterialTextureURL(entityId: entityId, type: .metallic)
-            {
+            if let metallicTexture: URL = getMaterialTextureURL(entityId: entityId, type: .metallic) {
                 metallicURL = metallicTexture
             }
 
-            if shouldSerializeMaterialTextureURLs,
-               let normalTexture: URL = getMaterialTextureURL(entityId: entityId, type: .normal)
-            {
+            if let normalTexture: URL = getMaterialTextureURL(entityId: entityId, type: .normal) {
                 normalURL = normalTexture
             }
+
+            if let heightTexture: URL = getMaterialTextureURL(entityId: entityId, type: .height) {
+                heightURL = heightTexture
+            }
+
+            let stScale: Float = getMaterialSTScale(entityId: entityId)
+            let heightScale: Float = getMaterialHeightScale(entityId: entityId)
+            let heightMidlevel: Float = getMaterialHeightMidlevel(entityId: entityId)
+            let heightEnabled: Bool = getMaterialHeightEnabled(entityId: entityId)
+            let heightRemapMin: Float = getMaterialHeightRemapMin(entityId: entityId)
+            let heightRemapMax: Float = getMaterialHeightRemapMax(entityId: entityId)
+            let baseColorWrapMode = getTextureWrapMode(entityId: entityId, textureType: .baseColor)?.rawValue
+            let roughnessWrapMode = getTextureWrapMode(entityId: entityId, textureType: .roughness)?.rawValue
+            let metallicWrapMode = getTextureWrapMode(entityId: entityId, textureType: .metallic)?.rawValue
+            let normalWrapMode = getTextureWrapMode(entityId: entityId, textureType: .normal)?.rawValue
+            let heightWrapMode = getTextureWrapMode(entityId: entityId, textureType: .height)?.rawValue
 
             entityData.materialData = MaterialData(
                 baseColorValue: baseColor,
@@ -594,7 +930,19 @@ public func serializeScene() -> SceneData {
                 baseColorURL: baseColorURL,
                 roughnessURL: roughnessURL,
                 metallicURL: metallicURL,
-                normalURL: normalURL
+                normalURL: normalURL,
+                heightURL: heightURL,
+                stScale: stScale,
+                baseColorWrapMode: baseColorWrapMode,
+                roughnessWrapMode: roughnessWrapMode,
+                metallicWrapMode: metallicWrapMode,
+                normalWrapMode: normalWrapMode,
+                heightWrapMode: heightWrapMode,
+                heightScale: heightScale,
+                heightMidlevel: heightMidlevel,
+                heightEnabled: heightEnabled,
+                heightRemapMin: heightRemapMin,
+                heightRemapMax: heightRemapMax
             )
         }
 
@@ -800,23 +1148,30 @@ public func serializeScene() -> SceneData {
             entityData.hasStaticBatchComponent = true
         }
 
-        // Geometry Streaming properties
+        // Geometry Streaming properties. Gaussian-streaming entities are excluded here and
+        // fully described by `gaussianData` below instead: restoring them also through this
+        // generic path would `registerComponent`/`scene.assign` a second, freshly-defaulted
+        // StreamingComponent on top of the one the Gaussian-specific restore already
+        // configured — assetKind isn't among the fields the generic restore re-sets, so it
+        // would silently revert from .gaussianSplat back to the .mesh default and the entity
+        // would stream through the wrong loader after every reload.
         let hasStreaming: Bool = hasComponent(entityId: entityId, componentType: StreamingComponent.self)
 
-        if hasStreaming {
-            entityData.hasStreamingComponent = hasStreaming
-
-            if let streamingComponent = scene.get(component: StreamingComponent.self, for: entityId) {
-                entityData.streamingData = StreamingData(
-                    streamingRadius: streamingComponent.streamingRadius,
-                    unloadRadius: streamingComponent.unloadRadius,
-                    priority: streamingComponent.priority,
-                    assetFilename: streamingComponent.assetFilename,
-                    assetExtension: streamingComponent.assetExtension,
-                    assetName: streamingComponent.assetName
-                )
-            }
+        if hasStreaming, let streamingComponent = scene.get(component: StreamingComponent.self, for: entityId),
+           streamingComponent.assetKind != .gaussianSplat
+        {
+            entityData.hasStreamingComponent = true
+            entityData.streamingData = StreamingData(
+                streamingRadius: streamingComponent.streamingRadius,
+                unloadRadius: streamingComponent.unloadRadius,
+                priority: streamingComponent.priority,
+                assetFilename: streamingComponent.assetFilename,
+                assetExtension: streamingComponent.assetExtension,
+                assetName: streamingComponent.assetName
+            )
         }
+
+        entityData.gaussianData = gaussianSceneData(for: entityId)
 
         // custom component
         var customComponents: [String: Data] = [:]
@@ -857,6 +1212,22 @@ public func serializeScene() -> SceneData {
                             let opacity = getMaterialOpacity(entityId: childId)
                             let alphaCutoff = getMaterialAlphaCutoff(entityId: childId)
                             let alphaModeRawValue = getMaterialAlphaMode(entityId: childId).rawValue
+                            let stScale = getMaterialSTScale(entityId: childId)
+                            let heightScale = getMaterialHeightScale(entityId: childId)
+                            let heightMidlevel = getMaterialHeightMidlevel(entityId: childId)
+                            let heightEnabled = getMaterialHeightEnabled(entityId: childId)
+                            let heightRemapMin = getMaterialHeightRemapMin(entityId: childId)
+                            let heightRemapMax = getMaterialHeightRemapMax(entityId: childId)
+                            let baseColorWrapMode = getTextureWrapMode(entityId: childId, textureType: .baseColor)?.rawValue
+                            let roughnessWrapMode = getTextureWrapMode(entityId: childId, textureType: .roughness)?.rawValue
+                            let metallicWrapMode = getTextureWrapMode(entityId: childId, textureType: .metallic)?.rawValue
+                            let normalWrapMode = getTextureWrapMode(entityId: childId, textureType: .normal)?.rawValue
+                            let heightWrapMode = getTextureWrapMode(entityId: childId, textureType: .height)?.rawValue
+                            let baseColorURL = getMaterialTextureURL(entityId: childId, type: .baseColor)
+                            let roughnessURL = getMaterialTextureURL(entityId: childId, type: .roughness)
+                            let metallicURL = getMaterialTextureURL(entityId: childId, type: .metallic)
+                            let normalURL = getMaterialTextureURL(entityId: childId, type: .normal)
+                            let heightURL = getMaterialTextureURL(entityId: childId, type: .height)
                             materialOverride = MaterialData(
                                 baseColorValue: baseColor,
                                 emissiveValue: emissive,
@@ -864,7 +1235,23 @@ public func serializeScene() -> SceneData {
                                 metallicValue: metallic,
                                 opacity: opacity,
                                 alphaCutoff: alphaCutoff,
-                                alphaMode: alphaModeRawValue
+                                alphaMode: alphaModeRawValue,
+                                baseColorURL: baseColorURL,
+                                roughnessURL: roughnessURL,
+                                metallicURL: metallicURL,
+                                normalURL: normalURL,
+                                heightURL: heightURL,
+                                stScale: stScale,
+                                baseColorWrapMode: baseColorWrapMode,
+                                roughnessWrapMode: roughnessWrapMode,
+                                metallicWrapMode: metallicWrapMode,
+                                normalWrapMode: normalWrapMode,
+                                heightWrapMode: heightWrapMode,
+                                heightScale: heightScale,
+                                heightMidlevel: heightMidlevel,
+                                heightEnabled: heightEnabled,
+                                heightRemapMin: heightRemapMin,
+                                heightRemapMax: heightRemapMax
                             )
                         }
 
@@ -945,6 +1332,12 @@ public func serializeScene() -> SceneData {
         toneMapOperator: ToneMappingParams.shared.toneMapOperator,
         gamma: ToneMappingParams.shared.gamma
     )
+
+    sceneData.tonemapOperator = TonemapParams.shared.operator
+    if let source = ColorGradeLUTParams.shared.source {
+        sceneData.colorGradeLUTFilename = source.filename
+        sceneData.colorGradeLUTExtension = source.extension
+    }
 
     sceneData.colorCorrection = ColorCorrectionData(
         lift: ColorCorrectionParams.shared.lift,
@@ -1099,9 +1492,75 @@ private final class AsyncLoadTracker: @unchecked Sendable {
     }
 }
 
+/// Runs a batch of async load-starter closures through a bounded concurrency window
+/// instead of firing all of them at once. Mirrors `PackLoadDispatcher`
+/// (RegistrationSystem.swift): `setEntityMeshAsync`'s Task body eventually takes
+/// `withWorldMutationGate`'s thread-blocking lock, and firing dozens of these
+/// simultaneously -- one per scene entity, as `deserializeScene` used to -- can park
+/// every thread in Swift's cooperative pool on that lock with none free to run the
+/// continuation that would release it. That's a genuine deadlock, reproducible with
+/// plain `setEntityMeshAsync` calls in a tight loop regardless of where they come
+/// from, and it's exactly what a multi-dozen-entity scene load hit here.
+private final class BoundedAsyncLoadDispatcher: @unchecked Sendable {
+    private let lock = NSLock()
+    private let starters: [(@escaping (Bool) -> Void) -> Void]
+    private let onAllComplete: (() -> Void)?
+    private var nextIndex = 0
+    private var remaining: Int
+
+    private static let maxConcurrentLoads = 8
+
+    init(starters: [(@escaping (Bool) -> Void) -> Void], onAllComplete: (() -> Void)? = nil) {
+        self.starters = starters
+        self.onAllComplete = onAllComplete
+        remaining = starters.count
+    }
+
+    func start() {
+        guard starters.isEmpty == false else {
+            onAllComplete?()
+            return
+        }
+        let initialCount = min(Self.maxConcurrentLoads, starters.count)
+        for _ in 0 ..< initialCount {
+            startNext()
+        }
+    }
+
+    private func startNext() {
+        lock.lock()
+        let index = nextIndex
+        guard index < starters.count else {
+            lock.unlock()
+            return
+        }
+        nextIndex += 1
+        lock.unlock()
+
+        let starter = starters[index]
+        starter { [self] _ in
+            recordCompletionAndAdvance()
+        }
+    }
+
+    private func recordCompletionAndAdvance() {
+        lock.lock()
+        remaining -= 1
+        let isDone = remaining <= 0
+        lock.unlock()
+
+        if isDone {
+            onAllComplete?()
+        } else {
+            startNext()
+        }
+    }
+}
+
 public func deserializeScene(
     sceneData: SceneData,
     meshLoadingMode: MeshLoadingMode = .asyncDefault,
+    onGaussianEntityRestored: ((EntityID, GaussianSceneRestoreInfo) -> Void)? = nil,
     completion: (() -> Void)? = nil
 ) {
     var uuidToEntityMap: [UUID: EntityID] = [:]
@@ -1123,17 +1582,16 @@ public func deserializeScene(
         completion?()
     })
 
-    if let sceneAuthoredSource = sceneData.sceneAuthoredSource {
-        loadTracker.registerLoad()
-        loadSceneAuthoredColorManagement(from: sceneAuthoredSource) { success in
-            if success == false {
-                Logger.logWarning(message: "[SceneSerializer] Failed to restore scene-authored color management")
-            }
-            loadTracker.completeLoad()
-        }
+    SceneAuthoredSourceStore.shared.clear()
+    ColorLUTParams.shared.clear()
+    if let filename = sceneData.colorGradeLUTFilename {
+        setColorGradeLUT(filename: filename, withExtension: sceneData.colorGradeLUTExtension ?? "cube")
     } else {
-        SceneAuthoredSourceStore.shared.clear()
-        ColorLUTParams.shared.clear()
+        ColorGradeLUTParams.shared.clear()
+    }
+
+    if let tonemapOperator = sceneData.tonemapOperator {
+        TonemapParams.shared.operator = tonemapOperator
     }
 
     if let env = sceneData.environment {
@@ -1238,6 +1696,11 @@ public func deserializeScene(
         SMAAParams.shared.edgeThreshold = antiAliasing.smaa.edgeThreshold
     }
 
+    // Mesh loads discovered below are queued here rather than fired immediately --
+    // see BoundedAsyncLoadDispatcher for why an unbounded burst of setEntityMeshAsync
+    // calls (one per entity) can deadlock Swift's cooperative thread pool.
+    var pendingMeshLoads: [(@escaping (Bool) -> Void) -> Void] = []
+
     withWorldMutationGate {
         for sourceEntityData in sceneData.entities {
             var sceneDataEntity = sourceEntityData
@@ -1295,43 +1758,49 @@ public func deserializeScene(
                 switch meshLoadingMode {
                 case .sync:
                     loadTracker.registerLoad()
-                    setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: nil) { success in
-                        applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
-                        applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
-                        if success {
-                            if sceneDataEntity.hasStaticBatchComponent == true {
-                                setEntityStaticBatchComponent(entityId: entityId)
+                    pendingMeshLoads.append { loadDone in
+                        setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: nil) { success in
+                            applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
+                            applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
+                            if success {
+                                if sceneDataEntity.hasStaticBatchComponent == true {
+                                    setEntityStaticBatchComponent(entityId: entityId)
+                                }
+                                applyAssetInstanceOverrides(entityId: entityId, overrides: assetInstance.overrides)
+                                if sceneDataEntity.hasAnimationComponent == true {
+                                    applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
+                                }
                             }
-                            applyAssetInstanceOverrides(entityId: entityId, overrides: assetInstance.overrides)
-                            if sceneDataEntity.hasAnimationComponent == true {
-                                applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
-                            }
+                            loadTracker.completeLoad()
+                            loadDone(success)
                         }
-                        loadTracker.completeLoad()
                     }
                 case .asyncDefault:
                     loadTracker.registerLoad()
-                    setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: nil) { success in
-                        applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
-                        applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
-                        if success {
-                            Logger.log(message: "✅ Asset instance '\(sceneDataEntity.name)' loaded")
-                            // Restore Static Batch Component (meshes now loaded)
-                            if sceneDataEntity.hasStaticBatchComponent == true {
-                                setEntityStaticBatchComponent(entityId: entityId)
-                            }
-                            // Apply overrides after async import completes (must run after static restore so
-                            // per-node static opt-outs can remove static from selected children).
-                            applyAssetInstanceOverrides(entityId: entityId, overrides: assetInstance.overrides)
+                    pendingMeshLoads.append { loadDone in
+                        setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: nil) { success in
+                            applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
+                            applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
+                            if success {
+                                Logger.log(message: "✅ Asset instance '\(sceneDataEntity.name)' loaded")
+                                // Restore Static Batch Component (meshes now loaded)
+                                if sceneDataEntity.hasStaticBatchComponent == true {
+                                    setEntityStaticBatchComponent(entityId: entityId)
+                                }
+                                // Apply overrides after async import completes (must run after static restore so
+                                // per-node static opt-outs can remove static from selected children).
+                                applyAssetInstanceOverrides(entityId: entityId, overrides: assetInstance.overrides)
 
-                            // Setup animations (skeleton is now available)
-                            if sceneDataEntity.hasAnimationComponent == true {
-                                applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
+                                // Setup animations (skeleton is now available)
+                                if sceneDataEntity.hasAnimationComponent == true {
+                                    applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
+                                }
+                            } else {
+                                Logger.logWarning(message: "❌ Asset instance '\(sceneDataEntity.name)' failed to load")
                             }
-                        } else {
-                            Logger.logWarning(message: "❌ Asset instance '\(sceneDataEntity.name)' failed to load")
+                            loadTracker.completeLoad()
+                            loadDone(success)
                         }
-                        loadTracker.completeLoad()
                     }
                 }
             } else if sceneDataEntity.hasRenderingComponent == true {
@@ -1346,6 +1815,7 @@ public func deserializeScene(
                         setEntityMeshDirect(entityId: entityId, meshes: meshes, assetName: sceneDataEntity.assetName)
                         applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
                         applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
+                        applyDeserializedMaterialData(entityId: entityId, entityData: sceneDataEntity)
 
                         // Restore Static Batch Component (procedural mesh already loaded)
                         if sceneDataEntity.hasStaticBatchComponent == true {
@@ -1353,18 +1823,22 @@ public func deserializeScene(
                         }
                     } else {
                         loadTracker.registerLoad()
-                        setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: sceneDataEntity.assetName) { success in
-                            applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
-                            applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
-                            if success {
-                                if sceneDataEntity.hasStaticBatchComponent == true {
-                                    setEntityStaticBatchComponent(entityId: entityId)
+                        pendingMeshLoads.append { loadDone in
+                            setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: sceneDataEntity.assetName) { success in
+                                applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
+                                applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
+                                if success {
+                                    applyDeserializedMaterialData(entityId: entityId, entityData: sceneDataEntity)
+                                    if sceneDataEntity.hasStaticBatchComponent == true {
+                                        setEntityStaticBatchComponent(entityId: entityId)
+                                    }
+                                    if sceneDataEntity.hasAnimationComponent == true {
+                                        applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
+                                    }
                                 }
-                                if sceneDataEntity.hasAnimationComponent == true {
-                                    applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
-                                }
+                                loadTracker.completeLoad()
+                                loadDone(success)
                             }
-                            loadTracker.completeLoad()
                         }
                     }
                 case .asyncDefault:
@@ -1373,6 +1847,7 @@ public func deserializeScene(
                         setEntityMeshDirect(entityId: entityId, meshes: meshes, assetName: sceneDataEntity.assetName)
                         applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
                         applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
+                        applyDeserializedMaterialData(entityId: entityId, entityData: sceneDataEntity)
 
                         // Restore Static Batch Component (procedural mesh already loaded)
                         if sceneDataEntity.hasStaticBatchComponent == true {
@@ -1382,65 +1857,31 @@ public func deserializeScene(
                         let fallbackLabel = withExtension.isEmpty ? filename : "\(filename).\(withExtension)"
                         let meshLabel = sceneDataEntity.name.isEmpty ? fallbackLabel : sceneDataEntity.name
                         loadTracker.registerLoad()
-                        setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: sceneDataEntity.assetName) { success in
-                            applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
-                            applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
-                            if success {
-                                Logger.log(message: "✅ Mesh loaded for \(meshLabel)")
+                        pendingMeshLoads.append { loadDone in
+                            setEntityMeshAsync(entityId: entityId, filename: filename, withExtension: withExtension, assetName: sceneDataEntity.assetName) { success in
+                                applyDeserializedLocalTransform(entityId: entityId, entityData: sceneDataEntity)
+                                applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
+                                if success {
+                                    Logger.log(message: "✅ Mesh loaded for \(meshLabel)")
 
-                                // Restore Static Batch Component (mesh now loaded)
-                                if sceneDataEntity.hasStaticBatchComponent == true {
-                                    setEntityStaticBatchComponent(entityId: entityId)
-                                }
+                                    applyDeserializedMaterialData(entityId: entityId, entityData: sceneDataEntity)
 
-                                // Setup animations (skeleton is now available)
-                                if sceneDataEntity.hasAnimationComponent == true {
-                                    applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
+                                    // Restore Static Batch Component (mesh now loaded)
+                                    if sceneDataEntity.hasStaticBatchComponent == true {
+                                        setEntityStaticBatchComponent(entityId: entityId)
+                                    }
+
+                                    // Setup animations (skeleton is now available)
+                                    if sceneDataEntity.hasAnimationComponent == true {
+                                        applyDeserializedAnimations(entityId: entityId, entityData: sceneDataEntity)
+                                    }
+                                } else {
+                                    Logger.logWarning(message: "❌ Mesh failed for \(meshLabel)")
                                 }
-                            } else {
-                                Logger.logWarning(message: "❌ Mesh failed for \(meshLabel)")
+                                loadTracker.completeLoad()
+                                loadDone(success)
                             }
-                            loadTracker.completeLoad()
                         }
-                    }
-                }
-
-                if let materialData = sceneDataEntity.materialData {
-                    let baseColorValue: simd_float4 = materialData.baseColorValue
-                    let roughnessValue: Float = materialData.roughnessValue
-                    let metallicValue: Float = materialData.metallicValue
-                    let emissiveValue: simd_float3 = materialData.emissiveValue
-
-                    updateMaterialColor(entityId: entityId, color: colorFromSimd(baseColorValue))
-                    updateMaterialRoughness(entityId: entityId, roughness: roughnessValue)
-                    updateMaterialMetallic(entityId: entityId, metallic: metallicValue)
-                    updateMaterialEmmisive(entityId: entityId, emmissive: emissiveValue)
-                    if let opacity = materialData.opacity {
-                        updateMaterialOpacity(entityId: entityId, opacity: opacity)
-                    }
-                    if let alphaCutoff = materialData.alphaCutoff {
-                        updateMaterialAlphaCutoff(entityId: entityId, cutoff: alphaCutoff)
-                    }
-                    if let alphaModeRawValue = materialData.alphaMode,
-                       let alphaMode = MaterialAlphaMode(rawValue: alphaModeRawValue)
-                    {
-                        updateMaterialAlphaMode(entityId: entityId, mode: alphaMode)
-                    }
-
-                    if let baseColorURL = materialData.baseColorURL {
-                        updateMaterialTexture(entityId: entityId, textureType: .baseColor, path: baseColorURL)
-                    }
-
-                    if let roughnessURL = materialData.roughnessURL {
-                        updateMaterialTexture(entityId: entityId, textureType: .roughness, path: roughnessURL)
-                    }
-
-                    if let metallicURL = materialData.metallicURL {
-                        updateMaterialTexture(entityId: entityId, textureType: .metallic, path: metallicURL)
-                    }
-
-                    if let normalURL = materialData.normalURL {
-                        updateMaterialTexture(entityId: entityId, textureType: .normal, path: normalURL)
                     }
                 }
             }
@@ -1471,6 +1912,14 @@ public func deserializeScene(
                     let intensity: Float = light.intensity
 
                     createDirLight(entityId: entityId)
+                    // createDirLight() only activates a light if activeDirectionalLight is nil.
+                    // Callers that clear the scene (destroyAllEntities()) right before
+                    // deserializing only mark the previous entities for deferred destruction —
+                    // the pointer isn't nulled until finalizePendingDestroys() runs on a later
+                    // frame — so this can silently see a stale non-nil pointer and skip
+                    // activation. A scene file that declares a directional light should always
+                    // become the active one when loaded, so force it explicitly.
+                    setDirectionalLight(.active(entityId))
 
                     guard let lightComponent = scene.get(component: LightComponent.self, for: entityId) else {
                         handleError(.noLightComponent)
@@ -1636,6 +2085,14 @@ public func deserializeScene(
                 applyDeserializedRenderProperties(entityId: entityId, entityData: sceneDataEntity)
             }
 
+            if let gaussianData = sceneDataEntity.gaussianData {
+                restoreGaussianSceneData(
+                    gaussianData,
+                    entityId: entityId,
+                    onGaussianEntityRestored: onGaussianEntityRestored
+                )
+            }
+
             if sceneDataEntity.hasCameraComponent == true {
                 if let camera = sceneDataEntity.cameraData {
                     let eye = camera.eye
@@ -1764,6 +2221,12 @@ public func deserializeScene(
         }
     }
 
+    // Fire the queued mesh loads now that entity creation/hierarchy setup is done and
+    // the world-mutation gate above has been released -- bounded so a scene with many
+    // entities doesn't burst dozens of setEntityMeshAsync calls at once (see
+    // BoundedAsyncLoadDispatcher).
+    BoundedAsyncLoadDispatcher(starters: pendingMeshLoads).start()
+
     // Allow completion once all registrations are known and async work is finished.
     loadTracker.finishRegistration()
 }
@@ -1804,13 +2267,22 @@ public func loadUntoldScene(
         return
     }
 
-    let sceneURL = gameDataURL
+    let preferredSceneURL = gameDataURL
         .appendingPathComponent("Scenes", isDirectory: true)
         .appendingPathComponent(sceneBaseName)
         .appendingPathExtension(untoldSceneFileExtension)
 
-    guard FileManager.default.fileExists(atPath: sceneURL.path) else {
-        Logger.log(message: "❌ Scene file not found: \(sceneURL.path)")
+    let sceneURL: URL?
+    if FileManager.default.fileExists(atPath: preferredSceneURL.path) {
+        sceneURL = preferredSceneURL
+    } else {
+        // SwiftPM test resources can be flattened by `.process("Resources")`; fall back
+        // through the shared resolver after preserving the BuildSystem `Scenes/` priority.
+        sceneURL = LoadingSystem.shared.resourceURL(forResource: sceneBaseName, withExtension: untoldSceneFileExtension)
+    }
+
+    guard let sceneURL else {
+        Logger.log(message: "❌ Scene file not found: \(sceneBaseName).\(untoldSceneFileExtension)")
         completion?(false)
         return
     }
@@ -1823,10 +2295,10 @@ public func loadUntoldScene(
 
         Logger.log(message: "📄 Loading Untold scene: \(sceneURL.lastPathComponent)")
 
-        deserializeScene(sceneData: sceneData, meshLoadingMode: meshLoadingMode) {
+        deserializeScene(sceneData: sceneData, meshLoadingMode: meshLoadingMode, completion: {
             Logger.log(message: "✅ Finished loading scene: \(sceneURL.lastPathComponent)")
             completion?(true)
-        }
+        })
     } catch {
         Logger.log(message: "❌ Failed to load scene \(sceneURL.lastPathComponent): \(error.localizedDescription)")
         completion?(false)
@@ -1904,6 +2376,34 @@ private func applyAssetInstanceOverrides(entityId: EntityID, overrides: [AssetOv
                 }
                 if let normalURL = material.normalURL {
                     updateMaterialTexture(entityId: derivedEntityId, textureType: .normal, path: normalURL)
+                }
+
+                if let stScale = material.stScale {
+                    updateMaterialSTScale(entityId: derivedEntityId, stScale: stScale)
+                }
+
+                if let baseColorWrapModeRawValue = material.baseColorWrapMode,
+                   let wrapMode = WrapMode(rawValue: baseColorWrapModeRawValue)
+                {
+                    updateTextureSampler(entityId: derivedEntityId, textureType: .baseColor, wrapMode: wrapMode)
+                }
+
+                if let roughnessWrapModeRawValue = material.roughnessWrapMode,
+                   let wrapMode = WrapMode(rawValue: roughnessWrapModeRawValue)
+                {
+                    updateTextureSampler(entityId: derivedEntityId, textureType: .roughness, wrapMode: wrapMode)
+                }
+
+                if let metallicWrapModeRawValue = material.metallicWrapMode,
+                   let wrapMode = WrapMode(rawValue: metallicWrapModeRawValue)
+                {
+                    updateTextureSampler(entityId: derivedEntityId, textureType: .metallic, wrapMode: wrapMode)
+                }
+
+                if let normalWrapModeRawValue = material.normalWrapMode,
+                   let wrapMode = WrapMode(rawValue: normalWrapModeRawValue)
+                {
+                    updateTextureSampler(entityId: derivedEntityId, textureType: .normal, wrapMode: wrapMode)
                 }
             }
         }

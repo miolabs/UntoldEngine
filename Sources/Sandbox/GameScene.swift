@@ -25,36 +25,23 @@
             // Make sure to convert your usdz files to .untold format as explained in docs/API/UsingTheExporter
 
             // Uncomment to render a simple mesh.
+
             /*
              let entity = createEntity()
              setEntityMeshAsync(entityId: entity, filename: "/path/to/file", withExtension: "untold") { success in
-                 setEntityName(entityId: entity, name: "redplayer")
-                 if success {
-                     loadSceneAuthored(filename: "/path/to/file", withExtension: "untold")
-                 }
-                 setSceneReady(success)
+              setEntityName(entityId: entity, name: "redplayer")
+              if success {
+                  loadSceneAuthored(filename: "/path/to/file", withExtension: "untold")
+              }
+              setSceneReady(success)
              }
              */
-            /*
-             let sceneRoot = createEntity()
-             setEntityStreamScene(
-                   entityId: sceneRoot,
-                   url: URL(fileURLWithPath: "/path/to/local/json")
-               ) { success in
-                   if success {
-                       loadSceneAuthored(url: URL(fileURLWithPath: "/path/to/local/json"))
-                   }
-                   setSceneReady(success)
-               }
-             */
+
+            let splat = createEntity()
+            setEntityGaussian(entityId: splat, filename: "/Users/haroldserrano/Downloads/UntoldXRTest/Sources/UntoldXRTest/GameData/Gaussians/gardenscene-spz", withExtension: "untoldgs")
+            setSceneReady(true)
 
             // Uncomment to render a streamed scene
-            /*
-             let sceneRoot = createEntity()
-             setEntityStreamScene(entityId: sceneRoot, url: URL(string: "https://d8pyi1c08k1w.cloudfront.net/dungeon3/dungeon3.json")!){ success in
-                  setSceneReady(success)
-              }
-               */
         }
 
         private func configureEngineSystems() {
@@ -63,6 +50,12 @@
             InputSystem.shared.registerKeyboardEvents()
             InputSystem.shared.registerMouseEvents()
             bypassPostProcessing = false
+            setSpatialDebug(.lodLevels(false))
+            // GaussianDebugOptions.shared.residencyDebugTint = true
+            // GaussianRuntimeLimits.workingSetSplatsOverride = 1_000_000
+            // GaussianDebugOptions.shared.levelDebugTint = true
+            setLogger(.categories([.gaussian, .oocTiming, .integration], true))
+            Logger.enable(category: .gaussian)
         }
 
         private func setupDefaultSceneObjects() {
@@ -72,9 +65,9 @@
             setCamera(.active(camera))
             setOrbitOffset(entityId: camera, uTargetOffset: Constants.orbitTargetOffset)
 
-//            let light = createEntity()
-//            setEntityName(entityId: light, name: "Directional Light")
-            // createDirLight(entityId: light)
+            let light = createEntity()
+            setEntityName(entityId: light, name: "Directional Light")
+            createDirLight(entityId: light)
         }
 
         func update(deltaTime _: Float) {

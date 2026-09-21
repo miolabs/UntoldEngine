@@ -163,7 +163,18 @@ public func loadImage(_ textureName: String, from directory: URL? = nil) throws 
         }
     }
 
-    guard let url = Bundle.module.url(forResource: textureName, withExtension: nil) else {
+    // Bundle.main is checked first so a macOS .app that flattens UntoldEngine's resources into
+    // Contents/Resources (required for codesigning/notarization) can find them. The filesystem
+    // check is a fallback for cases where Bundle.main's resource index misses a file that is
+    // actually present. Bundle.untoldEngineModuleResourceURL covers the unflattened case
+    // (swift run/swift test/CLI tools, and the nested layout on iOS/tvOS/visionOS) without the
+    // crash risk of the SwiftPM-generated Bundle.module accessor -- see
+    // Bundle+ResourceFallback.swift.
+    guard
+        let url = Bundle.main.url(forResource: textureName, withExtension: nil)
+        ?? Bundle.mainResourceURLByPath(forResource: textureName)
+        ?? Bundle.untoldEngineModuleResourceURL(forResource: textureName, withExtension: nil)
+    else {
         throw LoadError.urlCreationFailed(textureName)
     }
 
@@ -372,6 +383,7 @@ public func generateHDR(_ hdrName: String, from directory: URL? = nil) {
 
         iblSuccessful = true
         hdrURL = hdrName
+        hdrDirectoryURL = directory
 
     } catch {
         handleError(.iBLCreationFailed)
@@ -835,7 +847,11 @@ public func removeMaterialTexture(
         case .normal:
             updatedMaterial.normal.texture = nil
             updatedMaterial.normalURL = nil
-            // Keep normalMDLTexture for restore functionality
+        // Keep normalMDLTexture for restore functionality
+        case .height:
+            updatedMaterial.height.texture = nil
+            updatedMaterial.heightURL = nil
+            // Keep heightMDLTexture for restore functionality
         }
     }
 
@@ -889,7 +905,11 @@ func updateMaterialTexture(
             case .normal:
                 updatedMaterial.normal.texture = texture
                 updatedMaterial.normalURL = url
-                // Keep normalMDLTexture for restore functionality
+            // Keep normalMDLTexture for restore functionality
+            case .height:
+                updatedMaterial.height.texture = texture
+                updatedMaterial.heightURL = url
+                // Keep heightMDLTexture for restore functionality
             }
         }
 
@@ -915,6 +935,7 @@ public func getMaterialTextureURL(
     case .roughness: return material?.roughnessURL
     case .metallic: return material?.metallicURL
     case .normal: return material?.normalURL
+    case .height: return material?.heightURL
     }
 }
 
@@ -938,6 +959,7 @@ public func getMaterialMDLTexture(
     case .roughness: return material?.roughnessMDLTexture
     case .metallic: return material?.metallicMDLTexture
     case .normal: return material?.normalMDLTexture
+    case .height: return material?.heightMDLTexture
     }
 }
 
@@ -982,6 +1004,7 @@ public func restoreEmbeddedTexture(
     case .roughness: mdlTexture = material.roughnessMDLTexture
     case .metallic: mdlTexture = material.metallicMDLTexture
     case .normal: mdlTexture = material.normalMDLTexture
+    case .height: mdlTexture = material.heightMDLTexture
     }
 
     guard let mdlTex = mdlTexture else {
@@ -1029,6 +1052,9 @@ public func restoreEmbeddedTexture(
         case .normal:
             material.normal.texture = texture
             material.normalURL = pseudoURL
+        case .height:
+            material.height.texture = texture
+            material.heightURL = pseudoURL
         }
 
         guard updateMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex, mutate: { $0 = material }) else {
@@ -1460,6 +1486,70 @@ public func updateMaterialSTScale(entityId: EntityID, stScale: Float, meshIndex:
     _ = updateMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex, mutate: { $0.stScale = stScale })
 }
 
+/// Total Parallax Occlusion Mapping ray-march depth, in UV-normalized units.
+public func getMaterialHeightScale(entityId: EntityID, meshIndex: Int = 0, submeshIndex: Int = 0) -> Float {
+    getMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex)?.heightScale ?? 0.05
+}
+
+public func updateMaterialHeightScale(entityId: EntityID, heightScale: Float, meshIndex: Int = 0, submeshIndex: Int = 0) {
+    guard updateMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex, mutate: { $0.heightScale = heightScale }) else {
+        return
+    }
+    refreshStaticBatchingForMaterialChange(entityId: entityId)
+}
+
+/// Height-sample offset, matching Blender's Displacement node "Midlevel" convention.
+public func getMaterialHeightMidlevel(entityId: EntityID, meshIndex: Int = 0, submeshIndex: Int = 0) -> Float {
+    getMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex)?.heightMidlevel ?? 0.5
+}
+
+public func updateMaterialHeightMidlevel(entityId: EntityID, heightMidlevel: Float, meshIndex: Int = 0, submeshIndex: Int = 0) {
+    guard updateMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex, mutate: { $0.heightMidlevel = heightMidlevel }) else {
+        return
+    }
+    refreshStaticBatchingForMaterialChange(entityId: entityId)
+}
+
+/// Lower bound of the contrast-stretch applied to the raw height sample before `heightMidlevel`.
+/// Identity is 0.0. Useful for real-world displacement maps that only use a narrow slice of
+/// the full [0,1] range.
+public func getMaterialHeightRemapMin(entityId: EntityID, meshIndex: Int = 0, submeshIndex: Int = 0) -> Float {
+    getMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex)?.heightRemapMin ?? 0.0
+}
+
+public func updateMaterialHeightRemapMin(entityId: EntityID, heightRemapMin: Float, meshIndex: Int = 0, submeshIndex: Int = 0) {
+    guard updateMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex, mutate: { $0.heightRemapMin = heightRemapMin }) else {
+        return
+    }
+    refreshStaticBatchingForMaterialChange(entityId: entityId)
+}
+
+/// Upper bound of the contrast-stretch applied to the raw height sample before `heightMidlevel`.
+/// Identity is 1.0.
+public func getMaterialHeightRemapMax(entityId: EntityID, meshIndex: Int = 0, submeshIndex: Int = 0) -> Float {
+    getMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex)?.heightRemapMax ?? 1.0
+}
+
+public func updateMaterialHeightRemapMax(entityId: EntityID, heightRemapMax: Float, meshIndex: Int = 0, submeshIndex: Int = 0) {
+    guard updateMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex, mutate: { $0.heightRemapMax = heightRemapMax }) else {
+        return
+    }
+    refreshStaticBatchingForMaterialChange(entityId: entityId)
+}
+
+/// Enables/disables Parallax Occlusion Mapping for a material that has a height texture,
+/// without discarding the texture assignment itself.
+public func getMaterialHeightEnabled(entityId: EntityID, meshIndex: Int = 0, submeshIndex: Int = 0) -> Bool {
+    getMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex)?.heightEnabled ?? true
+}
+
+public func updateMaterialHeightEnabled(entityId: EntityID, heightEnabled: Bool, meshIndex: Int = 0, submeshIndex: Int = 0) {
+    guard updateMaterial(entityId: entityId, meshIndex: meshIndex, submeshIndex: submeshIndex, mutate: { $0.heightEnabled = heightEnabled }) else {
+        return
+    }
+    refreshStaticBatchingForMaterialChange(entityId: entityId)
+}
+
 public func getTextureWrapMode(
     entityId: EntityID,
     textureType: TextureType,
@@ -1472,14 +1562,14 @@ public func getTextureWrapMode(
     case .baseColor:
         return material.baseColor.wrapMode
     case .normal:
-        break
+        return material.normal.wrapMode
     case .roughness:
-        break
+        return material.roughness.wrapMode
     case .metallic:
-        break
+        return material.metallic.wrapMode
+    case .height:
+        return material.height.wrapMode
     }
-
-    return nil
 }
 
 public func updateTextureSampler(
@@ -1512,6 +1602,9 @@ public func updateTextureSampler(
         case .metallic:
             material.metallic.sampler = sampler
             material.metallic.wrapMode = wrapMode
+        case .height:
+            material.height.sampler = sampler
+            material.height.wrapMode = wrapMode
         }
     }
 }
@@ -1527,6 +1620,8 @@ func getTextureType(from filename: String) -> TextureType? {
         return .metallic
     } else if lowercasedName.contains("normalgx") || lowercasedName.contains("normaldx") || lowercasedName.contains("normal") {
         return .normal
+    } else if lowercasedName.contains("height") || lowercasedName.contains("displacement") || lowercasedName.contains("bump") {
+        return .height
     }
 
     return nil

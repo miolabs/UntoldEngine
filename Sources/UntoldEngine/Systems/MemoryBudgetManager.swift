@@ -172,6 +172,10 @@ public class MemoryBudgetManager: @unchecked Sendable {
 
     /// Memory entries indexed by entity ID
     private var memoryEntries: [EntityID: MemoryEntry] = [:]
+    private var auxiliaryMeshBytes: [EntityID: Int] = [:]
+    /// The Gaussian splat frame's shared working set (`GaussianSharedWorkingSet`): one entry for
+    /// the buffers every splat entity compacts into, counted with the geometry.
+    private var gaussianWorkingSetBytes: Int = 0
 
     /// Current frame counter for LRU tracking
     private var currentFrame: UInt64 = 0
@@ -330,6 +334,59 @@ public class MemoryBudgetManager: @unchecked Sendable {
         let meshSize = calculateMeshArrayMemory(meshes)
         let textureSize = meshes.reduce(0) { $0 + $1.textureMemorySize }
         registerMesh(entityId: entityId, meshSizeBytes: meshSize, textureSizeBytes: textureSize)
+    }
+
+    /// Bytes an entity keeps resident alongside its mesh — a splat on a mesh entity
+    /// (`GaussianComponent` next to a `RenderComponent`) — tracked apart from the mesh entry, so mesh streaming, which
+    /// registers and unregisters that entry whole, neither drops nor double-counts them. They
+    /// count toward the geometry total and budget checks, not toward `getMemorySize` (what
+    /// evicting the mesh would free). Zero removes the record.
+    public func setAuxiliaryMeshBytes(entityId: EntityID, bytes: Int) {
+        guard enabled else { return }
+
+        lock.lock()
+        let previous = auxiliaryMeshBytes[entityId] ?? 0
+        let clamped = max(0, bytes)
+        if clamped == 0 {
+            auxiliaryMeshBytes.removeValue(forKey: entityId)
+        } else {
+            auxiliaryMeshBytes[entityId] = clamped
+        }
+        totalMeshMemory += clamped - previous
+        lock.unlock()
+
+        checkThresholdLogging()
+    }
+
+    /// Bytes of the Gaussian splat frame's shared working set — the per-frame records, keys and
+    /// constants every splat entity compacts into (`GaussianSharedWorkingSet`), sized to a budget
+    /// rather than to what is loaded. One ledger entry, replaced on every call, counted toward
+    /// the geometry total and budget checks like the entities' own splat buffers; not tied to an
+    /// entity, so eviction never frees it.
+    public func setGaussianWorkingSetBytes(_ bytes: Int) {
+        guard enabled else { return }
+
+        lock.lock()
+        let clamped = max(0, bytes)
+        totalMeshMemory += clamped - gaussianWorkingSetBytes
+        gaussianWorkingSetBytes = clamped
+        lock.unlock()
+
+        checkThresholdLogging()
+    }
+
+    /// See `setGaussianWorkingSetBytes(_:)`.
+    public var gaussianWorkingSetBytesTracked: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return gaussianWorkingSetBytes
+    }
+
+    /// See `setAuxiliaryMeshBytes(entityId:bytes:)`.
+    public func auxiliaryMeshBytes(for entityId: EntityID) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return auxiliaryMeshBytes[entityId] ?? 0
     }
 
     /// Unregister an entity's memory
@@ -661,6 +718,8 @@ public class MemoryBudgetManager: @unchecked Sendable {
         defer { lock.unlock() }
 
         memoryEntries.removeAll()
+        auxiliaryMeshBytes.removeAll()
+        gaussianWorkingSetBytes = 0
         totalMeshMemory = 0
         totalTextureMemory = 0
         inFlightTextureReservation = 0

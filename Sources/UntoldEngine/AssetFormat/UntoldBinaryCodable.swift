@@ -256,11 +256,103 @@ extension UntoldMaterialRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
         writer.writeUInt32LE(roughnessTextureIndex)
         writer.writeUInt32LE(emissiveTextureIndex)
         writer.writeUInt32LE(occlusionTextureIndex)
+        writer.writeUInt32LE(heightTextureIndex)
+        writer.writeFloat32LE(heightScale)
+        writer.writeFloat32LE(heightMidlevel)
+        writer.writeFloat32LE(heightRemapMin)
+        writer.writeFloat32LE(heightRemapMax)
         writer.writeUInt32LE(reserved0[safe: 0] ?? 0)
         writer.writeUInt32LE(reserved0[safe: 1] ?? 0)
     }
 
+    /// Decodes the current (>= `UntoldFormat.minHeightRemapVersion`) on-disk layout, which
+    /// includes both the height-map and height-remap fields. Do not call this against files
+    /// written by an older exporter — use `decodeLegacyWithHeightNoRemap(from:)` or
+    /// `decodeLegacyWithoutHeight(from:)` instead, gated on the file header's `formatVersion`,
+    /// or every record after the first will be misaligned.
     public static func decode(from reader: UntoldBinaryReader) throws -> UntoldMaterialRecordV1 {
+        var record = try UntoldMaterialRecordV1(
+            nameOffset: reader.readUInt32LE(),
+            flags: reader.readUInt32LE(),
+            baseColorFactor: SIMD4<Float>(
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE()
+            ),
+            emissiveFactor: SIMD3<Float>(
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE()
+            ),
+            normalScale: reader.readFloat32LE(),
+            metallicFactor: reader.readFloat32LE(),
+            roughnessFactor: reader.readFloat32LE(),
+            occlusionStrength: reader.readFloat32LE(),
+            alphaCutoff: reader.readFloat32LE(),
+            baseColorTextureIndex: reader.readUInt32LE(),
+            normalTextureIndex: reader.readUInt32LE(),
+            metallicTextureIndex: reader.readUInt32LE(),
+            roughnessTextureIndex: reader.readUInt32LE(),
+            emissiveTextureIndex: reader.readUInt32LE(),
+            occlusionTextureIndex: reader.readUInt32LE(),
+            heightTextureIndex: reader.readUInt32LE(),
+            heightScale: reader.readFloat32LE(),
+            heightMidlevel: reader.readFloat32LE(),
+            heightRemapMin: reader.readFloat32LE(),
+            heightRemapMax: reader.readFloat32LE()
+        )
+        record.reserved0 = try [
+            reader.readUInt32LE(),
+            reader.readUInt32LE(),
+        ]
+        return record
+    }
+
+    /// Decodes the on-disk layout for `minHeightMapVersion <= formatVersion < minHeightRemapVersion`:
+    /// height-map fields present, height-remap fields not yet on disk (defaulted to identity).
+    public static func decodeLegacyWithHeightNoRemap(from reader: UntoldBinaryReader) throws -> UntoldMaterialRecordV1 {
+        var record = try UntoldMaterialRecordV1(
+            nameOffset: reader.readUInt32LE(),
+            flags: reader.readUInt32LE(),
+            baseColorFactor: SIMD4<Float>(
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE()
+            ),
+            emissiveFactor: SIMD3<Float>(
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE()
+            ),
+            normalScale: reader.readFloat32LE(),
+            metallicFactor: reader.readFloat32LE(),
+            roughnessFactor: reader.readFloat32LE(),
+            occlusionStrength: reader.readFloat32LE(),
+            alphaCutoff: reader.readFloat32LE(),
+            baseColorTextureIndex: reader.readUInt32LE(),
+            normalTextureIndex: reader.readUInt32LE(),
+            metallicTextureIndex: reader.readUInt32LE(),
+            roughnessTextureIndex: reader.readUInt32LE(),
+            emissiveTextureIndex: reader.readUInt32LE(),
+            occlusionTextureIndex: reader.readUInt32LE(),
+            heightTextureIndex: reader.readUInt32LE(),
+            heightScale: reader.readFloat32LE(),
+            heightMidlevel: reader.readFloat32LE()
+        )
+        record.reserved0 = try [
+            reader.readUInt32LE(),
+            reader.readUInt32LE(),
+        ]
+        return record
+    }
+
+    /// Decodes the pre-height-map on-disk layout (`formatVersion < UntoldFormat.minHeightMapVersion`).
+    /// Height fields are not present on disk for these files and are defaulted; `hasHeightMap`
+    /// on the resulting runtime material will correctly report `false` since `heightTextureIndex`
+    /// defaults to `UntoldFormat.invalidIndex`.
+    public static func decodeLegacyWithoutHeight(from reader: UntoldBinaryReader) throws -> UntoldMaterialRecordV1 {
         var record = try UntoldMaterialRecordV1(
             nameOffset: reader.readUInt32LE(),
             flags: reader.readUInt32LE(),
@@ -507,6 +599,36 @@ extension UntoldColorManagementRecordV1: UntoldBinaryEncodable, UntoldBinaryDeco
     }
 }
 
+extension UntoldColorGradeLUTRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
+    public func encode(to writer: UntoldBinaryWriter) {
+        writer.writeUInt32LE(lutUriOffset)
+        writer.writeUInt32LE(lutSize)
+        writer.writeFloat32LE(domainMin.x)
+        writer.writeFloat32LE(domainMin.y)
+        writer.writeFloat32LE(domainMin.z)
+        writer.writeFloat32LE(domainMax.x)
+        writer.writeFloat32LE(domainMax.y)
+        writer.writeFloat32LE(domainMax.z)
+    }
+
+    public static func decode(from reader: UntoldBinaryReader) throws -> UntoldColorGradeLUTRecordV1 {
+        try UntoldColorGradeLUTRecordV1(
+            lutUriOffset: reader.readUInt32LE(),
+            lutSize: reader.readUInt32LE(),
+            domainMin: SIMD3<Float>(
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE()
+            ),
+            domainMax: SIMD3<Float>(
+                reader.readFloat32LE(),
+                reader.readFloat32LE(),
+                reader.readFloat32LE()
+            )
+        )
+    }
+}
+
 extension UntoldSkeletonRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
     public func encode(to writer: UntoldBinaryWriter) {
         writer.writeUInt32LE(entityId)
@@ -740,6 +862,73 @@ extension UntoldPBRStaticVertexV1: UntoldBinaryEncodable, UntoldBinaryDecodable 
                 reader.readUInt8()
             )
         )
+    }
+}
+
+extension UntoldGaussianAssetRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
+    /// Serialized size in bytes: 4 words, 4 + 4 LOD entries, 3 floats, 5 alignment floats
+    /// (translation, yaw, scale — the former reserved words).
+    public static let encodedSize = 80
+
+    public func encode(to writer: UntoldBinaryWriter) {
+        writer.writeUInt32LE(entityId)
+        writer.writeUInt32LE(payloadPathOffset)
+        writer.writeUInt32LE(flags)
+        writer.writeUInt32LE(lodCount)
+        for index in 0 ..< Self.maxLODLevels {
+            writer.writeUInt32LE(lodSplatCounts[index])
+        }
+        for index in 0 ..< Self.maxLODLevels {
+            writer.writeFloat32LE(lodSwitchScreenHeights[index])
+        }
+        writer.writeFloat32LE(occluderShrinkMeters)
+        writer.writeFloat32LE(exposureOffsetEV)
+        writer.writeFloat32LE(swapDistanceMeters)
+        writer.writeFloat32LE(alignmentTranslation.x)
+        writer.writeFloat32LE(alignmentTranslation.y)
+        writer.writeFloat32LE(alignmentTranslation.z)
+        writer.writeFloat32LE(alignmentYawDegrees)
+        writer.writeFloat32LE(alignmentScale)
+    }
+
+    public static func decode(from reader: UntoldBinaryReader) throws -> UntoldGaussianAssetRecordV1 {
+        let entityId = try reader.readUInt32LE()
+        let payloadPathOffset = try reader.readUInt32LE()
+        let flags = try reader.readUInt32LE()
+        let lodCount = try reader.readUInt32LE()
+        var lodSplatCounts: [UInt32] = []
+        for _ in 0 ..< maxLODLevels {
+            try lodSplatCounts.append(reader.readUInt32LE())
+        }
+        var lodSwitchScreenHeights: [Float] = []
+        for _ in 0 ..< maxLODLevels {
+            try lodSwitchScreenHeights.append(reader.readFloat32LE())
+        }
+        let occluderShrinkMeters = try reader.readFloat32LE()
+        let exposureOffsetEV = try reader.readFloat32LE()
+        let swapDistanceMeters = try reader.readFloat32LE()
+        let translationX = try reader.readFloat32LE()
+        let translationY = try reader.readFloat32LE()
+        let translationZ = try reader.readFloat32LE()
+        let yawDegrees = try reader.readFloat32LE()
+        let scale = try reader.readFloat32LE()
+        // The alignment words are read as stored, flag or not: a record round-trips byte for
+        // byte, and `alignment` reports nil while the flag is clear.
+        var record = UntoldGaussianAssetRecordV1(
+            entityId: entityId,
+            payloadPathOffset: payloadPathOffset,
+            flags: flags,
+            lodCount: lodCount,
+            lodSplatCounts: lodSplatCounts,
+            lodSwitchScreenHeights: lodSwitchScreenHeights,
+            occluderShrinkMeters: occluderShrinkMeters,
+            exposureOffsetEV: exposureOffsetEV,
+            swapDistanceMeters: swapDistanceMeters
+        )
+        record.alignmentTranslation = SIMD3<Float>(translationX, translationY, translationZ)
+        record.alignmentYawDegrees = yawDegrees
+        record.alignmentScale = scale
+        return record
     }
 }
 

@@ -28,6 +28,7 @@ extension GeometryStreamingSystem {
         if isNearBand { reserveNearBandLoad(entityId: entityId) }
 
         streaming.state = .loading
+        streaming.loadDispatchCount += 1
         BatchingSystem.shared.notifyEntityStreamingStarted(entityId: entityId)
 
         // [Instrumentation] Measure scheduler latency: time from first range-detection to dispatch.
@@ -37,6 +38,11 @@ extension GeometryStreamingSystem {
                 message: "[OOC-Timing] Entity \(entityId): tick-to-dispatch=\(String(format: "%.1f", tickToDispatchMs))ms band=\(isNearBand ? "near" : "rest")",
                 category: LogCategory.oocTiming.rawValue
             )
+        }
+
+        if streaming.assetKind == .gaussianSplat {
+            loadGaussianStreamingEntity(entityId: entityId, streaming: streaming, isNearBand: isNearBand)
+            return
         }
 
         let hasLOD = scene.get(component: LODComponent.self, for: entityId) != nil
@@ -368,6 +374,11 @@ extension GeometryStreamingSystem {
         guard let streaming = scene.get(component: StreamingComponent.self, for: entityId),
               streaming.state == .loaded
         else { return }
+
+        if streaming.assetKind == .gaussianSplat {
+            unloadGaussian(entityId: entityId)
+            return
+        }
 
         // Clear first-detection timestamp so a future re-approach records a fresh baseline.
         firstRangeTimestamps.removeValue(forKey: entityId)

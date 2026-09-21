@@ -9,6 +9,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import CShaderTypes
 import Foundation
 import MetalKit
 import simd
@@ -52,8 +53,20 @@ private final class CoreRuntimeGlobals: @unchecked Sendable {
     var hzbBuildPyramidPipeline = ComputePipeline()
     var hzbOcclusionCullingPipeline = ComputePipeline()
     var gaussianResetVisibleCountPipeline = ComputePipeline()
+    var gaussianFinalizeVisibleSetPipeline = ComputePipeline()
     var gaussianFrustumCullPipeline = ComputePipeline()
-    var gaussianDepthPipeline = ComputePipeline()
+    var gaussianPreprocessPipeline = ComputePipeline()
+    var gaussianFinalizeSharedVisibleSetPipeline = ComputePipeline()
+    var gaussianDecodePipeline = ComputePipeline()
+    var gaussianResetVisibleChunkSetPipeline = ComputePipeline()
+    var gaussianChunkCullPipeline = ComputePipeline()
+    var gaussianFinalizeVisibleChunksPipeline = ComputePipeline()
+    var gaussianChunkDecodePreprocessPipeline = ComputePipeline()
+    var gaussianResetBudgetRequestPipeline = ComputePipeline()
+    var gaussianComputeBudgetScalePipeline = ComputePipeline()
+    var gaussianComputeChunkQuotasPipeline = ComputePipeline()
+    var gaussianPublishBudgetStatePipeline = ComputePipeline()
+    var gaussianReserveBudgetSplatsPipeline = ComputePipeline()
     var radixClearHistogramPipeline = ComputePipeline()
     var radixHistogramPipeline = ComputePipeline()
     var radixScanPerTGPipeline = ComputePipeline()
@@ -514,24 +527,234 @@ var hzbOcclusionCullingPipeline: ComputePipeline {
     }
 }
 
-var gaussianDepthPipeline: ComputePipeline {
+var gaussianDecodePipeline: ComputePipeline {
     get {
         let state = CoreRuntimeGlobals.shared
         state.lock.lock()
         defer { state.lock.unlock() }
-        return state.gaussianDepthPipeline
+        return state.gaussianDecodePipeline
     }
     set {
         let state = CoreRuntimeGlobals.shared
         state.lock.lock()
-        state.gaussianDepthPipeline = newValue
+        state.gaussianDecodePipeline = newValue
         state.lock.unlock()
     }
     _modify {
         let state = CoreRuntimeGlobals.shared
         state.lock.lock()
         defer { state.lock.unlock() }
-        yield &state.gaussianDepthPipeline
+        yield &state.gaussianDecodePipeline
+    }
+}
+
+var gaussianResetVisibleChunkSetPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianResetVisibleChunkSetPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianResetVisibleChunkSetPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianResetVisibleChunkSetPipeline
+    }
+}
+
+var gaussianChunkCullPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianChunkCullPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianChunkCullPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianChunkCullPipeline
+    }
+}
+
+var gaussianFinalizeVisibleChunksPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianFinalizeVisibleChunksPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianFinalizeVisibleChunksPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianFinalizeVisibleChunksPipeline
+    }
+}
+
+var gaussianChunkDecodePreprocessPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianChunkDecodePreprocessPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianChunkDecodePreprocessPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianChunkDecodePreprocessPipeline
+    }
+}
+
+var gaussianResetBudgetRequestPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianResetBudgetRequestPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianResetBudgetRequestPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianResetBudgetRequestPipeline
+    }
+}
+
+var gaussianComputeBudgetScalePipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianComputeBudgetScalePipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianComputeBudgetScalePipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianComputeBudgetScalePipeline
+    }
+}
+
+var gaussianComputeChunkQuotasPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianComputeChunkQuotasPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianComputeChunkQuotasPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianComputeChunkQuotasPipeline
+    }
+}
+
+var gaussianPublishBudgetStatePipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianPublishBudgetStatePipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianPublishBudgetStatePipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianPublishBudgetStatePipeline
+    }
+}
+
+var gaussianReserveBudgetSplatsPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianReserveBudgetSplatsPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianReserveBudgetSplatsPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianReserveBudgetSplatsPipeline
+    }
+}
+
+var gaussianFinalizeSharedVisibleSetPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianFinalizeSharedVisibleSetPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianFinalizeSharedVisibleSetPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianFinalizeSharedVisibleSetPipeline
     }
 }
 
@@ -556,6 +779,27 @@ var gaussianResetVisibleCountPipeline: ComputePipeline {
     }
 }
 
+var gaussianFinalizeVisibleSetPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianFinalizeVisibleSetPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianFinalizeVisibleSetPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianFinalizeVisibleSetPipeline
+    }
+}
+
 var gaussianFrustumCullPipeline: ComputePipeline {
     get {
         let state = CoreRuntimeGlobals.shared
@@ -574,6 +818,27 @@ var gaussianFrustumCullPipeline: ComputePipeline {
         state.lock.lock()
         defer { state.lock.unlock() }
         yield &state.gaussianFrustumCullPipeline
+    }
+}
+
+var gaussianPreprocessPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.gaussianPreprocessPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.gaussianPreprocessPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.gaussianPreprocessPipeline
     }
 }
 
@@ -820,15 +1085,18 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var gameModeValue: Bool = true
     private var applyIBLValue: Bool = false
     private var renderEnvironmentValue: Bool = false
+    private var renderSkyBackgroundValue: Bool = false
     private var ambientIntensityValue: Float = 0.4
     private var hdrURLValue: String = "teatro_massimo_2k.hdr"
     private var resourceURLValue: URL?
+    private var hdrDirectoryURLValue: URL?
     private var assetBasePathValue: URL?
     private var activeEntityValue: EntityID = .invalid
     private var enableEngineMetricsValue: Bool = false
     private var bypassPostProcessingValue: Bool = false
     private var antiAliasingModeValue: AntiAliasingMode = .fxaa
     private var renderDebugViewModeValue: RenderDebugViewMode = .lit
+    private var pomQualitySettingsValue: POMQualitySettings = .platformDefault
     private var cameraDefaultFOVValue: Float = 65.0
     private var cameraNearPlaneValue: Float = 0.1
     private var cameraFarPlaneValue: Float = 500.0
@@ -1189,6 +1457,22 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         }
     }
 
+    /// Selects the procedural atmospheric sky (true, default) vs. the debug/editor grid (false)
+    /// as the non-XR background when IBL (renderEnvironment) is disabled.
+    var renderSkyBackground: Bool {
+        get {
+            lock.lock()
+            let value = renderSkyBackgroundValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            renderSkyBackgroundValue = newValue
+            lock.unlock()
+        }
+    }
+
     var ambientIntensity: Float {
         get {
             lock.lock()
@@ -1227,6 +1511,20 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         set {
             lock.lock()
             resourceURLValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var hdrDirectoryURL: URL? {
+        get {
+            lock.lock()
+            let value = hdrDirectoryURLValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            hdrDirectoryURLValue = newValue
             lock.unlock()
         }
     }
@@ -1311,6 +1609,20 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         set {
             lock.lock()
             renderDebugViewModeValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var pomQualitySettings: POMQualitySettings {
+        get {
+            lock.lock()
+            let value = pomQualitySettingsValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            pomQualitySettingsValue = newValue
             lock.unlock()
         }
     }
@@ -1454,6 +1766,7 @@ public enum TextureType: String, CaseIterable, Identifiable {
     case roughness
     case metallic
     case normal
+    case height
 
     public var id: Self {
         self
@@ -1465,6 +1778,7 @@ public enum TextureType: String, CaseIterable, Identifiable {
         case .roughness: return "Roughness"
         case .metallic: return "Metallic"
         case .normal: return "Normal"
+        case .height: return "Height"
         }
     }
 }
@@ -1491,6 +1805,52 @@ public enum RenderDebugViewMode: Int, CaseIterable, Sendable {
     case preTonemapHDRLuminance = 13
     /// Routes the normal post-tonemap output explicitly for color-pipeline checks.
     case postTonemapOutput = 14
+    /// Visualizes the raw height-map sample used by Parallax Occlusion Mapping.
+    case heightDebug = 15
+    /// Visualizes the magnitude of the POM UV displacement as a heatmap.
+    case pomOffsetDebug = 16
+}
+
+/// Runtime tuning for Parallax Occlusion Mapping's per-pixel ray-march cost.
+///
+/// `minSteps`/`maxSteps` bound the adaptive step count (fewer near-normal, more at grazing
+/// angles). `maxDistance`/`fadeStartDistance` fade POM out entirely beyond a configurable
+/// distance — the single highest-leverage performance control, since most height-mapped
+/// surfaces in a scene (background walls, distant floors) don't need a per-pixel ray march at
+/// all. The fade is smooth (no popping at the cutoff) and gates the ray march itself, not just
+/// the visual result, so distant fragments skip the cost entirely.
+public struct POMQualitySettings: Equatable, Sendable {
+    public var minSteps: Float
+    public var maxSteps: Float
+    /// Distance beyond which POM fully fades to flat (normal-mapping-only).
+    public var maxDistance: Float
+    /// Distance at which the fade begins. Must be less than `maxDistance`.
+    public var fadeStartDistance: Float
+
+    public init(
+        minSteps: Float = 8.0,
+        maxSteps: Float = 32.0,
+        maxDistance: Float = 20.0,
+        fadeStartDistance: Float = 12.0
+    ) {
+        self.minSteps = minSteps
+        self.maxSteps = maxSteps
+        self.maxDistance = maxDistance
+        self.fadeStartDistance = fadeStartDistance
+    }
+
+    /// Platform-appropriate default. visionOS renders stereo (effectively doubling
+    /// per-pixel fragment work), so it defaults to a lower max step count and a tighter
+    /// distance cutoff than desktop/iOS — mirroring the same XR-vs-desktop default-profile
+    /// pattern used elsewhere in the renderer (e.g. `TextureLoader.defaultMaxTextureDimension`,
+    /// CSM cascade count).
+    public static var platformDefault: POMQualitySettings {
+        #if os(visionOS)
+            POMQualitySettings(minSteps: 4.0, maxSteps: 16.0, maxDistance: 15.0, fadeStartDistance: 9.0)
+        #else
+            POMQualitySettings(minSteps: 8.0, maxSteps: 32.0, maxDistance: 20.0, fadeStartDistance: 12.0)
+        #endif
+    }
 }
 
 // TODO: try to remove this var, because only make sense on the editor side
@@ -1507,6 +1867,11 @@ public var applyIBL: Bool {
 public var renderEnvironment: Bool {
     get { RuntimeGlobalsStore.shared.renderEnvironment }
     set { RuntimeGlobalsStore.shared.renderEnvironment = newValue }
+}
+
+public var renderSkyBackground: Bool {
+    get { RuntimeGlobalsStore.shared.renderSkyBackground }
+    set { RuntimeGlobalsStore.shared.renderSkyBackground = newValue }
 }
 
 public var ambientIntensity: Float {
@@ -1530,6 +1895,14 @@ public var hdrURL: String {
 public var resourceURL: URL? {
     get { RuntimeGlobalsStore.shared.resourceURL }
     set { RuntimeGlobalsStore.shared.resourceURL = newValue }
+}
+
+/// Directory the current `hdrURL` environment was loaded from, so a later
+/// IBL re-bake (viewport resize, `initSizeableResources()`) finds the same
+/// file. `nil` means the engine's own resource search (`resourceURL`).
+public var hdrDirectoryURL: URL? {
+    get { RuntimeGlobalsStore.shared.hdrDirectoryURL }
+    set { RuntimeGlobalsStore.shared.hdrDirectoryURL = newValue }
 }
 
 var currentGlobalTime: Float {
@@ -1738,6 +2111,14 @@ public var renderDebugViewMode: RenderDebugViewMode {
     set { RuntimeGlobalsStore.shared.renderDebugViewMode = newValue }
 }
 
+public func setPOMQuality(_ settings: POMQualitySettings) {
+    RuntimeGlobalsStore.shared.pomQualitySettings = settings
+}
+
+public func getPOMQuality() -> POMQualitySettings {
+    RuntimeGlobalsStore.shared.pomQualitySettings
+}
+
 public final class ToneMappingParams: ObservableObject, @unchecked Sendable {
     static let shared = ToneMappingParams()
 
@@ -1755,6 +2136,16 @@ public final class ColorGradingParams: ObservableObject, @unchecked Sendable {
     @Published public var temperature: Float = 0.0 // -1.0 to 1.0 (-1.0 bluish, 0.0 neutral, +1.0 warm, yellowish/orange)
     @Published public var tint: Float = 0.0 // -1.0 to 1.0 Green (-)/Magenta (+)
     @Published public var enabled: Bool = false
+
+    public func resetToDefaults() {
+        brightness = 0.0
+        contrast = 1.0
+        saturation = 1.0
+        exposure = 0.0
+        temperature = 0.0
+        tint = 0.0
+        enabled = false
+    }
 }
 
 /// Scene-wide color-grading LUT, baked from the source Blender scene's View
@@ -1827,6 +2218,141 @@ public final class ColorLUTParams: @unchecked Sendable {
     }
 }
 
+/// An externally-authored standard .cube 3D LUT (see CubeLUTLoader), applied
+/// as a post-tonemap creative grade. Unlike ColorLUTParams above (which
+/// replaces the tonemap step entirely with a proprietary baked LUT), this
+/// composes with whichever tonemap operator ran and operates in ordinary
+/// [domainMin, domainMax] display-referred space -- no shaper encoding.
+/// Asset-derived, installed/cleared by the scene-authored payload loader.
+struct ColorGradeLUTSnapshot {
+    let enabled: Bool
+    let lutTexture: MTLTexture?
+    let domainMin: SIMD3<Float>
+    let domainMax: SIMD3<Float>
+}
+
+public final class ColorGradeLUTParams: @unchecked Sendable {
+    public static let shared = ColorGradeLUTParams()
+
+    private struct State {
+        var enabled = false
+        var lutTexture: MTLTexture?
+        var domainMin = SIMD3<Float>(0, 0, 0)
+        var domainMax = SIMD3<Float>(1, 1, 1)
+        // Only set when installed via the standalone setColorGradeLUT(filename:)
+        // API (nil for the scene-authored colorGradeLUT path, which is already
+        // restorable via SceneData.sceneAuthoredSource) -- lets the scene
+        // serializer persist and restore a manually-chosen LUT independent of
+        // any scene asset. See SceneSerializer.swift.
+        var sourceFilename: String?
+        var sourceExtension: String?
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+
+    public var enabled: Bool {
+        get { snapshot().enabled }
+        set { setEnabled(newValue) }
+    }
+
+    public func setEnabled(_ enabled: Bool) {
+        lock.lock()
+        state.enabled = enabled && state.lutTexture != nil
+        lock.unlock()
+    }
+
+    func replace(
+        texture: MTLTexture,
+        domainMin: SIMD3<Float>,
+        domainMax: SIMD3<Float>,
+        sourceFilename: String? = nil,
+        sourceExtension: String? = nil
+    ) {
+        lock.lock()
+        state = State(
+            enabled: true,
+            lutTexture: texture,
+            domainMin: domainMin,
+            domainMax: domainMax,
+            sourceFilename: sourceFilename,
+            sourceExtension: sourceExtension
+        )
+        lock.unlock()
+    }
+
+    public func clear() {
+        lock.lock()
+        state = State()
+        lock.unlock()
+    }
+
+    /// The filename/extension last passed to setColorGradeLUT, if the active
+    /// LUT (if any) was installed that way. Used by the scene serializer.
+    public var source: (filename: String, extension: String)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let filename = state.sourceFilename, let ext = state.sourceExtension else { return nil }
+        return (filename, ext)
+    }
+
+    func snapshot() -> ColorGradeLUTSnapshot {
+        lock.lock()
+        let value = ColorGradeLUTSnapshot(
+            enabled: state.enabled,
+            lutTexture: state.lutTexture,
+            domainMin: state.domainMin,
+            domainMax: state.domainMax
+        )
+        lock.unlock()
+        return value
+    }
+}
+
+/// Which native tonemap operator the look pass runs when no whole-transform
+/// bake (ColorLUTParams) is active. Independent of, and composable with,
+/// both ColorLUTParams and ColorGradeLUTParams above.
+public enum TonemapOperator: String, Sendable, Codable, Equatable {
+    case aces
+    case agx
+
+    var shaderValue: Int32 {
+        switch self {
+        case .aces: Int32(tonemapOperatorACES.rawValue)
+        case .agx: Int32(tonemapOperatorAgX.rawValue)
+        }
+    }
+}
+
+public final class TonemapParams: @unchecked Sendable {
+    public static let shared = TonemapParams()
+
+    // ACES Filmic is the engine's default tonemap operator. AgX (Blender's
+    // default View Transform since 4.0) is available via
+    // setPostFX(.tonemapOperator(.agx)) for scenes that want to match it.
+    private let lock = NSLock()
+    private var _operator: TonemapOperator = .aces
+
+    public var `operator`: TonemapOperator {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _operator
+        }
+        set {
+            lock.lock()
+            _operator = newValue
+            lock.unlock()
+        }
+    }
+
+    public func resetToDefaults() {
+        lock.lock()
+        _operator = .aces
+        lock.unlock()
+    }
+}
+
 final class SceneAuthoredSourceStore: @unchecked Sendable {
     static let shared = SceneAuthoredSourceStore()
 
@@ -1867,6 +2393,12 @@ public final class BloomThresholdParams: ObservableObject, @unchecked Sendable {
     @Published public var threshold: Float = 0.5 // 0.0 to 5.0
     @Published public var intensity: Float = 0.0 // 0.0 to 2.0
     @Published public var enabled: Bool = false
+
+    public func resetToDefaults() {
+        threshold = 0.5
+        intensity = 0.0
+        enabled = false
+    }
 }
 
 public final class BloomCompositeParams: ObservableObject, @unchecked Sendable {
@@ -1884,6 +2416,14 @@ public final class VignetteParams: ObservableObject, @unchecked Sendable {
     @Published public var softness: Float = 0.45 // 0.0 to 1.0
     @Published public var center: simd_float2 = .init(0.5, 0.5) // 0-1
     @Published public var enabled: Bool = false
+
+    public func resetToDefaults() {
+        intensity = 0.7
+        radius = 0.75
+        softness = 0.45
+        center = .init(0.5, 0.5)
+        enabled = false
+    }
 }
 
 public final class ChromaticAberrationParams: ObservableObject, @unchecked Sendable {
@@ -1892,6 +2432,12 @@ public final class ChromaticAberrationParams: ObservableObject, @unchecked Senda
     @Published public var intensity: Float = 0.0 // 0.0 to 0.1
     @Published public var center: simd_float2 = .init(0.5, 0.5) // 0-1
     @Published public var enabled: Bool = false
+
+    public func resetToDefaults() {
+        intensity = 0.0
+        center = .init(0.5, 0.5)
+        enabled = false
+    }
 }
 
 public final class DepthOfFieldParams: ObservableObject, @unchecked Sendable {
@@ -1901,6 +2447,13 @@ public final class DepthOfFieldParams: ObservableObject, @unchecked Sendable {
     @Published public var focusRange: Float = 0.1 // 0.01-0.3
     @Published public var maxBlur: Float = 0 // 0.005-0.05
     @Published public var enabled: Bool = false
+
+    public func resetToDefaults() {
+        focusDistance = 1.0
+        focusRange = 0.1
+        maxBlur = 0
+        enabled = false
+    }
 }
 
 struct WireframeRenderState {
@@ -1936,12 +2489,22 @@ public final class FXAAParams: ObservableObject, @unchecked Sendable {
     @Published public var subpixelQuality: Float = 0.75 // 0.0–1.0; higher = stronger sub-pixel smoothing
     @Published public var edgeThreshold: Float = 0.125 // minimum local contrast to trigger AA
     @Published public var edgeThresholdMin: Float = 0.0625 // absolute threshold floor (skip very dark edges)
+
+    public func resetToDefaults() {
+        subpixelQuality = 0.75
+        edgeThreshold = 0.125
+        edgeThresholdMin = 0.0625
+    }
 }
 
 public final class SMAAParams: ObservableObject, @unchecked Sendable {
     public static let shared = SMAAParams()
 
     @Published public var edgeThreshold: Float = 0.1
+
+    public func resetToDefaults() {
+        edgeThreshold = 0.1
+    }
 }
 
 /// SSAO Quality Settings
@@ -1995,7 +2558,7 @@ public final class SSAOParams: ObservableObject, @unchecked Sendable {
     public static let shared = SSAOParams()
 
     @Published public var radius: Float = 0.5 // 0.1 to 2.0 how far to sample
-    @Published public var bias: Float = 0.025 // 0.01-0.1 avoid self occusion
+    @Published public var bias: Float = 0.025 // 0.01-0.1 angular (dot-product) slop that guards against G-buffer precision noise between coplanar samples
     @Published public var intensity: Float = 0 // 0.5-2.0 Final multiplier
     @Published public var enabled: Bool = false
     @Published public var quality: SSAOQuality = .balanced {
@@ -2021,6 +2584,14 @@ public final class SSAOParams: ObservableObject, @unchecked Sendable {
                 print("🔧 SSAO Quality changed to: \(quality) - textures & pipelines reinitialized")
             }
         }
+    }
+
+    public func resetToDefaults() {
+        radius = 0.5
+        bias = 0.025
+        intensity = 0
+        enabled = false
+        quality = .balanced
     }
 
     // Performance telemetry

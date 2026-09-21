@@ -284,6 +284,22 @@ func initBufferResources() {
         )
     }
 
+    /// Initialize Sky Buffers
+    /// Reuses the grid pass's fullscreen NDC quad (gridVertices / createGridVertexDescriptor) since
+    /// the sky pass needs the exact same "one triangle-pair covering the screen" geometry.
+    func initSkyBuffers() {
+        bufferResources.skyVertexBuffer = createBuffer(
+            device: renderInfo.device,
+            data: gridVertices,
+            label: "Sky Vertices"
+        )
+        bufferResources.skyUniforms = createEmptyBuffer(
+            device: renderInfo.device,
+            length: MemoryLayout<SkyUniforms>.stride,
+            label: "Sky Uniforms"
+        )
+    }
+
     /// Initialize Composite Buffers
     func initCompositeBuffers() {
         bufferResources.quadVerticesBuffer = createBuffer(
@@ -363,6 +379,7 @@ func initBufferResources() {
 
     // Initialize All Buffers
     initGridBuffers()
+    initSkyBuffers()
     initCompositeBuffers()
     initPointLightBuffer()
     initSpotLightBuffer()
@@ -547,7 +564,7 @@ func initRenderPassDescriptors() {
 
 func gBufferDebugModeNeedsStoredTargets(_ mode: RenderDebugViewMode) -> Bool {
     switch mode {
-    case .albedo, .normal, .position, .roughness, .metallic:
+    case .albedo, .normal, .position, .roughness, .metallic, .heightDebug, .pomOffsetDebug:
         return true
     case .lit, .depth, .ssaoBlurred, .fxaaEdgeDebug, .smaaEdges, .smaaBlend, .smaaDifference, .occlusionDebug,
          .preTonemapHDRLuminance, .postTonemapOutput:
@@ -783,6 +800,18 @@ func initTextureResources() {
     textureResources.hzbSourceDepthMap = createTexture(
         device: renderInfo.device,
         label: "HZB Source Depth Texture",
+        pixelFormat: renderInfo.depthPixelFormat,
+        width: viewportWidth,
+        height: viewportHeight,
+        usage: [.shaderRead, .renderTarget],
+        storageMode: .private
+    )
+
+    // Gaussian pass reads a snapshot of the opaque depth to occlude splats behind
+    // walls/geometry. Copied fresh each frame from depthMap (see gaussianExecution).
+    textureResources.gaussianOpaqueDepthSnapshot = createTexture(
+        device: renderInfo.device,
+        label: "Gaussian Opaque Depth Snapshot",
         pixelFormat: renderInfo.depthPixelFormat,
         width: viewportWidth,
         height: viewportHeight,
@@ -1101,12 +1130,102 @@ func initTextureResources() {
     textureResources.areaTextureLTCMag = makeFloat4Texture(data: flattenedLTC2, width: 64, height: 64)
 }
 
+/// Identifies a completed IBL bake so a later `initIBLResources()` call (e.g. from a
+/// viewport resize, or a fresh headless renderer in a test) can reuse it instead of
+/// re-decoding the HDR file and re-running the two blocking GPU prefilter passes.
+private struct IBLBakeCacheKey: Equatable {
+    let resolvedPath: String
+    let modificationDate: Date
+    let iblSize: Int
+    let pixelFormat: MTLPixelFormat
+    let device: ObjectIdentifier
+}
+
+private final class IBLBakeCacheState: @unchecked Sendable {
+    let lock = NSLock()
+    var key: IBLBakeCacheKey?
+    var irradianceMap: MTLTexture?
+    var specularMap: MTLTexture?
+    var iblBRDFMap: MTLTexture?
+    var environmentTexture: MTLTexture?
+    var iblEnvironmentTexture: MTLTexture?
+}
+
+private let iblBakeCacheState = IBLBakeCacheState()
+
+/// Invalidates the cached IBL bake so the next `initIBLResources()` call re-decodes and
+/// re-prefilters the HDR environment, even if the resolved path/mtime look unchanged
+/// (e.g. a file was rewritten in place within the same mtime-resolution window).
+public func invalidateIBLBakeCache() {
+    iblBakeCacheState.lock.lock()
+    defer { iblBakeCacheState.lock.unlock() }
+    iblBakeCacheState.key = nil
+    iblBakeCacheState.irradianceMap = nil
+    iblBakeCacheState.specularMap = nil
+    iblBakeCacheState.iblBRDFMap = nil
+    iblBakeCacheState.environmentTexture = nil
+    iblBakeCacheState.iblEnvironmentTexture = nil
+}
+
+private func iblBakeCacheKey(
+    hdrName: String, directory: URL?, iblSize: Int, pixelFormat: MTLPixelFormat, device: MTLDevice
+) -> IBLBakeCacheKey? {
+    guard let url = try? loadImage(hdrName, from: directory) else { return nil }
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+          let modificationDate = attributes[.modificationDate] as? Date
+    else { return nil }
+
+    return IBLBakeCacheKey(
+        resolvedPath: url.path,
+        modificationDate: modificationDate,
+        iblSize: iblSize,
+        pixelFormat: pixelFormat,
+        device: ObjectIdentifier(device)
+    )
+}
+
 func initIBLResources() {
     let wf = renderInfo.colorPipeline.working
     // IBL maps are low-frequency lookup textures — fixed small size,
     // NOT viewport-sized.  All three share a single render pass so
     // they must have the same dimensions.
     let iblSize = 256
+
+    // An environment set through `setRendering(.environment(.asset(...)))` or
+    // `generateHDR(_:from:)` may live outside the engine bundle; re-bake it
+    // from where it was loaded, or the resize would fail and leave the IBL
+    // textures blank.
+    let hdrDirectory = hdrDirectoryURL ?? resourceURL
+    let cacheKey = iblBakeCacheKey(hdrName: hdrURL, directory: hdrDirectory, iblSize: iblSize, pixelFormat: wf.ibl, device: renderInfo.device)
+
+    if let cacheKey {
+        iblBakeCacheState.lock.lock()
+        let isHit = iblBakeCacheState.key == cacheKey
+        let irradianceMap = iblBakeCacheState.irradianceMap
+        let specularMap = iblBakeCacheState.specularMap
+        let iblBRDFMap = iblBakeCacheState.iblBRDFMap
+        let environmentTexture = iblBakeCacheState.environmentTexture
+        let iblEnvironmentTexture = iblBakeCacheState.iblEnvironmentTexture
+        iblBakeCacheState.lock.unlock()
+
+        if isHit, let irradianceMap, let specularMap, let iblBRDFMap, let environmentTexture, let iblEnvironmentTexture {
+            textureResources.irradianceMap = irradianceMap
+            textureResources.specularMap = specularMap
+            textureResources.iblBRDFMap = iblBRDFMap
+            textureResources.environmentTexture = environmentTexture
+            textureResources.iblEnvironmentTexture = iblEnvironmentTexture
+
+            renderInfo.iblOffscreenRenderPassDescriptor = MTLRenderPassDescriptor()
+            renderInfo.iblOffscreenRenderPassDescriptor.renderTargetWidth = iblSize
+            renderInfo.iblOffscreenRenderPassDescriptor.renderTargetHeight = iblSize
+            renderInfo.iblOffscreenRenderPassDescriptor.colorAttachments[0].texture = irradianceMap
+            renderInfo.iblOffscreenRenderPassDescriptor.colorAttachments[1].texture = specularMap
+            renderInfo.iblOffscreenRenderPassDescriptor.colorAttachments[2].texture = iblBRDFMap
+
+            iblSuccessful = true
+            return
+        }
+    }
 
     // Irradiance Map
     textureResources.irradianceMap = createTexture(
@@ -1154,7 +1273,24 @@ func initIBLResources() {
     renderInfo.iblOffscreenRenderPassDescriptor.colorAttachments[2].texture =
         textureResources.iblBRDFMap
 
-    generateHDR(hdrURL, from: resourceURL)
+    generateHDR(hdrURL, from: hdrDirectory)
+
+    if iblSuccessful, let cacheKey,
+       let irradianceMap = textureResources.irradianceMap,
+       let specularMap = textureResources.specularMap,
+       let iblBRDFMap = textureResources.iblBRDFMap,
+       let environmentTexture = textureResources.environmentTexture,
+       let iblEnvironmentTexture = textureResources.iblEnvironmentTexture
+    {
+        iblBakeCacheState.lock.lock()
+        iblBakeCacheState.key = cacheKey
+        iblBakeCacheState.irradianceMap = irradianceMap
+        iblBakeCacheState.specularMap = specularMap
+        iblBakeCacheState.iblBRDFMap = iblBRDFMap
+        iblBakeCacheState.environmentTexture = environmentTexture
+        iblBakeCacheState.iblEnvironmentTexture = iblEnvironmentTexture
+        iblBakeCacheState.lock.unlock()
+    }
 }
 
 func createShadowVertexDescriptor() -> MTLVertexDescriptor {
