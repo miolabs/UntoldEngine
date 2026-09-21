@@ -4371,10 +4371,14 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
     The V1 exporter requires each mesh to carry exactly one material.  This
     mirrors the split step in the tile-streaming pipeline so that direct
     export-untold calls on multi-material USD assets also work.
+
+    Uses Blender's native separate-by-material on a duplicate of the object so
+    vertex groups, armature modifiers, and shape keys survive the split —
+    a bmesh copy would strip all three, silently un-skinning rigged
+    characters.
     """
-    import bpy, bmesh as _bmesh  # noqa: F401 — bmesh may not be at module level
+    import bpy
     result = []
-    split_count = 0
     for obj in objects:
         if getattr(obj, "type", None) != "MESH" or obj.data is None:
             result.append(obj)
@@ -4385,47 +4389,43 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
             result.append(obj)
             continue
         print(f"  Splitting '{obj.name}' into {len(used_indices)} single-material mesh(es)", flush=True)
-        split_count += len(used_indices)
-        for mat_idx in sorted(used_indices):
-            bm = _bmesh.new()
-            try:
-                bm.from_mesh(mesh)
-                to_delete = [f for f in bm.faces if f.material_index != mat_idx]
-                if to_delete:
-                    _bmesh.ops.delete(bm, geom=to_delete, context="FACES")
-                loose_edges = [e for e in bm.edges if not e.link_faces]
-                if loose_edges:
-                    _bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
-                loose_verts = [v for v in bm.verts if not v.link_faces and not v.link_edges]
-                if loose_verts:
-                    _bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
-                if not bm.faces:
-                    continue
-                new_mesh = bpy.data.meshes.new(f"{mesh.name}_mat{mat_idx}")
-                bm.to_mesh(new_mesh)
-                new_mesh.update()
-                mat = mesh.materials[mat_idx] if mat_idx < len(mesh.materials) else None
-                if mat:
-                    new_mesh.materials.append(mat)
-                    for p in new_mesh.polygons:
-                        p.material_index = 0
-                new_obj = bpy.data.objects.new(f"{obj.name}_mat{mat_idx}", new_mesh)
-                # Preserve the source object's parent link (if any) so nodes that
-                # already sit under a real Blender hierarchy still group correctly;
-                # UNTOLD_MATERIAL_SPLIT_SOURCE_PROP below is what reunites fragments
-                # of a *parentless* multi-material object, which parent-chain
-                # walking alone can't do since these fragments aren't parented to
-                # each other.
-                new_obj.parent = obj.parent
-                if obj.parent is not None:
-                    new_obj.matrix_parent_inverse = obj.matrix_parent_inverse.copy()
-                new_obj.matrix_world = obj.matrix_world.copy()
-                new_obj[UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
-                new_obj[UNTOLD_MATERIAL_SPLIT_SOURCE_PROP] = obj.name
-                bpy.context.scene.collection.objects.link(new_obj)
-                result.append(new_obj)
-            finally:
-                bm.free()
+
+        duplicate = obj.copy()
+        duplicate.data = obj.data.copy()
+        bpy.context.scene.collection.objects.link(duplicate)
+        before = set(bpy.context.scene.objects)
+
+        with bpy.context.temp_override(
+            object=duplicate,
+            active_object=duplicate,
+            selected_objects=[duplicate],
+            selected_editable_objects=[duplicate],
+        ):
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.separate(type="MATERIAL")
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        pieces = [o for o in bpy.context.scene.objects if o not in before]
+        pieces.append(duplicate)
+        for piece in pieces:
+            piece[UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
+            piece[UNTOLD_MATERIAL_SPLIT_SOURCE_PROP] = obj.name
+            # Collapse to the one used material slot so downstream extraction
+            # (which requires a single material assignment) picks the right one.
+            piece_used = {p.material_index for p in piece.data.polygons}
+            if piece_used:
+                used_index = piece_used.pop()
+                material = (
+                    piece.data.materials[used_index]
+                    if used_index < len(piece.data.materials)
+                    else None
+                )
+                piece.data.materials.clear()
+                if material is not None:
+                    piece.data.materials.append(material)
+                for polygon in piece.data.polygons:
+                    polygon.material_index = 0
+            result.append(piece)
     return result
 
 
