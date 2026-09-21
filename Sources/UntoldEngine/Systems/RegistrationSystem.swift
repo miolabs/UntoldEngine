@@ -826,9 +826,14 @@ private func registerRuntimeAnimationClips(
     var registeredNames: [String] = []
 
     for runtimeClip in runtimeClips {
-        let animationClip = AnimationClip(runtimeClip: runtimeClip)
-        animationComponent.animationClips[runtimeClip.name] = animationClip
-        registeredNames.append(runtimeClip.name)
+        // Register under the clip's own name unless another file already
+        // claimed it: distinct animation files often reuse an authoring-tool
+        // action name (e.g. "flex"), and clobbering would silently alias
+        // every later load to the last file.
+        if animationComponent.animationClips[runtimeClip.name] == nil {
+            animationComponent.animationClips[runtimeClip.name] = AnimationClip(runtimeClip: runtimeClip)
+            registeredNames.append(runtimeClip.name)
+        }
     }
 
     if runtimeClips.count == 1,
