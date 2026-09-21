@@ -29,7 +29,10 @@ enum DDMPrecompute {
     /// Smoothing schedule: `iterations` explicit Laplacian steps blending
     /// each vertex `blend` of the way toward its one-ring average. More
     /// iterations widen the smoothing radius (the DDM "p" parameter).
-    static let smoothingIterations = 24
+    /// The radius is topological — each step reaches one edge ring — so
+    /// production-density meshes (tens of thousands of vertices) need far
+    /// more steps than a low-poly test mesh for a visible effect.
+    static let smoothingIterations = 64
     static let smoothingBlend: Float = 0.85
 
     /// Diagonal regularizer added to the 3x3 block of each omega, scaled by
