@@ -147,6 +147,7 @@ final class DeformationSystem: @unchecked Sendable {
                     for: mesh, in: deformationComponent, device: commandBuffer.device
                 ) else { continue }
 
+                evaluatePoseDrivers(component: deformationComponent, mesh: mesh, entityId: entityId)
                 let morphDeltas = encodeMorphAccumulation(
                     encoder: encoder,
                     mesh: mesh,
@@ -381,7 +382,8 @@ final class DeformationSystem: @unchecked Sendable {
 
         let activeTargets = morphTargets.targets
             .compactMap { target -> (MorphTargetSet.Target, Float)? in
-                guard let weight = component.morphWeights[target.name], abs(weight) > 1e-4 else {
+                let driven = component.poseDriversEnabled ? component.drivenMorphWeights[target.name] : nil
+                guard let weight = driven ?? component.morphWeights[target.name], abs(weight) > 1e-4 else {
                     return nil
                 }
                 return (target, weight)

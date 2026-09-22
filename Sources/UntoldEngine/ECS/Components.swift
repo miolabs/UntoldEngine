@@ -382,6 +382,12 @@ public class DeformationComponent: Component {
     /// `setEntityMorphTargetWeight`); zero-weight targets are removed.
     var morphWeights: [String: Float] = [:]
 
+    /// Pose-space deformation: when enabled, morph targets authored with a
+    /// driver get their weight from the current pose each frame (see
+    /// `PoseDriverEvaluation`), overriding any manual weight for that target.
+    public var poseDriversEnabled: Bool = true
+    var drivenMorphWeights: [String: Float] = [:]
+
     /// Deformed streams per mesh, keyed by the mesh's MTKMesh identity and
     /// filled lazily by the deformation pass. Nil entries (pass not run yet,
     /// e.g. a graph without the deformation node) leave draws on the legacy
@@ -393,6 +399,7 @@ public class DeformationComponent: Component {
     func cleanUp() {
         meshDeformations.removeAll()
         morphWeights.removeAll()
+        drivenMorphWeights.removeAll()
     }
 }
 
