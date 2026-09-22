@@ -98,11 +98,14 @@ applies the same factor both ways, so a pose read with
 non-uniform rest scale under a rotation is approximated by its per-axis
 factors.
 
-**Clip switches.** A `changeAnimation` (or a motion-matching jump) while a
-physics pose is active inertializes from the pose on screen — the blended
-one. That is what a get-up wants: the clip starts where the body lies and
-eases into itself. For a cut, such as a reset that teleports the entity,
-pass `transitionHalflife: 0`.
+**Clip switches and pose history.** The blend reaches the skin and nothing
+else: the local pose the engine keeps between updates is the animation's
+own, so a `changeAnimation` or a motion-matching jump while a physics pose
+is active inertializes from the animation, not from the bodies. A body
+driven toward the animation (a powered ragdoll) therefore never drags the
+animation after itself. A get-up that should ease out of the fallen pose
+is the game's to author: read the displayed pose, hand it back as a
+physics pose and fade its weights.
 
 **Model space.** The skin matrices carry no entity transform — the shader
 applies it — so model space is the entity's space. A joint's world

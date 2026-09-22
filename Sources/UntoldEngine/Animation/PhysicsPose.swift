@@ -58,10 +58,30 @@ struct PhysicsPoseState {
     /// translation picks up from its ancestors' rest scales.
     var scales: [simd_float3] = []
 
+    /// The animated local pose the blend replaced, put back once the skin
+    /// has taken the blend: the physics pose lands on the skin only, never
+    /// in the pose history that transitions and motion matching inertialize
+    /// from — a body driven toward the animation must not drag the
+    /// animation after itself.
+    var animatedLocalPose = PoseBuffer()
+    var blendedThisFrame = false
+
     mutating func clear() {
         isActive = false
         modelTransforms = []
         weights = []
+        blendedThisFrame = false
+    }
+}
+
+extension PoseBuffer {
+    /// Copies `other` in without allocating in steady state.
+    mutating func assign(from other: PoseBuffer) {
+        resize(jointCount: other.jointCount)
+        for index in 0 ..< other.jointCount {
+            translations[index] = other.translations[index]
+            rotations[index] = other.rotations[index]
+        }
     }
 }
 
@@ -92,6 +112,7 @@ func applyPhysicsPose(
     skeleton: Skeleton,
     localScales: [simd_float3]
 ) {
+    animationComponent.physicsPose.blendedThisFrame = false
     guard animationComponent.physicsPose.isActive else { return }
 
     let jointCount = skeleton.jointPaths.count
@@ -99,6 +120,10 @@ func applyPhysicsPose(
           animationComponent.physicsPose.modelTransforms.count == jointCount,
           animationComponent.physicsPose.weights.count == jointCount
     else { return }
+
+    // The animated pose survives the blend (see `restoreAnimatedLocalPose`).
+    animationComponent.physicsPose.animatedLocalPose.assign(from: animationComponent.localPose)
+    animationComponent.physicsPose.blendedThisFrame = true
 
     if animationComponent.physicsPose.positions.count != jointCount {
         animationComponent.physicsPose.positions = [simd_float3](repeating: .zero, count: jointCount)
@@ -151,4 +176,13 @@ func applyPhysicsPose(
         )
         animationComponent.physicsPose.scales[index] = hasScales ? parentScale * localScales[index] : parentScale
     }
+}
+
+/// Once the skin has taken the blended pose, the animated local pose comes
+/// back: everything that reads `localPose` between updates — a transition
+/// beginning, the pose history, the next frame's inertialization — sees the
+/// animation's own pose. The displayed model pose keeps the blend.
+func restoreAnimatedLocalPose(animationComponent: AnimationComponent) {
+    guard animationComponent.physicsPose.blendedThisFrame else { return }
+    animationComponent.localPose.assign(from: animationComponent.physicsPose.animatedLocalPose)
 }

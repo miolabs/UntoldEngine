@@ -344,6 +344,29 @@ final class AnimationPhysicsPoseTests: XCTestCase {
         XCTAssertGreaterThan(abs(simd_dot(actualRotation.vector, expectedRotation.vector)), 0.9999)
     }
 
+    /// The blend reaches the skin and nothing else: the local pose the
+    /// engine keeps between updates — what a transition or a motion
+    /// matching jump inertializes from — is the animation's own.
+    func testTheBlendStaysOutOfThePoseHistory() {
+        setPose(weights: [0, 0, 1], b: physicsB)
+        AnimationSystem.shared.update(deltaTime)
+        assertMatrix(displayedModel()[2], physicsB, "the skin shows the physics pose")
+        let animatedLocal = Self.rigid(bOffset, bRotation)
+        let kept = Self.rigid(animationComponent.localPose.translations[2], animationComponent.localPose.rotations[2])
+        assertMatrix(kept, animatedLocal, "the local pose kept between updates is the clip's")
+
+        // A transition begun now inertializes from the clip, not from the
+        // physics pose: once the physics pose is cleared, the displayed
+        // pose is the clip's at once, with no offset to decay.
+        changeAnimation(entityId: entityId, name: "hold", transitionHalflife: 0.3)
+        clearPhysicsPose(entityId: entityId)
+        AnimationSystem.shared.update(deltaTime)
+        let displayed = displayedModel()
+        for index in jointPaths.indices {
+            assertMatrix(displayed[index], animatedModel[index], accuracy: 1e-3, "joint \(index)")
+        }
+    }
+
     func testWeightsAreClampedToTheUnitRange() {
         setPhysicsPose(
             entityId: entityId, jointModelTransforms: [.identity, physicsA, .identity], jointWeights: [-1, 3, 0]
