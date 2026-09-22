@@ -422,7 +422,20 @@ public enum AnimationPolicy: String, CaseIterable, Sendable {
 }
 
 public class AnimationComponent: Component {
-    var animationClips: [String: AnimationClip] = [:]
+    /// didSet prunes compiledClips whenever a clip is replaced or removed:
+    /// registerRuntimeAnimationClips overwrites entries in this dictionary
+    /// directly (not through removeAnimationClip), and CompiledAnimationClip
+    /// holds no reference back to its source AnimationClip. Without pruning,
+    /// a replaced clip's stale ObjectIdentifier key would linger in
+    /// compiledClips and could later be reassigned to an unrelated clip if
+    /// Swift reuses the freed address, silently serving the wrong pose data.
+    var animationClips: [String: AnimationClip] = [:] {
+        didSet {
+            let live = Set(animationClips.values.map(ObjectIdentifier.init))
+            compiledClips = compiledClips.filter { live.contains($0.key) }
+        }
+    }
+
     var currentAnimation: AnimationClip?
     public var animationsFilenames: [URL] = []
     var pause: Bool = false
@@ -432,8 +445,12 @@ public class AnimationComponent: Component {
 
     // Compiled sampling state (see docs/Architecture/animationPoseLayer.md):
     // clips resolved against this entity's skeleton, plus the per-entity
-    // sampler cursors and local pose the frame update writes into.
-    var compiledClips: [String: CompiledAnimationClip] = [:]
+    // sampler cursors and local pose the frame update writes into. Keyed by
+    // clip identity rather than AnimationClip.name: that name comes from the
+    // asset file (e.g. the source Blender action) and independently exported
+    // clips commonly share it, which previously made two distinct clips
+    // collide on one cache slot and serve each other's compiled pose data.
+    var compiledClips: [ObjectIdentifier: CompiledAnimationClip] = [:]
     var sampler = ClipSampler()
     var localPose = PoseBuffer()
 
@@ -479,17 +496,17 @@ public class AnimationComponent: Component {
 
     func removeAnimationClip(animationClip: String) {
         animationClips.removeValue(forKey: animationClip)
-        compiledClips.removeValue(forKey: animationClip)
     }
 
     /// Returns the compiled form of `clip` resolved against `skeleton`,
     /// compiling and caching it on first use.
     func compiledClip(for clip: AnimationClip, skeleton: Skeleton) -> CompiledAnimationClip {
-        if let cached = compiledClips[clip.name], cached.jointCount == skeleton.jointPaths.count {
+        let key = ObjectIdentifier(clip)
+        if let cached = compiledClips[key], cached.jointCount == skeleton.jointPaths.count {
             return cached
         }
         let compiled = CompiledAnimationClip(clip: clip, skeleton: skeleton)
-        compiledClips[clip.name] = compiled
+        compiledClips[key] = compiled
         return compiled
     }
 }
