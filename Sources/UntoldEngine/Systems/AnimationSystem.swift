@@ -274,6 +274,10 @@ private func updateAnimationSystem(deltaTime: Float) {
                 skin.updateJointMatrices(skeleton: skeletonComponent.skeleton)
             }
         }
+
+        // The physics pose was for the skin: the pose history stays the
+        // animation's own.
+        restoreAnimatedLocalPose(animationComponent: animationComponent)
     }
 }
 
