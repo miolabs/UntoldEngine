@@ -33,14 +33,20 @@ guard let joints = getSkeletonJointInfo(entityId: zombie) else { return }
 // joints.bindModelTransforms: model-space bind pose, one per joint
 ```
 
-2. Each frame, read the displayed pose to drive the rig (kinematic bodies
-   follow the animation) or to seed it (a ragdoll starts from the pose it
-   fell out of). The transforms are in the entity's model space; multiply
-   by the entity's world transform for world space:
+2. Each frame, read the pose to drive the rig (kinematic bodies follow
+   the animation, motors pull toward it) or to seed it (a ragdoll starts
+   from the pose it fell out of). `getJointModelTransforms` is the pose
+   on screen, physics pose included — right for seeding, since that is
+   where the body visibly is. `getAnimatedJointModelTransforms` is the
+   animation's own pose before the physics blend — right for driving,
+   since the displayed pose already contains the bodies' result and
+   aiming at it would only hold them where they are (they agree while no
+   physics pose is active). The transforms are in the entity's model
+   space; multiply by the entity's world transform for world space:
 
 ```swift
 let world = scene.get(component: WorldTransformComponent.self, for: zombie)?.space ?? .identity
-if let model = getJointModelTransforms(entityId: zombie) {
+if let model = getAnimatedJointModelTransforms(entityId: zombie) {
     for (index, transform) in model.enumerated() {
         rig.setKinematicTarget(index, world * transform)
     }
@@ -83,8 +89,20 @@ a model-space forward kinematics of the pose *as it is being modified*:
    its parent wherever that parent ended up — an animated hand rides on a
    physics-driven forearm.
 
-The rest scale is ignored in this composition, as in the IK stages; the
-skeleton folds it back in when it builds the skin matrices.
+Rotations compose rigidly, as in the IK stages. Rest scale enters only
+where it moves a joint: a child's local translation is scaled by its
+ancestors' rest scales when the skeleton builds the skin, and the blend
+applies the same factor both ways, so a pose read with
+`getJointModelTransforms` (rest scale included) comes back through
+`setPhysicsPose` unchanged. Uniform rest scales round-trip exactly; a
+non-uniform rest scale under a rotation is approximated by its per-axis
+factors.
+
+**Clip switches.** A `changeAnimation` (or a motion-matching jump) while a
+physics pose is active inertializes from the pose on screen — the blended
+one. That is what a get-up wants: the clip starts where the body lies and
+eases into itself. For a cut, such as a reset that teleports the entity,
+pass `transitionHalflife: 0`.
 
 **Model space.** The skin matrices carry no entity transform — the shader
 applies it — so model space is the entity's space. A joint's world

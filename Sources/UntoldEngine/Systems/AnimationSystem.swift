@@ -242,11 +242,22 @@ private func updateAnimationSystem(deltaTime: Float) {
         )
         // The physics pose lands last, on the fully animated pose, so for
         // the joints it weights the plugin's bodies win over every stage
-        // above.
+        // above. The animation's own pose is kept aside first, so a plugin
+        // driving its bodies toward the animation never chases its own
+        // blended result.
+        if animationComponent.physicsPose.isActive {
+            skeletonComponent.skeleton.captureAnimatedPose(
+                from: animationComponent.localPose,
+                localScales: compiledClip.restScales
+            )
+        } else {
+            skeletonComponent.skeleton.animatedPoseCaptured = false
+        }
         applyPhysicsPose(
             entityId: entity,
             animationComponent: animationComponent,
-            skeleton: skeletonComponent.skeleton
+            skeleton: skeletonComponent.skeleton,
+            localScales: compiledClip.restScales
         )
 
         animationComponent.hasSampledPose = true
@@ -656,6 +667,18 @@ public func getSkeletonJointInfo(entityId: EntityID) -> SkeletonJointInfo? {
 public func getJointModelTransforms(entityId: EntityID) -> [simd_float4x4]? {
     guard let skeleton = resolveAnimatedSkeleton(entityId: entityId) else { return nil }
     return skeleton.displayedModelPose
+}
+
+/// Model-space joint transforms of the animation alone — the pose the last
+/// update composed before the physics pose was blended in — in skeleton
+/// joint order and model space like `getJointModelTransforms`, and equal
+/// to it while no physics pose is active. A plugin drives its bodies
+/// toward this pose: the displayed pose already carries the bodies' own
+/// result, so aiming at it would only hold them where they are. Nil when
+/// there is no skeleton.
+public func getAnimatedJointModelTransforms(entityId: EntityID) -> [simd_float4x4]? {
+    guard let skeleton = resolveAnimatedSkeleton(entityId: entityId) else { return nil }
+    return skeleton.animatedModelPose
 }
 
 /// Hands in a pose from physics: one model-space transform and one weight

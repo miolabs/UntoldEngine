@@ -54,6 +54,9 @@ struct PhysicsPoseState {
     /// allocates in steady state.
     var positions: [simd_float3] = []
     var rotations: [simd_quatf] = []
+    /// Accumulated rest scale per joint, the factor a child's local
+    /// translation picks up from its ancestors' rest scales.
+    var scales: [simd_float3] = []
 
     mutating func clear() {
         isActive = false
@@ -75,13 +78,19 @@ struct PhysicsPoseState {
 /// 0 keep their animated local transform relative to their (possibly
 /// physics-driven) parent.
 ///
-/// Rest scale is ignored here, as in the IK stages: the composition is
-/// rigid, and the skeleton folds the rest scale back in when it builds
-/// the skin matrices.
+/// Rotations are composed rigidly, as in the IK stages. Rest scale enters
+/// only where it moves a joint: a child's local translation is scaled by
+/// its ancestors' rest scales when the skeleton builds the skin, so the
+/// walk accumulates that factor and applies it to translations both ways —
+/// the model-space pose a plugin reads with `getJointModelTransforms`
+/// (rest scale included) comes back through here unchanged. Exact for
+/// uniform rest scales; a non-uniform rest scale under a rotation is
+/// approximated by its per-axis factors.
 func applyPhysicsPose(
     entityId _: EntityID,
     animationComponent: AnimationComponent,
-    skeleton: Skeleton
+    skeleton: Skeleton,
+    localScales: [simd_float3]
 ) {
     guard animationComponent.physicsPose.isActive else { return }
 
@@ -96,7 +105,9 @@ func applyPhysicsPose(
         animationComponent.physicsPose.rotations = [simd_quatf](
             repeating: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1), count: jointCount
         )
+        animationComponent.physicsPose.scales = [simd_float3](repeating: simd_float3(repeating: 1), count: jointCount)
     }
+    let hasScales = localScales.count == jointCount
 
     let parentIndices = skeleton.parentIndices
     let weights = animationComponent.physicsPose.weights
@@ -107,6 +118,7 @@ func applyPhysicsPose(
         let parentPosition = parentIndex.map { animationComponent.physicsPose.positions[$0] } ?? .zero
         let parentRotation = parentIndex.map { animationComponent.physicsPose.rotations[$0] }
             ?? simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        let parentScale = parentIndex.map { animationComponent.physicsPose.scales[$0] } ?? simd_float3(repeating: 1)
 
         let weight = weights[index]
         if weight > 0 {
@@ -125,7 +137,7 @@ func applyPhysicsPose(
 
             let parentIsAnimated = parentIndex.map { weights[$0] <= 0 } ?? true
             if parentIsAnimated {
-                let targetLocalPosition = inverseParentRotation.act(targetModelPosition - parentPosition)
+                let targetLocalPosition = inverseParentRotation.act(targetModelPosition - parentPosition) / parentScale
                 animationComponent.localPose.translations[index] = simd_mix(
                     animationComponent.localPose.translations[index], targetLocalPosition, simd_float3(repeating: weight)
                 )
@@ -133,9 +145,10 @@ func applyPhysicsPose(
         }
 
         animationComponent.physicsPose.positions[index] = parentPosition
-            + parentRotation.act(animationComponent.localPose.translations[index])
+            + parentRotation.act(parentScale * animationComponent.localPose.translations[index])
         animationComponent.physicsPose.rotations[index] = simd_normalize(
             parentRotation * animationComponent.localPose.rotations[index]
         )
+        animationComponent.physicsPose.scales[index] = hasScales ? parentScale * localScales[index] : parentScale
     }
 }

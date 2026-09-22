@@ -175,7 +175,42 @@ final class AnimationPhysicsPoseTests: XCTestCase {
         let bare = createEntity()
         XCTAssertNil(getSkeletonJointInfo(entityId: bare))
         XCTAssertNil(getJointModelTransforms(entityId: bare))
+        XCTAssertNil(getAnimatedJointModelTransforms(entityId: bare))
         destroyEntity(entityId: bare)
+    }
+
+    func testAnimatedTransformsAreTheDisplayedOnesWithoutAPhysicsPose() throws {
+        let beforeUpdate = try XCTUnwrap(getAnimatedJointModelTransforms(entityId: entityId))
+        for index in jointPaths.indices {
+            assertMatrix(beforeUpdate[index], binds[index], "bind \(index)")
+        }
+
+        AnimationSystem.shared.update(deltaTime)
+        let animated = try XCTUnwrap(getAnimatedJointModelTransforms(entityId: entityId))
+        let displayed = displayedModel()
+        for index in jointPaths.indices {
+            assertMatrix(animated[index], displayed[index], "joint \(index)")
+        }
+    }
+
+    func testAnimatedTransformsStayTheClipsWhileAPhysicsPoseIsDisplayed() throws {
+        setPose(weights: [0, 1, 1], a: physicsA, b: physicsB)
+        AnimationSystem.shared.update(deltaTime)
+
+        let displayed = displayedModel()
+        assertMatrix(displayed[1], physicsA, "the displayed pose is the bodies'")
+        let animated = try XCTUnwrap(getAnimatedJointModelTransforms(entityId: entityId))
+        for index in jointPaths.indices {
+            assertMatrix(animated[index], animatedModel[index], "joint \(index)")
+        }
+
+        // Cleared, the two agree again on the next update.
+        clearPhysicsPose(entityId: entityId)
+        AnimationSystem.shared.update(deltaTime)
+        let after = try XCTUnwrap(getAnimatedJointModelTransforms(entityId: entityId))
+        for index in jointPaths.indices {
+            assertMatrix(after[index], displayedModel()[index], "joint \(index)")
+        }
     }
 
     // MARK: - Blending
@@ -264,6 +299,49 @@ final class AnimationPhysicsPoseTests: XCTestCase {
         for index in jointPaths.indices {
             assertMatrix(displayed[index], animatedModel[index], "joint \(index)")
         }
+    }
+
+    /// A rig whose root carries a rest scale: the model pose read back
+    /// (rest scale included) hands itself in as the physics pose without
+    /// moving anything, and a physics target lands where it says.
+    func testRestScaleRoundTripsThroughThePhysicsPose() {
+        let scale: Float = 2
+        scene.get(component: SkeletonComponent.self, for: entityId)?.skeleton = Skeleton(runtimeSkeleton: RuntimeSkeleton(
+            jointPaths: jointPaths, parentIndices: parentIndices,
+            bindTransforms: [
+                simd_float4x4(scale: simd_float3(repeating: scale)),
+                simd_float4x4(translation: aOffset * scale) * simd_float4x4(scale: simd_float3(repeating: scale)),
+                simd_float4x4(translation: (aOffset + bOffset) * scale) * simd_float4x4(scale: simd_float3(repeating: scale)),
+            ],
+            restTransforms: [
+                simd_float4x4(scale: simd_float3(repeating: scale)),
+                simd_float4x4(translation: aOffset),
+                simd_float4x4(translation: bOffset),
+            ]
+        ))
+        changeAnimation(entityId: entityId, name: "hold", transitionHalflife: 0)
+        AnimationSystem.shared.update(deltaTime)
+        let animated = displayedModel()
+        XCTAssertEqual(translation(of: animated[1]).y, aOffset.y * scale, accuracy: 1e-4, "the root's rest scale reaches the child")
+
+        // Identity round trip at full weight everywhere.
+        setPhysicsPose(entityId: entityId, jointModelTransforms: animated, jointWeights: [1, 1, 1])
+        AnimationSystem.shared.update(deltaTime)
+        let roundTrip = displayedModel()
+        for index in jointPaths.indices {
+            assertMatrix(roundTrip[index], animated[index], accuracy: 1e-3, "joint \(index)")
+        }
+
+        // A moved subtree top lands on its model-space target.
+        let target = Self.rigid(simd_float3(0.4, 2.6, 0.2), simd_quatf(angle: 0.4, axis: simd_float3(0, 0, 1)))
+            * simd_float4x4(scale: simd_float3(repeating: scale))
+        setPhysicsPose(entityId: entityId, jointModelTransforms: [.identity, target, .identity], jointWeights: [0, 1, 0])
+        AnimationSystem.shared.update(deltaTime)
+        let moved = displayedModel()
+        XCTAssertLessThan(simd_distance(translation(of: moved[1]), translation(of: target)), 1e-3)
+        let expectedRotation = rotation(of: target)
+        let actualRotation = rotation(of: moved[1])
+        XCTAssertGreaterThan(abs(simd_dot(actualRotation.vector, expectedRotation.vector)), 0.9999)
     }
 
     func testWeightsAreClampedToTheUnitRange() {
