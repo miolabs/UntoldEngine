@@ -62,6 +62,14 @@ class Skeleton {
         jointPaths.compactMap { self.jointPaths.firstIndex(of: $0) }
     }
 
+    /// The model-space joint matrices the last `updateWorldPose(from:localScales:)`
+    /// composed — the pose the skin shows — or the bind pose before the first
+    /// update, when nothing has been composed yet and the skin still carries
+    /// its identity fill (bind times inverse bind).
+    var displayedModelPose: [simd_float4x4] {
+        worldPoseScratch.count == jointPaths.count ? worldPoseScratch : bindTransform
+    }
+
     /// Updates the skeleton's world pose from a sampled local-space pose.
     /// Local matrices are rebuilt as T * R * S(rest scale), the hierarchy is
     /// composed, and the inverse bind transforms are applied — matching
