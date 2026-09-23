@@ -136,7 +136,12 @@ public extension RenderPasses {
         renderEncoder.label = "Muscle Debug Pass"
         renderEncoder.pushDebugGroup("Muscle Debug Pass")
         renderEncoder.setRenderPipelineState(pipelineState)
-        if let depthState = pipeline.depthState {
+        // The cages live under the skin, so never depth-test them. In visionOS
+        // mixed immersion the compositor drops pixels that wrote no depth, so
+        // there the lines must write theirs (same reason as the wireframe pass).
+        if let depthState = system.muscleDebugDepthState(
+            device: renderInfo.device, writeDepth: renderInfo.immersionStyle == .mixed
+        ) {
             renderEncoder.setDepthStencilState(depthState)
         }
         renderEncoder.waitForFence(renderInfo.fence, before: .vertex)

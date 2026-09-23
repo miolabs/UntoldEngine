@@ -32,6 +32,20 @@ final class DeformationSystem: @unchecked Sendable {
     /// Muscle cage wireframe overlay (see `RenderPasses.muscleDebugExecution`).
     var muscleDebugOverlayEnabled = false
     var muscleDebugLineBuffer: MTLBuffer?
+    private var muscleDebugDepthStates: [Bool: MTLDepthStencilState] = [:]
+
+    /// Always-pass depth state for the cage overlay, optionally writing depth.
+    func muscleDebugDepthState(device: MTLDevice, writeDepth: Bool) -> MTLDepthStencilState? {
+        if let cached = muscleDebugDepthStates[writeDepth] {
+            return cached
+        }
+        let descriptor = MTLDepthStencilDescriptor()
+        descriptor.depthCompareFunction = .always
+        descriptor.isDepthWriteEnabled = writeDepth
+        let state = device.makeDepthStencilState(descriptor: descriptor)
+        muscleDebugDepthStates[writeDepth] = state
+        return state
+    }
 
     var musclePredictPipeline = ComputePipeline()
     var muscleVolumeGradientPipeline = ComputePipeline()
