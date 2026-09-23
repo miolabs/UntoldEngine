@@ -27,6 +27,9 @@ V1 supports:
   `untold_driver_joint` / `untold_driver_pose` / `untold_driver_radius`
   custom properties on the shape key (or `<key>_untold_driver_*` on the mesh
   object where shape-key IDProperties are unavailable).
+- volumetric muscles (chunk 27: per-skeleton muscle definitions the engine
+  turns into procedural XPBD tet cages at load; exported from a JSON rig
+  description with `--muscles`).
 
 The design goals are:
 
@@ -537,6 +540,55 @@ The exporter does not write this chunk; a link is authored after the export by
 table, copy every other chunk's stored bytes, re-lay out the chunk offsets on the file
 alignment and recompute the content hash (`UntoldFormat.contentHash(of:in:)`).
 
+## Muscle Record Encoding
+
+Chunk type `27` (`muscleTable`) describes the volumetric muscles of a skeleton.
+The engine builds each muscle procedurally at load (a fusiform tetrahedral cage
+between two bone attachments), simulates it with XPBD inside the deformation
+pass and wraps the result onto the skinned surface, so the file stores only
+the definition, never geometry. One record per muscle; `elementCount` is the
+record count. Records are 128 bytes:
+
+```text
+skeletonEntityId             UInt32   // skeleton table entity id
+nameOffset                   UInt32
+flags                        UInt32   // 1 = the driver fields are valid
+forwardJointOffset           UInt32   // joint pair whose bind-pose direction is "forward"
+forwardTipJointOffset        UInt32   // (UInt32.max on both = model +Z)
+originJointOffset            UInt32   // joint name (last path component) or full path
+originTipJointOffset         UInt32   // bone tip override (UInt32.max = first non-twist child)
+originFraction               Float32  // 0 = at the joint, 1 = at the bone tip
+originOffset                 Float32 x 3  // character frame (lateral-left, up, forward), model units
+insertionJointOffset         UInt32
+insertionTipJointOffset      UInt32
+insertionFraction            Float32
+insertionOffset              Float32 x 3
+bellyRadius                  Float32
+tendonRadius                 Float32
+maxContraction               Float32  // fiber rest-length reduction at full activation
+fiberCompliance              Float32  // XPBD compliances (0 = rigid)
+crossCompliance              Float32
+volumeCompliance             Float32
+damping                      Float32  // velocity damping per second
+boneRadius                   Float32  // bone capsule collision radius (0 = none)
+skinInfluence                Float32  // skin binding falloff beyond the muscle surface
+rings                        UInt32   // cross-section rings along the axis (>= 2)
+segments                     UInt32   // vertices per ring (>= 3)
+driverJointOffset            UInt32   // activation driver joint (flags bit 0)
+driverStartAngle             Float32  // radians of rest-relative rotation at activation 0
+driverFullAngle              Float32  // radians at activation 1 (smaller than start = inverted)
+reserved0                    UInt32
+```
+
+Rules:
+
+- `skeletonEntityId` must match a skeleton record
+- both attachment joint offsets must be valid strings; unresolvable joint
+  names skip the muscle at load with a warning rather than failing the file
+- `rings >= 2`, `segments >= 3`, both radii `> 0`
+- the first record with a forward joint pair defines the character frame for
+  the whole skeleton
+
 ## Compression Rules
 
 Supported compression types:
@@ -568,6 +620,8 @@ The loader must reject files when:
 - vertex, index, or edge-index ranges exceed their chunk bounds
 - `vertexStrideBytes` does not match the declared vertex layout
 - `indexDataSizeBytes` does not match `indexCount * indexElementSize`
+- a muscle record references an unknown skeleton, lacks an attachment joint,
+  or has fewer than 2 rings / 3 segments or a non-positive radius
 
 ## Implementation Notes
 

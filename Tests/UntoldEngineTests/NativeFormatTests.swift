@@ -332,6 +332,114 @@ final class NativeFormatTests: XCTestCase {
         XCTAssertNil(runtimeTarget.driver, "Driver without a joint path must be dropped")
     }
 
+    func testMuscleTableRoundtripsIntoRuntimeSkeleton() throws {
+        // A one-joint skeleton on entity 0 plus one muscle record referencing
+        // it, assembled through the generic extra-chunk path. The tiny
+        // fixture's strings double as joint names.
+        let skeletonWriter = UntoldBinaryWriter()
+        UntoldSkeletonRecordV1(entityId: 0, nameOffset: 0, firstJointRecordIndex: 0, jointRecordCount: 2)
+            .encode(to: skeletonWriter)
+        let jointWriter = UntoldBinaryWriter()
+        let names = makeStringTable(["root_entity", "mesh_0", "mat_0", "albedo.ktx2"]).offsets
+        let joint0 = UntoldSkeletonJointRecordV1(
+            parentJointIndex: UntoldFormat.invalidIndex,
+            jointPathOffset: names["mesh_0"] ?? 0,
+            bindTransform: matrix_identity_float4x4,
+            restTransform: matrix_identity_float4x4
+        )
+        let joint1 = UntoldSkeletonJointRecordV1(
+            parentJointIndex: 0,
+            jointPathOffset: names["mat_0"] ?? 0,
+            bindTransform: matrix_identity_float4x4,
+            restTransform: matrix_identity_float4x4
+        )
+        joint0.encode(to: jointWriter)
+        joint1.encode(to: jointWriter)
+
+        let muscleWriter = UntoldBinaryWriter()
+        let muscle = UntoldMuscleRecordV1(
+            skeletonEntityId: 0,
+            nameOffset: names["root_entity"] ?? 0,
+            flags: UntoldMuscleRecordV1.flagHasDriver,
+            originJointOffset: names["mesh_0"] ?? 0,
+            originFraction: 0.15,
+            originOffset: SIMD3<Float>(0, 0, 0.02),
+            insertionJointOffset: names["mat_0"] ?? 0,
+            insertionFraction: 0.2,
+            insertionOffset: SIMD3<Float>(0, 0, 0.01),
+            bellyRadius: 0.04,
+            tendonRadius: 0.012,
+            maxContraction: 0.25,
+            fiberCompliance: 2e-6,
+            crossCompliance: 4e-6,
+            volumeCompliance: 0,
+            damping: 6,
+            boneRadius: 0.03,
+            skinInfluence: 0.03,
+            rings: 7,
+            segments: 8,
+            driverJointOffset: names["mat_0"] ?? 0,
+            driverStartAngle: 0.2,
+            driverFullAngle: 1.9
+        )
+        muscle.encode(to: muscleWriter)
+        XCTAssertEqual(muscleWriter.data.count, UntoldMuscleRecordV1.byteSize)
+
+        let fixture = makeTinyFixture(pluginChunks: [
+            (.skeletonTable, skeletonWriter.data, 1),
+            (.skeletonJointTable, jointWriter.data, 2),
+            (.muscleTable, muscleWriter.data, 1),
+        ])
+
+        let decoded = try UntoldReader().readAsset(from: fixture.fileData)
+        XCTAssertEqual(decoded.muscles, [muscle])
+
+        let loaded = try NativeFormatLoader().loadAssetSync(from: writeFixtureToTemporaryFile(fixture.fileData))
+        let rig = try XCTUnwrap(loaded.nodes.first?.skeleton?.muscleRig)
+        XCTAssertNil(rig.forwardReference)
+        XCTAssertEqual(rig.muscles.count, 1)
+        let definition = rig.muscles[0]
+        XCTAssertEqual(definition.name, "root_entity")
+        XCTAssertEqual(definition.origin.jointName, "mesh_0")
+        XCTAssertEqual(definition.insertion.jointName, "mat_0")
+        XCTAssertEqual(definition.origin.fraction, 0.15)
+        XCTAssertEqual(definition.insertion.offset, SIMD3<Float>(0, 0, 0.01))
+        XCTAssertEqual(definition.rings, 7)
+        XCTAssertEqual(definition.driver?.jointName, "mat_0")
+        XCTAssertEqual(definition.driver?.fullAngle, 1.9)
+    }
+
+    func testRejectsMuscleWithUnknownSkeleton() throws {
+        let muscleWriter = UntoldBinaryWriter()
+        UntoldMuscleRecordV1(
+            skeletonEntityId: 9,
+            nameOffset: UntoldFormat.invalidIndex,
+            originJointOffset: 0,
+            originFraction: 0,
+            originOffset: .zero,
+            insertionJointOffset: 0,
+            insertionFraction: 1,
+            insertionOffset: .zero,
+            bellyRadius: 0.04,
+            tendonRadius: 0.01,
+            maxContraction: 0.2,
+            fiberCompliance: 0,
+            crossCompliance: 0,
+            volumeCompliance: 0,
+            damping: 1,
+            boneRadius: 0,
+            skinInfluence: 0.01,
+            rings: 4,
+            segments: 6
+        ).encode(to: muscleWriter)
+        let fixture = makeTinyFixture(pluginChunks: [(.muscleTable, muscleWriter.data, 1)])
+        XCTAssertThrowsError(try UntoldReader().readAsset(from: fixture.fileData)) { error in
+            guard case .invalidMuscleRecord(index: 0, reason: _)? = error as? UntoldValidationError else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+
     func testRejectsMorphTargetWithInvalidMeshIndex() throws {
         let targetWriter = UntoldBinaryWriter()
         UntoldMorphTargetRecordV1(

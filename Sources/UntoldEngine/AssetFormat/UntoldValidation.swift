@@ -44,5 +44,6 @@ public enum UntoldValidationError: Error, Sendable, Equatable {
     case invalidMorphTargetMesh(targetIndex: Int, meshRecordIndex: UInt32)
     case invalidMorphTargetEntryRange(targetIndex: Int, entryEnd: UInt64, totalEntries: UInt64)
     case invalidMorphDriverTarget(UInt32)
+    case invalidMuscleRecord(index: Int, reason: String)
     case invalidGaussianAssetRecord(index: Int, reason: String)
 }

@@ -93,6 +93,7 @@ CHUNK_TYPES = {
     "morph_target_data": 24,
     "gaussian_asset_table": 25,
     "morph_driver_table": 26,
+    "muscle_table": 27,
 }
 
 VERTEX_LAYOUT_PBR_STATIC_V1 = 1
@@ -108,6 +109,8 @@ try:
 except ImportError:
     _MORPH_DTYPE = None
 MORPH_FLAG_HAS_NORMAL_DELTAS = 1 << 0
+MUSCLE_RECORD_SIZE = 128
+MUSCLE_FLAG_HAS_DRIVER = 1 << 0
 # Set from --export-shapekeys; shape keys are skipped entirely when False.
 EXPORT_SHAPE_KEYS = False
 INDEX_TYPE_UINT16 = 1
@@ -448,6 +451,12 @@ class StringTableBuilder:
         self._offsets[value] = offset
         return offset
 
+    def string_at(self, offset: int) -> Optional[str]:
+        for value, existing in self._offsets.items():
+            if existing == offset:
+                return value
+        return None
+
     @property
     def data(self) -> bytes:
         return self._writer.data
@@ -589,6 +598,178 @@ class SkeletonRecord:
     name_offset: int
     first_joint_record_index: int
     joint_record_count: int
+
+
+@dataclass(frozen=True)
+class MuscleRecord:
+    skeleton_entity_id: int
+    name_offset: int
+    flags: int
+    forward_joint_offset: int
+    forward_tip_joint_offset: int
+    origin_joint_offset: int
+    origin_tip_joint_offset: int
+    origin_fraction: float
+    origin_offset: tuple[float, float, float]
+    insertion_joint_offset: int
+    insertion_tip_joint_offset: int
+    insertion_fraction: float
+    insertion_offset: tuple[float, float, float]
+    belly_radius: float
+    tendon_radius: float
+    max_contraction: float
+    fiber_compliance: float
+    cross_compliance: float
+    volume_compliance: float
+    damping: float
+    bone_radius: float
+    skin_influence: float
+    rings: int
+    segments: int
+    driver_joint_offset: int
+    driver_start_angle: float
+    driver_full_angle: float
+
+
+MUSCLE_DEFAULTS: dict[str, float] = {
+    "maxContraction": 0.25,
+    "fiberCompliance": 2e-6,
+    "crossCompliance": 4e-6,
+    "volumeCompliance": 0.0,
+    "damping": 6.0,
+    "boneRadius": 0.0,
+    "skinInfluence": 0.03,
+    "rings": 7,
+    "segments": 8,
+}
+
+
+def load_muscle_rig(path: Path) -> dict:
+    """Reads and validates a muscle rig description (`--muscles`).
+
+    Schema (angles in degrees, lengths in model units, offsets in the character
+    frame lateral-left / up / forward):
+
+        {
+          "skeleton": "Armature",                       # optional skeleton name
+          "forwardReference": {"from": "LeftFoot", "to": "LeftToeBase"},   # optional
+          "muscles": [
+            {"name": "bicepsL",
+             "origin":    {"joint": "LeftArm",     "fraction": 0.15, "offset": [0, 0, 0.03], "tip": null},
+             "insertion": {"joint": "LeftForeArm", "fraction": 0.2,  "offset": [0, 0, 0.01]},
+             "bellyRadius": 0.045, "tendonRadius": 0.012,
+             "maxContraction": 0.25, "fiberCompliance": 2e-6, "crossCompliance": 4e-6,
+             "volumeCompliance": 0, "damping": 6, "boneRadius": 0.03, "skinInfluence": 0.03,
+             "rings": 7, "segments": 8,
+             "driver": {"joint": "LeftForeArm", "startAngle": 10, "fullAngle": 110}}
+          ]
+        }
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        rig = json.load(handle)
+    return validate_muscle_rig(rig)
+
+
+def validate_muscle_rig(rig: object) -> dict:
+    if not isinstance(rig, dict) or not isinstance(rig.get("muscles"), list) or not rig["muscles"]:
+        raise RuntimeError("Muscle rig JSON must be an object with a non-empty 'muscles' list")
+    forward = rig.get("forwardReference")
+    if forward is not None and (not isinstance(forward, dict) or not forward.get("from") or not forward.get("to")):
+        raise RuntimeError("Muscle rig 'forwardReference' needs 'from' and 'to' joint names")
+    for index, muscle in enumerate(rig["muscles"]):
+        if not isinstance(muscle, dict) or not muscle.get("name"):
+            raise RuntimeError(f"Muscle #{index} needs a 'name'")
+        for key in ("origin", "insertion"):
+            attachment = muscle.get(key)
+            if not isinstance(attachment, dict) or not attachment.get("joint"):
+                raise RuntimeError(f"Muscle {muscle['name']}: '{key}' needs a 'joint'")
+            offset = attachment.get("offset", [0.0, 0.0, 0.0])
+            if not isinstance(offset, (list, tuple)) or len(offset) != 3:
+                raise RuntimeError(f"Muscle {muscle['name']}: '{key}.offset' must have three components")
+        for key in ("bellyRadius", "tendonRadius"):
+            if float(muscle.get(key, 0.0)) <= 0.0:
+                raise RuntimeError(f"Muscle {muscle['name']}: '{key}' must be positive")
+        if int(muscle.get("rings", MUSCLE_DEFAULTS["rings"])) < 2 or int(muscle.get("segments", MUSCLE_DEFAULTS["segments"])) < 3:
+            raise RuntimeError(f"Muscle {muscle['name']}: needs rings >= 2 and segments >= 3")
+        driver = muscle.get("driver")
+        if driver is not None and (not isinstance(driver, dict) or not driver.get("joint")):
+            raise RuntimeError(f"Muscle {muscle['name']}: 'driver' needs a 'joint'")
+    return rig
+
+
+def build_muscle_records(rig: dict, skeletons: list["SkeletonRecord"], string_table: "StringTableBuilder") -> list[MuscleRecord]:
+    """Resolves a validated rig against the exported skeletons. The rig's
+    'skeleton' name selects the target skeleton; the first exported skeleton is
+    used otherwise."""
+    if not skeletons:
+        raise RuntimeError("--muscles requires a rigged (armature) export")
+    target = skeletons[0]
+    wanted = rig.get("skeleton")
+    if wanted:
+        matches = [
+            skeleton for skeleton in skeletons
+            if string_table.string_at(skeleton.name_offset) == wanted
+        ]
+        if not matches:
+            raise RuntimeError(f"--muscles: skeleton '{wanted}' not found in the export")
+        target = matches[0]
+
+    forward = rig.get("forwardReference")
+    forward_joint = string_table.add(forward["from"]) if forward else INVALID_INDEX
+    forward_tip = string_table.add(forward["to"]) if forward else INVALID_INDEX
+
+    def attachment_fields(attachment: dict) -> tuple[int, int, float, tuple[float, float, float]]:
+        tip = attachment.get("tip")
+        offset = attachment.get("offset", [0.0, 0.0, 0.0])
+        return (
+            string_table.add(str(attachment["joint"])),
+            string_table.add(str(tip)) if tip else INVALID_INDEX,
+            float(attachment.get("fraction", 0.5)),
+            (float(offset[0]), float(offset[1]), float(offset[2])),
+        )
+
+    records: list[MuscleRecord] = []
+    for muscle in rig["muscles"]:
+        origin_joint, origin_tip, origin_fraction, origin_offset = attachment_fields(muscle["origin"])
+        insertion_joint, insertion_tip, insertion_fraction, insertion_offset = attachment_fields(muscle["insertion"])
+        driver = muscle.get("driver")
+        flags = MUSCLE_FLAG_HAS_DRIVER if driver else 0
+
+        def value(key: str) -> float:
+            return float(muscle.get(key, MUSCLE_DEFAULTS[key]))
+
+        records.append(
+            MuscleRecord(
+                skeleton_entity_id=target.entity_id,
+                name_offset=string_table.add(str(muscle["name"])),
+                flags=flags,
+                forward_joint_offset=forward_joint,
+                forward_tip_joint_offset=forward_tip,
+                origin_joint_offset=origin_joint,
+                origin_tip_joint_offset=origin_tip,
+                origin_fraction=origin_fraction,
+                origin_offset=origin_offset,
+                insertion_joint_offset=insertion_joint,
+                insertion_tip_joint_offset=insertion_tip,
+                insertion_fraction=insertion_fraction,
+                insertion_offset=insertion_offset,
+                belly_radius=float(muscle["bellyRadius"]),
+                tendon_radius=float(muscle["tendonRadius"]),
+                max_contraction=value("maxContraction"),
+                fiber_compliance=value("fiberCompliance"),
+                cross_compliance=value("crossCompliance"),
+                volume_compliance=value("volumeCompliance"),
+                damping=value("damping"),
+                bone_radius=value("boneRadius"),
+                skin_influence=value("skinInfluence"),
+                rings=int(muscle.get("rings", MUSCLE_DEFAULTS["rings"])),
+                segments=int(muscle.get("segments", MUSCLE_DEFAULTS["segments"])),
+                driver_joint_offset=string_table.add(str(driver["joint"])) if driver else INVALID_INDEX,
+                driver_start_angle=math.radians(float(driver.get("startAngle", 0.0))) if driver else 0.0,
+                driver_full_angle=math.radians(float(driver.get("fullAngle", 90.0))) if driver else 0.0,
+            )
+        )
+    return records
 
 
 @dataclass(frozen=True)
@@ -1400,6 +1581,40 @@ def write_morph_driver_record(writer: BinaryWriter, target_index: int, joint_pat
     for component in pose_rotation:
         writer.write_f32(float(component))
     writer.write_f32(radius)
+    writer.write_u32(0)
+
+
+def write_muscle_record(writer: BinaryWriter, record: "MuscleRecord") -> None:
+    """Serializes one UntoldMuscleRecordV1 (128 bytes, see assetFormat.md)."""
+    writer.write_u32(record.skeleton_entity_id)
+    writer.write_u32(record.name_offset)
+    writer.write_u32(record.flags)
+    writer.write_u32(record.forward_joint_offset)
+    writer.write_u32(record.forward_tip_joint_offset)
+    writer.write_u32(record.origin_joint_offset)
+    writer.write_u32(record.origin_tip_joint_offset)
+    writer.write_f32(record.origin_fraction)
+    for component in record.origin_offset:
+        writer.write_f32(float(component))
+    writer.write_u32(record.insertion_joint_offset)
+    writer.write_u32(record.insertion_tip_joint_offset)
+    writer.write_f32(record.insertion_fraction)
+    for component in record.insertion_offset:
+        writer.write_f32(float(component))
+    writer.write_f32(record.belly_radius)
+    writer.write_f32(record.tendon_radius)
+    writer.write_f32(record.max_contraction)
+    writer.write_f32(record.fiber_compliance)
+    writer.write_f32(record.cross_compliance)
+    writer.write_f32(record.volume_compliance)
+    writer.write_f32(record.damping)
+    writer.write_f32(record.bone_radius)
+    writer.write_f32(record.skin_influence)
+    writer.write_u32(record.rings)
+    writer.write_u32(record.segments)
+    writer.write_u32(record.driver_joint_offset)
+    writer.write_f32(record.driver_start_angle)
+    writer.write_f32(record.driver_full_angle)
     writer.write_u32(0)
 
 
@@ -4677,6 +4892,7 @@ def build_untold_file(
     exported_cameras: Optional[list[ExportedCamera]] = None,
     compress_geometry: bool = False,
     color_grade_lut: Optional[ColorGradeLUT] = None,
+    muscle_rig: Optional[dict] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> bytes:
     if not exported_nodes:
@@ -5009,6 +5225,10 @@ def build_untold_file(
 
     if progress_callback is not None:
         progress_callback("Build chunks", 0, 1, output_path.name)
+    muscle_records: list[MuscleRecord] = []
+    if muscle_rig is not None:
+        muscle_records = build_muscle_records(muscle_rig, skeletons, string_table)
+
     string_chunk = string_table.data
     entity_writer = BinaryWriter()
     for entity in entities:
@@ -5148,6 +5368,14 @@ def build_untold_file(
                 len(color_grade_lut_records),
                 COMPRESSION_NONE,
             )
+        )
+    if muscle_records:
+        muscle_writer = BinaryWriter()
+        for muscle_record in muscle_records:
+            write_muscle_record(muscle_writer, muscle_record)
+        muscle_chunk = muscle_writer.data
+        chunk_payloads.append(
+            (CHUNK_TYPES["muscle_table"], muscle_chunk, len(muscle_chunk), len(muscle_records), COMPRESSION_NONE)
         )
     if morph_target_records:
         chunk_payloads.append(
@@ -5482,6 +5710,7 @@ def export_objects_to_untold(
     color_grade_lut_path: Optional[Path] = None,
     clean_sidecars: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
+    muscle_rig_path: Optional[Path] = None,
 ) -> dict[str, object]:
     exported_lights, exported_cameras = extract_scene_payload_from_objects(
         export_objects,
@@ -5512,6 +5741,7 @@ def export_objects_to_untold(
         color_grade_lut = stage_color_grade_lut_for_output(color_grade_lut_path, output_path.parent)
 
     exported_nodes = stage_nodes_for_output(exported_nodes, output_path, progress_callback=progress_callback)
+    muscle_rig = load_muscle_rig(muscle_rig_path) if muscle_rig_path is not None else None
     untold_bytes = build_untold_file(
         exported_nodes,
         output_path,
@@ -5520,6 +5750,7 @@ def export_objects_to_untold(
         exported_cameras=exported_cameras,
         compress_geometry=compress_geometry,
         color_grade_lut=color_grade_lut,
+        muscle_rig=muscle_rig,
         progress_callback=progress_callback,
     )
     if progress_callback is not None:
@@ -5669,6 +5900,7 @@ def write_single_untold_from_nodes(
     color_grade_lut_path: Optional[Path],
     validate: bool,
     progress_callback: Optional[ProgressCallback],
+    muscle_rig_path: Optional[Path] = None,
 ) -> dict[str, object]:
     """Builds and writes a single `.untold` file from already-extracted nodes.
 
@@ -5687,6 +5919,7 @@ def write_single_untold_from_nodes(
         color_grade_lut = stage_color_grade_lut_for_output(color_grade_lut_path, output_path.parent)
 
     exported_nodes = stage_nodes_for_output(exported_nodes, output_path, progress_callback=progress_callback)
+    muscle_rig = load_muscle_rig(muscle_rig_path) if muscle_rig_path is not None else None
     untold_bytes = build_untold_file(
         exported_nodes,
         output_path,
@@ -5695,6 +5928,7 @@ def write_single_untold_from_nodes(
         exported_cameras=exported_cameras,
         compress_geometry=compress_geometry,
         color_grade_lut=color_grade_lut,
+        muscle_rig=muscle_rig,
         progress_callback=progress_callback,
     )
     if progress_callback is not None:
@@ -5862,6 +6096,7 @@ def export_objects_to_untold_or_pack(
     color_grade_lut_path: Optional[Path] = None,
     clean_sidecars: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
+    muscle_rig_path: Optional[Path] = None,
 ) -> dict[str, object]:
     """Like export_objects_to_untold(), but writes a `.untoldpack` manifest plus
     one self-contained `.untold` per model instead of fusing everything into a
@@ -5913,6 +6148,7 @@ def export_objects_to_untold_or_pack(
             color_grade_lut_path=color_grade_lut_path,
             validate=validate,
             progress_callback=progress_callback,
+            muscle_rig_path=muscle_rig_path,
         )
         return result
 
@@ -5928,7 +6164,9 @@ def export_objects_to_untold_or_pack(
     result["node_count"] = len(exported_nodes)
     result["light_count"] = len(exported_lights)
     result["camera_count"] = len(exported_cameras)
-    result["dropped_scene_payload"] = bool(exported_lights or exported_cameras or color_grade_lut_path is not None)
+    result["dropped_scene_payload"] = bool(
+        exported_lights or exported_cameras or color_grade_lut_path is not None or muscle_rig_path is not None
+    )
     return result
 
 
@@ -5957,6 +6195,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--validate", action="store_true", help="Write a companion .validation.json file for engine-side validation tests.")
     parser.add_argument("--export-shapekeys", action="store_true", help="Export Blender shape keys as morph target chunks (with optional untold_driver_* custom-property pose drivers).")
+    parser.add_argument(
+        "--muscles",
+        default=None,
+        help="Path to a JSON muscle rig (see load_muscle_rig) to emit as the muscle table chunk; the engine builds and simulates volumetric XPBD muscles from it at load.",
+    )
     parser.add_argument(
         "--compress-geometry",
         action="store_true",
@@ -6054,6 +6297,7 @@ def main(argv: list[str]) -> int:
                 color_grade_lut_path=Path(args.color_grade_lut) if args.color_grade_lut else None,
                 validate=args.validate,
                 progress_callback=progress_stage_callback,
+                muscle_rig_path=normalize_blender_path(args.muscles) if args.muscles else None,
             )
             progress.advance("Stage nodes", output_path.name)
             progress.advance("Build file", output_path.name)

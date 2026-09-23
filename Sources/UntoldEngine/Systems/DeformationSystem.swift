@@ -29,6 +29,10 @@ final class DeformationSystem: @unchecked Sendable {
     var dualQuatPalettePipeline = ComputePipeline()
     var morphClearPipeline = ComputePipeline()
     var morphAccumulatePipeline = ComputePipeline()
+    var musclePredictPipeline = ComputePipeline()
+    var muscleVolumeGradientPipeline = ComputePipeline()
+    var muscleSolvePipeline = ComputePipeline()
+    var muscleSkinWrapPipeline = ComputePipeline()
 
     /// Per-vertex accumulated morph deltas, one pair of float4 buffers per
     /// morphing mesh. Keyed by mesh identity.
@@ -116,6 +120,34 @@ final class DeformationSystem: @unchecked Sendable {
             functionName: "deformMorphAccumulate",
             pipelineName: "Deformation Morph Accumulate pipe"
         )
+        createComputePipeline(
+            into: &musclePredictPipeline,
+            device: device,
+            library: library,
+            functionName: "musclePredict",
+            pipelineName: "Muscle Predict pipe"
+        )
+        createComputePipeline(
+            into: &muscleVolumeGradientPipeline,
+            device: device,
+            library: library,
+            functionName: "muscleVolumeGradient",
+            pipelineName: "Muscle Volume Gradient pipe"
+        )
+        createComputePipeline(
+            into: &muscleSolvePipeline,
+            device: device,
+            library: library,
+            functionName: "muscleSolve",
+            pipelineName: "Muscle Solve pipe"
+        )
+        createComputePipeline(
+            into: &muscleSkinWrapPipeline,
+            device: device,
+            library: library,
+            functionName: "muscleSkinWrap",
+            pipelineName: "Muscle Skin Wrap pipe"
+        )
     }
 
     static let executeDeformationPass: RenderPasses.RenderPassExecution = { commandBuffer in
@@ -140,6 +172,24 @@ final class DeformationSystem: @unchecked Sendable {
             guard let deformationComponent = scene.get(component: DeformationComponent.self, for: entityId),
                   let renderComponent = scene.get(component: RenderComponent.self, for: entityId)
             else { continue }
+
+            // Muscles simulate once per entity (in model space, driven by the
+            // skeleton pose) and are wrapped onto each mesh after skinning.
+            var muscleState: MuscleSimState?
+            if deformationComponent.musclesEnabled,
+               let skeleton = scene.get(component: SkeletonComponent.self, for: entityId)?.skeleton,
+               scene.get(component: AnimationComponent.self, for: entityId)?.hasSampledPose == true,
+               let state = self.muscleState(
+                   for: deformationComponent, skeleton: skeleton,
+                   device: commandBuffer.device, label: renderComponent.mesh.first?.name ?? "entity \(entityId)"
+               )
+            {
+                encodeMuscleSimulation(
+                    encoder: encoder, state: state, component: deformationComponent,
+                    entityId: entityId, skeleton: skeleton
+                )
+                muscleState = state
+            }
 
             for mesh in renderComponent.mesh {
                 guard let jointTransformBuffer = mesh.skin?.jointTransformsBuffer else { continue }
@@ -188,6 +238,13 @@ final class DeformationSystem: @unchecked Sendable {
                         encoder: encoder, pipeline: pipeline, mesh: mesh,
                         jointTransformBuffer: jointTransformBuffer, omegaBuffer: omegas,
                         morphDeltas: morphDeltas, output: buffers
+                    )
+                }
+
+                if let muscleState {
+                    encodeMuscleSkinWrap(
+                        encoder: encoder, state: muscleState, mesh: mesh,
+                        output: buffers, device: commandBuffer.device
                     )
                 }
             }

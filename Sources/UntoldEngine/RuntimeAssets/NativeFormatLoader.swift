@@ -510,10 +510,70 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 jointPaths: jointPaths,
                 parentIndices: parentIndices,
                 bindTransforms: bindTransforms,
-                restTransforms: restTransforms
+                restTransforms: restTransforms,
+                muscleRig: makeMuscleRig(decoded: decoded, skeletonEntityId: skeleton.entityId)
             )
         }
         return result
+    }
+
+    private func makeMuscleRig(decoded: UntoldDecodedAsset, skeletonEntityId: UInt32) throws -> MuscleRig? {
+        let records = decoded.muscles.filter { $0.skeletonEntityId == skeletonEntityId }
+        guard !records.isEmpty else { return nil }
+
+        var forwardReference: MuscleForwardReference?
+        var muscles: [MuscleDefinition] = []
+        for (index, record) in records.enumerated() {
+            if forwardReference == nil,
+               let from = try decoded.string(at: record.forwardJointOffset),
+               let to = try decoded.string(at: record.forwardTipJointOffset)
+            {
+                forwardReference = MuscleForwardReference(fromJointName: from, toJointName: to)
+            }
+            guard let originJoint = try decoded.string(at: record.originJointOffset),
+                  let insertionJoint = try decoded.string(at: record.insertionJointOffset)
+            else { continue }
+
+            var driver: MuscleActivationDriver?
+            if record.flags & UntoldMuscleRecordV1.flagHasDriver != 0,
+               let driverJoint = try decoded.string(at: record.driverJointOffset)
+            {
+                driver = MuscleActivationDriver(
+                    jointName: driverJoint,
+                    startAngle: record.driverStartAngle,
+                    fullAngle: record.driverFullAngle
+                )
+            }
+            try muscles.append(MuscleDefinition(
+                name: decoded.string(at: record.nameOffset) ?? "muscle_\(index)",
+                origin: MuscleAttachment(
+                    jointName: originJoint,
+                    fraction: record.originFraction,
+                    offset: record.originOffset,
+                    tipJointName: decoded.string(at: record.originTipJointOffset)
+                ),
+                insertion: MuscleAttachment(
+                    jointName: insertionJoint,
+                    fraction: record.insertionFraction,
+                    offset: record.insertionOffset,
+                    tipJointName: decoded.string(at: record.insertionTipJointOffset)
+                ),
+                bellyRadius: record.bellyRadius,
+                tendonRadius: record.tendonRadius,
+                maxContraction: record.maxContraction,
+                fiberCompliance: record.fiberCompliance,
+                crossCompliance: record.crossCompliance,
+                volumeCompliance: record.volumeCompliance,
+                damping: record.damping,
+                boneRadius: record.boneRadius,
+                skinInfluence: record.skinInfluence,
+                rings: Int(record.rings),
+                segments: Int(record.segments),
+                driver: driver
+            ))
+        }
+        guard !muscles.isEmpty else { return nil }
+        return MuscleRig(forwardReference: forwardReference, muscles: muscles)
     }
 
     private func makeRuntimeAnimationClips(decoded: UntoldDecodedAsset) throws -> [RuntimeAnimationClip] {

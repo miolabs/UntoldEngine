@@ -322,19 +322,23 @@ public struct RuntimeSkeleton: Sendable, Equatable {
     public var parentIndices: [Int?]
     public var bindTransforms: [simd_float4x4]
     public var restTransforms: [simd_float4x4]
+    /// Volumetric muscles from the asset's muscle table, if any.
+    public var muscleRig: MuscleRig?
 
     public init(
         name: String? = nil,
         jointPaths: [String],
         parentIndices: [Int?],
         bindTransforms: [simd_float4x4],
-        restTransforms: [simd_float4x4]
+        restTransforms: [simd_float4x4],
+        muscleRig: MuscleRig? = nil
     ) {
         self.name = name
         self.jointPaths = jointPaths
         self.parentIndices = parentIndices
         self.bindTransforms = bindTransforms
         self.restTransforms = restTransforms
+        self.muscleRig = muscleRig
     }
 }
 

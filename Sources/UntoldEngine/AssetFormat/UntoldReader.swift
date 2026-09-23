@@ -146,6 +146,12 @@ public final class UntoldReader: @unchecked Sendable {
             from: data,
             entries: chunks
         )
+        let muscles = try decodeTableIfPresent(
+            UntoldMuscleRecordV1.self,
+            chunkType: .muscleTable,
+            from: data,
+            entries: chunks
+        )
         let pluginChunks = try decodePluginChunks(from: data, entries: chunks)
 
         let decoded = UntoldDecodedAsset(
@@ -171,6 +177,7 @@ public final class UntoldReader: @unchecked Sendable {
             morphTargets: morphTargets,
             morphDrivers: morphDrivers,
             gaussianAssets: gaussianAssets,
+            muscles: muscles,
             pluginChunks: pluginChunks
         )
         try validateGaussianAssets(decoded)
@@ -404,6 +411,25 @@ public final class UntoldReader: @unchecked Sendable {
                 throw UntoldValidationError.invalidMorphDriverTarget(driver.targetIndex)
             }
         }
+
+        for (index, muscle) in asset.muscles.enumerated() {
+            guard asset.skeletons.contains(where: { $0.entityId == muscle.skeletonEntityId }) else {
+                throw UntoldValidationError.invalidMuscleRecord(
+                    index: index, reason: "skeleton entity \(muscle.skeletonEntityId) not found"
+                )
+            }
+            guard muscle.originJointOffset != UntoldFormat.invalidIndex,
+                  muscle.insertionJointOffset != UntoldFormat.invalidIndex
+            else {
+                throw UntoldValidationError.invalidMuscleRecord(index: index, reason: "missing attachment joint")
+            }
+            guard muscle.rings >= 2, muscle.segments >= 3 else {
+                throw UntoldValidationError.invalidMuscleRecord(index: index, reason: "rings < 2 or segments < 3")
+            }
+            guard muscle.bellyRadius > 0, muscle.tendonRadius > 0 else {
+                throw UntoldValidationError.invalidMuscleRecord(index: index, reason: "non-positive radius")
+            }
+        }
     }
 
     private func indexElementSize(for indexType: UntoldIndexType) -> UInt64 {
@@ -614,6 +640,7 @@ public struct UntoldDecodedAsset: Sendable {
     public let morphTargets: [UntoldMorphTargetRecordV1]
     public let morphDrivers: [UntoldMorphDriverRecordV1]
     public let gaussianAssets: [UntoldGaussianAssetRecordV1]
+    public let muscles: [UntoldMuscleRecordV1]
     public let pluginChunks: [UntoldPluginChunk]
 
     public init(
@@ -639,6 +666,7 @@ public struct UntoldDecodedAsset: Sendable {
         morphTargets: [UntoldMorphTargetRecordV1] = [],
         morphDrivers: [UntoldMorphDriverRecordV1] = [],
         gaussianAssets: [UntoldGaussianAssetRecordV1] = [],
+        muscles: [UntoldMuscleRecordV1] = [],
         pluginChunks: [UntoldPluginChunk] = []
     ) {
         self.header = header
@@ -663,6 +691,7 @@ public struct UntoldDecodedAsset: Sendable {
         self.morphTargets = morphTargets
         self.morphDrivers = morphDrivers
         self.gaussianAssets = gaussianAssets
+        self.muscles = muscles
         self.pluginChunks = pluginChunks
     }
 

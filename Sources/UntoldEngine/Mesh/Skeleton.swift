@@ -17,6 +17,10 @@ class Skeleton {
     var restTransform: [simd_float4x4]
     var currentPose: [simd_float4x4]
 
+    /// Volumetric muscles attached to this skeleton (from the asset's muscle
+    /// table or `setEntityMuscleRig`); simulated by the deformation pass.
+    var muscleRig: MuscleRig?
+
     /// Scratch storage for the compiled sampling path; reused across frames
     /// so pose composition never allocates in steady state.
     private var worldPoseScratch: [simd_float4x4] = []
@@ -44,6 +48,7 @@ class Skeleton {
         bindTransform = runtimeSkeleton.bindTransforms
         restTransform = runtimeSkeleton.restTransforms
         currentPose = runtimeSkeleton.restTransforms
+        muscleRig = runtimeSkeleton.muscleRig
     }
 
     deinit {}
