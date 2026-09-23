@@ -401,6 +401,8 @@ public class DeformationComponent: Component {
     var muscleActivations: [String: Float] = [:]
     /// When set, every muscle uses this activation.
     var muscleActivationOverride: Float?
+    /// Muscles that keep simulating but no longer move the skin.
+    var disabledMuscles: Set<String> = []
     /// Model-space gravity on free muscle particles.
     var muscleGravity = simd_float3(0, -2.0, 0)
     var muscleSim: MuscleSimState?
@@ -415,6 +417,7 @@ public class DeformationComponent: Component {
         drivenMorphWeights.removeAll()
         muscleActivations.removeAll()
         muscleActivationOverride = nil
+        disabledMuscles.removeAll()
         muscleSim = nil
         muscleBakeFailed = false
     }

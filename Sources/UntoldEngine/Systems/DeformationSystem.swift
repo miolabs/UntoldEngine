@@ -29,6 +29,10 @@ final class DeformationSystem: @unchecked Sendable {
     var dualQuatPalettePipeline = ComputePipeline()
     var morphClearPipeline = ComputePipeline()
     var morphAccumulatePipeline = ComputePipeline()
+    /// Muscle cage wireframe overlay (see `RenderPasses.muscleDebugExecution`).
+    var muscleDebugOverlayEnabled = false
+    var muscleDebugLineBuffer: MTLBuffer?
+
     var musclePredictPipeline = ComputePipeline()
     var muscleVolumeGradientPipeline = ComputePipeline()
     var muscleSolvePipeline = ComputePipeline()

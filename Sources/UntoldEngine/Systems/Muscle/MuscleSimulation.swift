@@ -205,7 +205,7 @@ extension DeformationSystem {
         let animationComponent = scene.get(component: AnimationComponent.self, for: entityId)
 
         updateActivations(state: state, component: component, skeleton: skeleton, animationComponent: animationComponent, frameDelta: frameDelta)
-        let frameParams = makeFrameParams(state: state, skeleton: skeleton, substepDelta: substepDelta)
+        let frameParams = makeFrameParams(state: state, component: component, skeleton: skeleton, substepDelta: substepDelta)
         state.writeMuscleParams { pointer in
             for (index, params) in frameParams.enumerated() {
                 pointer[index] = params
@@ -329,6 +329,8 @@ extension DeformationSystem {
             let target: Float
             if let override = component.muscleActivationOverride {
                 target = override
+            } else if let manual = component.muscleActivations[muscle.definition.name] {
+                target = manual
             } else if let driver = muscle.definition.driver,
                       let joint = muscle.driverJoint,
                       let animationComponent,
@@ -347,7 +349,7 @@ extension DeformationSystem {
         }
     }
 
-    private func makeFrameParams(state: MuscleSimState, skeleton: Skeleton, substepDelta: Float) -> [MuscleFrameParams] {
+    private func makeFrameParams(state: MuscleSimState, component: DeformationComponent, skeleton: Skeleton, substepDelta: Float) -> [MuscleFrameParams] {
         let dt2 = substepDelta * substepDelta
         return state.geometry.muscles.enumerated().map { index, muscle in
             let originJoint = skeleton.currentPose[muscle.originJoint]
@@ -377,7 +379,7 @@ extension DeformationSystem {
                 crossAlpha: definition.crossCompliance / dt2,
                 volumeAlpha: definition.volumeCompliance / dt2,
                 damping: definition.damping,
-                skinWeight: 1,
+                skinWeight: component.disabledMuscles.contains(definition.name) ? 0 : 1,
                 restVolume: muscle.restVolume,
                 pad0: 0,
                 particleStart: UInt32(muscle.particleRange.lowerBound),
@@ -478,8 +480,9 @@ public func setEntityMuscleSimulation(entityId: EntityID, enabled: Bool) {
     }
 }
 
-/// Manual activation (0...1) of a named muscle; used for muscles without an
-/// activation driver whenever no override is set.
+/// Manual activation (0...1) of a named muscle. While set it takes precedence
+/// over the muscle's pose driver; zero clears it and returns control to the
+/// driver. The override set by `setEntityMuscleActivationOverride` beats both.
 public func setEntityMuscleActivation(entityId: EntityID, name: String, activation: Float) {
     guard scene.exists(entityId) else { return }
     for targetEntityId in resolveAnimationBindingTargetEntities(entityId: entityId) {
@@ -488,6 +491,21 @@ public func setEntityMuscleActivation(entityId: EntityID, name: String, activati
             component.muscleActivations[name] = min(activation, 1)
         } else {
             component.muscleActivations.removeValue(forKey: name)
+        }
+    }
+}
+
+/// Shows or hides one muscle of `entityId`: a disabled muscle keeps
+/// simulating (and stays in the debug overlay, greyed) but no longer moves
+/// the skin.
+public func setEntityMuscleEnabled(entityId: EntityID, name: String, enabled: Bool) {
+    guard scene.exists(entityId) else { return }
+    for targetEntityId in resolveAnimationBindingTargetEntities(entityId: entityId) {
+        guard let component = scene.get(component: DeformationComponent.self, for: targetEntityId) else { continue }
+        if enabled {
+            component.disabledMuscles.remove(name)
+        } else {
+            component.disabledMuscles.insert(name)
         }
     }
 }
