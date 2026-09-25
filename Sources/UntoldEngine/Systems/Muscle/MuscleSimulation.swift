@@ -160,200 +160,66 @@ final class MuscleSimState: @unchecked Sendable {
     }
 }
 
-extension DeformationSystem {
-    /// Returns the entity's live muscle state, baking the rig on first use.
-    /// Nil when the skeleton carries no rig or nothing in it resolves.
-    func muscleState(
-        for component: DeformationComponent,
-        skeleton: Skeleton,
-        device: MTLDevice,
-        label: String
-    ) -> MuscleSimState? {
-        if let existing = component.muscleSim {
-            return existing
+/// Compute pipelines of the muscle kernels, resolved once per encode.
+struct MusclePipelines {
+    let predict: MTLComputePipelineState
+    let volumeGradient: MTLComputePipelineState
+    let solve: MTLComputePipelineState
+    let skinWrap: MTLComputePipelineState
+}
+
+/// ECS-free muscle simulation steps shared by the deformation pass, the
+/// headless tests and the ML deformer baker: activation, per-frame
+/// parameters, the substep encode and the skin wrap encode.
+enum MuscleSimulator {
+    /// Activation target of one muscle for a pose: the global override wins,
+    /// then a manual value, then the joint-angle driver, else zero.
+    static func activationTarget(
+        muscle: MuscleBakedMuscle,
+        localRotations: [simd_quatf]?,
+        restTransforms: [simd_float4x4],
+        override: Float?,
+        manual: [String: Float]
+    ) -> Float {
+        if let override {
+            return min(max(override, 0), 1)
         }
-        guard let rig = skeleton.muscleRig, !component.muscleBakeFailed else { return nil }
-        guard let geometry = MuscleGeometryBuilder.bake(rig: rig, skeleton: skeleton),
-              let state = MuscleSimState(geometry: geometry, device: device, label: label)
-        else {
-            component.muscleBakeFailed = true
-            Logger.logWarning(message: "Muscle rig for \(label) could not be built")
-            return nil
+        if let manual = manual[muscle.definition.name] {
+            return min(max(manual, 0), 1)
         }
-        component.muscleSim = state
-        Logger.log(message: "Muscle rig built for \(label): \(geometry.muscles.count) muscles, \(geometry.particleCount) particles, \(geometry.tets.count) tets")
-        return state
+        guard let driver = muscle.definition.driver,
+              let joint = muscle.driverJoint,
+              let localRotations,
+              localRotations.count == restTransforms.count
+        else { return 0 }
+        let rest = PoseDriverEvaluation.restRotation(from: restTransforms[joint])
+        let delta = rest.inverse * localRotations[joint]
+        let angle = 2 * acos(min(abs(delta.real), 1))
+        let span = driver.fullAngle - driver.startAngle
+        guard abs(span) > 1e-5 else { return 0 }
+        return min(max((angle - driver.startAngle) / span, 0), 1)
     }
 
-    /// Advances the entity's muscle simulation one frame: computes per-muscle
-    /// frame parameters from the current pose, then runs the substeps.
-    func encodeMuscleSimulation(
-        encoder: MTLComputeCommandEncoder,
-        state: MuscleSimState,
-        component: DeformationComponent,
-        entityId: EntityID,
-        skeleton: Skeleton
-    ) {
-        guard let predictPipeline = musclePredictPipeline.pipelineState,
-              let gradientPipeline = muscleVolumeGradientPipeline.pipelineState,
-              let solvePipeline = muscleSolvePipeline.pipelineState,
-              skeleton.currentPose.count == skeleton.jointPaths.count
-        else { return }
-
-        let frameDelta = min(max(timeSinceLastUpdate ?? (1.0 / 90.0), 1.0 / 240.0), 1.0 / 30.0)
-        let substepDelta = frameDelta / Float(muscleSubstepsPerFrame)
-        let animationComponent = scene.get(component: AnimationComponent.self, for: entityId)
-
-        updateActivations(state: state, component: component, skeleton: skeleton, animationComponent: animationComponent, frameDelta: frameDelta)
-        let frameParams = makeFrameParams(state: state, component: component, skeleton: skeleton, substepDelta: substepDelta)
-        state.writeMuscleParams { pointer in
-            for (index, params) in frameParams.enumerated() {
-                pointer[index] = params
-            }
-        }
-
-        if state.needsReset || component.muscleResetRequested {
-            state.resetPositions(referencePositions(state: state, frameParams: frameParams))
-            component.muscleResetRequested = false
-        }
-
-        var simParams = MuscleSimParams(
-            particleCount: UInt32(state.particleCount),
-            skinVertexCount: 0,
-            dt: substepDelta,
-            relaxation: muscleRelaxation,
-            gravity: simd_float4(component.muscleGravity, 0),
-            maxVelocity: 8,
-            pad0: 0, pad1: 0, pad2: 0
-        )
-
-        let width = solvePipeline.threadExecutionWidth
-        let threadgroups = MTLSize(width: (state.particleCount + width - 1) / width, height: 1, depth: 1)
-        let threadsPerGroup = MTLSize(width: width, height: 1, depth: 1)
-
-        for _ in 0 ..< muscleSubstepsPerFrame {
-            encoder.setComputePipelineState(predictPipeline)
-            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
-            encoder.setBuffer(state.prevPositions, offset: 0, index: Int(musclePassPrevPositionsIndex.rawValue))
-            encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
-            encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
-            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
-            encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
-
-            encoder.setComputePipelineState(gradientPipeline)
-            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
-            encoder.setBuffer(state.triangles, offset: 0, index: Int(musclePassTrianglesIndex.rawValue))
-            encoder.setBuffer(state.triOffsets, offset: 0, index: Int(musclePassParticleTriOffsetsIndex.rawValue))
-            encoder.setBuffer(state.triList, offset: 0, index: Int(musclePassParticleTriListIndex.rawValue))
-            encoder.setBuffer(state.gradients, offset: 0, index: Int(musclePassGradientsIndex.rawValue))
-            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
-            encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
-
-            encoder.setComputePipelineState(solvePipeline)
-            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
-            encoder.setBuffer(state.nextPositions, offset: 0, index: Int(musclePassPositionsOutIndex.rawValue))
-            encoder.setBuffer(state.prevPositions, offset: 0, index: Int(musclePassPrevPositionsIndex.rawValue))
-            encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
-            encoder.setBuffer(state.edges, offset: 0, index: Int(musclePassEdgesIndex.rawValue))
-            encoder.setBuffer(state.edgeOffsets, offset: 0, index: Int(musclePassParticleEdgeOffsetsIndex.rawValue))
-            encoder.setBuffer(state.edgeList, offset: 0, index: Int(musclePassParticleEdgeListIndex.rawValue))
-            encoder.setBuffer(state.gradients, offset: 0, index: Int(musclePassGradientsIndex.rawValue))
-            encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
-            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
-            encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
-
-            state.swapPositions()
-        }
-    }
-
-    /// Applies the muscle deltas to one mesh's deformed streams. Kicks off the
-    /// mesh's skin-binding bake on first use and skips the mesh until it is
-    /// ready.
-    func encodeMuscleSkinWrap(
-        encoder: MTLComputeCommandEncoder,
-        state: MuscleSimState,
-        mesh: Mesh,
-        output: MeshDeformationBuffers,
-        device: MTLDevice
-    ) {
-        guard let pipeline = muscleSkinWrapPipeline.pipelineState else { return }
-        let key = ObjectIdentifier(mesh.metalKitMesh)
-        let bindingBuffer: MTLBuffer
-        switch state.bindingState(for: key) {
-        case let .ready(buffer):
-            bindingBuffer = buffer
-        case .building:
-            return
-        case nil:
-            startSkinBindingBake(state: state, mesh: mesh, key: key, device: device)
-            return
-        }
-
-        var simParams = MuscleSimParams(
-            particleCount: UInt32(state.particleCount),
-            skinVertexCount: UInt32(output.vertexCount),
-            dt: 0,
-            relaxation: 0,
-            gravity: simd_float4(0, 0, 0, 0),
-            maxVelocity: 0,
-            pad0: 0, pad1: 0, pad2: 0
-        )
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(output.positions, offset: 0, index: Int(musclePassSkinPositionsIndex.rawValue))
-        encoder.setBuffer(output.normals, offset: 0, index: Int(musclePassSkinNormalsIndex.rawValue))
-        encoder.setBuffer(output.tangents, offset: 0, index: Int(musclePassSkinTangentsIndex.rawValue))
-        encoder.setBuffer(bindingBuffer, offset: 0, index: Int(musclePassSkinBindingIndex.rawValue))
-        encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
-        encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
-        encoder.setBuffer(state.tets, offset: 0, index: Int(musclePassTetsIndex.rawValue))
-        encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
-        encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
-        let width = pipeline.threadExecutionWidth
-        encoder.dispatchThreadgroups(
-            MTLSize(width: (output.vertexCount + width - 1) / width, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
-        )
-    }
-
-    // MARK: - CPU per-frame work
-
-    private func updateActivations(
-        state: MuscleSimState,
-        component: DeformationComponent,
-        skeleton: Skeleton,
-        animationComponent: AnimationComponent?,
-        frameDelta: Float
-    ) {
+    /// Exponentially smooths `state.activations` toward `targets`.
+    static func smoothActivations(state: MuscleSimState, targets: [Float], frameDelta: Float) {
         let blend = 1 - exp(-frameDelta / muscleActivationSmoothing)
-        for (index, muscle) in state.geometry.muscles.enumerated() {
-            let target: Float
-            if let override = component.muscleActivationOverride {
-                target = override
-            } else if let manual = component.muscleActivations[muscle.definition.name] {
-                target = manual
-            } else if let driver = muscle.definition.driver,
-                      let joint = muscle.driverJoint,
-                      let animationComponent,
-                      animationComponent.hasSampledPose,
-                      animationComponent.localPose.rotations.count == skeleton.jointPaths.count
-            {
-                let rest = PoseDriverEvaluation.restRotation(from: skeleton.restTransform[joint])
-                let delta = rest.inverse * animationComponent.localPose.rotations[joint]
-                let angle = 2 * acos(min(abs(delta.real), 1))
-                let span = driver.fullAngle - driver.startAngle
-                target = abs(span) < 1e-5 ? 0 : min(max((angle - driver.startAngle) / span, 0), 1)
-            } else {
-                target = component.muscleActivations[muscle.definition.name] ?? 0
-            }
-            state.activations[index] += (min(max(target, 0), 1) - state.activations[index]) * blend
+        for index in 0 ..< min(targets.count, state.activations.count) {
+            state.activations[index] += (targets[index] - state.activations[index]) * blend
         }
     }
 
-    private func makeFrameParams(state: MuscleSimState, component: DeformationComponent, skeleton: Skeleton, substepDelta: Float) -> [MuscleFrameParams] {
+    /// Per-muscle frame parameters for the skeleton's current model-space
+    /// joint palette (`Skeleton.currentPose`).
+    static func frameParams(
+        state: MuscleSimState,
+        currentPose: [simd_float4x4],
+        disabledMuscles: Set<String>,
+        substepDelta: Float
+    ) -> [MuscleFrameParams] {
         let dt2 = substepDelta * substepDelta
         return state.geometry.muscles.enumerated().map { index, muscle in
-            let originJoint = skeleton.currentPose[muscle.originJoint]
-            let insertionJoint = skeleton.currentPose[muscle.insertionJoint]
+            let originJoint = currentPose[muscle.originJoint]
+            let insertionJoint = currentPose[muscle.insertionJoint]
             let originCurrent = transformPoint(originJoint, muscle.originRest)
             let insertionCurrent = transformPoint(insertionJoint, muscle.insertionRest)
             var currentAxis = insertionCurrent - originCurrent
@@ -379,7 +245,7 @@ extension DeformationSystem {
                 crossAlpha: definition.crossCompliance / dt2,
                 volumeAlpha: definition.volumeCompliance / dt2,
                 damping: definition.damping,
-                skinWeight: component.disabledMuscles.contains(definition.name) ? 0 : 1,
+                skinWeight: disabledMuscles.contains(definition.name) ? 0 : 1,
                 restVolume: muscle.restVolume,
                 pad0: 0,
                 particleStart: UInt32(muscle.particleRange.lowerBound),
@@ -392,7 +258,7 @@ extension DeformationSystem {
     /// Passive reference positions for every particle under the given frame
     /// parameters (the CPU twin of the kernel's `muscleReferencePosition`),
     /// used to start the simulation at rest in the current pose.
-    func referencePositions(state: MuscleSimState, frameParams: [MuscleFrameParams]) -> [simd_float4] {
+    static func referencePositions(state: MuscleSimState, frameParams: [MuscleFrameParams]) -> [simd_float4] {
         state.geometry.particleInfos.enumerated().map { index, info in
             let params = frameParams[Int(info.muscleIndex)]
             let rest = simd_float3(info.restPosition.x, info.restPosition.y, info.restPosition.z)
@@ -414,9 +280,246 @@ extension DeformationSystem {
         }
     }
 
-    private func transformPoint(_ matrix: simd_float4x4, _ point: simd_float3) -> simd_float3 {
+    /// Writes `frameParams` into the state's next ring slot, resets the
+    /// particles to the passive reference when requested, and encodes the
+    /// frame's substeps (predict → volume gradient → solve, ping-ponging the
+    /// position buffers).
+    static func encodeFrame(
+        encoder: MTLComputeCommandEncoder,
+        pipelines: MusclePipelines,
+        state: MuscleSimState,
+        frameParams: [MuscleFrameParams],
+        substepDelta: Float,
+        gravity: simd_float3,
+        reset: Bool
+    ) {
+        state.writeMuscleParams { pointer in
+            for (index, params) in frameParams.enumerated() {
+                pointer[index] = params
+            }
+        }
+        if reset || state.needsReset {
+            state.resetPositions(referencePositions(state: state, frameParams: frameParams))
+        }
+
+        var simParams = MuscleSimParams(
+            particleCount: UInt32(state.particleCount),
+            skinVertexCount: 0,
+            dt: substepDelta,
+            relaxation: muscleRelaxation,
+            gravity: simd_float4(gravity, 0),
+            maxVelocity: 8,
+            pad0: 0, pad1: 0, pad2: 0
+        )
+        let width = pipelines.solve.threadExecutionWidth
+        let threadgroups = MTLSize(width: (state.particleCount + width - 1) / width, height: 1, depth: 1)
+        let threadsPerGroup = MTLSize(width: width, height: 1, depth: 1)
+
+        for _ in 0 ..< muscleSubstepsPerFrame {
+            encoder.setComputePipelineState(pipelines.predict)
+            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
+            encoder.setBuffer(state.prevPositions, offset: 0, index: Int(musclePassPrevPositionsIndex.rawValue))
+            encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
+            encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
+            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
+            encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
+
+            encoder.setComputePipelineState(pipelines.volumeGradient)
+            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
+            encoder.setBuffer(state.triangles, offset: 0, index: Int(musclePassTrianglesIndex.rawValue))
+            encoder.setBuffer(state.triOffsets, offset: 0, index: Int(musclePassParticleTriOffsetsIndex.rawValue))
+            encoder.setBuffer(state.triList, offset: 0, index: Int(musclePassParticleTriListIndex.rawValue))
+            encoder.setBuffer(state.gradients, offset: 0, index: Int(musclePassGradientsIndex.rawValue))
+            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
+            encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
+
+            encoder.setComputePipelineState(pipelines.solve)
+            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
+            encoder.setBuffer(state.nextPositions, offset: 0, index: Int(musclePassPositionsOutIndex.rawValue))
+            encoder.setBuffer(state.prevPositions, offset: 0, index: Int(musclePassPrevPositionsIndex.rawValue))
+            encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
+            encoder.setBuffer(state.edges, offset: 0, index: Int(musclePassEdgesIndex.rawValue))
+            encoder.setBuffer(state.edgeOffsets, offset: 0, index: Int(musclePassParticleEdgeOffsetsIndex.rawValue))
+            encoder.setBuffer(state.edgeList, offset: 0, index: Int(musclePassParticleEdgeListIndex.rawValue))
+            encoder.setBuffer(state.gradients, offset: 0, index: Int(musclePassGradientsIndex.rawValue))
+            encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
+            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
+            encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
+
+            state.swapPositions()
+        }
+    }
+
+    /// Applies the muscle deltas of `state` to skinned vertex streams in
+    /// place through `bindings`.
+    static func encodeSkinWrap(
+        encoder: MTLComputeCommandEncoder,
+        pipeline: MTLComputePipelineState,
+        state: MuscleSimState,
+        bindings: MTLBuffer,
+        positions: MTLBuffer,
+        normals: MTLBuffer,
+        tangents: MTLBuffer,
+        vertexCount: Int
+    ) {
+        var simParams = MuscleSimParams(
+            particleCount: UInt32(state.particleCount),
+            skinVertexCount: UInt32(vertexCount),
+            dt: 0,
+            relaxation: 0,
+            gravity: simd_float4(0, 0, 0, 0),
+            maxVelocity: 0,
+            pad0: 0, pad1: 0, pad2: 0
+        )
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(positions, offset: 0, index: Int(musclePassSkinPositionsIndex.rawValue))
+        encoder.setBuffer(normals, offset: 0, index: Int(musclePassSkinNormalsIndex.rawValue))
+        encoder.setBuffer(tangents, offset: 0, index: Int(musclePassSkinTangentsIndex.rawValue))
+        encoder.setBuffer(bindings, offset: 0, index: Int(musclePassSkinBindingIndex.rawValue))
+        encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
+        encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
+        encoder.setBuffer(state.tets, offset: 0, index: Int(musclePassTetsIndex.rawValue))
+        encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
+        encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
+        let width = pipeline.threadExecutionWidth
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (vertexCount + width - 1) / width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+    }
+
+    /// Bakes the skin binding of `positions` (bind-pose model space) into a
+    /// GPU buffer. Returns nil when the buffer cannot be allocated.
+    static func makeSkinBindingBuffer(positions: [simd_float4], geometry: MuscleBakedGeometry, device: MTLDevice, label: String) -> (buffer: MTLBuffer, boundCount: Int)? {
+        let bindings = MuscleGeometryBuilder.bindSkin(positions: positions, geometry: geometry)
+        let length = bindings.count * MemoryLayout<MuscleSkinBinding>.stride
+        let buffer = bindings.withUnsafeBytes { bytes -> MTLBuffer? in
+            guard let baseAddress = bytes.baseAddress else { return nil }
+            return device.makeBuffer(bytes: baseAddress, length: length, options: .storageModeShared)
+        }
+        guard let buffer else { return nil }
+        buffer.label = "\(label) muscle skin binding"
+        return (buffer, bindings.filter { $0.tetIndex != MUSCLE_SKIN_UNBOUND }.count)
+    }
+
+    static func transformPoint(_ matrix: simd_float4x4, _ point: simd_float3) -> simd_float3 {
         let transformed = matrix * simd_float4(point, 1)
         return simd_float3(transformed.x, transformed.y, transformed.z)
+    }
+}
+
+extension DeformationSystem {
+    var musclePipelines: MusclePipelines? {
+        guard let predict = musclePredictPipeline.pipelineState,
+              let gradient = muscleVolumeGradientPipeline.pipelineState,
+              let solve = muscleSolvePipeline.pipelineState,
+              let skinWrap = muscleSkinWrapPipeline.pipelineState
+        else { return nil }
+        return MusclePipelines(predict: predict, volumeGradient: gradient, solve: solve, skinWrap: skinWrap)
+    }
+
+    /// Returns the entity's live muscle state, baking the rig on first use.
+    /// Nil when the skeleton carries no rig or nothing in it resolves.
+    func muscleState(
+        for component: DeformationComponent,
+        skeleton: Skeleton,
+        device: MTLDevice,
+        label: String
+    ) -> MuscleSimState? {
+        if let existing = component.muscleSim {
+            return existing
+        }
+        guard let rig = skeleton.muscleRig, !component.muscleBakeFailed else { return nil }
+        guard let geometry = MuscleGeometryBuilder.bake(rig: rig, skeleton: skeleton),
+              let state = MuscleSimState(geometry: geometry, device: device, label: label)
+        else {
+            component.muscleBakeFailed = true
+            Logger.logWarning(message: "Muscle rig for \(label) could not be built")
+            return nil
+        }
+        component.muscleSim = state
+        Logger.log(message: "Muscle rig built for \(label): \(geometry.muscles.count) muscles, \(geometry.particleCount) particles, \(geometry.tets.count) tets")
+        return state
+    }
+
+    /// Advances the entity's muscle simulation one frame from the current
+    /// pose: activation, frame parameters, substeps.
+    func encodeMuscleSimulation(
+        encoder: MTLComputeCommandEncoder,
+        state: MuscleSimState,
+        component: DeformationComponent,
+        entityId: EntityID,
+        skeleton: Skeleton
+    ) {
+        guard let pipelines = musclePipelines,
+              skeleton.currentPose.count == skeleton.jointPaths.count
+        else { return }
+
+        let frameDelta = min(max(timeSinceLastUpdate ?? (1.0 / 90.0), 1.0 / 240.0), 1.0 / 30.0)
+        let substepDelta = frameDelta / Float(muscleSubstepsPerFrame)
+        let animationComponent = scene.get(component: AnimationComponent.self, for: entityId)
+        let localRotations = animationComponent?.hasSampledPose == true ? animationComponent?.localPose.rotations : nil
+
+        let targets = state.geometry.muscles.map { muscle in
+            MuscleSimulator.activationTarget(
+                muscle: muscle,
+                localRotations: localRotations,
+                restTransforms: skeleton.restTransform,
+                override: component.muscleActivationOverride,
+                manual: component.muscleActivations
+            )
+        }
+        MuscleSimulator.smoothActivations(state: state, targets: targets, frameDelta: frameDelta)
+        let frameParams = MuscleSimulator.frameParams(
+            state: state,
+            currentPose: skeleton.currentPose,
+            disabledMuscles: component.disabledMuscles,
+            substepDelta: substepDelta
+        )
+        MuscleSimulator.encodeFrame(
+            encoder: encoder,
+            pipelines: pipelines,
+            state: state,
+            frameParams: frameParams,
+            substepDelta: substepDelta,
+            gravity: component.muscleGravity,
+            reset: component.muscleResetRequested
+        )
+        component.muscleResetRequested = false
+    }
+
+    /// Applies the muscle deltas to one mesh's deformed streams. Kicks off the
+    /// mesh's skin-binding bake on first use and skips the mesh until it is
+    /// ready.
+    func encodeMuscleSkinWrap(
+        encoder: MTLComputeCommandEncoder,
+        state: MuscleSimState,
+        mesh: Mesh,
+        output: MeshDeformationBuffers,
+        device: MTLDevice
+    ) {
+        guard let pipeline = muscleSkinWrapPipeline.pipelineState else { return }
+        let key = ObjectIdentifier(mesh.metalKitMesh)
+        let bindingBuffer: MTLBuffer
+        switch state.bindingState(for: key) {
+        case let .ready(buffer):
+            bindingBuffer = buffer
+        case .building:
+            return
+        case nil:
+            startSkinBindingBake(state: state, mesh: mesh, key: key, device: device)
+            return
+        }
+        MuscleSimulator.encodeSkinWrap(
+            encoder: encoder,
+            pipeline: pipeline,
+            state: state,
+            bindings: bindingBuffer,
+            positions: output.positions,
+            normals: output.normals,
+            tangents: output.tangents,
+            vertexCount: output.vertexCount
+        )
     }
 
     private func startSkinBindingBake(state: MuscleSimState, mesh: Mesh, key: ObjectIdentifier, device: MTLDevice) {
@@ -429,17 +532,9 @@ extension DeformationSystem {
 
         state.setBindingState(.building, for: key)
         MuscleSimState.bakeQueue.async {
-            let bindings = MuscleGeometryBuilder.bindSkin(positions: positions, geometry: geometry)
-            let length = bindings.count * MemoryLayout<MuscleSkinBinding>.stride
-            let buffer = bindings.withUnsafeBytes { bytes -> MTLBuffer? in
-                guard let baseAddress = bytes.baseAddress else { return nil }
-                return device.makeBuffer(bytes: baseAddress, length: length, options: .storageModeShared)
-            }
-            if let buffer {
-                buffer.label = "\(meshName) muscle skin binding"
-                state.setBindingState(.ready(buffer), for: key)
-                let boundCount = bindings.filter { $0.tetIndex != MUSCLE_SKIN_UNBOUND }.count
-                Logger.log(message: "Muscle skin binding finished for mesh \(meshName): \(boundCount)/\(bindings.count) vertices bound")
+            if let result = MuscleSimulator.makeSkinBindingBuffer(positions: positions, geometry: geometry, device: device, label: meshName) {
+                state.setBindingState(.ready(result.buffer), for: key)
+                Logger.log(message: "Muscle skin binding finished for mesh \(meshName): \(result.boundCount)/\(positions.count) vertices bound")
             } else {
                 state.setBindingState(nil, for: key)
             }

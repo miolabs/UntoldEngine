@@ -324,6 +324,9 @@ public struct RuntimeSkeleton: Sendable, Equatable {
     public var restTransforms: [simd_float4x4]
     /// Volumetric muscles from the asset's muscle table, if any.
     public var muscleRig: MuscleRig?
+    /// Trained ML deformer payload: `<asset>.untoldml` next to the file, or
+    /// the asset's `mlDeformerTable` record.
+    public var mlDeformerURL: URL?
 
     public init(
         name: String? = nil,
@@ -331,7 +334,8 @@ public struct RuntimeSkeleton: Sendable, Equatable {
         parentIndices: [Int?],
         bindTransforms: [simd_float4x4],
         restTransforms: [simd_float4x4],
-        muscleRig: MuscleRig? = nil
+        muscleRig: MuscleRig? = nil,
+        mlDeformerURL: URL? = nil
     ) {
         self.name = name
         self.jointPaths = jointPaths
@@ -339,6 +343,7 @@ public struct RuntimeSkeleton: Sendable, Equatable {
         self.bindTransforms = bindTransforms
         self.restTransforms = restTransforms
         self.muscleRig = muscleRig
+        self.mlDeformerURL = mlDeformerURL
     }
 }
 

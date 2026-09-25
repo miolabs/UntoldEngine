@@ -409,6 +409,14 @@ public class DeformationComponent: Component {
     var muscleResetRequested = false
     var muscleBakeFailed = false
 
+    /// ML deformer: a trained network predicting the muscle skin deltas from
+    /// the pose (see `setEntityMLDeformer`).
+    public var mlDeformerEnabled: Bool = false
+    var mlDeformerWeight: Float = 1
+    var mlDeformerURL: URL?
+    var mlDeformerState: MLDeformerLoadState?
+    let mlDeformerLock = NSLock()
+
     public required init() {}
 
     func cleanUp() {
@@ -420,6 +428,7 @@ public class DeformationComponent: Component {
         disabledMuscles.removeAll()
         muscleSim = nil
         muscleBakeFailed = false
+        mlDeformerState = nil
     }
 }
 

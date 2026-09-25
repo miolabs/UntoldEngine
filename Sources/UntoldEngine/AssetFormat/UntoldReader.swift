@@ -152,6 +152,12 @@ public final class UntoldReader: @unchecked Sendable {
             from: data,
             entries: chunks
         )
+        let mlDeformers = try decodeTableIfPresent(
+            UntoldMLDeformerRecordV1.self,
+            chunkType: .mlDeformerTable,
+            from: data,
+            entries: chunks
+        )
         let pluginChunks = try decodePluginChunks(from: data, entries: chunks)
 
         let decoded = UntoldDecodedAsset(
@@ -178,6 +184,7 @@ public final class UntoldReader: @unchecked Sendable {
             morphDrivers: morphDrivers,
             gaussianAssets: gaussianAssets,
             muscles: muscles,
+            mlDeformers: mlDeformers,
             pluginChunks: pluginChunks
         )
         try validateGaussianAssets(decoded)
@@ -430,6 +437,17 @@ public final class UntoldReader: @unchecked Sendable {
                 throw UntoldValidationError.invalidMuscleRecord(index: index, reason: "non-positive radius")
             }
         }
+
+        for (index, record) in asset.mlDeformers.enumerated() {
+            guard asset.skeletons.contains(where: { $0.entityId == record.skeletonEntityId }) else {
+                throw UntoldValidationError.invalidMLDeformerRecord(
+                    index: index, reason: "skeleton entity \(record.skeletonEntityId) not found"
+                )
+            }
+            guard record.payloadPathOffset != UntoldFormat.invalidIndex else {
+                throw UntoldValidationError.invalidMLDeformerRecord(index: index, reason: "missing payload path")
+            }
+        }
     }
 
     private func indexElementSize(for indexType: UntoldIndexType) -> UInt64 {
@@ -641,6 +659,7 @@ public struct UntoldDecodedAsset: Sendable {
     public let morphDrivers: [UntoldMorphDriverRecordV1]
     public let gaussianAssets: [UntoldGaussianAssetRecordV1]
     public let muscles: [UntoldMuscleRecordV1]
+    public let mlDeformers: [UntoldMLDeformerRecordV1]
     public let pluginChunks: [UntoldPluginChunk]
 
     public init(
@@ -667,6 +686,7 @@ public struct UntoldDecodedAsset: Sendable {
         morphDrivers: [UntoldMorphDriverRecordV1] = [],
         gaussianAssets: [UntoldGaussianAssetRecordV1] = [],
         muscles: [UntoldMuscleRecordV1] = [],
+        mlDeformers: [UntoldMLDeformerRecordV1] = [],
         pluginChunks: [UntoldPluginChunk] = []
     ) {
         self.header = header
@@ -692,6 +712,7 @@ public struct UntoldDecodedAsset: Sendable {
         self.morphDrivers = morphDrivers
         self.gaussianAssets = gaussianAssets
         self.muscles = muscles
+        self.mlDeformers = mlDeformers
         self.pluginChunks = pluginChunks
     }
 

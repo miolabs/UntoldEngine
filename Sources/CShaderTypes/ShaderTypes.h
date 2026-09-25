@@ -325,6 +325,25 @@ typedef struct{
 
 #define MUSCLE_SKIN_UNBOUND 0xFFFFFFFFu
 
+// MARK: - ML deformer (PCA decode)
+
+typedef enum{
+    mlDecodePositionsIndex,        // deformed skin positions, updated in place
+    mlDecodeNormalsIndex,
+    mlDecodeActiveIndicesIndex,    // uint per active vertex: mesh-local vertex index
+    mlDecodeDeltaMeanIndex,        // half[activeCount * 6]
+    mlDecodeBasisIndex,            // half[componentCount * activeCount * 6]
+    mlDecodeCoefficientsIndex,     // float[componentCount]
+    mlDecodeParamsIndex,
+}MLDecodeBufferIndices;
+
+typedef struct{
+    unsigned int activeCount;
+    unsigned int vertexCount;
+    unsigned int componentCount;
+    float weight;                  // blend of the decoded delta (0...1)
+}MLDecodeParams;
+
 
 typedef enum{
     prePassGizmoBufferIndex,

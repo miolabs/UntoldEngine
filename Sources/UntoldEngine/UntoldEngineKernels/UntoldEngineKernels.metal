@@ -42,6 +42,7 @@ using namespace metal;
 #include "../Shaders/HZBCompute.metal"
 #include "../Shaders/DeformationCompute.metal"
 #include "../Shaders/MuscleCompute.metal"
+#include "../Shaders/MLDeformerCompute.metal"
 #include "../Shaders/ARShader.metal"
 #include "../Shaders/SSAOBilateralBlurShader.metal"
 #include "../Shaders/SSAOUpsampleShader.metal"
