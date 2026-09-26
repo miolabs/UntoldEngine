@@ -162,7 +162,10 @@ private func updateAnimationSystem(deltaTime: Float) {
             continue
         }
 
-        if isAnimationComponentPaused(entityId: entity) {
+        // A paused clip still re-poses when an external pose drives it
+        // (motion capture over a frozen base pose); time just stands still.
+        let paused = isAnimationComponentPaused(entityId: entity)
+        if paused, animationComponent.externalPose.isActive == false {
             continue
         }
 
@@ -177,7 +180,9 @@ private func updateAnimationSystem(deltaTime: Float) {
             )
         }
 
-        animationComponent.currentTime += deltaTime * animationComponent.playbackSpeed
+        if paused == false {
+            animationComponent.currentTime += deltaTime * animationComponent.playbackSpeed
+        }
 
         guard let animationClip = animationComponent.currentAnimation else { continue }
 
@@ -218,6 +223,13 @@ private func updateAnimationSystem(deltaTime: Float) {
         animationComponent.transition.apply(
             to: &animationComponent.localPose,
             deltaTime: deltaTime
+        )
+        // External pose sources (motion capture) override the animated
+        // rotations of the joints they drive.
+        applyExternalPose(
+            state: &animationComponent.externalPose,
+            skeleton: skeletonComponent.skeleton,
+            pose: &animationComponent.localPose
         )
         // The override layer (an upper-body posture) and reach IK shape the
         // displayed pose before the feet are planted.

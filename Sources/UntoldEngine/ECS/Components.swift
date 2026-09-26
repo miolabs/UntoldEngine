@@ -496,6 +496,8 @@ public class AnimationComponent: Component {
     var footIK = FootIKState()
     var motionMatching = MotionMatchingState()
     var poseLayer = PoseLayerState()
+    /// Pose driven from outside the clip pipeline (see `setEntityExternalPose`).
+    var externalPose = ExternalPoseState()
     var reachIK = ReachIKState()
 
     public required init() {}
@@ -516,6 +518,7 @@ public class AnimationComponent: Component {
         footIK = FootIKState()
         motionMatching = MotionMatchingState()
         poseLayer = PoseLayerState()
+        externalPose = ExternalPoseState()
         reachIK = ReachIKState()
     }
 
