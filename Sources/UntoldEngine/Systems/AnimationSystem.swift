@@ -240,6 +240,25 @@ private func updateAnimationSystem(deltaTime: Float) {
             skeleton: skeletonComponent.skeleton,
             deltaTime: deltaTime
         )
+        // The physics pose lands last, on the fully animated pose, so for
+        // the joints it weights the plugin's bodies win over every stage
+        // above. The animation's own pose is kept aside first, so a plugin
+        // driving its bodies toward the animation never chases its own
+        // blended result.
+        if animationComponent.physicsPose.isActive {
+            skeletonComponent.skeleton.captureAnimatedPose(
+                from: animationComponent.localPose,
+                localScales: compiledClip.restScales
+            )
+        } else {
+            skeletonComponent.skeleton.animatedPoseCaptured = false
+        }
+        applyPhysicsPose(
+            entityId: entity,
+            animationComponent: animationComponent,
+            skeleton: skeletonComponent.skeleton,
+            localScales: compiledClip.restScales
+        )
 
         animationComponent.hasSampledPose = true
         animationComponent.lastSampleDeltaTime = deltaTime
@@ -255,6 +274,10 @@ private func updateAnimationSystem(deltaTime: Float) {
                 skin.updateJointMatrices(skeleton: skeletonComponent.skeleton)
             }
         }
+
+        // The physics pose was for the skin: the pose history stays the
+        // animation's own.
+        restoreAnimatedLocalPose(animationComponent: animationComponent)
     }
 }
 
@@ -611,6 +634,111 @@ public func setReachIKChainWeights(entityId: EntityID, weights: [Float]) {
 
     for (_, animationComponent) in animationComponents {
         animationComponent.reachIK.chainWeights = weights
+    }
+}
+
+/// The skeleton the animation APIs act on for `entityId`: on the entity or
+/// its first descendant that carries an `AnimationComponent`.
+private func resolveAnimatedSkeleton(entityId: EntityID) -> Skeleton? {
+    let targetEntityId = resolveEntityWithAnimationComponent(entityId: entityId) ?? entityId
+    guard let skeleton = scene.get(component: SkeletonComponent.self, for: targetEntityId)?.skeleton else {
+        handleError(.noSkeletonComponent, entityId)
+        return nil
+    }
+    return skeleton
+}
+
+/// The entity's skeleton — joint paths, parents and the model-space bind
+/// pose — for a physics plugin to build a rig that maps onto it. Resolves
+/// the skeleton on the entity or its first descendant that carries an
+/// `AnimationComponent`, as the other animation APIs do. Nil when there is
+/// no skeleton.
+public func getSkeletonJointInfo(entityId: EntityID) -> SkeletonJointInfo? {
+    guard let skeleton = resolveAnimatedSkeleton(entityId: entityId) else { return nil }
+    return SkeletonJointInfo(
+        jointPaths: skeleton.jointPaths,
+        parentIndices: skeleton.parentIndices,
+        bindModelTransforms: skeleton.bindTransform
+    )
+}
+
+/// Model-space joint transforms of the displayed pose, in skeleton joint
+/// order: what the last animation update composed (physics pose included),
+/// or the bind pose before the first update. Model space is the entity's
+/// space — the skin matrices carry no entity transform, the shader applies
+/// it — so a joint's world transform is the entity's world transform times
+/// its entry here. Nil when there is no skeleton.
+public func getJointModelTransforms(entityId: EntityID) -> [simd_float4x4]? {
+    guard let skeleton = resolveAnimatedSkeleton(entityId: entityId) else { return nil }
+    return skeleton.displayedModelPose
+}
+
+/// Model-space joint transforms of the animation alone — the pose the last
+/// update composed before the physics pose was blended in — in skeleton
+/// joint order and model space like `getJointModelTransforms`, and equal
+/// to it while no physics pose is active. A plugin drives its bodies
+/// toward this pose: the displayed pose already carries the bodies' own
+/// result, so aiming at it would only hold them where they are. Nil when
+/// there is no skeleton.
+public func getAnimatedJointModelTransforms(entityId: EntityID) -> [simd_float4x4]? {
+    guard let skeleton = resolveAnimatedSkeleton(entityId: entityId) else { return nil }
+    return skeleton.animatedModelPose
+}
+
+/// Hands in a pose from physics: one model-space transform and one weight
+/// (0…1) per joint, in skeleton joint order, blended into the displayed
+/// pose on every animation update after foot IK until `clearPhysicsPose`.
+/// A weighted joint takes the physics rotation, slerped by its weight; it
+/// also takes the physics translation (lerped) when it has no parent or
+/// its parent's weight is 0 — the top of a physics-driven subtree — while
+/// the joints below keep their animated bone offsets. Joints at weight 0
+/// keep the animated pose relative to their (possibly physics-driven)
+/// parent. Both arrays must hold exactly one entry per skeleton joint, or
+/// the call is ignored.
+///
+/// The blend happens inside the animation update, so the pose is not
+/// applied while the entity is paused (`pauseAnimationComponent`): a
+/// paused entity keeps showing the last pose it composed.
+public func setPhysicsPose(entityId: EntityID, jointModelTransforms: [simd_float4x4], jointWeights: [Float]) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (componentEntityId, animationComponent) in animationComponents {
+        guard let skeleton = scene.get(component: SkeletonComponent.self, for: componentEntityId)?.skeleton,
+              skeleton.jointPaths.count == jointModelTransforms.count,
+              skeleton.jointPaths.count == jointWeights.count
+        else {
+            handleError(.physicsPoseJointCountMismatch, entityId)
+            continue
+        }
+        // The transforms share the caller's storage; the weights are
+        // clamped into storage kept from the previous call, so a plugin
+        // feeding a pose every frame does not allocate here.
+        animationComponent.physicsPose.modelTransforms = jointModelTransforms
+        if animationComponent.physicsPose.weights.count != jointWeights.count {
+            animationComponent.physicsPose.weights = jointWeights
+        }
+        for index in jointWeights.indices {
+            animationComponent.physicsPose.weights[index] = min(max(jointWeights[index], 0), 1)
+        }
+        animationComponent.physicsPose.isActive = true
+    }
+}
+
+/// Stops blending the physics pose in: the next animation update shows the
+/// animated pose again.
+public func clearPhysicsPose(entityId: EntityID) {
+    let animationComponents = animationComponentsForEntityOrDescendants(entityId: entityId)
+    guard animationComponents.isEmpty == false else {
+        handleError(.noAnimationComponent, entityId)
+        return
+    }
+
+    for (_, animationComponent) in animationComponents {
+        animationComponent.physicsPose.clear()
     }
 }
 
