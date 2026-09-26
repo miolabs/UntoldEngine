@@ -62,6 +62,51 @@ class Skeleton {
         jointPaths.compactMap { self.jointPaths.firstIndex(of: $0) }
     }
 
+    /// The model-space joint matrices the last `updateWorldPose(from:localScales:)`
+    /// composed — the pose the skin shows — or the bind pose before the first
+    /// update, when nothing has been composed yet and the skin still carries
+    /// its identity fill (bind times inverse bind).
+    var displayedModelPose: [simd_float4x4] {
+        worldPoseScratch.count == jointPaths.count ? worldPoseScratch : bindTransform
+    }
+
+    /// The model-space joint matrices the animation alone composed on the
+    /// last update, before a physics pose was blended in — captured only
+    /// while one is active; otherwise the displayed pose is the animation.
+    var animatedModelPose: [simd_float4x4] {
+        animatedPoseCaptured && animatedPoseScratch.count == jointPaths.count ? animatedPoseScratch : displayedModelPose
+    }
+
+    /// Set by `captureAnimatedPose`; cleared by the animation update when no
+    /// physics pose is active.
+    var animatedPoseCaptured = false
+    private var animatedPoseScratch: [simd_float4x4] = []
+
+    /// Composes the animated local pose into `animatedModelPose` with the
+    /// same T * R * S(rest scale) chain as `updateWorldPose`, without
+    /// touching the displayed pose or the skin.
+    func captureAnimatedPose(from localPose: PoseBuffer, localScales: [simd_float3]) {
+        let jointCount = jointPaths.count
+        guard localPose.jointCount == jointCount, localScales.count == jointCount else {
+            animatedPoseCaptured = false
+            return
+        }
+        if animatedPoseScratch.count != jointCount {
+            animatedPoseScratch = [simd_float4x4](repeating: .identity, count: jointCount)
+        }
+        for index in 0 ..< jointCount {
+            let localMatrix = simd_float4x4(translation: localPose.translations[index])
+                * simd_float4x4(localPose.rotations[index])
+                * simd_float4x4(scale: localScales[index])
+            if let parentIndex = parentIndices[index] {
+                animatedPoseScratch[index] = animatedPoseScratch[parentIndex] * localMatrix
+            } else {
+                animatedPoseScratch[index] = localMatrix
+            }
+        }
+        animatedPoseCaptured = true
+    }
+
     /// Updates the skeleton's world pose from a sampled local-space pose.
     /// Local matrices are rebuilt as T * R * S(rest scale), the hierarchy is
     /// composed, and the inverse bind transforms are applied — matching
