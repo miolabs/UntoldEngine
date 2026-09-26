@@ -616,14 +616,14 @@ public enum RenderPasses {
         ensureShadowCacheConfigured()
         guard let frustum = shadowFrustum(for: cascadeIdx) else { return [] }
 
-        let cameraPosition: simd_float3
-        if let cam = CameraSystem.shared.activeCamera,
-           let camComp = scene.get(component: CameraComponent.self, for: cam)
-        {
-            cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(camComp.localPosition)
-        } else {
-            cameraPosition = .zero
-        }
+        // Conservative, direction-agnostic pre-reject: a caster farther than the engine's
+        // own shadow-distance horizon (maxShadowCastingDistance) from anything this cascade's
+        // camera-frustum slice could see cannot matter to this cascade, regardless of light
+        // direction — unlike a camera-depth cutoff, this never excludes the far/shallow-angle
+        // casters that motivated removing the old per-cascade distance cull, since it is
+        // measured from the cascade's own world-space bounding sphere, not the camera.
+        let cascadeCenter = shadowSystem.cascadeWorldCenters[cascadeIdx]
+        let cascadeReach = shadowSystem.cascadeWorldRadii[cascadeIdx] + RenderPasses.maxShadowCastingDistance
 
         // Rebuild candidate list if dirty. At most one rebuild per dirty event, shared
         // across all cascade invocations in the same frame.
@@ -671,20 +671,16 @@ public enum RenderPasses {
                 localMax: localTransformComponent.boundingBox.max,
                 worldMatrix: worldTransformComponent.space
             )
-            // Per-cascade distance limit: cap at the cascade's own split distance so
-            // objects beyond this cascade's far plane are not rendered into it.
-            // This prevents the near cascade from receiving shadow casters that are
-            // only relevant to farther cascades, cutting draw calls significantly for
-            // the near (most expensive) cascade.
-            let cascadeMaxDistance = shadowCascadeMaxDistance(
-                cascadeIdx: cascadeIdx,
-                splitDistances: shadowSystem.cascadeSplitDistances,
-                globalMax: RenderPasses.maxShadowCastingDistance
-            )
+            // Directional-light caster relevance cannot be determined from camera
+            // distance or the cascade receiver split — a caster outside a cascade's
+            // camera-depth interval can still project a shadow into that interval.
+            // The world-space distance reject above stays correct for any light
+            // direction; the fitted light-space cascade frustum below is the
+            // correctness-preserving cull for what actually lands in the map.
             if shadowEntityBeyondMaxDistance(
                 worldMin: worldMin, worldMax: worldMax,
-                cameraPosition: cameraPosition,
-                maxDistance: cascadeMaxDistance
+                cameraPosition: cascadeCenter,
+                maxDistance: cascadeReach
             ) { continue }
             if isAABBInFrustum(frustum, min: worldMin, max: worldMax) {
                 result.append(entityId)
@@ -4409,8 +4405,10 @@ public enum RenderPasses {
         let shouldDrawStaticBatchCells = settings.showStaticBatchCellBounds
         let shouldDrawTileBounds = settings.showTileBounds
         let shouldDrawOccludedBounds = isOcclusionDebugMode
+        let shouldDrawGaussianChunkBounds = settings.showGaussianChunkBounds
         guard settings.enabled || isOcclusionDebugMode,
               shouldDrawOctreeBounds || shouldDrawStaticBatchCells || shouldDrawTileBounds || shouldDrawOccludedBounds
+              || shouldDrawGaussianChunkBounds
         else {
             return
         }
@@ -4440,6 +4438,7 @@ public enum RenderPasses {
         let staticBatchCellBounds = shouldDrawStaticBatchCells ? snapshot.staticBatchCellBounds : []
         let tileBounds = shouldDrawTileBounds ? snapshot.tileBounds : []
         let occludedBounds = shouldDrawOccludedBounds ? snapshot.occludedEntityBounds : []
+        let gaussianChunkBounds = shouldDrawGaussianChunkBounds ? snapshot.gaussianChunkBounds : []
 
         let maxLeafNodeCount = settings.maxLeafNodeCount
         let drawLeafCount = maxLeafNodeCount > 0 ? min(maxLeafNodeCount, leafBounds.count) : leafBounds.count
@@ -4454,8 +4453,12 @@ public enum RenderPasses {
         let maxTileNodeCount = settings.maxTileNodeCount
         let drawTileCount = maxTileNodeCount > 0 ? min(maxTileNodeCount, tileBounds.count) : tileBounds.count
         let drawOccludedCount = occludedBounds.count
+        // Already capped to settings.maxGaussianChunkCount by the collector.
+        let drawGaussianChunkCount = gaussianChunkBounds.count
 
-        guard drawLeafCount > 0 || drawStaticBatchCellCount > 0 || drawTileCount > 0 || drawOccludedCount > 0 else {
+        guard drawLeafCount > 0 || drawStaticBatchCellCount > 0 || drawTileCount > 0 || drawOccludedCount > 0
+            || drawGaussianChunkCount > 0
+        else {
             return
         }
 
@@ -4493,6 +4496,20 @@ public enum RenderPasses {
             groupedBounds[key]?.bounds.append(item.bounds)
         }
 
+        // Regular depth-tested group, like octree/tile/batch-cell bounds above: a chunk box is
+        // co-located with the splats it bounds, so it should respect depth like they do, unlike
+        // the occluded-entity case below where the whole point is showing something otherwise
+        // hidden.
+        for i in 0 ..< drawGaussianChunkCount {
+            let item = gaussianChunkBounds[i]
+            let key = spatialDebugColorKey(item.color)
+            if groupedBounds[key] == nil {
+                groupedBounds[key] = (color: item.color, bounds: [])
+                groupOrder.append(key)
+            }
+            groupedBounds[key]?.bounds.append(item.bounds)
+        }
+
         // Occluded entity bounds are kept separate — they need an always-pass depth
         // state so the lines are visible even though the mesh is behind an occluder.
         var occludedGroupedBounds: [SpatialDebugColorKey: (color: simd_float4, bounds: [AABB])] = [:]
@@ -4508,7 +4525,7 @@ public enum RenderPasses {
         }
 
         var lineVertices: [SIMD4<Float>] = []
-        let drawBoundsCount = drawLeafCount + drawStaticBatchCellCount + drawTileCount + drawOccludedCount
+        let drawBoundsCount = drawLeafCount + drawStaticBatchCellCount + drawTileCount + drawOccludedCount + drawGaussianChunkCount
         lineVertices.reserveCapacity(drawBoundsCount * 24)
         var batches: [SpatialDebugLineBatch] = []
         batches.reserveCapacity(groupOrder.count)
@@ -4970,28 +4987,6 @@ private func uploadAndBindLights<T>(
     // Bind
     encoder.setFragmentBuffer(buf, offset: 0, index: bufferIndex)
     return true
-}
-
-// MARK: - Shadow cascade distance helpers (internal — exposed for testing via @testable import)
-
-/// Returns the effective maximum shadow-casting distance for a single CSM cascade.
-///
-/// Each cascade only needs shadow casters within its own split range.  Capping at the
-/// cascade's split distance prevents the near cascade from receiving distant casters
-/// that are only relevant to farther cascades, reducing shadow draw calls on cascade 0.
-///
-/// - Parameters:
-///   - cascadeIdx:    Index of the cascade (0 = nearest).
-///   - splitDistances: Per-cascade far-plane distances from the camera, as computed by ShadowSystem.
-///   - globalMax:     The scene-wide shadow distance cap (RenderPasses.maxShadowCastingDistance).
-/// - Returns: The tighter of globalMax and the cascade's own split distance.
-func shadowCascadeMaxDistance(
-    cascadeIdx: Int,
-    splitDistances: [Float],
-    globalMax: Float
-) -> Float {
-    guard cascadeIdx < splitDistances.count else { return globalMax }
-    return min(globalMax, splitDistances[cascadeIdx])
 }
 
 /// Returns true when the entity's AABB is farther than maxDistance from the camera.

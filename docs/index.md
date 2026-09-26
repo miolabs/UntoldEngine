@@ -17,33 +17,32 @@
 
 # Untold Engine
 
-Untold Engine is an **open-source Swift/Metal XR engine for
-high-performance Apple-platform spatial visualization apps**, giving
-developers full control over rendering, shaders, and the engine pipeline.
-
-Untold Engine is built for developers and teams who:
-
-- Need **full control over Metal rendering, shaders, and engine systems**
-- Prefer a native **Swift + Metal** architecture on Apple platforms
-- Are building **XR, 3D, or spatial visualization applications**
-- Need to handle **large scenes, streaming data, or custom asset pipelines**
-- Want an open engine they can inspect, modify, extend, and embed
+Untold Engine is an **open-source Swift/Metal XR engine for Apple
+platforms**. It gives you full control over rendering, shaders, physics,
+and input, so you can build your own interactive spatial and XR worlds.
 
 Creator & Lead Developer:  
 [Harold Serrano](http://www.haroldserrano.com)
 
-![archviz-demo](images/gifs/archviz-demo.gif)
+[![CoolSaber demo](images/coolsaber-thumbnail.png)](https://youtu.be/4JWZf_NFddY)
 
 ---
 
 ## Built For
 
-Untold Engine is designed for developers building custom spatial visualization
-software on Apple platforms, including:
+Untold Engine is built for developers and teams who:
 
-- Vision Pro and spatial computing apps
-- Architectural walkthroughs and large-scene visualizers
-- Custom rendering pipelines and research prototypes
+- Need **full control over Metal rendering, shaders, physics, and engine systems**
+- Prefer a native **Swift + Metal** architecture on Apple platforms
+- Are building **interactive XR, 3D, or spatial worlds** — not just viewing them
+- Need to handle **large scenes, streaming data, or custom asset pipelines**
+- Want an open engine they can inspect, modify, extend, and embed
+
+Untold Engine is well-suited for:
+
+- Interactive XR experiences on Vision Pro — hand tracking, physics, and gameplay built on ARKit
+- Spatial worlds and digital twins — archviz walkthroughs, tap-to-inspect twins, and city-scale streamed environments
+- Custom rendering pipelines and graphics research — rendering extensions, Gaussian splats, shader-level control
 
 The engine owns the rendering and XR foundation. Your app owns the vertical
 workflow, product experience, and customer-specific behavior.
@@ -57,13 +56,12 @@ workflow, product experience, and customer-specific behavior.
 | [CoolSaber](https://github.com/untoldengine/UntoldArcade/tree/main/CoolSaber) | PSVR2-driven lightsaber duels, blades clashing over SharePlay |
 | [CoolWater](https://github.com/untoldengine/UntoldArcade/tree/main/CoolWater) | Real-time animated water with reflection, refraction, and ripples |
 | [CoolCloth](https://github.com/untoldengine/UntoldArcade/tree/main/CoolCloth) | GPU cloth simulation (XPBD) you can punch a ball through |
+| [CoolWeb](https://github.com/untoldengine/UntoldArcade/tree/main/CoolWeb) | Spider-Man web-shooter — gesture-triggered webs that stick to real room geometry |
 | [Archviz Viewer](https://untoldengine.github.io/UntoldEngine/LearningPaths/ArchvizToVisionPro/) | Blender-authored architectural scene walked through in mixed reality |
 | [Bedroom Digital Twin](https://untoldengine.github.io/UntoldEngine/LearningPaths/BedroomDigitalTwin/) | Tap-to-inspect digital twin bedroom with live mock status data |
 | [City Streaming](https://untoldengine.github.io/UntoldEngine/LearningPaths/CityStreamingOnVisionPro/) | City-scale scene streamed in tile by tile with LOD/HLOD |
 
 Full source for every demo above lives in the [UntoldArcade](https://github.com/untoldengine/UntoldArcade) repo.
-
-![coolsaber-demo](images/gifs/coolsaber-demo.gif)
 
 ## Try the Engine Right Now
 
@@ -80,7 +78,7 @@ Clone the repository and launch the Starter Demo:
 ```bash
 git clone https://github.com/untoldengine/UntoldEngine.git
 cd UntoldEngine
-git checkout v0.19.1
+git checkout v0.20.0
 swift run StarterDemo
 ```
 
@@ -124,6 +122,11 @@ To create your own XR, 3D, or spatial visualization app using Untold Engine, see
 
 ## Core Direction
 
+**Vision:** An engine that empowers creativity and never stands in its way.
+
+**Mission:** Build a reliable engine that lets developers focus on creating,
+not troubleshooting the tools they depend on.
+
 Untold Engine is built around three focused goals:
 
 - **Spatial Engine First** — Designed for spatial computing applications. LOD, geometry streaming, and static batching exist to support large, real-world-scale environments where presence and performance both matter.
@@ -131,16 +134,6 @@ Untold Engine is built around three focused goals:
 - **XR / visionOS Support** — Spatial input, AR workflows, and Vision Pro support are functional today and expanding with each release.
 
 - **Metal-First Architecture** — The rendering layer stays close to Metal to maintain performance, shader control, and pipeline flexibility without abstraction layers getting in the way.
-
----
-
-## Example Use Cases
-
-Untold Engine is well-suited for:
-
-- Vision Pro and ARKit-based visualization apps
-- Large-scale scene visualization: interiors, archviz, cities, datasets
-- Custom rendering pipelines and graphics experiments
 
 ---
 
@@ -244,6 +237,19 @@ See open issues for planned features and known improvements.
 
 ---
 
+# Engineering Principles
+
+Untold Engine is built to a set of engineering principles that put
+reliability, testing, and developer experience ahead of feature velocity —
+the same discipline that keeps a spatial engine stable as scenes, platforms,
+and contributors grow.
+
+See [ENGINEERING_PRINCIPLES.md](https://github.com/untoldengine/UntoldEngine/blob/main/ENGINEERING_PRINCIPLES.md) for the full set
+of principles that guide how the engine is developed, reviewed, and
+maintained.
+
+---
+
 # Support
 
 For help or questions, open a [GitHub Issue](https://github.com/untoldengine/UntoldEngine/issues).
@@ -253,6 +259,8 @@ For help or questions, open a [GitHub Issue](https://github.com/untoldengine/Unt
 # Contributing
 
 Contributions are welcome — whether that's fixing bugs, improving systems, writing documentation, or proposing ideas.
+
+All contributions are expected to follow our [Engineering Principles](https://github.com/untoldengine/UntoldEngine/blob/main/ENGINEERING_PRINCIPLES.md).
 
 Before submitting a pull request, please review the [Contributing Guidelines](Contributor/ContributionGuidelines.md).
 
