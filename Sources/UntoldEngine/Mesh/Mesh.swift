@@ -50,6 +50,7 @@ public struct Mesh {
     /// callers that only need to read it.
     public var boundingBox: (min: simd_float3, max: simd_float3)
     var skin: Skin?
+    var morphTargets: MorphTargetSet?
     var featureEdgeIndexBuffer: MTLBuffer?
     var featureEdgeIndexCount: Int = 0
     var featureEdgeIndexType: MTLIndexType = .uint32
@@ -322,6 +323,8 @@ public struct Mesh {
                 submesh.material = Material(runtimeMaterial: runtimeMaterial, device: device)
                 mesh.submeshes[0] = submesh
             }
+
+            mesh.morphTargets = MorphTargetSet(primitive: primitive, device: device)
 
             return mesh
         } catch {
