@@ -246,8 +246,10 @@ public func setEngine(_ property: EngineProperty) {
         assetBasePath = url
     case .metrics(.enabled):
         enableEngineMetrics = true
+        setEngineStatsCollection(enabled: true)
     case .metrics(.disabled):
         enableEngineMetrics = false
+        setEngineStatsCollection(enabled: false)
     }
 }
 

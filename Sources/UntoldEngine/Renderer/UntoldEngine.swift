@@ -273,6 +273,9 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         }
 
         private func publishEngineStats(frameStartTime: Double) {
+            // Gathering the per-frame snapshot walks visible entities and batch groups; skip all of
+            // it when collection is off (the default in release builds).
+            guard EngineStatsMonitor.shared.isCollecting else { return }
             let frameTotalMs: Double
             if let dt = timeSinceLastUpdate as Float?, dt > 0 {
                 frameTotalMs = Double(dt) * 1000.0
@@ -292,9 +295,18 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             let drawStats = RenderStatsCollector.shared.snapshot()
             let tileRenderCosts = auditVisibleTileRenderCosts()
             let memStats = MemoryBudgetManager.shared.getStats()
+            let gpuPasses = GPUPassTimer.shared.snapshot()
+            let gpuAllocatedBytes = renderInfo.device?.currentAllocatedSize ?? 0
+            let thermalState = ProcessInfo.processInfo.thermalState.rawValue
+            #if os(iOS) || os(visionOS) || os(tvOS)
+                let availableMemoryBytes = Int(os_proc_available_memory())
+            #else
+                let availableMemoryBytes = 0
+            #endif
 
             EngineStatsMonitor.shared.update { snapshot in
                 snapshot.timing.frameTotalMs = frameTotalMs
+                snapshot.gpuPasses = gpuPasses
 
                 snapshot.render.drawCallsTotal = drawStats.drawCallsTotal
                 snapshot.render.drawCallsOpaque = drawStats.drawCallsOpaque
@@ -386,6 +398,9 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
                 snapshot.memory.utilizationPercent = Double(memStats.utilizationPercent)
                 snapshot.memory.isUnderPressure = memStats.isUnderPressure
                 snapshot.memory.trackedEntityCount = memStats.trackedEntityCount
+                snapshot.memory.gpuAllocatedBytes = gpuAllocatedBytes
+                snapshot.memory.availableMemoryBytes = availableMemoryBytes
+                snapshot.memory.thermalState = thermalState
             }
             EngineStatsMonitor.shared.completeFrame()
         }
@@ -579,22 +594,28 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         #endif
         EngineProfiler.shared.beginScope(.update)
         calculateDeltaTime()
-        traverseSceneGraph()
+        profileSystem(.scenegraph, \.scenegraphMs) {
+            traverseSceneGraph()
+        }
         handleInputCallback?()
 
         let extensionUpdateContext = makeEngineExtensionUpdateContext()
-        RenderExtensionRegistry.shared.updateExtensions(
-            deltaTime: timeSinceLastUpdate,
-            context: extensionUpdateContext
-        )
-        EngineExtensionRegistry.shared.updateExtensions(
-            deltaTime: timeSinceLastUpdate,
-            context: extensionUpdateContext
-        )
+        profileSystem(.extensionsUpdate, \.extensionsUpdateMs) {
+            RenderExtensionRegistry.shared.updateExtensions(
+                deltaTime: timeSinceLastUpdate,
+                context: extensionUpdateContext
+            )
+            EngineExtensionRegistry.shared.updateExtensions(
+                deltaTime: timeSinceLastUpdate,
+                context: extensionUpdateContext
+            )
+        }
 
         // 3. LOD selection (decides which representation is active, checks residency)
-        LODSystem.shared.update(deltaTime: fixedStep)
-        GaussianLODSystem.shared.update(deltaTime: fixedStep)
+        profileSystem(.lod, \.lodMs) {
+            LODSystem.shared.update(deltaTime: fixedStep)
+            GaussianLODSystem.shared.update(deltaTime: fixedStep)
+        }
 
         // 4. Flush events (residency and LOD change events are processed)
         SystemEventBus.shared.flushEvents()
@@ -621,17 +642,23 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         OctreeSystem.shared.updateDirtyBounds()
 
         if gameMode == true {
-            AnimationSystem.shared.update(timeSinceLastUpdate)
+            profileSystem(.animation, \.animationMs) {
+                AnimationSystem.shared.update(timeSinceLastUpdate)
+            }
 
             // USC scripts (runs every frame in Play mode)
-            USCSystem.shared.update(timeSinceLastUpdate)
+            profileSystem(.scripting, \.scriptingMs) {
+                USCSystem.shared.update(timeSinceLastUpdate)
+            }
 
             // fixed‐timestep physics
             physicsAccumulator += timeSinceLastUpdate
             let maxSteps = 5
             var steps = 0
             while physicsAccumulator >= fixedStep, steps < maxSteps {
-                updatePhysicsSystem(deltaTime: fixedStep)
+                profileSystem(.physics, \.physicsMs) {
+                    updatePhysicsSystem(deltaTime: fixedStep)
+                }
                 EngineExtensionRegistry.shared.fixedUpdateExtensions(
                     deltaTime: fixedStep,
                     context: extensionUpdateContext
@@ -640,13 +667,23 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
                     deltaTime: fixedStep,
                     context: extensionUpdateContext
                 )
-                updateCustomSystems(deltaTime: fixedStep)
+                profileSystem(.customSystems, \.customSystemsMs) {
+                    updateCustomSystems(deltaTime: fixedStep)
+                }
                 physicsAccumulator -= fixedStep
                 steps += 1
             }
+            #if ENGINE_STATS_ENABLED
+                let physicsSteps = steps
+                EngineStatsMonitor.shared.update { snapshot in
+                    snapshot.timing.physicsStepCount = physicsSteps
+                }
+            #endif
 
             // user game update
-            gameUpdateCallback?(timeSinceLastUpdate)
+            profileSystem(.gameUpdate, \.gameUpdateMs) {
+                gameUpdateCallback?(timeSinceLastUpdate)
+            }
         }
 
         // Per-frame view update event — fires every frame regardless of gameMode
@@ -801,6 +838,31 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     }
 
     /// XR path finalization hook. Call this once after XR submission for the frame.
+    /// Runs `body` inside a profiler signpost scope and, when engine stats are compiled in, adds its
+    /// CPU time to the `EngineTimingStats` field selected by `keyPath`. Systems that run several times
+    /// per frame (fixed-step physics) accumulate.
+    @inline(__always)
+    private func profileSystem(
+        _ scope: ProfileScope,
+        _ keyPath: WritableKeyPath<EngineTimingStats, Double>,
+        _ body: () -> Void
+    ) {
+        EngineProfiler.shared.beginScope(scope)
+        #if ENGINE_STATS_ENABLED
+            let start = CACurrentMediaTime()
+        #endif
+        body()
+        #if ENGINE_STATS_ENABLED
+            let elapsedMs = (CACurrentMediaTime() - start) * 1000.0
+            EngineStatsMonitor.shared.update { snapshot in
+                snapshot.timing[keyPath: keyPath] += elapsedMs
+            }
+        #else
+            _ = keyPath
+        #endif
+        EngineProfiler.shared.endScope(scope)
+    }
+
     public func finalizeXRStatsAndMonitors(frameStartTime: Double) {
         #if ENGINE_STATS_ENABLED
             publishEngineStats(frameStartTime: frameStartTime)

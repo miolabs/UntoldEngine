@@ -33,13 +33,23 @@ func UpdateRenderingSystem(in view: MTKView) {
     }
 
     // Wait for available command buffer slot to prevent unbounded memory growth
+    #if ENGINE_STATS_ENABLED
+        let semaphoreWaitStart = CACurrentMediaTime()
+    #endif
     commandBufferSemaphore.wait()
+    #if ENGINE_STATS_ENABLED
+        let semaphoreWaitMs = (CACurrentMediaTime() - semaphoreWaitStart) * 1000.0
+        EngineStatsMonitor.shared.update { snapshot in
+            snapshot.timing.semaphoreWaitMs = semaphoreWaitMs
+        }
+    #endif
 
     if let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() {
         #if ENGINE_STATS_ENABLED
             let renderTotalStart = CACurrentMediaTime()
         #endif
         renderInfo.lastCommandBuffer = commandBuffer
+        GPUPassTimer.shared.beginFrame(commandBuffer: commandBuffer)
         renderInfo.currentInFlightFrameSlot = acquireUniformFrameSlot()
 
         // Always refresh the scene-root matrices so that effectiveCameraPosition() and
@@ -141,6 +151,7 @@ func UpdateRenderingSystem(in view: MTKView) {
             let submitStart = CACurrentMediaTime()
         #endif
         commandBuffer.commit()
+        GPUPassTimer.shared.endFrame()
         #if ENGINE_STATS_ENABLED
             let submitMs = (CACurrentMediaTime() - submitStart) * 1000.0
             let renderTotalMs = (CACurrentMediaTime() - renderTotalStart) * 1000.0
@@ -1481,7 +1492,7 @@ public let outputTransformRenderPass: RenderPasses.RenderPassExecution = { comma
     // Do not override clearColor here: the XR layer sets it per immersion mode
     // (UntoldEngineXR.swift), and the fullscreen quad overwrites every pixel anyway.
 
-    guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+    guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, passLabel: "Output Transform Pass") else {
         handleError(.renderPassCreationFailed, "Output Transform Pass: encoder creation failed")
         return
     }

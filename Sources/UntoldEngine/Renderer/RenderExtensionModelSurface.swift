@@ -246,7 +246,7 @@ public extension RenderPassContext {
         descriptor.depthAttachment.loadAction = .load
         descriptor.depthAttachment.storeAction = .store
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: label) else {
             handleError(.renderPassCreationFailed, label)
             return
         }
