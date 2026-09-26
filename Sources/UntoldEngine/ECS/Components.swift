@@ -113,6 +113,20 @@ public class GaussianComponent: Component {
     var gaussianVisibleCount: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
     var visibleSplatCountForRendering: UInt = 0
     var splatCount: UInt = 0
+    /// A chunked entity's most recent stale readback (two or three frames old, like
+    /// `visibleSplatCountForRendering`) of which chunk indices passed `gaussianChunkCull`'s
+    /// frustum/HZB test this frame. Debug-view only: populated only while
+    /// `SpatialDebugVisualization.shared.showGaussianChunkBounds` is on, and read by
+    /// `SpatialDebugBoundsCollector` to color each chunk's drawn wireframe box green (in this
+    /// set) or red (not).
+    var visibleChunkIndicesForRendering: Set<UInt32> = []
+    /// A chunked entity with coarse levels' most recent stale readback of every chunk's drawn
+    /// level (0 fine, 1, 2 — `GaussianChunkLevelState.level`), indexed by chunk index, one entry
+    /// per chunk in the whole entity (not just the currently-visible subset). Debug-view only:
+    /// populated only while `SpatialDebugVisualization.shared.showGaussianChunkBounds` is on and
+    /// its `gaussianChunkColorMode` is `.level`. Empty for an entity with no coarse levels at all
+    /// (`chunkTable.coarse == nil`) — every chunk is trivially fine then.
+    var chunkLevelsForRendering: [UInt8] = []
     /// The `.untoldgs` chunk table (decode constants on the GPU, index on the CPU), kept from
     /// the load so the frame can cull whole chunks before it looks at their splats. nil for a
     /// `.ply` or a CPU-decoded asset, which keep the per-splat cull over the whole buffer.
@@ -462,8 +476,17 @@ public class AnimationComponent: Component {
         didSet {
             let live = Set(animationClips.values.map(ObjectIdentifier.init))
             compiledClips = compiledClips.filter { live.contains($0.key) }
+            hiddenClipAliases = hiddenClipAliases.filter { animationClips[$0] != nil }
         }
     }
+
+    /// Keys in `animationClips` that are internal aliases rather than
+    /// logical/display clip names. registerRuntimeAnimationClips adds an
+    /// alias when an asset's embedded clip name differs from the caller's
+    /// preferred name, so both names keep working as lookup keys (e.g. for
+    /// changeAnimation) while getAllAnimationClips() reports only the
+    /// preferred name — otherwise one logical animation shows up twice.
+    var hiddenClipAliases: Set<String> = []
 
     var currentAnimation: AnimationClip?
     public var animationsFilenames: [URL] = []
@@ -499,11 +522,13 @@ public class AnimationComponent: Component {
     /// Pose driven from outside the clip pipeline (see `setEntityExternalPose`).
     var externalPose = ExternalPoseState()
     var reachIK = ReachIKState()
+    var physicsPose = PhysicsPoseState()
 
     public required init() {}
 
     func cleanUp() {
         animationClips.removeAll()
+        hiddenClipAliases.removeAll()
         currentAnimation?.cleanUp()
         currentAnimation = nil
         compiledClips.removeAll()
@@ -520,14 +545,27 @@ public class AnimationComponent: Component {
         poseLayer = PoseLayerState()
         externalPose = ExternalPoseState()
         reachIK = ReachIKState()
+        physicsPose = PhysicsPoseState()
     }
 
+    /// One display name per logical animation: hidden aliases (see
+    /// `hiddenClipAliases`) are excluded so an asset whose embedded clip
+    /// name differs from its preferred name is listed once, not twice.
     func getAllAnimationClips() -> [String] {
-        Array(animationClips.keys)
+        Array(animationClips.keys.filter { hiddenClipAliases.contains($0) == false })
     }
 
+    /// Removes the logical clip named `animationClip` along with every
+    /// other key (aliases) referencing the same `AnimationClip` instance,
+    /// so removing either the preferred name or the embedded-name alias
+    /// removes the whole animation rather than leaving the other name
+    /// dangling.
     func removeAnimationClip(animationClip: String) {
-        animationClips.removeValue(forKey: animationClip)
+        guard let clip = animationClips[animationClip] else { return }
+        let keysToRemove = animationClips.compactMap { key, value in value === clip ? key : nil }
+        for key in keysToRemove {
+            animationClips.removeValue(forKey: key)
+        }
     }
 
     /// Returns the compiled form of `clip` resolved against `skeleton`,
