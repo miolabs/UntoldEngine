@@ -33,8 +33,8 @@
 
         private let layerRenderer: LayerRenderer?
 
-        // Cache last valid device anchor to use when ARKit returns nil
-        // (prevents "Presenting a drawable without a device anchor" error)
+        /// Cache last valid device anchor to use when ARKit returns nil
+        /// (prevents "Presenting a drawable without a device anchor" error)
         private var lastValidDeviceAnchor: DeviceAnchor? {
             didSet {
                 #if canImport(ARKit)
@@ -53,6 +53,7 @@
         public var currentDevicePose: simd_float4x4? {
             devicePoseLock.withLock { latestDevicePose }
         }
+
         private var missingAnchorFrameCount: Int = 0
         private var lastAnchorDiagnosticsLogTime: CFTimeInterval = 0
         private let anchorDiagnosticsLogIntervalSeconds: CFTimeInterval = 1.0
