@@ -19,6 +19,8 @@ public struct SkeletonJointPose: Sendable, Equatable {
     public var parentIndex: Int?
     /// Joint origin in world space.
     public var worldPosition: simd_float3
+    /// Joint orientation in world space.
+    public var worldRotation: simd_quatf
 }
 
 /// One joint of an entity's skeleton in its rest pose.
@@ -88,7 +90,8 @@ public func entitySkeletonJointPoses(entityId: EntityID) -> [SkeletonJointPose] 
             poses.append(SkeletonJointPose(
                 path: skeleton.jointPaths[index],
                 parentIndex: skeleton.parentIndices[index],
-                worldPosition: simd_float3(origin.x, origin.y, origin.z)
+                worldPosition: simd_float3(origin.x, origin.y, origin.z),
+                worldRotation: PoseDriverEvaluation.restRotation(from: world)
             ))
         }
         return poses

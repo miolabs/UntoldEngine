@@ -387,6 +387,58 @@ final class MeshDeformationBuffers {
     }
 }
 
+/// Externally supplied deformed positions and normals for some vertices of
+/// a mesh (see `setEntityDeformationOverride`), triple-buffered so the CPU
+/// writes never race the frame the GPU is reading.
+final class MeshDeformationOverride {
+    static let ringCount = 3
+    let capacity: Int
+    let indices: [MTLBuffer]
+    let positions: [MTLBuffer]
+    let normals: [MTLBuffer]
+    private(set) var count = 0
+    private(set) var slot = 0
+
+    init?(device: MTLDevice, capacity: Int, label: String) {
+        guard capacity > 0 else { return nil }
+        var indices: [MTLBuffer] = []
+        var positions: [MTLBuffer] = []
+        var normals: [MTLBuffer] = []
+        for ring in 0 ..< Self.ringCount {
+            guard let i = device.makeBuffer(length: capacity * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+                  let p = device.makeBuffer(length: capacity * MemoryLayout<simd_float4>.stride, options: .storageModeShared),
+                  let n = device.makeBuffer(length: capacity * MemoryLayout<simd_float4>.stride, options: .storageModeShared)
+            else { return nil }
+            i.label = "\(label) override indices \(ring)"
+            p.label = "\(label) override positions \(ring)"
+            n.label = "\(label) override normals \(ring)"
+            indices.append(i)
+            positions.append(p)
+            normals.append(n)
+        }
+        self.capacity = capacity
+        self.indices = indices
+        self.positions = positions
+        self.normals = normals
+    }
+
+    /// Writes the next slot; entries beyond the capacity are dropped.
+    func write(indices newIndices: [UInt32], positions newPositions: [simd_float3], normals newNormals: [simd_float3]) {
+        let count = min(newIndices.count, newPositions.count, newNormals.count, capacity)
+        let next = (slot + 1) % Self.ringCount
+        let indexPointer = indices[next].contents().bindMemory(to: UInt32.self, capacity: capacity)
+        let positionPointer = positions[next].contents().bindMemory(to: simd_float4.self, capacity: capacity)
+        let normalPointer = normals[next].contents().bindMemory(to: simd_float4.self, capacity: capacity)
+        for i in 0 ..< count {
+            indexPointer[i] = newIndices[i]
+            positionPointer[i] = simd_float4(newPositions[i], 1)
+            normalPointer[i] = simd_float4(newNormals[i], 0)
+        }
+        slot = next
+        self.count = count
+    }
+}
+
 /// Opts an entity's skinned meshes into the deformation compute pass.
 /// Entities without this component keep the legacy vertex-shader skinning path.
 public class DeformationComponent: Component {
@@ -407,6 +459,10 @@ public class DeformationComponent: Component {
     /// e.g. a graph without the deformation node) leave draws on the legacy
     /// vertex-shader path.
     var meshDeformations: [ObjectIdentifier: MeshDeformationBuffers] = [:]
+    /// Per mesh (keyed like `meshDeformations`): vertices whose deformed
+    /// position and normal come from outside the pass.
+    var meshOverrides: [ObjectIdentifier: MeshDeformationOverride] = [:]
+    let meshOverrideLock = NSLock()
 
     /// Volumetric muscle simulation (XPBD tet cages wrapped onto the skin);
     /// needs a muscle rig on the skeleton. See `setEntityMuscleSimulation`.
