@@ -408,12 +408,41 @@ public class DeformationComponent: Component {
     /// vertex-shader path.
     var meshDeformations: [ObjectIdentifier: MeshDeformationBuffers] = [:]
 
+    /// Volumetric muscle simulation (XPBD tet cages wrapped onto the skin);
+    /// needs a muscle rig on the skeleton. See `setEntityMuscleSimulation`.
+    public var musclesEnabled: Bool = false
+    /// Manual per-muscle activations for muscles without a driver.
+    var muscleActivations: [String: Float] = [:]
+    /// When set, every muscle uses this activation.
+    var muscleActivationOverride: Float?
+    /// Muscles that keep simulating but no longer move the skin.
+    var disabledMuscles: Set<String> = []
+    /// Model-space gravity on free muscle particles.
+    var muscleGravity = simd_float3(0, -2.0, 0)
+    var muscleSim: MuscleSimState?
+    var muscleResetRequested = false
+    var muscleBakeFailed = false
+
+    /// ML deformer: a trained network predicting the muscle skin deltas from
+    /// the pose (see `setEntityMLDeformer`).
+    public var mlDeformerEnabled: Bool = false
+    var mlDeformerWeight: Float = 1
+    var mlDeformerURL: URL?
+    var mlDeformerState: MLDeformerLoadState?
+    let mlDeformerLock = NSLock()
+
     public required init() {}
 
     func cleanUp() {
         meshDeformations.removeAll()
         morphWeights.removeAll()
         drivenMorphWeights.removeAll()
+        muscleActivations.removeAll()
+        muscleActivationOverride = nil
+        disabledMuscles.removeAll()
+        muscleSim = nil
+        muscleBakeFailed = false
+        mlDeformerState = nil
     }
 }
 
