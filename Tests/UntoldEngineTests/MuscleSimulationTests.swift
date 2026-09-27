@@ -106,57 +106,20 @@ final class MuscleSimulationTests: XCTestCase {
         params: [MuscleFrameParams],
         substepDelta: Float
     ) {
-        state.writeMuscleParams { pointer in
-            for (index, value) in params.enumerated() {
-                pointer[index] = value
-            }
-        }
-        var simParams = MuscleSimParams(
-            particleCount: UInt32(state.particleCount),
-            skinVertexCount: 0,
-            dt: substepDelta,
-            relaxation: muscleRelaxation,
-            gravity: simd_float4(0, -2, 0, 0),
-            maxVelocity: 8,
-            pad0: 0, pad1: 0, pad2: 0
-        )
         let commandBuffer = pipelines.queue.makeCommandBuffer()!
         let encoder = commandBuffer.makeComputeCommandEncoder()!
-        let width = pipelines.solve.threadExecutionWidth
-        let groups = MTLSize(width: (state.particleCount + width - 1) / width, height: 1, depth: 1)
-        let perGroup = MTLSize(width: width, height: 1, depth: 1)
-        for _ in 0 ..< muscleSubstepsPerFrame {
-            encoder.setComputePipelineState(pipelines.predict)
-            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
-            encoder.setBuffer(state.prevPositions, offset: 0, index: Int(musclePassPrevPositionsIndex.rawValue))
-            encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
-            encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
-            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
-            encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: perGroup)
-
-            encoder.setComputePipelineState(pipelines.gradient)
-            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
-            encoder.setBuffer(state.triangles, offset: 0, index: Int(musclePassTrianglesIndex.rawValue))
-            encoder.setBuffer(state.triOffsets, offset: 0, index: Int(musclePassParticleTriOffsetsIndex.rawValue))
-            encoder.setBuffer(state.triList, offset: 0, index: Int(musclePassParticleTriListIndex.rawValue))
-            encoder.setBuffer(state.gradients, offset: 0, index: Int(musclePassGradientsIndex.rawValue))
-            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
-            encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: perGroup)
-
-            encoder.setComputePipelineState(pipelines.solve)
-            encoder.setBuffer(state.currentPositions, offset: 0, index: Int(musclePassPositionsIndex.rawValue))
-            encoder.setBuffer(state.nextPositions, offset: 0, index: Int(musclePassPositionsOutIndex.rawValue))
-            encoder.setBuffer(state.prevPositions, offset: 0, index: Int(musclePassPrevPositionsIndex.rawValue))
-            encoder.setBuffer(state.particleInfo, offset: 0, index: Int(musclePassParticleInfoIndex.rawValue))
-            encoder.setBuffer(state.edges, offset: 0, index: Int(musclePassEdgesIndex.rawValue))
-            encoder.setBuffer(state.edgeOffsets, offset: 0, index: Int(musclePassParticleEdgeOffsetsIndex.rawValue))
-            encoder.setBuffer(state.edgeList, offset: 0, index: Int(musclePassParticleEdgeListIndex.rawValue))
-            encoder.setBuffer(state.gradients, offset: 0, index: Int(musclePassGradientsIndex.rawValue))
-            encoder.setBuffer(state.currentMuscleParams, offset: 0, index: Int(musclePassMuscleParamsIndex.rawValue))
-            encoder.setBytes(&simParams, length: MemoryLayout<MuscleSimParams>.stride, index: Int(musclePassParamsIndex.rawValue))
-            encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: perGroup)
-            state.swapPositions()
-        }
+        MuscleSimulator.encodeFrame(
+            encoder: encoder,
+            pipelines: MusclePipelines(
+                predict: pipelines.predict, volumeGradient: pipelines.gradient,
+                solve: pipelines.solve, skinWrap: pipelines.skinWrap
+            ),
+            state: state,
+            frameParams: params,
+            substepDelta: substepDelta,
+            gravity: simd_float3(0, -2, 0),
+            reset: false
+        )
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -184,7 +147,7 @@ final class MuscleSimulationTests: XCTestCase {
         let frameDelta: Float = 1.0 / 90.0
         let substepDelta = frameDelta / Float(muscleSubstepsPerFrame)
         let initial = frameParams(geometry: geometry, elbowAngle: 0, activation: 0, substepDelta: substepDelta)
-        state.resetPositions(DeformationSystem.shared.referencePositions(state: state, frameParams: initial))
+        state.resetPositions(MuscleSimulator.referencePositions(state: state, frameParams: initial))
 
         var maxDrift: Float = 0
         var bellyRadiusRelaxed: Float = 0
@@ -281,7 +244,7 @@ final class MuscleSimulationTests: XCTestCase {
 
         // Relaxed: the simulated cage equals the reference, so the delta is zero.
         let relaxed = frameParams(geometry: geometry, elbowAngle: 0, activation: 0, substepDelta: substepDelta)
-        state.resetPositions(DeformationSystem.shared.referencePositions(state: state, frameParams: relaxed))
+        state.resetPositions(MuscleSimulator.referencePositions(state: state, frameParams: relaxed))
         state.writeMuscleParams { pointer in pointer[0] = relaxed[0] }
         let relaxedResult = runWrap()
         XCTAssertLessThan(simd_length(relaxedResult.position - skinPoint), 1e-5)

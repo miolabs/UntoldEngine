@@ -1123,3 +1123,22 @@ extension UntoldMuscleRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
         return record
     }
 }
+
+extension UntoldMLDeformerRecordV1: UntoldBinaryEncodable, UntoldBinaryDecodable {
+    public func encode(to writer: UntoldBinaryWriter) {
+        writer.writeUInt32LE(skeletonEntityId)
+        writer.writeUInt32LE(payloadPathOffset)
+        writer.writeUInt32LE(flags)
+        writer.writeUInt32LE(reserved0)
+    }
+
+    public static func decode(from reader: UntoldBinaryReader) throws -> UntoldMLDeformerRecordV1 {
+        var record = try UntoldMLDeformerRecordV1(
+            skeletonEntityId: reader.readUInt32LE(),
+            payloadPathOffset: reader.readUInt32LE(),
+            flags: reader.readUInt32LE()
+        )
+        record.reserved0 = try reader.readUInt32LE()
+        return record
+    }
+}

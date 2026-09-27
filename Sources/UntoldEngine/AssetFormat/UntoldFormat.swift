@@ -122,6 +122,7 @@ public struct UntoldChunkType: RawRepresentable, Hashable, Sendable, Equatable {
     public static let gaussianAssetTable = UntoldChunkType(rawValue: 25)
     public static let morphDriverTable = UntoldChunkType(rawValue: 26)
     public static let muscleTable = UntoldChunkType(rawValue: 27)
+    public static let mlDeformerTable = UntoldChunkType(rawValue: 28)
 
     public static let firstPluginChunkRawValue: UInt32 = 0x8000
 
@@ -1203,6 +1204,23 @@ public struct UntoldMuscleRecordV1: Sendable, Equatable {
         self.driverJointOffset = driverJointOffset
         self.driverStartAngle = driverStartAngle
         self.driverFullAngle = driverFullAngle
+        reserved0 = 0
+    }
+}
+
+/// Links a skeleton to a trained ML deformer payload (`.untoldml`, path
+/// relative to the asset's directory). 16 bytes. The runtime also picks up
+/// `<asset>.untoldml` next to the file without a record.
+public struct UntoldMLDeformerRecordV1: Sendable, Equatable {
+    public var skeletonEntityId: UInt32
+    public var payloadPathOffset: UInt32
+    public var flags: UInt32
+    public var reserved0: UInt32
+
+    public init(skeletonEntityId: UInt32, payloadPathOffset: UInt32, flags: UInt32 = 0) {
+        self.skeletonEntityId = skeletonEntityId
+        self.payloadPathOffset = payloadPathOffset
+        self.flags = flags
         reserved0 = 0
     }
 }

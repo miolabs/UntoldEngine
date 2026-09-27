@@ -409,6 +409,57 @@ final class NativeFormatTests: XCTestCase {
         XCTAssertEqual(definition.driver?.fullAngle, 1.9)
     }
 
+    func testMLDeformerRecordAndSidecarResolveThePayloadURL() throws {
+        let names = makeStringTable(["root_entity", "mesh_0", "mat_0", "albedo.ktx2"]).offsets
+        let skeletonWriter = UntoldBinaryWriter()
+        UntoldSkeletonRecordV1(entityId: 0, nameOffset: 0, firstJointRecordIndex: 0, jointRecordCount: 1)
+            .encode(to: skeletonWriter)
+        let jointWriter = UntoldBinaryWriter()
+        UntoldSkeletonJointRecordV1(
+            parentJointIndex: UntoldFormat.invalidIndex,
+            jointPathOffset: names["mesh_0"] ?? 0,
+            bindTransform: matrix_identity_float4x4,
+            restTransform: matrix_identity_float4x4
+        ).encode(to: jointWriter)
+        let recordWriter = UntoldBinaryWriter()
+        let record = UntoldMLDeformerRecordV1(skeletonEntityId: 0, payloadPathOffset: names["albedo.ktx2"] ?? 0)
+        record.encode(to: recordWriter)
+        XCTAssertEqual(recordWriter.data.count, 16)
+
+        let fixture = makeTinyFixture(pluginChunks: [
+            (.skeletonTable, skeletonWriter.data, 1),
+            (.skeletonJointTable, jointWriter.data, 1),
+            (.mlDeformerTable, recordWriter.data, 1),
+        ])
+        let decoded = try UntoldReader().readAsset(from: fixture.fileData)
+        XCTAssertEqual(decoded.mlDeformers, [record])
+
+        // Record path, relative to the asset's directory.
+        let assetURL = try writeFixtureToTemporaryFile(fixture.fileData)
+        let loaded = try NativeFormatLoader().loadAssetSync(from: assetURL)
+        XCTAssertEqual(
+            loaded.nodes.first?.skeleton?.mlDeformerURL?.lastPathComponent, "albedo.ktx2"
+        )
+
+        // A `<asset>.untoldml` sidecar wins over the record.
+        let sidecar = assetURL.deletingPathExtension().appendingPathExtension("untoldml")
+        try Data([0]).write(to: sidecar)
+        defer { try? FileManager.default.removeItem(at: sidecar) }
+        let reloaded = try NativeFormatLoader().loadAssetSync(from: assetURL)
+        XCTAssertEqual(reloaded.nodes.first?.skeleton?.mlDeformerURL, sidecar)
+    }
+
+    func testRejectsMLDeformerWithUnknownSkeleton() throws {
+        let recordWriter = UntoldBinaryWriter()
+        UntoldMLDeformerRecordV1(skeletonEntityId: 5, payloadPathOffset: 0).encode(to: recordWriter)
+        let fixture = makeTinyFixture(pluginChunks: [(.mlDeformerTable, recordWriter.data, 1)])
+        XCTAssertThrowsError(try UntoldReader().readAsset(from: fixture.fileData)) { error in
+            guard case .invalidMLDeformerRecord(index: 0, reason: _)? = error as? UntoldValidationError else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+
     func testRejectsMuscleWithUnknownSkeleton() throws {
         let muscleWriter = UntoldBinaryWriter()
         UntoldMuscleRecordV1(

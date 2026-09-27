@@ -51,6 +51,7 @@ final class DeformationSystem: @unchecked Sendable {
     var muscleVolumeGradientPipeline = ComputePipeline()
     var muscleSolvePipeline = ComputePipeline()
     var muscleSkinWrapPipeline = ComputePipeline()
+    var mlDecodePipeline = ComputePipeline()
 
     /// Per-vertex accumulated morph deltas, one pair of float4 buffers per
     /// morphing mesh. Keyed by mesh identity.
@@ -166,6 +167,13 @@ final class DeformationSystem: @unchecked Sendable {
             functionName: "muscleSkinWrap",
             pipelineName: "Muscle Skin Wrap pipe"
         )
+        createComputePipeline(
+            into: &mlDecodePipeline,
+            device: device,
+            library: library,
+            functionName: "deformMLDecode",
+            pipelineName: "ML Deformer Decode pipe"
+        )
     }
 
     static let executeDeformationPass: RenderPasses.RenderPassExecution = { commandBuffer in
@@ -207,6 +215,25 @@ final class DeformationSystem: @unchecked Sendable {
                     entityId: entityId, skeleton: skeleton
                 )
                 muscleState = state
+            }
+
+            // The ML deformer predicts the same deltas from the pose; one
+            // network evaluation per entity, one decode dispatch per mesh.
+            var mlModel: MLDeformerModel?
+            if deformationComponent.mlDeformerEnabled,
+               let skeleton = scene.get(component: SkeletonComponent.self, for: entityId)?.skeleton,
+               let animationComponent = scene.get(component: AnimationComponent.self, for: entityId),
+               animationComponent.hasSampledPose,
+               let model = mlDeformerModel(
+                   for: deformationComponent, skeleton: skeleton,
+                   device: commandBuffer.device, label: renderComponent.mesh.first?.name ?? "entity \(entityId)"
+               )
+            {
+                model.updateCoefficients(
+                    localRotations: animationComponent.localPose.rotations,
+                    restTransforms: skeleton.restTransform
+                )
+                mlModel = model
             }
 
             for mesh in renderComponent.mesh {
@@ -263,6 +290,12 @@ final class DeformationSystem: @unchecked Sendable {
                     encodeMuscleSkinWrap(
                         encoder: encoder, state: muscleState, mesh: mesh,
                         output: buffers, device: commandBuffer.device
+                    )
+                }
+                if let mlModel, let pipeline = mlDecodePipeline.pipelineState {
+                    mlModel.encodeDecode(
+                        encoder: encoder, pipeline: pipeline, mesh: mesh,
+                        output: buffers, weight: deformationComponent.mlDeformerWeight
                     )
                 }
             }

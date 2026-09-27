@@ -20,6 +20,8 @@ class Skeleton {
     /// Volumetric muscles attached to this skeleton (from the asset's muscle
     /// table or `setEntityMuscleRig`); simulated by the deformation pass.
     var muscleRig: MuscleRig?
+    /// Trained ML deformer payload (`.untoldml`) belonging to this skeleton.
+    var mlDeformerURL: URL?
 
     /// Scratch storage for the compiled sampling path; reused across frames
     /// so pose composition never allocates in steady state.
@@ -49,6 +51,7 @@ class Skeleton {
         restTransform = runtimeSkeleton.restTransforms
         currentPose = runtimeSkeleton.restTransforms
         muscleRig = runtimeSkeleton.muscleRig
+        mlDeformerURL = runtimeSkeleton.mlDeformerURL
     }
 
     deinit {}

@@ -51,7 +51,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         }
 
         let runtimeMaterials = try decoded.materials.map { try makeRuntimeMaterial(from: $0, decoded: decoded, baseURL: url.deletingLastPathComponent()) }
-        let nodes = try makeRuntimeNodes(
+        var nodes = try makeRuntimeNodes(
             decoded: decoded,
             rootTransform: decoded.header.rootTransform,
             runtimeMaterials: runtimeMaterials,
@@ -63,6 +63,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             morphChunkData: morphChunkData,
             baseURL: url.deletingLastPathComponent()
         )
+        try attachMLDeformerPayloads(to: &nodes, decoded: decoded, assetURL: url)
 
         return try RuntimeAsset(
             sourceURL: url,
@@ -515,6 +516,25 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             )
         }
         return result
+    }
+
+    /// Resolves each skeleton's ML deformer payload: `<asset>.untoldml` next
+    /// to the file wins, else the skeleton's `mlDeformerTable` record.
+    private func attachMLDeformerPayloads(to nodes: inout [RuntimeAssetNode], decoded: UntoldDecodedAsset, assetURL: URL) throws {
+        let sidecar = assetURL.deletingPathExtension().appendingPathExtension("untoldml")
+        let sidecarExists = FileManager.default.fileExists(atPath: sidecar.path)
+        let baseURL = assetURL.deletingLastPathComponent()
+        for index in nodes.indices where nodes[index].skeleton != nil {
+            if sidecarExists {
+                nodes[index].skeleton?.mlDeformerURL = sidecar
+                continue
+            }
+            if let record = decoded.mlDeformers.first(where: { $0.skeletonEntityId == nodes[index].id }),
+               let path = try decoded.string(at: record.payloadPathOffset), !path.isEmpty
+            {
+                nodes[index].skeleton?.mlDeformerURL = baseURL.appendingPathComponent(path)
+            }
+        }
     }
 
     private func makeMuscleRig(decoded: UntoldDecodedAsset, skeletonEntityId: UInt32) throws -> MuscleRig? {

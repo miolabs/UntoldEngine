@@ -30,6 +30,9 @@ V1 supports:
 - volumetric muscles (chunk 27: per-skeleton muscle definitions the engine
   turns into procedural XPBD tet cages at load; exported from a JSON rig
   description with `--muscles`).
+- ML deformer link (chunk 28: a skeleton's trained `.untoldml` payload; the
+  runtime also picks up `<asset>.untoldml` next to the file without a
+  record). See [`muscleDeformation.md`](muscleDeformation.md).
 
 The design goals are:
 
@@ -589,6 +592,26 @@ Rules:
 - the first record with a forward joint pair defines the character frame for
   the whole skeleton
 
+## ML Deformer Record Encoding
+
+Chunk type `28` (`mlDeformerTable`) links a skeleton to a trained ML deformer
+payload (`.untoldml`, see [`muscleDeformation.md`](muscleDeformation.md)).
+One record per skeleton; `elementCount` is the record count. Records are
+16 bytes:
+
+```text
+skeletonEntityId             UInt32   // skeleton table entity id
+payloadPathOffset            UInt32   // string table, path relative to this file's directory
+flags                        UInt32   // reserved, 0
+reserved0                    UInt32
+```
+
+Rules:
+
+- `skeletonEntityId` must match a skeleton record; the path must be a valid string
+- a `<asset>.untoldml` file next to the `.untold` takes precedence over the record,
+  so a payload can be dropped beside an existing asset without re-exporting
+
 ## Compression Rules
 
 Supported compression types:
@@ -622,6 +645,7 @@ The loader must reject files when:
 - `indexDataSizeBytes` does not match `indexCount * indexElementSize`
 - a muscle record references an unknown skeleton, lacks an attachment joint,
   or has fewer than 2 rings / 3 segments or a non-positive radius
+- an ML deformer record references an unknown skeleton or has no payload path
 
 ## Implementation Notes
 
