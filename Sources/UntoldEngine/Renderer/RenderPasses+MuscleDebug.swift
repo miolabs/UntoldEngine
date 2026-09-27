@@ -16,12 +16,14 @@ import simd
 public extension RenderPasses {
     /// Draws every simulated muscle cage as wireframe lines over the lit
     /// scene (edges coloured green → red by activation, grey when the muscle
-    /// is disabled, bone capsules in cyan). Reads back the last simulated
-    /// particle positions from the shared buffers; a tuning aid, not a
-    /// shipping feature. Enabled with `setMuscleDebugOverlay(enabled:)`.
+    /// is disabled, bone capsules in cyan), plus the world-space line sets
+    /// registered with `setDebugLines(_:named:)`. Reads back the last
+    /// simulated particle positions from the shared buffers; a tuning aid,
+    /// not a shipping feature. Cages enabled with `setMuscleDebugOverlay(enabled:)`.
     static let muscleDebugExecution: RenderPassExecution = { commandBuffer in
         let system = DeformationSystem.shared
-        guard system.muscleDebugOverlayEnabled else { return }
+        let debugLineSets = DebugLineStore.shared.snapshot()
+        guard system.muscleDebugOverlayEnabled || !debugLineSets.isEmpty else { return }
         guard let pipeline = PipelineManager.shared.renderPipelinesByType[.spatialDebug],
               pipeline.success, let pipelineState = pipeline.pipelineState
         else { return }
@@ -39,7 +41,9 @@ public extension RenderPasses {
         var vertices: [simd_float4] = []
         var batches: [Batch] = []
 
-        let entities = queryEntities(with: [DeformationComponent.self, SkeletonComponent.self])
+        let entities = system.muscleDebugOverlayEnabled
+            ? queryEntities(with: [DeformationComponent.self, SkeletonComponent.self])
+            : []
         for entityId in entities {
             guard let component = scene.get(component: DeformationComponent.self, for: entityId),
                   component.musclesEnabled,
@@ -106,6 +110,22 @@ public extension RenderPasses {
                     vertexStart: capsuleStart, vertexCount: vertices.count - capsuleStart
                 ))
             }
+        }
+
+        // Registered world-space lines: one batch per run of equal colour.
+        for segments in debugLineSets {
+            var batchStart = vertices.count
+            var batchColor = segments[0].color
+            for segment in segments {
+                if segment.color != batchColor {
+                    batches.append(Batch(color: batchColor, model: matrix_identity_float4x4, vertexStart: batchStart, vertexCount: vertices.count - batchStart))
+                    batchStart = vertices.count
+                    batchColor = segment.color
+                }
+                vertices.append(simd_float4(segment.start, 1))
+                vertices.append(simd_float4(segment.end, 1))
+            }
+            batches.append(Batch(color: batchColor, model: matrix_identity_float4x4, vertexStart: batchStart, vertexCount: vertices.count - batchStart))
         }
 
         guard !vertices.isEmpty else { return }

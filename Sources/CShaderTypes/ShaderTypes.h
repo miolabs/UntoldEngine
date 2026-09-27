@@ -337,6 +337,22 @@ typedef enum{
     mlDecodeParamsIndex,
 }MLDecodeBufferIndices;
 
+// Deformation override: vertices whose deformed position and normal are
+// supplied from outside (a cloth simulation driving part of a skinned
+// mesh); runs last in the deformation pass.
+typedef enum{
+    deformOverrideIndicesIndex,    // uint per entry: mesh-local vertex index
+    deformOverridePositionsIndex,  // float4 per entry, model space
+    deformOverrideNormalsIndex,    // float4 per entry, model space
+    deformOverrideOutPositionIndex,
+    deformOverrideOutNormalIndex,
+    deformOverrideParamsIndex,
+}DeformOverrideBufferIndices;
+
+typedef struct{
+    uint count;
+}DeformOverrideParams;
+
 typedef struct{
     unsigned int activeCount;
     unsigned int vertexCount;

@@ -52,6 +52,7 @@ final class DeformationSystem: @unchecked Sendable {
     var muscleSolvePipeline = ComputePipeline()
     var muscleSkinWrapPipeline = ComputePipeline()
     var mlDecodePipeline = ComputePipeline()
+    var deformOverridePipeline = ComputePipeline()
 
     /// Per-vertex accumulated morph deltas, one pair of float4 buffers per
     /// morphing mesh. Keyed by mesh identity.
@@ -173,6 +174,13 @@ final class DeformationSystem: @unchecked Sendable {
             library: library,
             functionName: "deformMLDecode",
             pipelineName: "ML Deformer Decode pipe"
+        )
+        createComputePipeline(
+            into: &deformOverridePipeline,
+            device: device,
+            library: library,
+            functionName: "deformOverride",
+            pipelineName: "Deformation Override pipe"
         )
     }
 
@@ -298,6 +306,7 @@ final class DeformationSystem: @unchecked Sendable {
                         output: buffers, weight: deformationComponent.mlDeformerWeight
                     )
                 }
+                encodeOverride(encoder: encoder, component: deformationComponent, mesh: mesh, output: buffers)
             }
         }
 
@@ -446,6 +455,36 @@ final class DeformationSystem: @unchecked Sendable {
         let width = pipeline.threadExecutionWidth
         encoder.dispatchThreadgroups(
             MTLSize(width: (jointCount + width - 1) / width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+    }
+
+    /// Writes the externally supplied vertices (a simulation's) over the
+    /// deformed stream, last in the pass.
+    private func encodeOverride(
+        encoder: MTLComputeCommandEncoder,
+        component: DeformationComponent,
+        mesh: Mesh,
+        output: MeshDeformationBuffers
+    ) {
+        guard let pipeline = deformOverridePipeline.pipelineState else { return }
+        let key = ObjectIdentifier(mesh.metalKitMesh)
+        let (override, count, slot) = component.meshOverrideLock.withLock { () -> (MeshDeformationOverride?, Int, Int) in
+            guard let override = component.meshOverrides[key] else { return (nil, 0, 0) }
+            return (override, override.count, override.slot)
+        }
+        guard let override, count > 0 else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(override.indices[slot], offset: 0, index: Int(deformOverrideIndicesIndex.rawValue))
+        encoder.setBuffer(override.positions[slot], offset: 0, index: Int(deformOverridePositionsIndex.rawValue))
+        encoder.setBuffer(override.normals[slot], offset: 0, index: Int(deformOverrideNormalsIndex.rawValue))
+        encoder.setBuffer(output.positions, offset: 0, index: Int(deformOverrideOutPositionIndex.rawValue))
+        encoder.setBuffer(output.normals, offset: 0, index: Int(deformOverrideOutNormalIndex.rawValue))
+        var params = DeformOverrideParams(count: UInt32(count))
+        encoder.setBytes(&params, length: MemoryLayout<DeformOverrideParams>.stride, index: Int(deformOverrideParamsIndex.rawValue))
+        let width = pipeline.threadExecutionWidth
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (count + width - 1) / width, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
         )
     }
