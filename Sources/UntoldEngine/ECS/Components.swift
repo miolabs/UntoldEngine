@@ -346,6 +346,77 @@ public class SkeletonComponent: Component {
     }
 }
 
+/// How a `DeformationComponent` entity's skin vertices are deformed each frame.
+/// - `lbs`: linear blend skinning (compute-pass port of the legacy path).
+/// - `dqs`: dual-quaternion skinning — fixes candy-wrapper collapse and
+///   volume loss at twisting joints.
+/// - `ddm`: Direct Delta Mush — smoothed rigid fit per vertex; needs a
+///   one-time per-mesh bake that runs in the background, falling back to
+///   `lbs` until ready.
+public enum SkinningMode: String, CaseIterable, Sendable {
+    case lbs
+    case dqs
+    case ddm
+}
+
+/// GPU-written deformed vertex streams for one mesh, produced by the
+/// deformation compute pass and consumed by the render passes in place of the
+/// base position/normal/tangent streams.
+final class MeshDeformationBuffers {
+    let positions: MTLBuffer
+    let normals: MTLBuffer
+    let tangents: MTLBuffer
+    let vertexCount: Int
+
+    init?(device: MTLDevice, vertexCount: Int, label: String) {
+        let length = vertexCount * MemoryLayout<simd_float4>.stride
+        guard vertexCount > 0,
+              let positions = device.makeBuffer(length: length, options: .storageModePrivate),
+              let normals = device.makeBuffer(length: length, options: .storageModePrivate),
+              let tangents = device.makeBuffer(length: length, options: .storageModePrivate)
+        else {
+            return nil
+        }
+        positions.label = "\(label) deformed positions"
+        normals.label = "\(label) deformed normals"
+        tangents.label = "\(label) deformed tangents"
+        self.positions = positions
+        self.normals = normals
+        self.tangents = tangents
+        self.vertexCount = vertexCount
+    }
+}
+
+/// Opts an entity's skinned meshes into the deformation compute pass.
+/// Entities without this component keep the legacy vertex-shader skinning path.
+public class DeformationComponent: Component {
+    public var skinningMode: SkinningMode = .lbs
+
+    /// Active morph-target weights by target name (see
+    /// `setEntityMorphTargetWeight`); zero-weight targets are removed.
+    var morphWeights: [String: Float] = [:]
+
+    /// Pose-space deformation: when enabled, morph targets authored with a
+    /// driver get their weight from the current pose each frame (see
+    /// `PoseDriverEvaluation`), overriding any manual weight for that target.
+    public var poseDriversEnabled: Bool = true
+    var drivenMorphWeights: [String: Float] = [:]
+
+    /// Deformed streams per mesh, keyed by the mesh's MTKMesh identity and
+    /// filled lazily by the deformation pass. Nil entries (pass not run yet,
+    /// e.g. a graph without the deformation node) leave draws on the legacy
+    /// vertex-shader path.
+    var meshDeformations: [ObjectIdentifier: MeshDeformationBuffers] = [:]
+
+    public required init() {}
+
+    func cleanUp() {
+        meshDeformations.removeAll()
+        morphWeights.removeAll()
+        drivenMorphWeights.removeAll()
+    }
+}
+
 /// Per-entity animation control policy.
 ///
 /// Layered animation control (see upstream discussion #801): the global

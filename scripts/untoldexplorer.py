@@ -89,10 +89,27 @@ CHUNK_TYPES = {
     "camera_table": 20,
     "color_management_table": 21,
     "color_grade_lut_table": 22,
+    "morph_target_table": 23,
+    "morph_target_data": 24,
     "gaussian_asset_table": 25,
+    "morph_driver_table": 26,
 }
 
 VERTEX_LAYOUT_PBR_STATIC_V1 = 1
+MORPH_ENTRY_SIZE = 16
+try:
+    import numpy as _np_for_morphs
+    _MORPH_DTYPE = _np_for_morphs.dtype([
+        ("vi", "<u4"),
+        ("px", "<u2"), ("py", "<u2"), ("pz", "<u2"),
+        ("nx", "<u2"), ("ny", "<u2"), ("nz", "<u2"),
+    ])
+    assert _MORPH_DTYPE.itemsize == MORPH_ENTRY_SIZE
+except ImportError:
+    _MORPH_DTYPE = None
+MORPH_FLAG_HAS_NORMAL_DELTAS = 1 << 0
+# Set from --export-shapekeys; shape keys are skipped entirely when False.
+EXPORT_SHAPE_KEYS = False
 INDEX_TYPE_UINT16 = 1
 INDEX_TYPE_UINT32 = 2
 LIGHT_TYPE_DIRECTIONAL = 1
@@ -721,6 +738,7 @@ class ExportedMesh:
     material: ExportedMaterial
     skin_binding: Optional["ExportedSkinBinding"]
     validation_mesh: ValidationMesh
+    morph_targets: tuple["ExportedMorphTarget", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -797,6 +815,24 @@ class ExportedSkinBinding:
     skin_to_skeleton_map: list[int]
     joint_indices: bytes
     joint_weights: bytes
+
+
+@dataclass(frozen=True)
+class ExportedMorphDriver:
+    joint_path: str
+    pose_rotation: tuple[float, float, float, float]
+    radius: float
+    kernel: int = 0
+
+
+@dataclass(frozen=True)
+class ExportedMorphTarget:
+    name: str
+    flags: int
+    position_scale: float
+    entry_count: int
+    entries: bytes
+    driver: Optional[ExportedMorphDriver] = None
 
 
 @dataclass(frozen=True)
@@ -1346,6 +1382,25 @@ def write_skeleton_joint_record(writer: BinaryWriter, joint: SkeletonJointRecord
     writer.write_u32(0)
     writer.write_matrix4x4_column_major(joint.bind_transform_rows)
     writer.write_matrix4x4_column_major(joint.rest_transform_rows)
+
+
+def write_morph_target_record(writer: BinaryWriter, mesh_record_index: int, name_offset: int, flags: int, first_entry_index: int, entry_count: int, position_scale: float) -> None:
+    writer.write_u32(mesh_record_index)
+    writer.write_u32(name_offset)
+    writer.write_u32(flags)
+    writer.write_u32(first_entry_index)
+    writer.write_u32(entry_count)
+    writer.write_f32(position_scale)
+
+
+def write_morph_driver_record(writer: BinaryWriter, target_index: int, joint_path_offset: int, kernel: int, pose_rotation, radius: float) -> None:
+    writer.write_u32(target_index)
+    writer.write_u32(joint_path_offset)
+    writer.write_u32(kernel)
+    for component in pose_rotation:
+        writer.write_f32(float(component))
+    writer.write_f32(radius)
+    writer.write_u32(0)
 
 
 def write_skin_record(writer: BinaryWriter, skin: SkinRecord) -> None:
@@ -3759,6 +3814,84 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
     )
 
 
+
+def extract_shape_key_targets(mesh_object, evaluated_mesh, u_vi, conv_np):
+    """Sparse float16 morph deltas per non-basis shape key, mapped from the
+    ORIGINAL mesh's vertex domain (the evaluated mesh has shape keys flattened)
+    onto the exported deduplicated vertex order via u_vi."""
+    if not EXPORT_SHAPE_KEYS or not _HAS_NUMPY:
+        return ()
+    data = getattr(mesh_object, "data", None)
+    shape_keys = getattr(data, "shape_keys", None)
+    if shape_keys is None or len(shape_keys.key_blocks) < 2:
+        return ()
+    n_orig = len(data.vertices)
+    if n_orig != len(evaluated_mesh.vertices):
+        print(
+            f"[untold] Skipping shape keys on {mesh_object.name}: evaluated vertex "
+            f"count {len(evaluated_mesh.vertices)} != original {n_orig} (generative modifiers?)"
+        )
+        return ()
+
+    def block_positions(block):
+        cos = np.empty(n_orig * 3, dtype=np.float32)
+        block.data.foreach_get("co", cos)
+        return cos.reshape(-1, 3)
+
+    armature = armature_for_mesh(mesh_object)
+    targets = []
+    for block in shape_keys.key_blocks[1:]:
+        reference = block.relative_key or shape_keys.key_blocks[0]
+        delta = block_positions(block) - block_positions(reference)
+        du = delta[u_vi]
+        if conv_np is not None:
+            du = du @ conv_np[:3, :3].T
+        magnitudes = np.abs(du).max(axis=1)
+        sparse_indices = np.nonzero(magnitudes > 1e-5)[0]
+        if sparse_indices.size == 0:
+            continue
+
+        entry_array = np.zeros(sparse_indices.size, dtype=_MORPH_DTYPE)
+        entry_array["vi"] = sparse_indices.astype(np.uint32)
+        d16 = du[sparse_indices].astype(np.float16).view(np.uint16)
+        entry_array["px"] = d16[:, 0]
+        entry_array["py"] = d16[:, 1]
+        entry_array["pz"] = d16[:, 2]
+
+        driver = None
+        def block_prop(name, default=None):
+            try:
+                return block.get(name, default)
+            except TypeError:
+                # Some Blender versions don't expose IDProperties on ShapeKey
+                # blocks; fall back to a "<key name>_<prop>" property stored on
+                # the mesh object instead.
+                return mesh_object.get(f"{block.name}_{name}", default)
+
+        joint_name = block_prop("untold_driver_joint")
+        if joint_name and armature is not None:
+            bone = armature.data.bones.get(joint_name)
+            if bone is not None:
+                pose = tuple(float(v) for v in (block_prop("untold_driver_pose") or (0.0, 0.0, 0.0, 1.0)))
+                driver = ExportedMorphDriver(
+                    joint_path=bone_path(bone),
+                    pose_rotation=pose if len(pose) == 4 else (0.0, 0.0, 0.0, 1.0),
+                    radius=float(block_prop("untold_driver_radius", 0.5)),
+                )
+            else:
+                print(f"[untold] Shape key {block.name}: driver joint {joint_name!r} not found in armature")
+
+        targets.append(ExportedMorphTarget(
+            name=block.name,
+            flags=0,
+            position_scale=1.0,
+            entry_count=int(sparse_indices.size),
+            entries=entry_array.tobytes(),
+            driver=driver,
+        ))
+    return tuple(targets)
+
+
 def _extract_mesh_numpy(mesh_object: object, mesh_data: object, asset_path: Path,
                         *, conversion_matrix, validate: bool) -> ExportedMesh:
     """numpy-accelerated mesh extraction (inner worker, mesh_data already evaluated)."""
@@ -3918,6 +4051,8 @@ def _extract_mesh_numpy(mesh_object: object, mesh_data: object, asset_path: Path
     u_col = c_col[first_occ]   # (U, 4)
     u_jidx = c_jidx[first_occ] # (U, 4)
     u_jwgt = c_jwgt[first_occ] # (U, 4)
+    u_vi   = c_vi[first_occ]   # (U,) exported vertex -> original Blender vertex
+    morph_targets = extract_shape_key_targets(mesh_object, mesh_data, u_vi, conv_np)
 
     # ── vectorized packing ─────────────────────────────────────────────────
 
@@ -4022,6 +4157,7 @@ def _extract_mesh_numpy(mesh_object: object, mesh_data: object, asset_path: Path
             else None
         ),
         validation_mesh=vmesh,
+        morph_targets=morph_targets,
     )
 
 
@@ -4235,10 +4371,14 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
     The V1 exporter requires each mesh to carry exactly one material.  This
     mirrors the split step in the tile-streaming pipeline so that direct
     export-untold calls on multi-material USD assets also work.
+
+    Uses Blender's native separate-by-material on a duplicate of the object so
+    vertex groups, armature modifiers, and shape keys survive the split —
+    a bmesh copy would strip all three, silently un-skinning rigged
+    characters.
     """
-    import bpy, bmesh as _bmesh  # noqa: F401 — bmesh may not be at module level
+    import bpy
     result = []
-    split_count = 0
     for obj in objects:
         if getattr(obj, "type", None) != "MESH" or obj.data is None:
             result.append(obj)
@@ -4249,47 +4389,43 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
             result.append(obj)
             continue
         print(f"  Splitting '{obj.name}' into {len(used_indices)} single-material mesh(es)", flush=True)
-        split_count += len(used_indices)
-        for mat_idx in sorted(used_indices):
-            bm = _bmesh.new()
-            try:
-                bm.from_mesh(mesh)
-                to_delete = [f for f in bm.faces if f.material_index != mat_idx]
-                if to_delete:
-                    _bmesh.ops.delete(bm, geom=to_delete, context="FACES")
-                loose_edges = [e for e in bm.edges if not e.link_faces]
-                if loose_edges:
-                    _bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
-                loose_verts = [v for v in bm.verts if not v.link_faces and not v.link_edges]
-                if loose_verts:
-                    _bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
-                if not bm.faces:
-                    continue
-                new_mesh = bpy.data.meshes.new(f"{mesh.name}_mat{mat_idx}")
-                bm.to_mesh(new_mesh)
-                new_mesh.update()
-                mat = mesh.materials[mat_idx] if mat_idx < len(mesh.materials) else None
-                if mat:
-                    new_mesh.materials.append(mat)
-                    for p in new_mesh.polygons:
-                        p.material_index = 0
-                new_obj = bpy.data.objects.new(f"{obj.name}_mat{mat_idx}", new_mesh)
-                # Preserve the source object's parent link (if any) so nodes that
-                # already sit under a real Blender hierarchy still group correctly;
-                # UNTOLD_MATERIAL_SPLIT_SOURCE_PROP below is what reunites fragments
-                # of a *parentless* multi-material object, which parent-chain
-                # walking alone can't do since these fragments aren't parented to
-                # each other.
-                new_obj.parent = obj.parent
-                if obj.parent is not None:
-                    new_obj.matrix_parent_inverse = obj.matrix_parent_inverse.copy()
-                new_obj.matrix_world = obj.matrix_world.copy()
-                new_obj[UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
-                new_obj[UNTOLD_MATERIAL_SPLIT_SOURCE_PROP] = obj.name
-                bpy.context.scene.collection.objects.link(new_obj)
-                result.append(new_obj)
-            finally:
-                bm.free()
+
+        duplicate = obj.copy()
+        duplicate.data = obj.data.copy()
+        bpy.context.scene.collection.objects.link(duplicate)
+        before = set(bpy.context.scene.objects)
+
+        with bpy.context.temp_override(
+            object=duplicate,
+            active_object=duplicate,
+            selected_objects=[duplicate],
+            selected_editable_objects=[duplicate],
+        ):
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.separate(type="MATERIAL")
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        pieces = [o for o in bpy.context.scene.objects if o not in before]
+        pieces.append(duplicate)
+        for piece in pieces:
+            piece[UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
+            piece[UNTOLD_MATERIAL_SPLIT_SOURCE_PROP] = obj.name
+            # Collapse to the one used material slot so downstream extraction
+            # (which requires a single material assignment) picks the right one.
+            piece_used = {p.material_index for p in piece.data.polygons}
+            if piece_used:
+                used_index = piece_used.pop()
+                material = (
+                    piece.data.materials[used_index]
+                    if used_index < len(piece.data.materials)
+                    else None
+                )
+                piece.data.materials.clear()
+                if material is not None:
+                    piece.data.materials.append(material)
+                for polygon in piece.data.polygons:
+                    polygon.material_index = 0
+            result.append(piece)
     return result
 
 
@@ -4567,6 +4703,9 @@ def build_untold_file(
     edge_index_writer = BinaryWriter()
     joint_index_writer = BinaryWriter()
     joint_weight_writer = BinaryWriter()
+    morph_entry_writer = BinaryWriter()
+    morph_target_records: list[tuple] = []
+    morph_driver_records: list[tuple] = []
 
     def add_texture(texture: Optional[ExportedTexture], flags: int = 0) -> int:
         if texture is None:
@@ -4742,6 +4881,26 @@ def build_untold_file(
             )
             mesh_record_count = 1
 
+            for morph in exported_mesh.morph_targets:
+                first_entry_index = morph_entry_writer.count // MORPH_ENTRY_SIZE
+                morph_entry_writer.write_bytes(morph.entries)
+                if morph.driver is not None:
+                    morph_driver_records.append((
+                        len(morph_target_records),
+                        string_table.add(morph.driver.joint_path),
+                        morph.driver.kernel,
+                        morph.driver.pose_rotation,
+                        morph.driver.radius,
+                    ))
+                morph_target_records.append((
+                    len(meshes) - 1,
+                    string_table.add(morph.name),
+                    morph.flags,
+                    first_entry_index,
+                    morph.entry_count,
+                    morph.position_scale,
+                ))
+
             if exported_mesh.skin_binding is not None:
                 skin_binding = exported_mesh.skin_binding
                 first_joint_mapping_index = len(skin_joint_mappings)
@@ -4901,6 +5060,22 @@ def build_untold_file(
         write_skin_joint_mapping_record(skin_mapping_writer, mapping)
     skin_mapping_chunk = skin_mapping_writer.data
 
+    morph_target_writer = BinaryWriter()
+    for mesh_record_index, name_offset, flags, first_entry_index, entry_count, position_scale in morph_target_records:
+        write_morph_target_record(
+            morph_target_writer, mesh_record_index, name_offset, flags,
+            first_entry_index, entry_count, position_scale,
+        )
+    morph_target_chunk = morph_target_writer.data
+
+    morph_driver_writer = BinaryWriter()
+    for target_index, joint_path_offset, kernel, pose_rotation, radius in morph_driver_records:
+        write_morph_driver_record(
+            morph_driver_writer, target_index, joint_path_offset, kernel, pose_rotation, radius,
+        )
+    morph_driver_chunk = morph_driver_writer.data
+    morph_entry_raw = morph_entry_writer.data
+
     mesh_writer = BinaryWriter()
     for mesh in meshes:
         write_mesh_record(mesh_writer, mesh)
@@ -4974,6 +5149,17 @@ def build_untold_file(
                 COMPRESSION_NONE,
             )
         )
+    if morph_target_records:
+        chunk_payloads.append(
+            (CHUNK_TYPES["morph_target_table"], morph_target_chunk, len(morph_target_chunk), len(morph_target_records), COMPRESSION_NONE)
+        )
+        chunk_payloads.append(
+            (CHUNK_TYPES["morph_target_data"], morph_entry_raw, len(morph_entry_raw), len(morph_entry_raw) // MORPH_ENTRY_SIZE, COMPRESSION_NONE)
+        )
+        if morph_driver_records:
+            chunk_payloads.append(
+                (CHUNK_TYPES["morph_driver_table"], morph_driver_chunk, len(morph_driver_chunk), len(morph_driver_records), COMPRESSION_NONE)
+            )
 
     # Content hash is computed over the (compressed) bytes in chunk order — matches
     # runtime validation in UntoldReader.validateContentHash.
@@ -5770,6 +5956,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Orientation of the input USD/USDZ before any exporter-side conversion. Use 'blender-native' for assets still in Blender's default space (-Y forward, +Z up), or 'engine-oriented' for assets already oriented to the engine's convention (+Z forward, +Y up).",
     )
     parser.add_argument("--validate", action="store_true", help="Write a companion .validation.json file for engine-side validation tests.")
+    parser.add_argument("--export-shapekeys", action="store_true", help="Export Blender shape keys as morph target chunks (with optional untold_driver_* custom-property pose drivers).")
     parser.add_argument(
         "--compress-geometry",
         action="store_true",
@@ -5792,7 +5979,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    global EXPORT_SHAPE_KEYS
     args = parse_args(argv)
+    EXPORT_SHAPE_KEYS = bool(getattr(args, "export_shapekeys", False))
     input_path = normalize_blender_path(args.input)
     output_path = normalize_blender_path(args.output)
 

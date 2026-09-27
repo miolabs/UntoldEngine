@@ -33,18 +33,21 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         let edgeIndexChunkData: Data?
         let jointIndexChunkData: Data?
         let jointWeightChunkData: Data?
+        let morphChunkData: Data?
         if decoded.header.fileType == .animation {
             vertexChunkData = Data()
             indexChunkData = Data()
             edgeIndexChunkData = nil
             jointIndexChunkData = nil
             jointWeightChunkData = nil
+            morphChunkData = nil
         } else {
             vertexChunkData = try reader.readChunkData(.vertexData, from: fileData, entries: decoded.chunks)
             indexChunkData = try reader.readChunkData(.indexData, from: fileData, entries: decoded.chunks)
             edgeIndexChunkData = try? reader.readChunkData(.edgeIndexData, from: fileData, entries: decoded.chunks)
             jointIndexChunkData = try? reader.readChunkData(.jointIndexData, from: fileData, entries: decoded.chunks)
             jointWeightChunkData = try? reader.readChunkData(.jointWeightData, from: fileData, entries: decoded.chunks)
+            morphChunkData = try? reader.readChunkData(.morphTargetData, from: fileData, entries: decoded.chunks)
         }
 
         let runtimeMaterials = try decoded.materials.map { try makeRuntimeMaterial(from: $0, decoded: decoded, baseURL: url.deletingLastPathComponent()) }
@@ -57,6 +60,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             edgeIndexChunkData: edgeIndexChunkData,
             jointIndexChunkData: jointIndexChunkData,
             jointWeightChunkData: jointWeightChunkData,
+            morphChunkData: morphChunkData,
             baseURL: url.deletingLastPathComponent()
         )
 
@@ -94,6 +98,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
+        morphChunkData: Data?,
         baseURL: URL
     ) throws -> [RuntimeAssetNode] {
         guard decoded.header.fileType != .animation else { return [] }
@@ -138,6 +143,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 edgeIndexChunkData: edgeIndexChunkData,
                 jointIndexChunkData: jointIndexChunkData,
                 jointWeightChunkData: jointWeightChunkData,
+                morphChunkData: morphChunkData,
                 runtimeSkeletonsByEntity: runtimeSkeletonsByEntity,
                 gaussianAssetsByEntity: gaussianAssetsByEntity
             )
@@ -312,6 +318,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
+        morphChunkData: Data?,
         runtimeSkeletonsByEntity: [UInt32: RuntimeSkeleton],
         gaussianAssetsByEntity: [UInt32: RuntimeGaussianAssetLink] = [:]
     ) throws -> RuntimeAssetNode {
@@ -331,7 +338,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                     indexChunkData: indexChunkData,
                     edgeIndexChunkData: edgeIndexChunkData,
                     jointIndexChunkData: jointIndexChunkData,
-                    jointWeightChunkData: jointWeightChunkData
+                    jointWeightChunkData: jointWeightChunkData,
+                    morphChunkData: morphChunkData
                 )
             }
         } else {
@@ -362,7 +370,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         indexChunkData: Data,
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
-        jointWeightChunkData: Data?
+        jointWeightChunkData: Data?,
+        morphChunkData: Data?
     ) throws -> RuntimeMeshPrimitive {
         let vertexLayout: RuntimeVertexLayout = switch decoded.header.vertexLayout {
         case .pbrStaticV1:
@@ -432,6 +441,39 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             skin = nil
         }
 
+        var morphTargets: [RuntimeMorphTarget] = []
+        if let morphChunkData {
+            for (globalTargetIndex, target) in decoded.morphTargets.enumerated()
+                where target.meshRecordIndex == meshIndex
+            {
+                let entryBytes = Int(target.entryCount) * UntoldMorphSparseEntryV1.byteSize
+                let entryData = try slice(
+                    from: morphChunkData,
+                    offset: Int(target.firstEntryIndex) * UntoldMorphSparseEntryV1.byteSize,
+                    size: entryBytes
+                )
+                var driver: RuntimeMorphDriver?
+                if let driverRecord = decoded.morphDrivers.first(where: { $0.targetIndex == UInt32(globalTargetIndex) }),
+                   let jointPath = try decoded.string(at: driverRecord.jointPathOffset)
+                {
+                    driver = RuntimeMorphDriver(
+                        jointPath: jointPath,
+                        poseRotation: driverRecord.poseRotation,
+                        radius: driverRecord.radius,
+                        kernelType: driverRecord.kernelType
+                    )
+                }
+                try morphTargets.append(RuntimeMorphTarget(
+                    name: decoded.string(at: target.nameOffset) ?? "morph_\(globalTargetIndex)",
+                    hasNormalDeltas: target.flags & UntoldMorphTargetRecordV1.flagHasNormalDeltas != 0,
+                    positionScale: target.positionScale,
+                    entryCount: Int(target.entryCount),
+                    entryData: entryData,
+                    driver: driver
+                ))
+            }
+        }
+
         return RuntimeMeshPrimitive(
             name: primitiveName,
             localTransform: matrix_identity_float4x4,
@@ -448,6 +490,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             edgeIndexCount: edgeIndexCount,
             material: material,
             skin: skin,
+            morphTargets: morphTargets,
             estimatedGPUBytes: Int(mesh.estimatedGPUBytes)
         )
     }
