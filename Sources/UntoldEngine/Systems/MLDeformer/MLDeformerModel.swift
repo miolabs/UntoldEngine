@@ -149,6 +149,14 @@ final class MLDeformerModel: @unchecked Sendable {
     }
 }
 
+/// What the background load takes across to its queue: the skeleton, which
+/// it only reads joint names from, and the component, whose load state it
+/// writes under the component's own lock.
+private struct MLDeformerLoadRequest: @unchecked Sendable {
+    let component: DeformationComponent
+    let skeleton: Skeleton
+}
+
 /// Background load state of an entity's ML deformer.
 enum MLDeformerLoadState {
     case loading
@@ -182,19 +190,20 @@ extension DeformationSystem {
         }
         component.mlDeformerState = .loading
         let lock = component.mlDeformerLock
+        let request = MLDeformerLoadRequest(component: component, skeleton: skeleton)
         Self.mlDeformerLoadQueue.async {
             do {
                 let payload = try MLDeformerPayload(contentsOf: url)
-                guard let model = MLDeformerModel(payload: payload, skeleton: skeleton, device: device, label: label) else {
+                guard let model = MLDeformerModel(payload: payload, skeleton: request.skeleton, device: device, label: label) else {
                     throw MLDeformerPayloadError.inconsistent("GPU tables")
                 }
                 lock.lock()
-                component.mlDeformerState = .ready(model)
+                request.component.mlDeformerState = .ready(model)
                 lock.unlock()
                 Logger.log(message: "ML deformer loaded for \(label): \(payload.jointPaths.count) joints, \(payload.componentCount) components, \(payload.activeCount) active vertices")
             } catch {
                 lock.lock()
-                component.mlDeformerState = .failed
+                request.component.mlDeformerState = .failed
                 lock.unlock()
                 Logger.logWarning(message: "ML deformer payload \(url.lastPathComponent) failed to load: \(error)")
             }

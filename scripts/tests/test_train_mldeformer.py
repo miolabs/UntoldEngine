@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # the trainer needs numpy; the exporter's tests do not
+    raise unittest.SkipTest("numpy is not installed")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
