@@ -915,7 +915,12 @@ private func registerUntoldRuntimeAsset(
 
         ensureUntoldNodeComponents(entityId: entityId)
         applyLocalTransform(matchedNode.localTransform, to: entityId)
-        setEntityName(entityId: entityId, name: matchedNode.name)
+        // Only default the entity's name to the node's internal name when the caller
+        // hasn't already assigned one (e.g. a user-renamed scene entity) -- otherwise
+        // this silently clobbers it and breaks findEntity(name:) lookups. See #1262.
+        if hasNoCallerAssignedName(entityId: entityId) {
+            setEntityName(entityId: entityId, name: matchedNode.name)
+        }
 
         guard matchedNode.primitives.isEmpty == false else {
             handleError(.assetDataMissing, "Node '\(assetName)' in '\(filename).\(withExtension)' has no renderable primitives")
@@ -939,7 +944,23 @@ private func registerUntoldRuntimeAsset(
     ensureUntoldNodeComponents(entityId: entityId)
     applyLocalTransform(runtimeAsset.rootTransform, to: entityId)
 
-    let hasHierarchy = runtimeAsset.nodes.count > 1 || runtimeAsset.nodes.contains(where: { $0.parentID != nil || $0.primitives.isEmpty })
+    // Nodes that never get their own entity: skeleton/joint-only nodes (no primitives,
+    // carries skeleton data -- resolvedRuntimeSkeleton() reads it straight from
+    // nodesByID, so the mesh entity picks it up independently) and their armature-root
+    // parent (no primitives, no skeleton of its own, exists only to hold the skeleton
+    // node -- a pure rig-scaffolding artifact, not an authored group). Both are exporter
+    // artifacts with no semantic meaning to preserve; an ordinary container/Xform node
+    // that isn't the direct parent of a skeleton node is left untouched, so genuine
+    // authored hierarchies (e.g. a named group of meshes) are unaffected. See #1273.
+    let skeletonOnlyNodeIDs = Set(runtimeAsset.nodes.filter { $0.primitives.isEmpty && $0.skeleton != nil }.map(\.id))
+    let armatureRootNodeIDs = Set(runtimeAsset.nodes.filter { node in
+        node.primitives.isEmpty && node.skeleton == nil
+            && runtimeAsset.nodes.contains { skeletonOnlyNodeIDs.contains($0.id) && $0.parentID == node.id }
+    }.map(\.id))
+    let skippedEntityNodeIDs = skeletonOnlyNodeIDs.union(armatureRootNodeIDs)
+
+    let structuralNodes = runtimeAsset.nodes.filter { !skippedEntityNodeIDs.contains($0.id) }
+    let hasHierarchy = structuralNodes.count > 1
     if hasHierarchy {
         let assetInstanceComp = AssetInstanceComponent(
             assetURL: url,
@@ -958,26 +979,70 @@ private func registerUntoldRuntimeAsset(
 
     let nodesByID = Dictionary(uniqueKeysWithValues: runtimeAsset.nodes.map { ($0.id, $0) })
     var entityByNodeID: [UInt32: EntityID] = [:]
+    // For each node (skipped or not), the asset-intrinsic worldTransform basis its
+    // *children* should be composed against: a surviving node's own worldTransform, or
+    // (propagated through any skipped ancestors) the nearest surviving ancestor's
+    // worldTransform, or runtimeAsset.rootTransform if every ancestor was skipped.
+    // Kept entirely in asset-local math (no ECS WorldTransformComponent reads) so a
+    // caller-placed entityId's own external scene parent is composed in exactly once,
+    // by the normal ECS parent/child propagation after setParent -- not cancelled out.
+    var childBasisByNodeID: [UInt32: simd_float4x4] = [:]
 
     for node in runtimeAsset.nodes {
+        // Skeleton-only node or its armature-root parent: rig scaffolding, not a real
+        // scene object. Map it straight to whatever entity its nearest surviving
+        // ancestor resolved to (possibly entityId itself) so any of its descendants
+        // that do need entities still parent correctly -- see the comment above.
+        if skippedEntityNodeIDs.contains(node.id) {
+            entityByNodeID[node.id] = node.parentID.flatMap { entityByNodeID[$0] } ?? entityId
+            childBasisByNodeID[node.id] = node.parentID.flatMap { childBasisByNodeID[$0] } ?? runtimeAsset.rootTransform
+            continue
+        }
+
         let targetEntityId: EntityID
-        if runtimeAsset.nodes.count == 1, node.parentID == nil {
-            // Single-node asset: the caller's entity IS the mesh node.
+        if structuralNodes.count == 1 {
+            // Sole surviving node once rig-scaffolding is excluded: the caller's entity
+            // IS this node, regardless of how many armature/skeleton wrapper levels it
+            // was nested under in the source asset.
             targetEntityId = entityId
         } else {
             // Multi-node scene: entityId is the parent container (identity transform);
-            // every scene node gets its own entity so no node hijacks the root.
+            // every remaining scene node gets its own entity so no node hijacks the root.
             targetEntityId = createEntity()
         }
 
         entityByNodeID[node.id] = targetEntityId
+        childBasisByNodeID[node.id] = node.worldTransform
+        let parentEntityId = node.parentID.flatMap { entityByNodeID[$0] } ?? entityId
 
         ensureUntoldNodeComponents(entityId: targetEntityId)
-        applyLocalTransform(node.localTransform, to: targetEntityId)
-        setEntityName(entityId: targetEntityId, name: node.name)
+        if targetEntityId == entityId {
+            // Collapsing straight onto entityId: node.worldTransform already bakes in
+            // runtimeAsset.rootTransform and every ancestor's local transform (including
+            // any skipped rig-scaffolding levels), so it becomes entityId's own local
+            // transform outright. entityId's real external scene parent (if any) then
+            // composes on top of this via the normal ECS propagation.
+            applyLocalTransform(node.worldTransform, to: targetEntityId)
+        } else if node.parentID.map({ skippedEntityNodeIDs.contains($0) }) ?? false {
+            // This node's immediate parent in the source asset was skipped, so
+            // node.localTransform -- relative to that now-nonexistent parent -- no
+            // longer applies. Recompose relative to the nearest surviving ancestor's
+            // own worldTransform instead (or rootTransform if none survived).
+            let parentBasis = node.parentID.flatMap { childBasisByNodeID[$0] } ?? runtimeAsset.rootTransform
+            applyLocalTransform(simd_mul(parentBasis.inverse, node.worldTransform), to: targetEntityId)
+        } else {
+            applyLocalTransform(node.localTransform, to: targetEntityId)
+        }
+        // Same guard as the named-node path above (see #1262): only default the
+        // caller's own reused entity to the node's internal name when it doesn't
+        // already have a caller-assigned one. Freshly created child entities
+        // (targetEntityId != entityId) never have a prior name, so this is a no-op
+        // for them and they're always named from the node.
+        if targetEntityId != entityId || hasNoCallerAssignedName(entityId: entityId) {
+            setEntityName(entityId: targetEntityId, name: node.name)
+        }
 
         if targetEntityId != entityId {
-            let parentEntityId = node.parentID.flatMap { entityByNodeID[$0] } ?? entityId
             setParent(childId: targetEntityId, parentId: parentEntityId)
 
             let derivedComp = DerivedAssetNodeComponent(
@@ -993,11 +1058,10 @@ private func registerUntoldRuntimeAsset(
 
         attachGaussianAssetLinkIfPresent(entityId: targetEntityId, node: node)
 
+        // Any node reaching here without primitives is a plain hierarchy container
+        // (e.g. a wrapper Xform) -- the skeleton-only case was already skipped above,
+        // so it carries no skeleton data worth resolving.
         guard !node.primitives.isEmpty else {
-            registerRuntimeSkeletonIfNeeded(
-                entityId: targetEntityId,
-                skeleton: resolvedRuntimeSkeleton(for: node, nodesByID: nodesByID)
-            )
             continue
         }
 
@@ -3542,6 +3606,12 @@ func getMeshesForEntity(entityId: EntityID) -> [Mesh]? {
     entityMeshMap[entityId]
 }
 
+/// True when the entity has no non-empty caller-assigned name yet, so a node/asset
+/// name is safe to use as a default without clobbering something the caller set.
+func hasNoCallerAssignedName(entityId: EntityID) -> Bool {
+    entityNameMap[entityId]?.isEmpty ?? true
+}
+
 public func setEntityName(entityId: EntityID, name: String) {
     if let previousName = entityNameMap[entityId], !previousName.isEmpty {
         if var list = reverseEntityNameMap[previousName] {
@@ -3782,6 +3852,12 @@ struct GaussianLoadResult {
     /// `LocalTransformComponent.boundingBox` — see `computeGaussianSplatBoundingBox`.
     let boundingBox: (min: simd_float3, max: simd_float3)
 }
+
+/// Built once by buildGaussianLoadResult and handed off exactly once (to the caller that
+/// attaches it via applyGaussianLoadResult) — safe to cross an actor boundary despite the
+/// non-Sendable MTLBuffer/GaussianPageManager fields, which is what setEntityGaussianAsync
+/// below relies on to run the parse/encode work in a detached Task.
+extension GaussianLoadResult: @unchecked Sendable {}
 
 // `UntoldGSError`, `UntoldGSAsset` and `UntoldGSFormat` live in AssetFormat/UntoldGS*.swift.
 
@@ -4362,29 +4438,26 @@ public func setEntityGaussian(entityId: EntityID, source: GaussianSource) {
     }
 }
 
-/// Asynchronously reads and encodes a `.ply` Gaussian splat asset and attaches it to
-/// `entityId` without blocking the main thread. Parsing, per-splat encoding, and spherical-
-/// harmonics packing all run before the world-mutation gate is acquired; only the final
-/// component registration runs under `withWorldMutationGate`, mirroring `setEntityMeshAsync`'s
-/// pattern of keeping GPU resource work outside the gate.
+/// Shared async implementation behind `setEntityGaussianAsync`. Parsing, per-splat encoding,
+/// and spherical-harmonics packing all run off the calling thread (via `Task.detached`) before
+/// the world-mutation gate is acquired; only the final component registration runs under
+/// `withWorldMutationGate`, mirroring `setEntityMeshAsync`'s pattern of keeping GPU resource
+/// work outside the gate.
 ///
-/// `async -> Bool` (rather than `setEntityMeshAsync`'s fire-and-forget/completion shape) so
-/// `GeometryStreamingSystem.loadMesh` can `await` it directly from its own dispatch `Task`,
-/// the same way it awaits the mesh path. Used both by direct callers that want a non-blocking
-/// one-off load, and internally by the streaming system for distance-streamed splat props —
-/// gaussians have no cache/OCC layer analogous to `MeshResourceManager`, so unlike mesh
-/// streaming there is no separate streaming-only loader.
-@discardableResult
-public func setEntityGaussianAsync(
-    entityId: EntityID,
-    filename: String,
-    withExtension: String,
-    completion: (@Sendable (Bool) -> Void)? = nil
-) async -> Bool {
-    guard let result = buildGaussianLoadResult(filename: filename, withExtension: withExtension) else {
-        completion?(false)
-        return false
-    }
+/// `async -> Bool` so `GeometryStreamingSystem.loadGaussianStreamingEntity` can `await` it
+/// directly from its own dispatch `Task`, the same way it awaits the mesh path.
+/// `setEntityGaussianAsync` wraps this in a fire-and-forget `Task` for callers that just want
+/// `setEntityMeshAsync`'s plain completion-closure ergonomics.
+func performGaussianAsyncLoad(entityId: EntityID, filename: String, withExtension: String) async -> Bool {
+    // buildGaussianLoadResult is a plain synchronous function — awaiting it directly would
+    // just run it inline on whatever actor called us (e.g. still the main thread, if called
+    // from a `Task { @MainActor in ... }`). Task.detached guarantees the parse/decode/encode
+    // work actually happens off the caller's thread regardless of where it's awaited from.
+    let result = await Task.detached(priority: .userInitiated) {
+        buildGaussianLoadResult(filename: filename, withExtension: withExtension)
+    }.value
+
+    guard let result else { return false }
 
     withWorldMutationGate {
         applyGaussianLoadResult(result, to: entityId)
@@ -4392,8 +4465,25 @@ public func setEntityGaussianAsync(
             LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil)
     }
 
-    completion?(true)
     return true
+}
+
+/// Asynchronously reads and encodes a `.ply`/`.untoldgs` Gaussian splat asset and attaches it
+/// to `entityId` without blocking the caller — call it directly, no `Task`/`await` needed at
+/// the call site, and read the result via `completion`, exactly like `setEntityMeshAsync`.
+/// Gaussians have no cache/OCC layer analogous to `MeshResourceManager`, so unlike mesh
+/// streaming there is no separate streaming-only loader.
+public func setEntityGaussianAsync(
+    entityId: EntityID,
+    filename: String,
+    withExtension: String,
+    completion: ((Bool) -> Void)? = nil
+) {
+    let completionBox = completion.map { BoolCompletionBox(callback: $0) }
+    Task {
+        let success = await performGaussianAsyncLoad(entityId: entityId, filename: filename, withExtension: withExtension)
+        completionBox?.call(success)
+    }
 }
 
 public struct GaussianStreamingOptions {

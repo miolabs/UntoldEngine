@@ -43,8 +43,8 @@ final class NativeFormatRegistrationTests: BaseRenderSetup {
         XCTAssertTrue(hasComponent(entityId: entityId, componentType: LocalTransformComponent.self))
         XCTAssertTrue(hasComponent(entityId: entityId, componentType: ScenegraphComponent.self))
 
-        // redplayer.untold is hierarchical: the skinned mesh lives on a child entity,
-        // not the root. Resolve down to the entity that carries the render component.
+        // redplayer.untold's only non-mesh nodes are rig scaffolding, so the mesh
+        // collapses onto entityId itself (see #1273); resolve defensively either way.
         let renderEntityId = resolveEntityForAnimationBinding(entityId: entityId) ?? entityId
         XCTAssertTrue(hasComponent(entityId: renderEntityId, componentType: RenderComponent.self))
 
@@ -56,6 +56,42 @@ final class NativeFormatRegistrationTests: BaseRenderSetup {
         XCTAssertFalse(renderComponent.mesh.isEmpty, "Sync .untold load should register at least one mesh")
         XCTAssertEqual(renderComponent.assetURL.pathExtension, "untold")
         XCTAssertFalse(renderComponent.assetName.isEmpty, "Sync .untold load should register an asset name")
+    }
+
+    func testSetEntityMesh_doesNotCreateDeadSkeletonEntity() async {
+        // Regression test for #1273: redplayer.untold is a single-mesh rigged
+        // character whose exported node graph is Armature (SkelRoot, no
+        // primitives) -> [soccer_player_0 (mesh), Armature.001 (Skeleton, no
+        // primitives)]. Both Armature and Armature.001 are pure rig scaffolding --
+        // Armature.001's SkeletonComponent is dead (AnimationSystem only ever looks
+        // at the mesh entity's own SkeletonComponent, which registerUntoldNodePayload
+        // populates independently from the raw node data), and Armature is a
+        // pass-through wrapper with nothing of its own to render. Importing this
+        // asset must not spawn entities for either -- the mesh collapses straight
+        // onto the caller's entity.
+        let entityId = createEntity()
+        setEntityName(entityId: entityId, name: "DeadSkeletonRoot")
+
+        let loadExp = expectation(description: "redplayer loaded")
+        setEntityMeshAsync(entityId: entityId, filename: "redplayer", withExtension: "untold") { _ in loadExp.fulfill() }
+        await fulfillment(of: [loadExp], timeout: 10)
+
+        var allEntities: [EntityID] = [entityId]
+        var frontier = [entityId]
+        while !frontier.isEmpty {
+            let children = frontier.flatMap { getEntityChildren(parentId: $0) }
+            allEntities.append(contentsOf: children)
+            frontier = children
+        }
+
+        XCTAssertEqual(allEntities, [entityId], "A single-mesh rigged asset with no authored hierarchy should collapse entirely onto the caller's entity, not spawn child entities for armature/skeleton scaffolding")
+
+        let skeletonEntities = allEntities.filter { hasComponent(entityId: $0, componentType: SkeletonComponent.self) }
+        let renderEntities = allEntities.filter { hasComponent(entityId: $0, componentType: RenderComponent.self) }
+
+        XCTAssertEqual(renderEntities.count, 1, "redplayer.untold has exactly one mesh; exactly one entity should carry RenderComponent")
+        XCTAssertEqual(skeletonEntities.count, 1, "The Skeleton node must not get its own dead SkeletonComponent entity")
+        XCTAssertEqual(skeletonEntities, renderEntities, "SkeletonComponent must live on the same entity as the mesh's RenderComponent, not a sibling")
     }
 
     func testSetEntityMeshAsync_loadsUntoldMesh() async {
@@ -80,8 +116,8 @@ final class NativeFormatRegistrationTests: BaseRenderSetup {
         XCTAssertTrue(hasComponent(entityId: entityId, componentType: LocalTransformComponent.self))
         XCTAssertTrue(hasComponent(entityId: entityId, componentType: ScenegraphComponent.self))
 
-        // redplayer.untold is hierarchical: the skinned mesh lives on a child entity,
-        // not the root. Resolve down to the entity that carries the render component.
+        // redplayer.untold's only non-mesh nodes are rig scaffolding, so the mesh
+        // collapses onto entityId itself (see #1273); resolve defensively either way.
         let renderEntityId = resolveEntityForAnimationBinding(entityId: entityId) ?? entityId
         XCTAssertTrue(hasComponent(entityId: renderEntityId, componentType: RenderComponent.self))
 
@@ -189,6 +225,68 @@ final class NativeFormatRegistrationTests: BaseRenderSetup {
         XCTAssertEqual(renderComponent.assetName, nodeName, "RenderComponent assetName must match requested node name")
     }
 
+    func testSetEntityMesh_namedNodeLoadPreservesCallerAssignedName() async throws {
+        // Regression test for #1262: a legacy scene-load style call where the caller
+        // already named the entity (e.g. a user-renamed scene entity) before requesting
+        // a specific node by name. The node's internal name must not clobber it, so
+        // findEntity(name:) keeps resolving the caller-assigned name afterward.
+        guard let untoldURL = Bundle.module.url(forResource: "redplayer", withExtension: "untold") else {
+            XCTFail("Failed to locate redplayer.untold")
+            return
+        }
+
+        let asset = try await NativeFormatLoader().loadAsset(from: untoldURL)
+        guard let nodeName = asset.nodes.first(where: { !$0.primitives.isEmpty })?.name else {
+            XCTFail("redplayer.untold has no nodes with primitives")
+            return
+        }
+        XCTAssertNotEqual(nodeName, "UserAssignedName", "test fixture assumption: node name must differ from the caller-assigned name")
+
+        let entityId = createEntity()
+        setEntityName(entityId: entityId, name: "UserAssignedName")
+
+        let namedLoadExp = expectation(description: "named node loaded")
+        setEntityMeshAsync(entityId: entityId, filename: "redplayer", withExtension: "untold", assetName: nodeName) { _ in namedLoadExp.fulfill() }
+        await fulfillment(of: [namedLoadExp], timeout: 10)
+
+        XCTAssertEqual(getEntityName(entityId: entityId), "UserAssignedName")
+        XCTAssertEqual(findEntity(named: "UserAssignedName"), entityId)
+        XCTAssertNil(findEntity(named: nodeName))
+    }
+
+    func testSetEntityMesh_singleNodeLoadPreservesCallerAssignedName() async throws {
+        // Regression test for #1262: the hierarchy path (no `assetName` given) also
+        // reuses the caller's entity as the mesh node when the asset has exactly one
+        // node with no parent -- e.g. the "New Asset Instance" scene-loading workflow,
+        // which names entities from scene data before calling setEntityMeshAsync with
+        // assetName: nil. That reused entity must not have its caller-assigned name
+        // clobbered by the node's internal name either.
+        guard let untoldURL = Bundle.module.url(forResource: "singlecube", withExtension: "untold") else {
+            XCTFail("Failed to locate singlecube.untold")
+            return
+        }
+
+        let asset = try await NativeFormatLoader().loadAsset(from: untoldURL)
+        XCTAssertEqual(asset.nodes.count, 1, "test fixture assumption: singlecube.untold must have exactly one node")
+        guard let node = asset.nodes.first else {
+            XCTFail("singlecube.untold has no nodes")
+            return
+        }
+        XCTAssertNil(node.parentID, "test fixture assumption: the single node must have no parent")
+        XCTAssertNotEqual(node.name, "UserAssignedName", "test fixture assumption: node name must differ from the caller-assigned name")
+
+        let entityId = createEntity()
+        setEntityName(entityId: entityId, name: "UserAssignedName")
+
+        let loadExp = expectation(description: "single-node mesh loaded")
+        setEntityMeshAsync(entityId: entityId, filename: "singlecube", withExtension: "untold", assetName: nil) { _ in loadExp.fulfill() }
+        await fulfillment(of: [loadExp], timeout: 10)
+
+        XCTAssertEqual(getEntityName(entityId: entityId), "UserAssignedName")
+        XCTAssertEqual(findEntity(named: "UserAssignedName"), entityId)
+        XCTAssertNil(findEntity(named: node.name))
+    }
+
     func testSetEntityMesh_returnsFalseForUnknownNodeName() async {
         let entityId = createEntity()
         setEntityName(entityId: entityId, name: "BadNameEntity")
@@ -206,6 +304,9 @@ final class NativeFormatRegistrationTests: BaseRenderSetup {
     }
 
     func testSetEntityAnimations_resolvesHierarchicalUntoldRootToSkinnedDescendant() async throws {
+        // redplayer.untold's only non-mesh nodes are rig scaffolding (an armature-root
+        // Xform and a dead skeleton-data node), so #1273's fix collapses the whole asset
+        // straight onto the caller's entity -- no separate child entity is spawned for it.
         guard let modelURL = Bundle.module.url(forResource: "redplayer", withExtension: "untold") else {
             XCTFail("Failed to locate redplayer.untold")
             return
@@ -235,7 +336,7 @@ final class NativeFormatRegistrationTests: BaseRenderSetup {
         await fulfillment(of: [loadExp_rootEntity], timeout: 10)
 
         let bindingEntity = try XCTUnwrap(resolveEntityForAnimationBinding(entityId: rootEntity))
-        XCTAssertNotEqual(bindingEntity, rootEntity)
+        XCTAssertEqual(bindingEntity, rootEntity, "redplayer.untold has no real (non-rig-scaffolding) hierarchy left to preserve; the mesh should collapse onto the caller's entity")
         XCTAssertTrue(hasComponent(entityId: bindingEntity, componentType: SkeletonComponent.self))
         XCTAssertTrue(hasComponent(entityId: bindingEntity, componentType: RenderComponent.self))
 
