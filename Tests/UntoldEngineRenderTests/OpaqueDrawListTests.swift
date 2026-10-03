@@ -95,9 +95,9 @@ final class OpaqueDrawListTests: BaseRenderSetup {
             add(meshes(cube, with: red), to: &list),
         ]
 
-        // The materials in the order they were first seen; within red, the cube (seen
-        // first) before the sphere.
-        XCTAssertEqual(encodedLists(list), [lists[0], lists[4], lists[2], lists[1], lists[3]])
+        // The materials in the order they were first seen (red, then green); within each,
+        // the cube before the sphere, because the cube was the first mesh seen.
+        XCTAssertEqual(encodedLists(list), [lists[0], lists[4], lists[2], lists[3], lists[1]])
     }
 
     func testDrawsThatShareMaterialAndMeshKeepTheOrderTheyWereAddedIn() {
