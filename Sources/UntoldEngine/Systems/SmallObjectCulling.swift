@@ -24,7 +24,10 @@ import simd
 struct SmallObjectCulling {
     /// Objects under this many pixels tall are not drawn and cast no shadow. Zero draws
     /// everything. Set with `setRendering(.smallObjectCulling(pixels:))`.
-    nonisolated(unsafe) static var minimumPixels: Float = 1.0
+    // Try-out only: UNTOLD_SMALL_OBJECT_PIXELS in the environment sets the size without
+    // an editor setting. Not part of the change that goes upstream.
+    nonisolated(unsafe) static var minimumPixels: Float = ProcessInfo.processInfo.environment["UNTOLD_SMALL_OBJECT_PIXELS"]
+        .flatMap(Float.init).map { $0.isFinite ? max($0, 0) : 1.0 } ?? 1.0
 
     /// The camera, in the space the entities' world transforms are in.
     let cameraPosition: simd_float3
