@@ -311,6 +311,180 @@ public enum RenderPasses {
         }
     }
 
+    /// The textures, samplers and flags an opaque draw binds for its material, by identity:
+    /// equal values mean the encoder already holds them.
+    private struct OpaqueMaterialBinding: Equatable {
+        let baseColor: ObjectIdentifier?
+        let roughness: ObjectIdentifier?
+        let metallic: ObjectIdentifier?
+        let normal: ObjectIdentifier?
+        let height: ObjectIdentifier?
+        let emissive: ObjectIdentifier?
+        let baseColorSampler: ObjectIdentifier?
+        let materialSampler: ObjectIdentifier?
+        let normalSampler: ObjectIdentifier?
+        let heightSampler: ObjectIdentifier?
+        let stScale: Float
+        let normalIsPackedXY: Bool
+
+        @inline(__always)
+        init(_ material: Material) {
+            baseColor = material.baseColor.texture.map { ObjectIdentifier($0) }
+            roughness = material.roughness.texture.map { ObjectIdentifier($0) }
+            metallic = material.metallic.texture.map { ObjectIdentifier($0) }
+            normal = material.normal.texture.map { ObjectIdentifier($0) }
+            height = material.height.texture.map { ObjectIdentifier($0) }
+            emissive = material.emissive.texture.map { ObjectIdentifier($0) }
+            baseColorSampler = material.baseColor.sampler.map { ObjectIdentifier($0) }
+            materialSampler = material.roughness.sampler.map { ObjectIdentifier($0) }
+            normalSampler = material.normal.sampler.map { ObjectIdentifier($0) }
+            heightSampler = material.height.sampler.map { ObjectIdentifier($0) }
+            stScale = material.stScale
+            normalIsPackedXY = material.normalIsPackedXY
+        }
+    }
+
+    /// Encodes the draws of `drawList` in its order, setting on the encoder only what
+    /// differs from what the draw before left there: the vertex streams when the mesh
+    /// changes, the textures and samplers when the material does, the material
+    /// parameters when their bytes do.
+    private static func encodeOpaqueDraws(
+        _ drawList: OpaqueDrawList,
+        pass: OpaquePassState,
+        renderEncoder: MTLRenderCommandEncoder
+    ) {
+        let viewMatrix = pass.viewMatrix
+        var pomQuality = pass.pomQuality
+        renderEncoder.setFragmentBytes(&pomQuality, length: MemoryLayout<POMQualityUniform>.stride, index: Int(modelPassFragmentPOMQualityIndex.rawValue))
+
+        // What the encoder holds from the draws before.
+        var uniformsMeshList: Int32 = -1
+        var uniformsMesh: Int32 = -1
+        var boundStreams: ObjectIdentifier?
+        var boundMaterial: OpaqueMaterialBinding?
+        var boundParameters = MaterialParametersUniform()
+        var hasBoundParameters = false
+
+        for drawIndex in drawList.order() {
+            let draw = drawList.draws[drawIndex]
+            let listIndex = Int(draw.meshList)
+            let meshIndex = Int(draw.mesh)
+            let submeshIndex = Int(draw.submesh)
+            let entityIndex = Int(drawList.meshLists[listIndex].entity)
+
+            // The transforms of the mesh, for the first of its submeshes that comes up.
+            if uniformsMeshList != draw.meshList || uniformsMesh != draw.mesh {
+                uniformsMeshList = draw.meshList
+                uniformsMesh = draw.mesh
+
+                var modelUniforms = Uniforms()
+                let modelMatrix = simd_mul(drawList.entities[entityIndex].world.space, drawList.meshLists[listIndex].meshes[meshIndex].localSpace)
+                modelUniforms.modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
+                modelUniforms.normalMatrix = matrix3x3_upper_left(modelMatrix).inverse.transpose
+                modelUniforms.viewMatrix = viewMatrix
+                modelUniforms.modelMatrix = modelMatrix
+                modelUniforms.cameraPosition = pass.cameraPosition
+                modelUniforms.projectionMatrix = pass.projectionMatrix
+                renderEncoder.setVertexBytes(&modelUniforms, length: MemoryLayout<Uniforms>.stride, index: Int(modelPassUniformIndex.rawValue))
+                renderEncoder.setFragmentBytes(&modelUniforms, length: MemoryLayout<Uniforms>.stride, index: Int(modelPassFragmentUniformIndex.rawValue))
+
+                // The streams of a mesh that neither deforms nor is skinned are the same for
+                // every entity that draws it.
+                let deformation = drawList.entities[entityIndex].deformation
+                let isRigid = deformation == nil && drawList.meshLists[listIndex].meshes[meshIndex].skin == nil
+                let streams = ObjectIdentifier(drawList.meshLists[listIndex].meshes[meshIndex].metalKitMesh)
+                if !isRigid || boundStreams != streams {
+                    renderEncoder.bindModelVertexStreams(
+                        mesh: drawList.meshLists[listIndex].meshes[meshIndex],
+                        deformation: deformation,
+                        hasSkeleton: drawList.entities[entityIndex].hasSkeleton
+                    )
+                    boundStreams = isRigid ? streams : nil
+                }
+            }
+
+            guard let material = drawList.meshLists[listIndex].meshes[meshIndex].submeshes[submeshIndex].material else { continue }
+
+            let binding = OpaqueMaterialBinding(material)
+            if binding != boundMaterial {
+                boundMaterial = binding
+                var stScale: Float = material.stScale
+                renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
+                renderEncoder.setFragmentTexture(material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue))
+                renderEncoder.setFragmentSamplerState(material.baseColor.sampler, index: Int(modelPassBaseSamplerIndex.rawValue))
+                renderEncoder.setFragmentTexture(material.roughness.texture, index: Int(modelPassRoughnessTextureIndex.rawValue))
+                renderEncoder.setFragmentSamplerState(material.roughness.sampler, index: Int(modelPassMaterialSamplerIndex.rawValue))
+                renderEncoder.setFragmentTexture(material.metallic.texture, index: Int(modelPassMetallicTextureIndex.rawValue))
+
+                var hasNormal = (material.normal.texture != nil)
+                renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
+                var normalIsPackedXY = material.normalIsPackedXY
+                renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
+                renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
+                renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
+                renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
+                renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
+                renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
+            }
+
+            var materialParameters = MaterialParametersUniform()
+            materialParameters.specular = material.specular
+            materialParameters.specularTint = material.specularTint
+            materialParameters.subsurface = material.subsurface
+            materialParameters.anisotropic = material.anisotropic
+            materialParameters.sheen = material.sheen
+            materialParameters.sheenTint = material.sheenTint
+            materialParameters.clearCoat = material.clearCoat
+            materialParameters.clearCoatGloss = material.clearCoatGloss
+            materialParameters.baseColor = material.baseColorValue
+            materialParameters.roughness = material.roughnessValue
+            materialParameters.metallic = material.metallicValue
+            materialParameters.ior = material.ior
+            materialParameters.edgeTint = material.edgeTint
+            materialParameters.alphaCutoff = material.alphaCutoff
+            materialParameters.passthroughAlpha = drawList.entities[entityIndex].passthroughAlpha
+            materialParameters.alphaMode = Int32(material.alphaMode.rawValue)
+            materialParameters.interactWithLight = material.interactWithLight
+            materialParameters.emmissive = material.emissiveValue
+            applyMaterialTextureState(material: material, materialParameters: &materialParameters)
+            if pass.colorsByLOD {
+                applyLODDebugColorOverride(entityId: drawList.entities[entityIndex].entityId, materialParameters: &materialParameters)
+            }
+            if pass.colorsByStreamingTier {
+                applyStreamingTierDebugColorOverride(entityId: drawList.entities[entityIndex].entityId, materialParameters: &materialParameters)
+            }
+            materialParameters.lodDither = simd_float4(
+                drawList.meshLists[listIndex].ditherThreshold,
+                drawList.meshLists[listIndex].ditherMode,
+                0.0,
+                0.0
+            )
+            applyTileRepresentationDither(fade: drawList.entities[entityIndex].tileRepresentationFade, materialParameters: &materialParameters)
+            applyMeshFadeDither(fade: drawList.entities[entityIndex].meshFade, materialParameters: &materialParameters)
+
+            let sameParameters = hasBoundParameters && withUnsafeBytes(of: &materialParameters) { new in
+                withUnsafeBytes(of: &boundParameters) { old in
+                    memcmp(new.baseAddress!, old.baseAddress!, new.count) == 0
+                }
+            }
+            if !sameParameters {
+                boundParameters = materialParameters
+                hasBoundParameters = true
+                renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
+            }
+
+            let metalKitSubmesh = drawList.meshLists[listIndex].meshes[meshIndex].submeshes[submeshIndex].metalKitSubmesh
+            renderEncoder.drawIndexedPrimitivesTracked(
+                type: metalKitSubmesh.primitiveType,
+                indexCount: metalKitSubmesh.indexCount,
+                indexType: metalKitSubmesh.indexType,
+                indexBuffer: metalKitSubmesh.indexBuffer.buffer,
+                indexBufferOffset: metalKitSubmesh.indexBuffer.offset,
+                category: .opaque
+            )
+        }
+    }
+
     /// The outgoing and the incoming level of an entity whose LOD fade is running, or nil
     /// when the entity just draws its meshes. `lod` is `OpaquePassState.fadingLOD(of:)`.
     private static func lodFadeDraws(lod: LODComponent?, renderComponent: RenderComponent) -> [LODDitherDraw]? {
@@ -2341,7 +2515,12 @@ public enum RenderPasses {
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
         renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
 
-        for entityId in visibleEntityIds {
+        // The draws are gathered first and encoded in an order that lets neighbours
+        // share their state (see OpaqueDrawList).
+        let visibleEntities = visibleEntityIds
+        var drawList = OpaqueDrawList(expectedEntities: visibleEntities.count)
+
+        for entityId in visibleEntities {
             guard let entity = sceneSnapshot.entity(entityId) else { continue }
             let traits = entity.traits
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
@@ -2358,106 +2537,29 @@ public enum RenderPasses {
 
             guard let components = sceneSnapshot.drawComponents(of: entity) else { continue }
             let renderComponent = components.render
-            let worldTransformComponent = components.world
 
             // What every draw of the entity shares.
-            let deformation = sceneSnapshot.deformation(of: entity)
-            let hasSkeleton = traits.contains(.skeleton)
-            let passthroughAlpha = pass.passthroughAlpha(for: renderMode)
-            let tileRepresentationFade = sceneSnapshot.tileRepresentationFade(of: entity)
-            let meshFade = sceneSnapshot.meshFade(of: entity)
+            let entityIndex = drawList.add(entity: OpaqueDrawList.Entity(
+                entityId: entityId,
+                world: components.world,
+                deformation: sceneSnapshot.deformation(of: entity),
+                hasSkeleton: traits.contains(.skeleton),
+                passthroughAlpha: pass.passthroughAlpha(for: renderMode),
+                tileRepresentationFade: sceneSnapshot.tileRepresentationFade(of: entity),
+                meshFade: sceneSnapshot.meshFade(of: entity)
+            ))
 
             // The entity's meshes, or its outgoing and incoming levels while a LOD fade runs.
-            let fadeDraws = lodFadeDraws(lod: fadingLOD, renderComponent: renderComponent)
-            for drawIndex in 0 ..< (fadeDraws?.count ?? 1) {
-                let lodDraw = fadeDraws?[drawIndex] ?? LODDitherDraw(meshes: renderComponent.mesh, threshold: 1.0, mode: 0.0)
-                for mesh in lodDraw.meshes {
-                    var modelUniforms = Uniforms()
-                    let modelMatrix = simd_mul(worldTransformComponent.space, mesh.localSpace)
-                    let modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
-                    let normalMatrix = matrix3x3_upper_left(modelMatrix).inverse.transpose
-
-                    modelUniforms.modelViewMatrix = modelViewMatrix
-                    modelUniforms.normalMatrix = normalMatrix
-                    modelUniforms.viewMatrix = viewMatrix
-                    modelUniforms.modelMatrix = modelMatrix
-                    modelUniforms.cameraPosition = pass.cameraPosition
-                    modelUniforms.projectionMatrix = pass.projectionMatrix
-
-                    renderEncoder.setVertexBytes(&modelUniforms, length: MemoryLayout<Uniforms>.stride, index: Int(modelPassUniformIndex.rawValue))
-
-                    renderEncoder.bindModelVertexStreams(mesh: mesh, deformation: deformation, hasSkeleton: hasSkeleton)
-
-                    renderEncoder.setFragmentBytes(&modelUniforms, length: MemoryLayout<Uniforms>.stride, index: Int(modelPassFragmentUniformIndex.rawValue))
-
-                    for subMesh in mesh.submeshes {
-                        guard let material = subMesh.material else { continue }
-                        if material.alphaMode == .blend { continue }
-
-                        var stScale: Float = material.stScale
-                        renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
-                        var pomQuality = pass.pomQuality
-                        renderEncoder.setFragmentBytes(&pomQuality, length: MemoryLayout<POMQualityUniform>.stride, index: Int(modelPassFragmentPOMQualityIndex.rawValue))
-                        renderEncoder.setFragmentTexture(material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue))
-                        renderEncoder.setFragmentSamplerState(material.baseColor.sampler, index: Int(modelPassBaseSamplerIndex.rawValue))
-                        renderEncoder.setFragmentTexture(material.roughness.texture, index: Int(modelPassRoughnessTextureIndex.rawValue))
-                        renderEncoder.setFragmentSamplerState(material.roughness.sampler, index: Int(modelPassMaterialSamplerIndex.rawValue))
-                        renderEncoder.setFragmentTexture(material.metallic.texture, index: Int(modelPassMetallicTextureIndex.rawValue))
-
-                        var hasNormal = (material.normal.texture != nil)
-                        renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
-                        var normalIsPackedXY = material.normalIsPackedXY
-                        renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
-
-                        var materialParameters = MaterialParametersUniform()
-                        materialParameters.specular = material.specular
-                        materialParameters.specularTint = material.specularTint
-                        materialParameters.subsurface = material.subsurface
-                        materialParameters.anisotropic = material.anisotropic
-                        materialParameters.sheen = material.sheen
-                        materialParameters.sheenTint = material.sheenTint
-                        materialParameters.clearCoat = material.clearCoat
-                        materialParameters.clearCoatGloss = material.clearCoatGloss
-                        materialParameters.baseColor = material.baseColorValue
-                        materialParameters.roughness = material.roughnessValue
-                        materialParameters.metallic = material.metallicValue
-                        materialParameters.ior = material.ior
-                        materialParameters.edgeTint = material.edgeTint
-                        materialParameters.alphaCutoff = material.alphaCutoff
-                        materialParameters.passthroughAlpha = passthroughAlpha
-                        materialParameters.alphaMode = Int32(material.alphaMode.rawValue)
-                        materialParameters.interactWithLight = material.interactWithLight
-                        materialParameters.emmissive = material.emissiveValue
-                        applyMaterialTextureState(material: material, materialParameters: &materialParameters)
-                        if pass.colorsByLOD {
-                            applyLODDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
-                        }
-                        if pass.colorsByStreamingTier {
-                            applyStreamingTierDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
-                        }
-                        applyLODDither(draw: lodDraw, materialParameters: &materialParameters)
-                        applyTileRepresentationDither(fade: tileRepresentationFade, materialParameters: &materialParameters)
-                        applyMeshFadeDither(fade: meshFade, materialParameters: &materialParameters)
-
-                        renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
-                        renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
-                        renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
-                        renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
-                        renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
-                        renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
-
-                        renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
-                            category: .opaque
-                        )
-                    }
+            if let fadeDraws = lodFadeDraws(lod: fadingLOD, renderComponent: renderComponent) {
+                for fadeDraw in fadeDraws {
+                    drawList.add(meshes: fadeDraw.meshes, ditherThreshold: fadeDraw.threshold, ditherMode: fadeDraw.mode, entity: entityIndex)
                 }
+            } else {
+                drawList.add(meshes: renderComponent.mesh, ditherThreshold: 1.0, ditherMode: 0.0, entity: entityIndex)
             }
         }
+
+        encodeOpaqueDraws(drawList, pass: pass, renderEncoder: renderEncoder)
 
         // ── Sub-pass 1b: Batched geometry ───────────────────────────────────────
         if BatchingSystem.shared.isEnabled() {
