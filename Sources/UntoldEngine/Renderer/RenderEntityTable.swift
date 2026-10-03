@@ -38,6 +38,7 @@ final class RenderEntityTable: @unchecked Sendable {
         static let lod = Flags(rawValue: 1 << 8)
         static let deformation = Flags(rawValue: 1 << 9)
         static let skeleton = Flags(rawValue: 1 << 10)
+        static let tileLODTag = Flags(rawValue: 1 << 11)
 
         /// Entities no geometry pass draws: cameras, lights and gizmos.
         static let notGeometry: Flags = [.gizmo, .light, .camera, .sceneCamera]
@@ -86,6 +87,7 @@ final class RenderEntityTable: @unchecked Sendable {
             (getComponentId(for: LODComponent.self), .lod),
             (getComponentId(for: DeformationComponent.self), .deformation),
             (getComponentId(for: SkeletonComponent.self), .skeleton),
+            (getComponentId(for: TileLODTagComponent.self), .tileLODTag),
         ]
 
         rows.removeAll(keepingCapacity: true)
