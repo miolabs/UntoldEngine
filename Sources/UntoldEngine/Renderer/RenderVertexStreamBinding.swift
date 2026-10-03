@@ -40,36 +40,35 @@ extension MTLRenderCommandEncoder {
     /// has a skeleton: the entity's meshes are then bound without asking the scene again.
     func bindModelVertexStreams(mesh: Mesh, deformation: DeformationComponent?, hasSkeleton: Bool) {
         let deformed = deformedStreams(mesh: mesh, deformation: deformation)
-        // Asked once: `vertexBuffers` hands out a new array every time it is read.
-        let vertexBuffers = mesh.metalKitMesh.vertexBuffers
+        let vertexBuffers = mesh.vertexBuffers
 
         setVertexBuffer(
-            deformed?.positions ?? vertexBuffers[Int(modelPassVerticesIndex.rawValue)].buffer,
+            deformed?.positions ?? vertexBuffers[Int(modelPassVerticesIndex.rawValue)],
             offset: 0,
             index: Int(modelPassVerticesIndex.rawValue)
         )
         setVertexBuffer(
-            deformed?.normals ?? vertexBuffers[Int(modelPassNormalIndex.rawValue)].buffer,
+            deformed?.normals ?? vertexBuffers[Int(modelPassNormalIndex.rawValue)],
             offset: 0,
             index: Int(modelPassNormalIndex.rawValue)
         )
         setVertexBuffer(
-            vertexBuffers[Int(modelPassUVIndex.rawValue)].buffer,
+            vertexBuffers[Int(modelPassUVIndex.rawValue)],
             offset: 0,
             index: Int(modelPassUVIndex.rawValue)
         )
         setVertexBuffer(
-            deformed?.tangents ?? vertexBuffers[Int(modelPassTangentIndex.rawValue)].buffer,
+            deformed?.tangents ?? vertexBuffers[Int(modelPassTangentIndex.rawValue)],
             offset: 0,
             index: Int(modelPassTangentIndex.rawValue)
         )
         setVertexBuffer(
-            vertexBuffers[Int(modelPassJointIdIndex.rawValue)].buffer,
+            vertexBuffers[Int(modelPassJointIdIndex.rawValue)],
             offset: 0,
             index: Int(modelPassJointIdIndex.rawValue)
         )
         setVertexBuffer(
-            vertexBuffers[Int(modelPassJointWeightsIndex.rawValue)].buffer,
+            vertexBuffers[Int(modelPassJointWeightsIndex.rawValue)],
             offset: 0,
             index: Int(modelPassJointWeightsIndex.rawValue)
         )
@@ -93,20 +92,20 @@ extension MTLRenderCommandEncoder {
     /// See `bindModelVertexStreams(mesh:deformation:hasSkeleton:)`.
     func bindShadowVertexStreams(mesh: Mesh, deformation: DeformationComponent?, hasSkeleton: Bool) {
         let deformed = deformedStreams(mesh: mesh, deformation: deformation)
-        let vertexBuffers = mesh.metalKitMesh.vertexBuffers
+        let vertexBuffers = mesh.vertexBuffers
 
         setVertexBuffer(
-            deformed?.positions ?? vertexBuffers[Int(modelPassVerticesIndex.rawValue)].buffer,
+            deformed?.positions ?? vertexBuffers[Int(modelPassVerticesIndex.rawValue)],
             offset: 0,
             index: Int(shadowPassModelPositionIndex.rawValue)
         )
         setVertexBuffer(
-            vertexBuffers[Int(modelPassJointIdIndex.rawValue)].buffer,
+            vertexBuffers[Int(modelPassJointIdIndex.rawValue)],
             offset: 0,
             index: Int(shadowPassJointIdIndex.rawValue)
         )
         setVertexBuffer(
-            vertexBuffers[Int(modelPassJointWeightsIndex.rawValue)].buffer,
+            vertexBuffers[Int(modelPassJointWeightsIndex.rawValue)],
             offset: 0,
             index: Int(shadowPassJointWeightsIndex.rawValue)
         )
