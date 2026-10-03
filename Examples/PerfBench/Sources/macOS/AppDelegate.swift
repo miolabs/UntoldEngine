@@ -25,14 +25,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var renderer: UntoldRenderer!
     private var runner: BenchRunner!
 
+    /// The display the bench runs on: one whose maximum refresh rate is the requested one, else
+    /// the fastest connected display. Not `NSScreen.main`, which is the screen with keyboard
+    /// focus and so depends on where the terminal that launched the bench happens to be.
+    private static func benchScreen(requestedHz: Int?) -> NSScreen? {
+        let screens = NSScreen.screens
+        if let requestedHz {
+            if let match = screens.first(where: { $0.maximumFramesPerSecond == requestedHz }) {
+                return match
+            }
+            let rates = screens.map { String($0.maximumFramesPerSecond) }.joined(separator: ", ")
+            print("PERFBENCH_WARNING no connected display runs at \(requestedHz) Hz (connected: \(rates) Hz); using the fastest one")
+        }
+        return screens.max { $0.maximumFramesPerSecond < $1.maximumFramesPerSecond }
+    }
+
     func applicationDidFinishLaunching(_: Notification) {
         let config = BenchConfig.fromEnvironment()
+        let screen = Self.benchScreen(requestedHz: config.refreshHz)
         var render = BenchRenderSettings(platform: "macOS")
         render.viewportWidth = Int(Constants.drawableSize.width)
         render.viewportHeight = Int(Constants.drawableSize.height)
         render.layout = "single"
         render.vsync = true
-        render.displayRefreshHz = Double(NSScreen.main?.maximumFramesPerSecond ?? 60)
+        render.displayRefreshHz = Double(screen?.maximumFramesPerSecond ?? 60)
         runner = BenchRunner(config: config, render: render)
 
         guard let renderer = UntoldRenderer.create() else {
@@ -52,9 +68,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         (view.layer as? CAMetalLayer)?.contentsScale = 1.0
         renderInfo.viewPort = simd_float2(Float(Constants.drawableSize.width), Float(Constants.drawableSize.height))
 
+        // The drawable keeps its fixed pixel size. The window shows it one drawable pixel per
+        // device pixel, so the window server presents it without rescaling, and is scaled down
+        // further only if the chosen display is smaller than that, so it never hangs over onto a
+        // neighbouring display that refreshes at another rate.
+        let styleMask: NSWindow.StyleMask = [.titled, .closable]
+        let backingScale = max(1.0, screen?.backingScaleFactor ?? 1.0)
+        var contentSize = CGSize(
+            width: Constants.drawableSize.width / backingScale,
+            height: Constants.drawableSize.height / backingScale
+        )
+        if let screen {
+            let visible = screen.visibleFrame
+            let framed = NSWindow.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize), styleMask: styleMask)
+            let chromeHeight = framed.height - contentSize.height
+            let fit = min(1.0, visible.width / contentSize.width, (visible.height - chromeHeight) / contentSize.height)
+            contentSize = CGSize(width: floor(contentSize.width * fit), height: floor(contentSize.height * fit))
+        }
         window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: Constants.drawableSize),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(origin: .zero, size: contentSize),
+            styleMask: styleMask,
             backing: .buffered,
             defer: false
         )
@@ -64,7 +97,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var viewOptions = UntoldViewOptions.default
         viewOptions.preferredFramesPerSecond = Int(render.displayRefreshHz)
         window.contentView = NSHostingView(rootView: BenchView(renderer: renderer, runner: runner, viewOptions: viewOptions))
-        window.center()
+        if let screen {
+            // Centre the window on the chosen display; the display it sits on paces its frames.
+            let visible = screen.visibleFrame
+            window.setFrameOrigin(NSPoint(
+                x: visible.midX - window.frame.width / 2,
+                y: visible.midY - window.frame.height / 2
+            ))
+        } else {
+            window.center()
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)

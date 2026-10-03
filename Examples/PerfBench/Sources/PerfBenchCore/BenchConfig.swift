@@ -25,6 +25,7 @@ import Foundation
 /// | `UNTOLD_BENCH_IMMERSION` | `full` or `mixed` (visionOS) | `full` |
 /// | `UNTOLD_BENCH_PER_FRAME` | `0` records one line per second instead of per frame | per frame |
 /// | `UNTOLD_BENCH_AA` | `fxaa`, `smaa`, `msaa` or `none`: anti-aliasing for every scene (the post-FX scene keeps SMAA) | engine default (FXAA) |
+/// | `UNTOLD_BENCH_REFRESH` | macOS: run on a connected display with this maximum refresh rate, for example `120` | the fastest connected display |
 public struct BenchConfig: Sendable {
     public var sceneIDs: [String]
     public var warmupSeconds: Double
@@ -38,6 +39,8 @@ public struct BenchConfig: Sendable {
     public var perFrame: Bool
     /// Anti-aliasing mode name from the environment, or nil to leave the engine's default.
     public var antiAliasing: String?
+    /// Refresh rate of the display to run on (macOS), or nil for the fastest connected display.
+    public var refreshHz: Int?
 
     public static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> BenchConfig {
         func double(_ key: String, _ fallback: Double) -> Double {
@@ -69,7 +72,8 @@ public struct BenchConfig: Sendable {
             autoStart: environment["UNTOLD_BENCH_AUTOSTART"] != "0",
             immersion: environment["UNTOLD_BENCH_IMMERSION"] ?? "full",
             perFrame: environment["UNTOLD_BENCH_PER_FRAME"] != "0",
-            antiAliasing: environment["UNTOLD_BENCH_AA"].map { $0.lowercased() }
+            antiAliasing: environment["UNTOLD_BENCH_AA"].map { $0.lowercased() },
+            refreshHz: environment["UNTOLD_BENCH_REFRESH"].flatMap { Int($0) }.flatMap { $0 > 0 ? $0 : nil }
         )
     }
 

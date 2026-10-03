@@ -15,7 +15,9 @@
 #   --out DIR             where run folders land (default: perf/results)
 #   --label TEXT          stored in summary.json (default: git describe)
 #   --config Debug|Release (default: Release)
-#   --repeat N            run the whole scene set N times and aggregate (min of times, mean of rates)
+#   --repeat N            run the whole scene set N times and aggregate (minimum of each time and rate)
+#   --refresh N           macOS: run on a connected display whose maximum refresh rate is N Hz
+#                         (default: the fastest connected display). Baselines are keyed by the rate.
 #   --xctrace TEMPLATE    also record an Instruments trace, e.g. "Metal System Trace" (device runs)
 #   --lock-diagnostics    build the engine with ENGINE_LOCK_DIAGNOSTICS: every engine lock is counted
 #                         and timed, and each scene reports lock calls, contention, wait and hold
@@ -48,6 +50,7 @@ LOCK_DIAGNOSTICS=0
 COMPARE=1
 UPDATE_BASELINE=0
 REPEAT=1
+REFRESH=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -59,6 +62,7 @@ while [ $# -gt 0 ]; do
     --config) CONFIG="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
+    --refresh) REFRESH="$2"; shift 2 ;;
     --xctrace) XCTRACE_TEMPLATE="$2"; shift 2 ;;
     --lock-diagnostics) LOCK_DIAGNOSTICS=1; COMPARE=0; shift ;;
     --no-compare) COMPARE=0; shift ;;
@@ -109,7 +113,7 @@ case "$PLATFORM" in
     echo "== Running $APP"
     UNTOLD_BENCH_SCENES="$SCENES" UNTOLD_BENCH_SECONDS="$SECONDS_PER_SCENE" UNTOLD_BENCH_WARMUP="$WARMUP" \
     UNTOLD_BENCH_OUTPUT="$OUT_DIR" UNTOLD_BENCH_RUN_ID="$RUN_ID" UNTOLD_BENCH_LABEL="$LABEL" \
-    UNTOLD_STATS=1 UNTOLD_GPU_PASS_TIMING=1 \
+    UNTOLD_STATS=1 UNTOLD_GPU_PASS_TIMING=1 UNTOLD_BENCH_REFRESH="$REFRESH" \
       "$APP/Contents/MacOS/PerfBench" | tee "$OUT_DIR/$RUN_ID.log" | grep -v "^PERFBENCH_SUMMARY_JSON"
     ;;
 
