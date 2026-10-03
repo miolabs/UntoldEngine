@@ -63,6 +63,9 @@ CONFIG_FIELDS = [
     # Frames are display-paced, and the GPU stretches its work over the slack a slower display
     # leaves, so times taken at different refresh rates are not comparable.
     ("displayRefreshHz", 0.0),
+    # A build with ENGINE_LOCK_DIAGNOSTICS counts and times every engine lock, so its frame and
+    # CPU times are not comparable with a normal build's.
+    ("lockDiagnostics", False),
 ]
 
 

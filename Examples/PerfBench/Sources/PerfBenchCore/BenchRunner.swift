@@ -108,6 +108,7 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
             }
         }
         render.antiAliasing = String(describing: antiAliasingMode)
+        render.lockDiagnostics = EngineLockDiagnostics.isCompiledIn
         summary.render = render
         gameMode = true
         setState(.building(0))
