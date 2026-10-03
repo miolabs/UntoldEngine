@@ -83,6 +83,7 @@ nav:
     - Animation System: API/UsingAnimationSystem.md
     - Animation Transitions: API/UsingAnimationTransitions.md
     - Root Motion: API/UsingRootMotion.md
+    - Physics Pose: API/UsingPhysicsPose.md
     - Physics System: API/UsingPhysicsSystem.md
     - Steering System: API/UsingSteeringSystem.md
     - Scripting System: API/UsingScriptingSystem.md
@@ -135,6 +136,7 @@ nav:
     - Creating an Engine Extension Plugin: Extensions/CreatingAnEngineExtensionPlugin.md
     - Creating a Physics Backend Plugin: Extensions/CreatingAPhysicsBackendPlugin.md
   - Contributing:
+    - Engineering Principles: Contributor/EngineeringPrinciples.md
     - Guidelines: Contributor/ContributionGuidelines.md
     - Versioning: Contributor/versioning.md
     - Formatting: Contributor/Formatting.md

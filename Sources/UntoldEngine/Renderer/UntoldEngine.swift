@@ -172,6 +172,8 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
 
         initFrustumCulllingCompute()
 
+        DeformationSystem.shared.initComputePipelines()
+
         TextureStreamingSystem.shared.configure(device: renderInfo.device)
 
         initGuassianComputePipelines()
@@ -197,7 +199,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             BatchingSystem.shared.applyRuntimeBatchingTuning(.macOSBalanced)
         #endif
 
-        Logger.log(message: "Untold Engine Starting. Version 0.19.1")
+        Logger.log(message: "Untold Engine Starting. Version 0.21.0")
     }
 
     public func initSizeableResources() {

@@ -33,22 +33,25 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         let edgeIndexChunkData: Data?
         let jointIndexChunkData: Data?
         let jointWeightChunkData: Data?
+        let morphChunkData: Data?
         if decoded.header.fileType == .animation {
             vertexChunkData = Data()
             indexChunkData = Data()
             edgeIndexChunkData = nil
             jointIndexChunkData = nil
             jointWeightChunkData = nil
+            morphChunkData = nil
         } else {
             vertexChunkData = try reader.readChunkData(.vertexData, from: fileData, entries: decoded.chunks)
             indexChunkData = try reader.readChunkData(.indexData, from: fileData, entries: decoded.chunks)
             edgeIndexChunkData = try? reader.readChunkData(.edgeIndexData, from: fileData, entries: decoded.chunks)
             jointIndexChunkData = try? reader.readChunkData(.jointIndexData, from: fileData, entries: decoded.chunks)
             jointWeightChunkData = try? reader.readChunkData(.jointWeightData, from: fileData, entries: decoded.chunks)
+            morphChunkData = try? reader.readChunkData(.morphTargetData, from: fileData, entries: decoded.chunks)
         }
 
         let runtimeMaterials = try decoded.materials.map { try makeRuntimeMaterial(from: $0, decoded: decoded, baseURL: url.deletingLastPathComponent()) }
-        let nodes = try makeRuntimeNodes(
+        var nodes = try makeRuntimeNodes(
             decoded: decoded,
             rootTransform: decoded.header.rootTransform,
             runtimeMaterials: runtimeMaterials,
@@ -57,8 +60,10 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             edgeIndexChunkData: edgeIndexChunkData,
             jointIndexChunkData: jointIndexChunkData,
             jointWeightChunkData: jointWeightChunkData,
+            morphChunkData: morphChunkData,
             baseURL: url.deletingLastPathComponent()
         )
+        try attachMLDeformerPayloads(to: &nodes, decoded: decoded, assetURL: url)
 
         return try RuntimeAsset(
             sourceURL: url,
@@ -94,6 +99,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
+        morphChunkData: Data?,
         baseURL: URL
     ) throws -> [RuntimeAssetNode] {
         guard decoded.header.fileType != .animation else { return [] }
@@ -138,6 +144,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 edgeIndexChunkData: edgeIndexChunkData,
                 jointIndexChunkData: jointIndexChunkData,
                 jointWeightChunkData: jointWeightChunkData,
+                morphChunkData: morphChunkData,
                 runtimeSkeletonsByEntity: runtimeSkeletonsByEntity,
                 gaussianAssetsByEntity: gaussianAssetsByEntity
             )
@@ -312,6 +319,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
         jointWeightChunkData: Data?,
+        morphChunkData: Data?,
         runtimeSkeletonsByEntity: [UInt32: RuntimeSkeleton],
         gaussianAssetsByEntity: [UInt32: RuntimeGaussianAssetLink] = [:]
     ) throws -> RuntimeAssetNode {
@@ -331,7 +339,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                     indexChunkData: indexChunkData,
                     edgeIndexChunkData: edgeIndexChunkData,
                     jointIndexChunkData: jointIndexChunkData,
-                    jointWeightChunkData: jointWeightChunkData
+                    jointWeightChunkData: jointWeightChunkData,
+                    morphChunkData: morphChunkData
                 )
             }
         } else {
@@ -362,7 +371,8 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         indexChunkData: Data,
         edgeIndexChunkData: Data?,
         jointIndexChunkData: Data?,
-        jointWeightChunkData: Data?
+        jointWeightChunkData: Data?,
+        morphChunkData: Data?
     ) throws -> RuntimeMeshPrimitive {
         let vertexLayout: RuntimeVertexLayout = switch decoded.header.vertexLayout {
         case .pbrStaticV1:
@@ -432,6 +442,39 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             skin = nil
         }
 
+        var morphTargets: [RuntimeMorphTarget] = []
+        if let morphChunkData {
+            for (globalTargetIndex, target) in decoded.morphTargets.enumerated()
+                where target.meshRecordIndex == meshIndex
+            {
+                let entryBytes = Int(target.entryCount) * UntoldMorphSparseEntryV1.byteSize
+                let entryData = try slice(
+                    from: morphChunkData,
+                    offset: Int(target.firstEntryIndex) * UntoldMorphSparseEntryV1.byteSize,
+                    size: entryBytes
+                )
+                var driver: RuntimeMorphDriver?
+                if let driverRecord = decoded.morphDrivers.first(where: { $0.targetIndex == UInt32(globalTargetIndex) }),
+                   let jointPath = try decoded.string(at: driverRecord.jointPathOffset)
+                {
+                    driver = RuntimeMorphDriver(
+                        jointPath: jointPath,
+                        poseRotation: driverRecord.poseRotation,
+                        radius: driverRecord.radius,
+                        kernelType: driverRecord.kernelType
+                    )
+                }
+                try morphTargets.append(RuntimeMorphTarget(
+                    name: decoded.string(at: target.nameOffset) ?? "morph_\(globalTargetIndex)",
+                    hasNormalDeltas: target.flags & UntoldMorphTargetRecordV1.flagHasNormalDeltas != 0,
+                    positionScale: target.positionScale,
+                    entryCount: Int(target.entryCount),
+                    entryData: entryData,
+                    driver: driver
+                ))
+            }
+        }
+
         return RuntimeMeshPrimitive(
             name: primitiveName,
             localTransform: matrix_identity_float4x4,
@@ -448,6 +491,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             edgeIndexCount: edgeIndexCount,
             material: material,
             skin: skin,
+            morphTargets: morphTargets,
             estimatedGPUBytes: Int(mesh.estimatedGPUBytes)
         )
     }
@@ -467,10 +511,89 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
                 jointPaths: jointPaths,
                 parentIndices: parentIndices,
                 bindTransforms: bindTransforms,
-                restTransforms: restTransforms
+                restTransforms: restTransforms,
+                muscleRig: makeMuscleRig(decoded: decoded, skeletonEntityId: skeleton.entityId)
             )
         }
         return result
+    }
+
+    /// Resolves each skeleton's ML deformer payload: `<asset>.untoldml` next
+    /// to the file wins, else the skeleton's `mlDeformerTable` record.
+    private func attachMLDeformerPayloads(to nodes: inout [RuntimeAssetNode], decoded: UntoldDecodedAsset, assetURL: URL) throws {
+        let sidecar = assetURL.deletingPathExtension().appendingPathExtension("untoldml")
+        let sidecarExists = FileManager.default.fileExists(atPath: sidecar.path)
+        let baseURL = assetURL.deletingLastPathComponent()
+        for index in nodes.indices where nodes[index].skeleton != nil {
+            if sidecarExists {
+                nodes[index].skeleton?.mlDeformerURL = sidecar
+                continue
+            }
+            if let record = decoded.mlDeformers.first(where: { $0.skeletonEntityId == nodes[index].id }),
+               let path = try decoded.string(at: record.payloadPathOffset), !path.isEmpty
+            {
+                nodes[index].skeleton?.mlDeformerURL = baseURL.appendingPathComponent(path)
+            }
+        }
+    }
+
+    private func makeMuscleRig(decoded: UntoldDecodedAsset, skeletonEntityId: UInt32) throws -> MuscleRig? {
+        let records = decoded.muscles.filter { $0.skeletonEntityId == skeletonEntityId }
+        guard !records.isEmpty else { return nil }
+
+        var forwardReference: MuscleForwardReference?
+        var muscles: [MuscleDefinition] = []
+        for (index, record) in records.enumerated() {
+            if forwardReference == nil,
+               let from = try decoded.string(at: record.forwardJointOffset),
+               let to = try decoded.string(at: record.forwardTipJointOffset)
+            {
+                forwardReference = MuscleForwardReference(fromJointName: from, toJointName: to)
+            }
+            guard let originJoint = try decoded.string(at: record.originJointOffset),
+                  let insertionJoint = try decoded.string(at: record.insertionJointOffset)
+            else { continue }
+
+            var driver: MuscleActivationDriver?
+            if record.flags & UntoldMuscleRecordV1.flagHasDriver != 0,
+               let driverJoint = try decoded.string(at: record.driverJointOffset)
+            {
+                driver = MuscleActivationDriver(
+                    jointName: driverJoint,
+                    startAngle: record.driverStartAngle,
+                    fullAngle: record.driverFullAngle
+                )
+            }
+            try muscles.append(MuscleDefinition(
+                name: decoded.string(at: record.nameOffset) ?? "muscle_\(index)",
+                origin: MuscleAttachment(
+                    jointName: originJoint,
+                    fraction: record.originFraction,
+                    offset: record.originOffset,
+                    tipJointName: decoded.string(at: record.originTipJointOffset)
+                ),
+                insertion: MuscleAttachment(
+                    jointName: insertionJoint,
+                    fraction: record.insertionFraction,
+                    offset: record.insertionOffset,
+                    tipJointName: decoded.string(at: record.insertionTipJointOffset)
+                ),
+                bellyRadius: record.bellyRadius,
+                tendonRadius: record.tendonRadius,
+                maxContraction: record.maxContraction,
+                fiberCompliance: record.fiberCompliance,
+                crossCompliance: record.crossCompliance,
+                volumeCompliance: record.volumeCompliance,
+                damping: record.damping,
+                boneRadius: record.boneRadius,
+                skinInfluence: record.skinInfluence,
+                rings: Int(record.rings),
+                segments: Int(record.segments),
+                driver: driver
+            ))
+        }
+        guard !muscles.isEmpty else { return nil }
+        return MuscleRig(forwardReference: forwardReference, muscles: muscles)
     }
 
     private func makeRuntimeAnimationClips(decoded: UntoldDecodedAsset) throws -> [RuntimeAnimationClip] {
@@ -571,7 +694,7 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
         )
     }
 
-    private func resolvedURL(from string: String?, baseURL: URL) -> URL? {
+    func resolvedURL(from string: String?, baseURL: URL) -> URL? {
         guard let string, !string.isEmpty else { return nil }
         if let absolute = URL(string: string), absolute.scheme != nil {
             return absolute
@@ -587,7 +710,39 @@ public struct NativeFormatLoader: NamedRuntimeAssetLoading {
             return flattenedBundleURL
         }
 
+        // Exporters have baked URIs whose folder casing (e.g. "Textures") drifts from
+        // the actual on-disk casing (e.g. "textures") the asset was later checked in
+        // with. That's invisible in editor workflows on a case-insensitive dev volume,
+        // but bundled app resources can land on a case-sensitive layout, so an exact
+        // fileExists check above silently fails even though the file is right there.
+        // Walk the relative path component-by-component, matching each segment against
+        // the real directory listing case-insensitively.
+        if let caseInsensitiveMatch = caseInsensitiveResolvedURL(relativePath: string, baseURL: baseURL) {
+            return caseInsensitiveMatch
+        }
+
         return relativeURL
+    }
+
+    func caseInsensitiveResolvedURL(relativePath: String, baseURL: URL) -> URL? {
+        // Always resolves through the real directory listing rather than probing
+        // fileExists(atPath:) first -- on a case-insensitive volume that probe would
+        // "succeed" for the wrong-case component and short-circuit into a URL that
+        // doesn't reflect the real on-disk casing, even though it happens to still be
+        // loadable there. Matching against the listing keeps the result deterministic
+        // across both case-sensitive and case-insensitive filesystems.
+        let fm = FileManager.default
+        var current = baseURL
+        for component in relativePath.split(separator: "/") {
+            let component = String(component)
+            guard let entries = try? fm.contentsOfDirectory(atPath: current.path),
+                  let match = entries.first(where: { $0.caseInsensitiveCompare(component) == .orderedSame })
+            else {
+                return nil
+            }
+            current = current.appendingPathComponent(match)
+        }
+        return fm.fileExists(atPath: current.path) ? current : nil
     }
 
     private func slice(from data: Data, offset: Int, size: Int) throws -> Data {
