@@ -143,10 +143,19 @@ UNTOLD_EXPORT_TEMP_OBJECT_PROP = "_untold_export_temp_object"
 MATERIAL_ALPHA_MODE_OPAQUE = 0
 MATERIAL_ALPHA_MODE_MASK = 1
 MATERIAL_ALPHA_MODE_BLEND = 2
-# The opacity a fully transmissive surface (Principled Transmission Weight 1) keeps
-# when exported: the engine has no transmission, so glass becomes a blended surface
-# this opaque, enough to keep its tint and reflections visible.
+# The opacity a fully transmissive, clear surface (Principled Transmission Weight 1 with
+# a white base colour) keeps when exported: the engine has no transmission, so glass
+# becomes a blended surface this opaque, enough to keep its reflections visible. Tinted
+# or frosted glass comes out more opaque, by what its colour and its roughness take from
+# what is seen through it, and a metal opaque (see principled_transmittance).
 TRANSMISSION_OPACITY = 0.1
+# The deepest relief the engine's parallax occlusion mapping can show, as a share of the
+# texture's width (the engine's heightScale; its own default is 0.05). Blender leaves a
+# Displacement Scale and a Bump Distance at 1, a metre, and what it draws from them
+# under its default "Bump Only" displacement is the shading of a bump, not a hollow a
+# metre deep. Carried over as a parallax depth, such a value smears the texture across
+# the surface, so a height with a scale above this is left out of the export.
+MAX_PARALLAX_HEIGHT_SCALE = 0.2
 # Samples per channel of the lookup tables that carry RGB Curves and ColorRamp nodes.
 CURVE_LUT_SIZE = 256
 # Rec. 709 luminance, which Blender uses to turn a colour into a value (a Color output
@@ -1852,6 +1861,16 @@ def blender_required() -> None:
         raise RuntimeError("This exporter must run inside Blender so it can use bpy for USD import and mesh extraction.")
 
 
+def single_file_output_path(output_path: Path) -> Path:
+    """The single `.untold` an output path stands for. A scene with several models is
+    written as a `.untoldpack` of the same name, and a caller may name that pack as the
+    output: taken as it is, the pack would count as a stale single-file export and be
+    removed right after it is written."""
+    if output_path.suffix.lower() == ".untoldpack":
+        return output_path.with_suffix(".untold")
+    return output_path
+
+
 def normalize_blender_path(path: str) -> Path:
     raw_path = path
     if bpy is not None and path.startswith("//"):
@@ -3252,6 +3271,44 @@ def _walk_material_graph(
             )
 
 
+def _heights_too_deep_for_parallax(material: object) -> list[tuple[object, float]]:
+    """The Displacement and Bump nodes extract_material reads a height from, whose Scale
+    or Distance is above MAX_PARALLAX_HEIGHT_SCALE, each with that value."""
+    node_tree = getattr(material, "node_tree", None)
+    if node_tree is None:
+        return []
+
+    def too_deep(node: object, scale_name: str) -> Optional[float]:
+        inputs = getattr(node, "inputs", None)
+        height_input = inputs.get("Height") if inputs is not None else None
+        scale_input = inputs.get(scale_name) if inputs is not None else None
+        if height_input is None or not getattr(height_input, "is_linked", False):
+            return None
+        if scale_input is None or getattr(scale_input, "is_linked", False):
+            return None
+        scale = float(scale_input.default_value)
+        return scale if scale > MAX_PARALLAX_HEIGHT_SCALE else None
+
+    found: list[tuple[object, float]] = []
+    output = _material_output_node(node_tree)
+    displacement_input = output.inputs.get("Displacement") if output is not None else None
+    if displacement_input is not None and getattr(displacement_input, "is_linked", False):
+        node = displacement_input.links[0].from_node
+        if node.bl_idname == "ShaderNodeDisplacement":
+            scale = too_deep(node, "Scale")
+            if scale is not None:
+                found.append((node, scale))
+    principled = _principled_bsdf_node(node_tree)
+    normal_input = principled.inputs.get("Normal") if principled is not None else None
+    if normal_input is not None and getattr(normal_input, "is_linked", False):
+        node = normal_input.links[0].from_node
+        if node.bl_idname == "ShaderNodeBump":
+            scale = too_deep(node, "Distance")
+            if scale is not None:
+                found.append((node, scale))
+    return found
+
+
 def analyze_material(material: object) -> MaterialGraphAnalysis:
     """Classify how faithfully the exporter can represent a material's node graph.
 
@@ -3284,8 +3341,11 @@ def analyze_material(material: object) -> MaterialGraphAnalysis:
     if principled is not None:
         transmission, unfollowed = principled_transmission(principled)
         if transmission or unfollowed:
-            opacity = 1.0 - transmission * (1.0 - TRANSMISSION_OPACITY)
-            reason = f"transmission is approximated as a blended surface at {opacity:.0%} opacity"
+            opacity = transmission_opacity(principled_transmittance(principled)[0])
+            if opacity >= 0.995:
+                reason = "nothing is seen through its transmission (a black base colour, a metal, or a fully rough surface), so it is exported as an opaque surface"
+            else:
+                reason = f"transmission is approximated as a blended surface at {opacity:.0%} opacity"
             if unfollowed:
                 reason = (
                     "Transmission is driven by a texture or node math the exporter cannot follow; "
@@ -3299,6 +3359,17 @@ def analyze_material(material: object) -> MaterialGraphAnalysis:
                     reason,
                 )
             )
+
+    for height_node, height_scale in _heights_too_deep_for_parallax(material):
+        findings.append(
+            MaterialGraphFinding(
+                getattr(height_node, "name", "") or height_node.bl_idname,
+                height_node.bl_idname,
+                MATERIAL_GRAPH_BAKEABLE,
+                f"its height of {height_scale:g} is the shading of a bump, too deep to be a parallax depth; "
+                "the relief it gives is not exported",
+            )
+        )
 
     distinct_uv_transforms = {_uv_transform_key(transform) for transform in _material_image_uv_transforms(material)}
     if len(distinct_uv_transforms) > 1:
@@ -5141,19 +5212,58 @@ def principled_transmission(node: object) -> tuple[float, bool]:
     return min(max(transmission, 0.0), 1.0), unfollowed
 
 
+def principled_transmittance(node: object) -> tuple[float, bool]:
+    """How much of what is behind it a Principled BSDF lets one see, in [0, 1], and
+    whether its transmission could not be followed (see principled_transmission).
+
+    Transmission says how much of the surface is glass. Three things then take from
+    what is seen through it:
+
+    - The base colour tints the light that crosses it: clear glass (a white base
+      colour) lets all of it through and black glass none, which is why black glass
+      looks like a black mirror and not like a window. The tint counts by its brightness.
+    - Blender lays the metal over the glass, so the metallic share of a surface lets
+      nothing through whatever its transmission says.
+    - A rough surface scatters what crosses it: frosted glass glows with the light
+      behind it and shows nothing of what is there.
+
+    A base colour, a metallic value or a roughness the exporter cannot follow to a
+    constant (a texture) counts as clear, as no metal and as polished.
+    """
+    transmission, unfollowed = principled_transmission(node)
+    if transmission <= 0.0:
+        return 0.0, unfollowed
+    inputs = getattr(node, "inputs", None)
+
+    def constant(name: str, default: float) -> float:
+        socket = inputs.get(name) if inputs is not None else None
+        value = evaluate_socket_facing(socket) if socket is not None else None
+        return default if value is None else min(max(_as_scalar(value), 0.0), 1.0)
+
+    tint = constant("Base Color", 1.0)
+    metallic = constant("Metallic", 0.0)
+    roughness = constant("Roughness", 0.0)
+    return transmission * (1.0 - metallic) * tint * (1.0 - roughness), unfollowed
+
+
+def transmission_opacity(transmittance: float) -> float:
+    """The opacity of the blended surface that stands in for a transmissive one."""
+    return 1.0 - transmittance * (1.0 - TRANSMISSION_OPACITY)
+
+
 def _shader_opacity(node: Optional[object]) -> Optional[float]:
     """How much of the surface a shader covers: 1 for a BSDF, 0 for Transparent BSDF,
-    less for a transmissive Principled BSDF (see TRANSMISSION_OPACITY), mixed by a Mix
-    Shader's factor. A Mix Shader driven by Geometry > Backfacing takes the front-face
-    side. None for anything else (a linked factor, Add Shader, ...)."""
+    less for a transmissive Principled BSDF (see principled_transmittance), mixed by a
+    Mix Shader's factor. A Mix Shader driven by Geometry > Backfacing takes the
+    front-face side. None for anything else (a linked factor, Add Shader, ...)."""
     if node is None:
         return None
     node_id = node.bl_idname
     if node_id == "ShaderNodeBsdfTransparent":
         return 0.0
     if node_id == "ShaderNodeBsdfPrincipled":
-        transmission, _ = principled_transmission(node)
-        return 1.0 - transmission * (1.0 - TRANSMISSION_OPACITY)
+        transmittance, _ = principled_transmittance(node)
+        return transmission_opacity(transmittance)
     if node_id in {"ShaderNodeBsdfDiffuse", "ShaderNodeBsdfGlossy", "ShaderNodeEmission"}:
         return 1.0
     if node_id == "ShaderNodeMixShader":
@@ -5399,7 +5509,11 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
                 midlevel_input = displacement_source.inputs.get("Midlevel")
                 if scale_input is not None and not scale_input.is_linked:
                     height_scale = float(scale_input.default_value)
-                if midlevel_input is not None and not midlevel_input.is_linked:
+                if height_scale > MAX_PARALLAX_HEIGHT_SCALE:
+                    # The shading of a bump, not a depth (see MAX_PARALLAX_HEIGHT_SCALE).
+                    height_texture = None
+                    height_scale = 0.05
+                elif midlevel_input is not None and not midlevel_input.is_linked:
                     # The engine's POM is unidirectional (ray-marches INTO the surface from an
                     # apparent flat top; it cannot bulge outward past the true polygon surface
                     # the way Blender's signed displacement-around-Midlevel can). Copying
@@ -5426,6 +5540,10 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
                 distance_input = normal_source.inputs.get("Distance")
                 if distance_input is not None and not distance_input.is_linked:
                     height_scale = float(distance_input.default_value)
+                if height_scale > MAX_PARALLAX_HEIGHT_SCALE:
+                    # The shading of a bump, not a depth (see MAX_PARALLAX_HEIGHT_SCALE).
+                    height_texture = None
+                    height_scale = 0.05
                 # Bump has no Midlevel-equivalent input; height_midlevel/height_remap_max stay
                 # at their neutral defaults.
 
@@ -7542,6 +7660,7 @@ def write_single_untold_from_nodes(
     Blender add-on's "Export Untold Asset" operator behave identically when a
     scene's model topology changes between runs at the same --output stem.
     """
+    output_path = single_file_output_path(output_path)
     exported_nodes = normalize_export_nodes(exported_nodes)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -7639,6 +7758,7 @@ def write_untold_pack_from_groups(
     else beside the manifest; the manifest's model paths are relative to its own
     folder either way.
     """
+    output_path = single_file_output_path(output_path)
     pack_path = output_path.with_suffix(".untoldpack")
     models_root = assets_dir or output_path.parent
     # Captured before write_untoldpack_manifest() overwrites pack_path below, so
@@ -7843,7 +7963,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         argv = argv[1:]
     parser = argparse.ArgumentParser(description="Cook USD scene or animation data into UntoldEngine's .untold format.")
     parser.add_argument("--input", required=True, help="Path to a source USD/USDZ asset or a .blend file.")
-    parser.add_argument("--output", required=True, help="Path to the output .untold file (or .untoldanim with --animation).")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help=(
+            "Path to the output .untold file (or .untoldanim with --animation). A scene with several "
+            "models is written as a .untoldpack of the same name; that name may be given as well."
+        ),
+    )
     parser.add_argument("--file-type", default="tile", choices=sorted(FILE_TYPES.keys()), help="Untold file type to emit.")
     parser.add_argument("--mesh-name", default=None, help="Optional mesh object name when the USD asset imports multiple meshes.")
     parser.add_argument(
@@ -7907,7 +8034,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     EXPORT_SHAPE_KEYS = bool(getattr(args, "export_shapekeys", False))
     input_path = normalize_blender_path(args.input)
-    output_path = normalize_blender_path(args.output)
+    output_path = single_file_output_path(normalize_blender_path(args.output))
     assets_dir = normalize_blender_path(args.assets_dir) if args.assets_dir else None
 
     if input_path.suffix.lower() not in {".usd", ".usda", ".usdc", ".usdz", ".blend"}:
