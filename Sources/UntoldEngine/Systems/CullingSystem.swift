@@ -624,36 +624,30 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     let frustumReadBuffer = frustumTripleBuffer.bufferForRead(frame: submitFrameIndex)
 
-    let transformId = getComponentId(for: WorldTransformComponent.self)
-    let renderId = getComponentId(for: RenderComponent.self)
-    let entities = queryEntitiesWithComponentIds([transformId, renderId], in: scene)
+    let sceneSnapshot = RenderSceneSnapshot()
+    let isXRStereoMode = renderInfo.isXRStereoMode
 
     var entityAABBContainer: [EntityAABB] = []
-    entityAABBContainer.reserveCapacity(entities.count) // Pre-allocate to avoid reallocation churn
+    entityAABBContainer.reserveCapacity(sceneSnapshot.entityCapacity) // Pre-allocate to avoid reallocation churn
 
-    for entityId in entities {
-        guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
-            handleError(.noRenderComponent, entityId)
-            continue
-        }
+    sceneSnapshot.forEachEntity(with: [.render, .worldTransform]) { entity in
+        let entityId = entity.entityId
+        guard let renderComponent = sceneSnapshot.render(of: entity),
+              let worldTransformComponent = sceneSnapshot.worldTransform(of: entity)
+        else { return }
 
         // Skip entities that are hidden (e.g., during bulk loading)
         if !renderComponent.isVisible {
-            continue
+            return
         }
 
-        guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else {
-            handleError(.noWorldTransformComponent, entityId)
-            continue
-        }
-
-        guard let localTransformComponent = scene.get(component: LocalTransformComponent.self, for: entityId) else {
+        guard let localTransformComponent = sceneSnapshot.localTransform(of: entity) else {
             handleError(.noLocalTransformComponent, entityId)
-            continue
+            return
         }
 
-        if hasComponent(entityId: entityId, componentType: GizmoComponent.self) {
-            continue
+        if entity.traits.contains(.gizmo) {
+            return
         }
 
         // In XR stereo mode, use a single AABB per entity.  The tighter sub-AABBs
@@ -661,7 +655,7 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         // tracking drift and cause segment-level occlusion popping.  The unsegmented
         // AABB has a conservative nearDepth (closest corner of the full entity) that
         // is far less likely to fall behind a stale occluder in the HZB.
-        if renderInfo.isXRStereoMode {
+        if isXRStereoMode {
             let singleAABB = makeObjectAABB(
                 localMin: localTransformComponent.boundingBox.min,
                 localMax: localTransformComponent.boundingBox.max,
@@ -951,36 +945,29 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     let frustumReadBuffer = frustumTripleBuffer.bufferForRead(frame: submitFrameIndex)
 
-    let transformId = getComponentId(for: WorldTransformComponent.self)
-    let renderId = getComponentId(for: RenderComponent.self)
-    let entities = queryEntitiesWithComponentIds([transformId, renderId], in: scene)
+    let sceneSnapshot = RenderSceneSnapshot()
 
     var entityAABBContainer: [EntityAABB] = []
-    entityAABBContainer.reserveCapacity(entities.count) // Pre-allocate to avoid reallocation churn
+    entityAABBContainer.reserveCapacity(sceneSnapshot.entityCapacity) // Pre-allocate to avoid reallocation churn
 
-    for entityId in entities {
-        guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
-            handleError(.noRenderComponent, entityId)
-            continue
-        }
+    sceneSnapshot.forEachEntity(with: [.render, .worldTransform]) { entity in
+        let entityId = entity.entityId
+        guard let renderComponent = sceneSnapshot.render(of: entity),
+              let worldTransformComponent = sceneSnapshot.worldTransform(of: entity)
+        else { return }
 
         // Skip entities that are hidden (e.g., during bulk loading)
         if !renderComponent.isVisible {
-            continue
+            return
         }
 
-        guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else {
-            handleError(.noWorldTransformComponent, entityId)
-            continue
-        }
-
-        guard let localTransformComponent = scene.get(component: LocalTransformComponent.self, for: entityId) else {
+        guard let localTransformComponent = sceneSnapshot.localTransform(of: entity) else {
             handleError(.noLocalTransformComponent, entityId)
-            continue
+            return
         }
 
-        if hasComponent(entityId: entityId, componentType: LightComponent.self) {
-            continue
+        if entity.traits.contains(.light) {
+            return
         }
 
         // get object AABB — elongated meshes are split into segments.
