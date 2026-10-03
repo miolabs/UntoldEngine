@@ -26,6 +26,9 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
         case building(Int)
         case warmup(Int)
         case recording(Int)
+        /// Recording has stopped; waiting for work the scene started (a load in flight, a thread)
+        /// to finish before its entities are destroyed.
+        case settling(Int)
         case tearingDown(Int)
         case finished
     }
@@ -41,6 +44,9 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
     public var sceneOrigin: simd_float3 = .zero
     /// Whether the runner moves the camera along each scene's orbit (off on visionOS).
     public var drivesCamera = true
+    /// Whether the app is the active (frontmost) one, asked once per recorded frame on the update
+    /// thread. Set on macOS, where an app that is not frontmost runs at background priority.
+    public var isAppActive: (() -> Bool)?
     public var onFinished: ((BenchRunSummary) -> Void)?
 
     private let scenes: [BenchScene]
@@ -50,6 +56,9 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
     private var phaseDeadline: Double = 0.0
     private var sceneStart: Double = 0.0
     private var cameraEntity: EntityID?
+    private var recordedFrames = 0
+    private var recordedActiveFrames = 0
+    private var loadAtRecordingStart: MachineLoadSample?
     private let startLock = NSLock()
     private var startRequested = false
     private var started = false
@@ -115,7 +124,7 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
     }
 
     /// Call from the engine's game update callback every frame, on the engine's update thread.
-    public func update(deltaTime _: Float) {
+    public func update(deltaTime: Float) {
         beginRunIfRequested()
         let now = CACurrentMediaTime()
         switch state {
@@ -137,6 +146,7 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
 
         case let .warmup(index):
             driveCamera(scenes[index], elapsed: now - sceneStart)
+            scenes[index].update(deltaTime: deltaTime, elapsed: now - sceneStart)
             setStatus(String(format: "%@: warming up %.0fs", scenes[index].id, phaseDeadline - now))
             if now >= phaseDeadline {
                 EngineStatsMonitor.shared.reset()
@@ -148,14 +158,31 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
                     setStatus("Recording failed: \(error)")
                 }
                 phaseDeadline = now + config.measureSeconds
+                recordedFrames = 0
+                recordedActiveFrames = 0
+                loadAtRecordingStart = MachineLoadSample.now()
                 setState(.recording(index))
             }
 
         case let .recording(index):
             driveCamera(scenes[index], elapsed: now - sceneStart)
+            scenes[index].update(deltaTime: deltaTime, elapsed: now - sceneStart)
+            recordedFrames += 1
+            if isAppActive?() ?? true {
+                recordedActiveFrames += 1
+            }
             setStatus(String(format: "%@: recording %.0fs", scenes[index].id, phaseDeadline - now))
             if now >= phaseDeadline {
-                finishScene(index)
+                stopRecording(index)
+                scenes[index].requestStop()
+                phaseDeadline = now + Self.settleTimeoutSeconds
+                setState(.settling(index))
+            }
+
+        case let .settling(index):
+            setStatus("\(scenes[index].id): finishing")
+            if scenes[index].isQuiescent || now >= phaseDeadline {
+                teardownScene(index)
                 phaseDeadline = now + 0.75
                 setState(.tearingDown(index))
             }
@@ -201,10 +228,19 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
         cameraLookAt(entityId: cameraEntity, eye: eye, target: sceneOrigin + orbit.center, up: simd_float3(0, 1, 0))
     }
 
-    private func finishScene(_ index: Int) {
+    /// Longest the runner waits for a scene to become quiescent before destroying its entities.
+    private static let settleTimeoutSeconds = 5.0
+
+    /// Ends the recording and stores the scene's result. The scene itself keeps running until
+    /// `teardownScene`, so nothing it has in flight is cut off while it is being measured.
+    private func stopRecording(_ index: Int) {
         let scene = scenes[index]
         let recording = stopEngineStatsRecording() ?? EngineStatsRecordingSummary()
         let snapshot = getEngineStatsSnapshot()
+        var otherLoad = 0.0
+        if let start = loadAtRecordingStart, let end = MachineLoadSample.now() {
+            otherLoad = end.otherProcessLoadCores(since: start)
+        }
         if render.viewportWidth == 0 {
             render.viewportWidth = snapshot.compositor.viewTextureWidth
             render.viewportHeight = snapshot.compositor.viewTextureHeight
@@ -219,8 +255,14 @@ public final class BenchRunner: ObservableObject, @unchecked Sendable {
             warmupSeconds: config.warmupSeconds,
             measureSeconds: config.measureSeconds,
             summary: recording,
-            lastSnapshot: snapshot
+            lastSnapshot: snapshot,
+            activeFraction: recordedFrames > 0 ? Double(recordedActiveFrames) / Double(recordedFrames) : 1.0,
+            otherProcessLoadCores: otherLoad
         ))
+    }
+
+    private func teardownScene(_ index: Int) {
+        let scene = scenes[index]
         scene.teardown()
         cameraEntity = nil
         setSceneReady(false)

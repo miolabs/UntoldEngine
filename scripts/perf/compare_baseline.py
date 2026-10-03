@@ -5,6 +5,11 @@ Baselines live in perf/baselines/<model>/<platform>/<scene>.json and hold the sc
 app wrote it, so a baseline is only ever compared with the same platform, layout, foveation and
 viewport. Exit status 1 means at least one metric regressed past its threshold.
 
+A run of a build with ENGINE_LOCK_DIAGNOSTICS (render.lockDiagnostics) has its own baselines, in
+perf/baselines/<model>/<platform>-lockdiag/, and is judged on its lock numbers only: lock calls
+per frame and time spent waiting for a lock per frame, per lock name. Its frame and CPU times
+carry the instrumentation and are not judged.
+
 Several summaries may be given (repeated runs): every time metric and every rate is aggregated by
 its minimum across runs. On a lightly loaded machine CPU and GPU clocks drift between runs, and
 other activity on the machine makes it skip refreshes; both only ever inflate a time or a rate, so
@@ -16,11 +21,21 @@ judged only when the baseline shows the GPU busy for at least --gpu-busy-fractio
 it is on a headset, and reported as information otherwise. A GPU or CPU time also only counts as
 changed when it moves by more than the relative tolerance and by more than an absolute slack.
 
+The same holds for small CPU times: a system that takes a fraction of a millisecond in a scene
+that leaves the CPU idle runs at whatever clock and core the scheduler picks, and measured 0.2 and
+0.8 ms in consecutive runs of the same build. A per-system CPU mean is judged only when the
+baseline's value is at least --cpu-floor-ms. Each scene also carries how many CPU cores other
+processes used while it was recorded. When even the quietest run had --busy-cores or more, the
+scene is marked and its frame pacing (frame percentiles, over-budget and missed-deadline rates) is
+reported as information: skipped refreshes and long frames are then the machine's, not the
+engine's. The CPU means of the heavier systems are still judged; they hold up under that load.
+
     compare_baseline.py perf/results/<run>/summary.json [more summary.json ...]
                         [--baselines DIR] [--update]
                         [--time-tolerance 0.10] [--rate-tolerance 0.005] [--pass-tolerance 0.20]
                         [--gpu-slack-ms 0.5] [--pass-slack-ms 0.25] [--cpu-slack-ms 0.1]
-                        [--gpu-busy-fraction 0.5]
+                        [--gpu-busy-fraction 0.5] [--cpu-floor-ms 1.0] [--busy-cores 1.0]
+                        [--lock-call-tolerance 0.03] [--lock-wait-tolerance 0.25] [--lock-wait-slack-ms 0.05]
 """
 import argparse
 import json
@@ -119,8 +134,34 @@ def aggregate(scenes):
                 merged[label] = min(merged.get(label, value), value)
         s[field] = merged
     s["worstThermalState"] = max(x["summary"].get("worstThermalState", 0) for x in scenes)
+    first["otherProcessLoadCores"] = min(x.get("otherProcessLoadCores", 0.0) for x in scenes)
+    locks = [lock_metrics(x["summary"]) for x in scenes]
+    if any(locks):
+        merged = {}
+        for per_run in locks:
+            for name, values in per_run.items():
+                best = merged.setdefault(name, dict(values))
+                for key, value in values.items():
+                    best[key] = min(best[key], value)
+        s["lockPerFrame"] = merged
     first["runs"] = len(scenes)
     return first
+
+
+def lock_metrics(summary):
+    """Per lock name: calls, hold ms, contended acquisitions and wait ms, each per frame."""
+    if "lockPerFrame" in summary:
+        return summary["lockPerFrame"]
+    frames = max(1, summary.get("frames", 0))
+    result = {}
+    for name, calls in summary.get("lockCallsPerFrame", {}).items():
+        result[name] = {
+            "calls": calls,
+            "holdMs": summary.get("lockHoldMsPerFrame", {}).get(name, 0.0),
+            "contended": summary.get("lockContended", {}).get(name, 0) / frames,
+            "waitMs": summary.get("lockWaitMs", {}).get(name, 0.0) / frames,
+        }
+    return result
 
 
 def main():
@@ -136,6 +177,13 @@ def main():
     ap.add_argument("--cpu-slack-ms", type=float, default=0.1, help="a per-system CPU mean must also move by more than this")
     ap.add_argument("--gpu-busy-fraction", type=float, default=0.5,
                     help="judge GPU times only when the baseline's mean GPU time is at least this fraction of its mean frame time")
+    ap.add_argument("--cpu-floor-ms", type=float, default=1.0,
+                    help="judge a per-system CPU mean only when the baseline's value is at least this")
+    ap.add_argument("--busy-cores", type=float, default=1.0,
+                    help="mark a scene when other processes used at least this many cores in its quietest run")
+    ap.add_argument("--lock-call-tolerance", type=float, default=0.03, help="relative slack for lock calls per frame")
+    ap.add_argument("--lock-wait-tolerance", type=float, default=0.25, help="relative slack for lock wait time per frame")
+    ap.add_argument("--lock-wait-slack-ms", type=float, default=0.05, help="lock wait time per frame must also move by more than this")
     args = ap.parse_args()
 
     runs = [load(p) for p in args.summaries]
@@ -152,10 +200,12 @@ def main():
 
     model = safe_model(first["device"]["model"])
     platform = first["render"]["platform"]
-    base_dir = os.path.join(args.baselines, model, platform)
+    lock_mode = bool(first["render"].get("lockDiagnostics", False))
+    base_dir = os.path.join(args.baselines, model, platform + ("-lockdiag" if lock_mode else ""))
     r = first["render"]
     print(f"{len(runs)} run(s), label={first.get('label','')!r} device={first['device']['model']} platform={platform} "
-          f"viewport={r.get('viewportWidth')}x{r.get('viewportHeight')} x{r.get('viewCount')} refresh={r.get('displayRefreshHz')}")
+          f"viewport={r.get('viewportWidth')}x{r.get('viewportHeight')} x{r.get('viewCount')} refresh={r.get('displayRefreshHz')}"
+          + (" lock diagnostics build" if lock_mode else ""))
 
     if args.update:
         os.makedirs(base_dir, exist_ok=True)
@@ -168,12 +218,21 @@ def main():
         return 0
 
     regressions = 0
+    not_judged = 0
     for scene in scenes:
         path = os.path.join(base_dir, f"{scene['id']}.json")
         s = scene["summary"]
         over, missed = scene_rates(s)
         head = (f"{scene['id']}: frames {s.get('frames',0)} p95 {s.get('p95FrameMs',0):.2f} p99 {s.get('p99FrameMs',0):.2f} "
                 f"gpu {s.get('meanGPUExecutionMs',0):.2f} overBudget {over*100:.2f}% missed {missed*100:.2f}%")
+        if lock_mode:
+            now_locks = lock_metrics(s)
+            total = sum(v["calls"] for v in now_locks.values())
+            waited = sum(v["waitMs"] for v in now_locks.values())
+            head = f"{scene['id']}: frames {s.get('frames',0)} lock calls {total:.0f}/frame, wait {waited:.3f} ms/frame"
+        other_load = scene.get("otherProcessLoadCores", 0.0)
+        if other_load >= args.busy_cores:
+            head += f"  [machine busy: other processes used {other_load:.1f} cores in the quietest run]"
         if not os.path.exists(path):
             print(f"{head}  [no baseline]")
             continue
@@ -186,17 +245,43 @@ def main():
         bover, bmissed = scene_rates(b)
         print(head)
 
+        if lock_mode:
+            ref_locks = lock_metrics(b)
+            for name in sorted(set(now_locks) | set(ref_locks), key=lambda n: -now_locks.get(n, ref_locks.get(n))["calls"]):
+                now, ref = now_locks.get(name), ref_locks.get(name)
+                if ref is None:
+                    print(f"    {name:28s} {now['calls']:9.0f} calls/frame  (new lock name, not in the baseline)")
+                    continue
+                if now is None:
+                    print(f"    {name:28s} gone ({ref['calls']:.0f} calls/frame in the baseline)")
+                    continue
+                delta = (now["calls"] - ref["calls"]) / ref["calls"] if ref["calls"] > 0 else 0.0
+                flag = "REGRESSION" if delta > args.lock_call_tolerance else ("better" if delta < -args.lock_call_tolerance else "ok")
+                print(f"    {name:28s} {now['calls']:9.0f} vs {ref['calls']:9.0f} calls/frame {delta*100:+7.1f}%  {flag}")
+                regressions += flag == "REGRESSION"
+                moved = abs(now["waitMs"] - ref["waitMs"]) > args.lock_wait_slack_ms
+                wdelta = (now["waitMs"] - ref["waitMs"]) / ref["waitMs"] if ref["waitMs"] > 0 else (1.0 if now["waitMs"] > 0 else 0.0)
+                if moved or now["waitMs"] > args.lock_wait_slack_ms or ref["waitMs"] > args.lock_wait_slack_ms:
+                    wflag = "REGRESSION" if wdelta > args.lock_wait_tolerance and moved else ("better" if wdelta < -args.lock_wait_tolerance and moved else "ok")
+                    print(f"    {'  wait':28s} {now['waitMs']:9.3f} vs {ref['waitMs']:9.3f} ms/frame    {wdelta*100:+7.1f}%  {wflag}"
+                          f"   (contended {now['contended']:.0f} vs {ref['contended']:.0f} per frame)")
+                    regressions += wflag == "REGRESSION"
+            continue
+
         # With the GPU idle most of the frame its times follow the clock state, not the workload.
         gpu_busy = rate(b.get("meanGPUExecutionMs", 0.0), b.get("meanFrameMs", 0.0)) >= args.gpu_busy_fraction
 
-        def judge(label, now, ref, tolerance, unit="ms", relative=True, slack=0.0, informational=False):
+        machine_busy = other_load >= args.busy_cores
+
+        def judge(label, now, ref, tolerance, unit="ms", relative=True, slack=0.0, informational=False,
+                  reason="GPU mostly idle"):
             nonlocal regressions
             if relative:
                 if ref <= 0:
                     return
                 delta = (now - ref) / ref
                 if informational:
-                    print(f"    {label:28s} {now:9.3f} vs {ref:9.3f} {unit} {delta*100:+7.1f}%  (info, GPU mostly idle)")
+                    print(f"    {label:28s} {now:9.3f} vs {ref:9.3f} {unit} {delta*100:+7.1f}%  (info, {reason})")
                     return
                 moved = abs(now - ref) > slack
                 flag = "REGRESSION" if delta > tolerance and moved else ("better" if delta < -tolerance and moved else "ok")
@@ -204,29 +289,44 @@ def main():
             else:
                 delta = now - ref
                 flag = "REGRESSION" if delta > tolerance else "ok"
+                if informational:
+                    flag = f"(info, {reason})"
                 print(f"    {label:28s} {now*100:8.2f}% vs {ref*100:8.2f}%  {delta*100:+6.2f}pt  {flag}")
             if flag == "REGRESSION":
                 regressions += 1
 
         for key, label in FRAME_METRICS:
-            is_gpu = key == "minGPUExecutionMs"
-            judge(label, s.get(key, 0.0), b.get(key, 0.0), args.time_tolerance,
-                  slack=args.gpu_slack_ms if is_gpu else 0.0, informational=is_gpu and not gpu_busy)
+            if key == "minGPUExecutionMs":
+                judge(label, s.get(key, 0.0), b.get(key, 0.0), args.time_tolerance,
+                      slack=args.gpu_slack_ms, informational=not gpu_busy)
+            else:
+                judge(label, s.get(key, 0.0), b.get(key, 0.0), args.time_tolerance,
+                      informational=machine_busy, reason="machine busy")
         for key, label in INFO_METRICS:
             now, ref = s.get(key, 0.0), b.get(key, 0.0)
             if ref > 0:
                 print(f"    {label:28s} {now:9.3f} vs {ref:9.3f} ms {(now-ref)/ref*100:+7.1f}%  (info)")
-        judge("overBudgetRate", over, bover, args.rate_tolerance, relative=False)
-        judge("missedDeadlineRate", missed, bmissed, args.rate_tolerance, relative=False)
+        judge("overBudgetRate", over, bover, args.rate_tolerance, relative=False,
+              informational=machine_busy, reason="machine busy")
+        judge("missedDeadlineRate", missed, bmissed, args.rate_tolerance, relative=False,
+              informational=machine_busy, reason="machine busy")
+        not_judged += machine_busy
         tnow, tref = s.get("timingMeanMs", {}), b.get("timingMeanMs", {})
         for field in TIMING_FIELDS:
             if field in tnow and field in tref and tref[field] >= 0.02:
-                judge(f"cpu {field}", tnow[field], tref[field], args.time_tolerance, slack=args.cpu_slack_ms)
+                if tref[field] >= args.cpu_floor_ms:
+                    judge(f"cpu {field}", tnow[field], tref[field], args.time_tolerance, slack=args.cpu_slack_ms)
+                else:
+                    delta = (tnow[field] - tref[field]) / tref[field]
+                    print(f"    {'cpu ' + field:28s} {tnow[field]:9.3f} vs {tref[field]:9.3f} ms {delta*100:+7.1f}%  (info, under {args.cpu_floor_ms:g} ms)")
         pnow, pref = s.get("gpuPassMinMs", {}), b.get("gpuPassMinMs", {})
         for label in sorted(pref):
             if label in pnow and pref[label] >= 0.05:
                 judge(f"gpu min {label[:20]}", pnow[label], pref[label], args.pass_tolerance,
                       slack=args.pass_slack_ms, informational=not gpu_busy)
+    if not_judged:
+        print(f"frame pacing not judged in {not_judged} scene(s): other processes kept the machine busy; "
+              "run again on a quiet machine to judge it")
     if regressions:
         print(f"{regressions} regression(s)")
         return 1
