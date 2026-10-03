@@ -293,6 +293,11 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             currentSnapshot.compositor.deadlineSampleCount = _deadlineSampleCount
             currentSnapshot.compositor.missingAnchorCount = _missingAnchorCount
 
+            #if ENGINE_LOCK_DIAGNOSTICS
+                // What every named engine lock did since the previous frame was completed.
+                currentSnapshot.locks = EngineLockDiagnostics.consumeFrameDelta()
+            #endif
+
             // Update 30-frame rolling average for CPU frame time
             let frameMs = currentSnapshot.timing.frameTotalMs
             _frameMsBuffer[_frameMsBufferIndex] = frameMs

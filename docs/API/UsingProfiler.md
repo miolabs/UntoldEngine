@@ -236,6 +236,61 @@ Results come from the command buffer's completion handler, so the snapshot descr
 
 Passes are timed when they create their encoder through the labelled helpers `makeRenderCommandEncoder(descriptor:passLabel:)`, `makeComputeCommandEncoder(passLabel:)` or `makeBlitCommandEncoder(passLabel:)` on `MTLCommandBuffer`. New passes and rendering extensions should use them; they behave exactly like the plain Metal calls when the timer is off or the command buffer is not the frame's.
 
+## Lock Diagnostics
+
+Every engine lock is an `EngineLock`, an `EngineProtected<State>` or an `EngineRecursiveLock` (`Utils/EngineLock.swift`), each created with a name. In a normal build they compile down to the bare `os_unfair_lock` call: an uncontended lock and unlock costs the same as the primitive (1.7 ns on an M4 Max, against 5.9 ns for `NSLock` and 11.3 ns for `NSRecursiveLock`; `EngineRecursiveLock` costs 2.9 ns).
+
+Built with the compile-time flag `ENGINE_LOCK_DIAGNOSTICS`, the same types also count every acquisition and time how long each lock was waited for and held. It is a build mode and not a runtime switch on purpose: a frame takes hundreds of thousands of locks, and a runtime check on each would cost a measurable part of the frame it is measuring.
+
+```bash
+swift build -Xswiftc -DENGINE_LOCK_DIAGNOSTICS                 # SwiftPM
+xcodebuild ... 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) ENGINE_LOCK_DIAGNOSTICS'
+scripts/perf/run_bench.sh macos --lock-diagnostics             # PerfBench, own build folder
+```
+
+In such a build the verbose stats output adds one line with the busiest locks of the frame, and `EngineStatsSnapshot.locks` carries the per-frame numbers for every lock name (the recorder's summary keeps `lockCallsPerFrame`, `lockHoldMsPerFrame`, `lockContended` and `lockWaitMs`):
+
+```
+Locks: 125663 calls | contended 0 | wait 0.00ms | held 6.93ms | Globals.core 65814 | ECS.componentIds 48599 | Scene.channelRenderMode 10398 | Globals.runtime 851
+```
+
+For a table over any period, reset the counters, run the work and print the report:
+
+```swift
+EngineLockDiagnostics.reset()
+for _ in 0 ..< 120 { renderer.draw(in: view) }
+print(EngineLockDiagnostics.report(per: 120, unit: "frame"))
+```
+
+```
+Engine locks: 125663.1 lock calls per frame
+  lock                                    taken  reentries  contended    wait ms    hold ms  max hold ms  instances
+  Globals.core                          55746.6    10068.0          0      0.000      4.269       7.7047          1
+  ECS.componentIds                      48599.4        0.0          0      0.000      1.863       1.1247          1
+  Scene.channelRenderMode               10398.0        0.0          0      0.000      0.760       5.2308          1
+  Globals.runtime                         851.1        0.0          5      0.004      0.034       0.2187          1
+  by source location (calls per frame)
+     62973.4  UntoldEngine/Globals.swift:90  [Globals.core]
+     48599.4  UntoldEngine/ComponentPool.swift:40  [ECS.componentIds]
+     10398.0  UntoldEngine/SceneContextVisibility.swift:85  [Scene.channelRenderMode]
+```
+
+| Column | What it tells you |
+|---|---|
+| `taken` | Times the lock was taken, per frame (or per whatever `per:` divides by). Locks created with the same name are reported together. |
+| `reentries` | Times a thread that already held a recursive lock took it again. A lock call all the same, and a sign that a caller holds the lock across code that reads the same state. |
+| `contended` | Acquisitions that found the lock held by another thread and had to wait. Zero on a single-threaded path means the lock protects nothing there: the question is why it is taken at all. |
+| `wait ms` | Total time spent waiting in contended acquisitions. This is the cost of contention. |
+| `hold ms` | Time the lock was held, per frame. The clock ticks every 42 ns on Apple silicon and the instrumentation itself runs inside the hold, so read it summed over many acquisitions and compare it between runs of the same build mode; it is not an absolute cost. |
+| `max hold ms` | Longest single hold since the last reset. A lock held for milliseconds will stall any other thread that needs it, however rarely that happens. |
+| `instances` | Live lock objects under this name. |
+
+The source-location rows appear when `EngineLockDiagnostics.recordsSites` is on (`UNTOLD_LOCK_SITES=1` in the environment). They name the file and line of the `lock()` or `withLock` call, which for a global accessor is the accessor: enough to tell which global is read per entity.
+
+Frame times from a diagnostics build are not comparable with a normal build: at 1,000 cubes the instrumentation adds several milliseconds. Judge it on counts, contention and wait time, and take frame times from a normal build. `EngineLockDiagnostics.isCompiledIn` tells the two apart at runtime, and PerfBench records it as `render.lockDiagnostics` so the comparer never matches such a run to a normal baseline.
+
+Locks still declared as `NSLock` or `NSRecursiveLock` are invisible to these counters; the opt-in `LockCensusTests` (`UNTOLD_LOCK_CENSUS=1`) counts those through a hook and prints both views.
+
 ## OOC And Asset Triage Mode
 
 High-volume instrumentation categories are disabled by default:

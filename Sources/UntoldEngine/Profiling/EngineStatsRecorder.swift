@@ -49,6 +49,15 @@ public struct EngineStatsRecordingSummary: Codable, Equatable, Sendable {
     /// Mean of the per-frame CPU timing fields (`EngineTimingStats` and the compositor phases),
     /// keyed by field name: what a CPU-side optimization changes.
     public var timingMeanMs: [String: Double] = [:]
+    /// Lock calls per frame by lock name (acquisitions plus re-entries), averaged over the run.
+    /// Empty unless the build was compiled with `ENGINE_LOCK_DIAGNOSTICS`; so are the three below.
+    public var lockCallsPerFrame: [String: Double] = [:]
+    /// Time each lock name was held per frame, averaged over the run.
+    public var lockHoldMsPerFrame: [String: Double] = [:]
+    /// Acquisitions that had to wait for another thread, summed over the run.
+    public var lockContended: [String: Int] = [:]
+    /// Time spent waiting in those acquisitions, summed over the run.
+    public var lockWaitMs: [String: Double] = [:]
     public var worstThermalState: Int = 0
     public var peakGPUAllocatedBytes: Int = 0
 
@@ -85,6 +94,7 @@ public final class EngineStatsRecorder: @unchecked Sendable {
     private var gpuPassMins: [String: Double] = [:]
     private var timingSums: [String: Double] = [:]
     private var timingSamples = 0
+    private var lockSums: [String: (calls: Int, holdMs: Double, contended: Int, waitMs: Double)] = [:]
     private var firstTimestamp: Double?
     private var lastTimestamp: Double = 0.0
     private var lastWrittenSecond: Double = -1.0
@@ -168,6 +178,14 @@ public final class EngineStatsRecorder: @unchecked Sendable {
             timingSums[name, default: 0.0] += value
         }
         timingSamples += 1
+        for lock in snapshot.locks {
+            var entry = lockSums[lock.name] ?? (0, 0.0, 0, 0.0)
+            entry.calls += lock.acquisitions + lock.reentries
+            entry.holdMs += lock.holdMs
+            entry.contended += lock.contended
+            entry.waitMs += lock.waitMs
+            lockSums[lock.name] = entry
+        }
         if snapshot.timestampSeconds > 0 {
             if firstTimestamp == nil {
                 firstTimestamp = snapshot.timestampSeconds
@@ -208,6 +226,12 @@ public final class EngineStatsRecorder: @unchecked Sendable {
         if timingSamples > 0 {
             for (name, sum) in timingSums {
                 result.timingMeanMs[name] = sum / Double(timingSamples)
+            }
+            for (name, entry) in lockSums {
+                result.lockCallsPerFrame[name] = Double(entry.calls) / Double(timingSamples)
+                result.lockHoldMsPerFrame[name] = entry.holdMs / Double(timingSamples)
+                result.lockContended[name] = entry.contended
+                result.lockWaitMs[name] = entry.waitMs
             }
         }
         result.worstThermalState = lastSnapshotMaxThermal

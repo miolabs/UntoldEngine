@@ -58,6 +58,7 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     let pressure = snapshot.memory.isUnderPressure ? " PRESSURE" : ""
     let compositorLine = compositorStatsLine(snapshot)
     let gpuPassLine = gpuPassStatsLine(snapshot)
+    let lockLine = lockStatsLine(snapshot)
     let hitchLine = hitchStatsLine(snapshot)
     let gpuAllocMB = formatMB(snapshot.memory.gpuAllocatedBytes)
     let availableMB = snapshot.memory.availableMemoryBytes > 0 ? " | avail \(formatMB(snapshot.memory.availableMemoryBytes))mb" : ""
@@ -72,7 +73,7 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     TileReps: resident full/lod/hlod \(snapshot.streaming.residentFullTileRepresentations)/\(snapshot.streaming.residentLODRepresentations)/\(snapshot.streaming.residentHLODRepresentations) | visible full/lod/hlod \(snapshot.streaming.visibleFullTileRepresentations)/\(snapshot.streaming.visibleLODRepresentations)/\(snapshot.streaming.visibleHLODRepresentations) | overlap visible full+lod/full+hlod/lod+hlod \(snapshot.streaming.fullAndLODVisibleOverlapTiles)/\(snapshot.streaming.fullAndHLODVisibleOverlapTiles)/\(snapshot.streaming.lodAndHLODVisibleOverlapTiles) residentFull+fallback \(snapshot.streaming.fullAndFallbackResidentOverlapTiles) | fades \(snapshot.streaming.activeTileRepresentationFades) waiting \(snapshot.streaming.waitingTileRepresentationFades)
     TileRenderCost: visible full/lod/hlod \(snapshot.render.tileFullVisibleInstances)/\(snapshot.render.tileLODVisibleInstances)/\(snapshot.render.tileHLODVisibleInstances) | draws full/lod/hlod \(snapshot.render.tileFullDrawsEstimate)/\(snapshot.render.tileLODDrawsEstimate)/\(snapshot.render.tileHLODDrawsEstimate) | tris full/lod/hlod \(snapshot.render.tileFullTrianglesEstimate)/\(snapshot.render.tileLODTrianglesEstimate)/\(snapshot.render.tileHLODTrianglesEstimate)
     Batching: groups \(snapshot.batching.batchGroupCount) | batchedMeshes \(snapshot.batching.batchedMeshCount) | dirty \(snapshot.batching.dirtyCellsBeforePrune)→\(snapshot.batching.dirtyCellsAfterPrune) | defWork \(snapshot.batching.deferredByWorkBudget) skipComplex \(snapshot.batching.skippedByComplexityGuard) | dispatched \(snapshot.batching.dispatchedBuilds)→\(snapshot.batching.lastRebuildOutputBatchCount) groups | rebuilds/s \(snapshot.batching.rebuildsThisSecond) | rebuildMs \(formatMs(snapshot.batching.lastRebuildCostMs))
-    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure) | gpuAlloc \(gpuAllocMB)mb\(availableMB) | thermal \(snapshot.memory.thermalStateName)\(hitchLine)\(compositorLine)\(gpuPassLine)
+    Memory: mesh \(meshMB)/\(meshBudgetMB)mb | tex \(texMB)/\(texBudgetMB)mb | total \(memPct) | entities \(snapshot.memory.trackedEntityCount)\(pressure) | gpuAlloc \(gpuAllocMB)mb\(availableMB) | thermal \(snapshot.memory.thermalStateName)\(hitchLine)\(compositorLine)\(gpuPassLine)\(lockLine)
     """
 }
 
@@ -108,6 +109,20 @@ private func gpuPassStatsLine(_ snapshot: EngineStatsSnapshot) -> String {
     }.joined(separator: " | ")
     let skipped = g.passesSkipped > 0 ? " skipped \(g.passesSkipped)" : ""
     return "\nGPU passes (\(g.passes.count), sum \(formatMs(g.totalMs))ms\(skipped)): \(entries)"
+}
+
+/// One line with the busiest engine locks of the frame, prefixed with a newline. Empty unless the
+/// build was compiled with `ENGINE_LOCK_DIAGNOSTICS`.
+private func lockStatsLine(_ snapshot: EngineStatsSnapshot) -> String {
+    guard !snapshot.locks.isEmpty else { return "" }
+    let calls = snapshot.locks.reduce(0) { $0 + $1.acquisitions + $1.reentries }
+    let contended = snapshot.locks.reduce(0) { $0 + $1.contended }
+    let waitMs = snapshot.locks.reduce(0.0) { $0 + $1.waitMs }
+    let holdMs = snapshot.locks.reduce(0.0) { $0 + $1.holdMs }
+    let entries = snapshot.locks.prefix(6).map { lock in
+        "\(lock.name) \(lock.acquisitions + lock.reentries)"
+    }.joined(separator: " | ")
+    return "\nLocks: \(calls) calls | contended \(contended) | wait \(formatMs(waitMs))ms | held \(formatMs(holdMs))ms | \(entries)"
 }
 
 /// One line of Compositor Services frame accounting, prefixed with a newline so it can be appended

@@ -80,6 +80,12 @@ let package = Package(
                 .headerSearchPath("."),
             ]
         ),
+        // Word-sized atomics for the engine's lock types (see EngineLock.swift).
+        .target(
+            name: "CEngineAtomics",
+            path: "Sources/CEngineAtomics",
+            publicHeadersPath: "include"
+        ),
         .target(
             name: "UntoldEngineShaderSupport",
             path: "Sources/UntoldEngineShaderSupport",
@@ -90,7 +96,7 @@ let package = Package(
         ),
         .target(
             name: "UntoldEngine",
-            dependencies: ["CShaderTypes"],
+            dependencies: ["CShaderTypes", "CEngineAtomics"],
             path: "Sources/UntoldEngine",
             exclude: [
                 "Shaders",
