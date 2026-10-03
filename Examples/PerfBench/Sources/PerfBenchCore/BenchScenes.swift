@@ -36,7 +36,8 @@ public struct BenchCameraOrbit: Sendable {
 
 /// One benchmark scene. `build` creates every entity relative to `origin`; the runner destroys
 /// them afterwards, so `teardown` only has to undo global settings the scene changed. Scenes are
-/// built from the engine's update callback, on the main thread or the XR render thread.
+/// built, updated and torn down from the engine's update callback, on the main thread or the XR
+/// render thread.
 public protocol BenchScene {
     var id: String { get }
     var title: String { get }
@@ -44,10 +45,20 @@ public protocol BenchScene {
     /// Camera orbit for macOS and iOS. On visionOS the head is the camera and the orbit is ignored.
     var orbit: BenchCameraOrbit { get }
     func build(origin: simd_float3)
+    /// Called once per frame during warm-up and recording, for scenes whose load is game code
+    /// running every frame. `elapsed` counts from the end of `build`.
+    func update(deltaTime: Float, elapsed: Double)
+    /// Recording has ended: stop starting work of the scene's own (loads, threads).
+    func requestStop()
+    /// Whether everything the scene started has finished, so its entities can be destroyed.
+    var isQuiescent: Bool { get }
     func teardown()
 }
 
 public extension BenchScene {
+    func update(deltaTime _: Float, elapsed _: Double) {}
+    func requestStop() {}
+    var isQuiescent: Bool { true }
     func teardown() {}
 }
 
@@ -61,6 +72,9 @@ public enum BenchScenes {
         AnimationScene(),
         StadiumScene(),
         GaussianScene(),
+        LockAPICallsScene(),
+        LockLoadingScene(),
+        LockSecondThreadScene(),
     ]
 
     public static func scenes(withIDs ids: [String]) -> [BenchScene] {

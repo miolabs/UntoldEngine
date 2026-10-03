@@ -485,6 +485,9 @@ public struct EngineStatsSnapshot: Codable, Sendable {
     public var gpuPasses: GPUPassTimingSnapshot = .init()
     /// Frame-time distribution and over-budget counts since the monitor was reset.
     public var hitches: EngineHitchStats = .init()
+    /// What each named engine lock did during the frame, most active first. Empty unless the
+    /// build was compiled with `ENGINE_LOCK_DIAGNOSTICS` (see `EngineLockDiagnostics`).
+    public var locks: [EngineLockStats] = []
 
     public init(
         frameIndex: UInt64 = 0,
@@ -497,7 +500,8 @@ public struct EngineStatsSnapshot: Codable, Sendable {
         memory: EngineMemoryStats = .init(),
         compositor: EngineCompositorStats = .init(),
         gpuPasses: GPUPassTimingSnapshot = .init(),
-        hitches: EngineHitchStats = .init()
+        hitches: EngineHitchStats = .init(),
+        locks: [EngineLockStats] = []
     ) {
         self.frameIndex = frameIndex
         self.timestampSeconds = timestampSeconds
@@ -510,6 +514,7 @@ public struct EngineStatsSnapshot: Codable, Sendable {
         self.compositor = compositor
         self.gpuPasses = gpuPasses
         self.hitches = hitches
+        self.locks = locks
     }
 }
 

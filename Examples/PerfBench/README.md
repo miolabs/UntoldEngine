@@ -22,6 +22,12 @@ compared with a number from after it.
 | `animation-16` | 16 skinned characters running: the animation system and GPU skinning. |
 | `stadium` | The stadium and grass assets: material binds and textures. |
 | `gaussian` | A small Gaussian splat plus primitives: the splat cull, depth-key and radix-sort passes. |
+| `locks-api` | The 1k grid with game code reading and moving every entity through the public API each frame: what the API costs in lock calls. |
+| `locks-loading` | The 1k grid while an asset loads, is destroyed and loads again: contention between the loader's threads and the frame. |
+| `locks-threads` | The 1k grid while a second thread reads every entity's transform in a loop, as a render thread reads what the main thread updates on visionOS: contention and wait on the scene's locks. |
+
+The three `locks-` scenes are judged on lock numbers in the `locks` session below, and on frame
+and CPU times like any other scene in a normal build.
 
 Assets come from `Tests/UntoldEngineRenderTests/Resources`; the project copies the `Models` and
 `Animations` folders and the splat file into the app bundle.
@@ -50,14 +56,27 @@ the window server does not rescale it on the GPU that is being measured.
 ```bash
 brew install xcodegen                      # once
 
-scripts/perf/run_bench.sh macos                                  # this Mac
+scripts/perf/run_bench.sh macos --session quick                  # the gate for every change, about 3 min
+scripts/perf/run_bench.sh macos --session locks                  # lock calls and lock wait time per frame
+scripts/perf/run_bench.sh macos --session full                   # every scene, then the locks session
+
+scripts/perf/run_bench.sh macos                                  # this Mac, every scene once
 scripts/perf/run_bench.sh visionos --device "Javier's Apple Vision Pro"
 scripts/perf/run_bench.sh ios --device <udid>
 
 scripts/perf/run_bench.sh macos --scenes primitives-1k,postfx --seconds 10
 scripts/perf/run_bench.sh macos --update-baseline                # store this run as the baseline
 scripts/perf/run_bench.sh visionos --device <udid> --xctrace "Metal System Trace"
+scripts/perf/run_bench.sh macos --lock-diagnostics               # count and time every engine lock
 ```
+
+The three sessions:
+
+| Session | What it runs | Judged on |
+|---|---|---|
+| `quick` | `cube`, `primitives-1k`, `animation-16`, `stadium`; 10 s each, three repeats | The baseline: frame pacing, per-system CPU time, GPU time where the GPU is busy. Run it for every change. |
+| `locks` | `primitives-1k` and the three `locks-` scenes in a build with `ENGINE_LOCK_DIAGNOSTICS`; two repeats | The lock baseline (`perf/baselines/<model>/<platform>-lockdiag/`): lock calls per frame and lock wait time per frame, per lock name. Lock calls repeat to within 0.1 % between runs. |
+| `full` | Every scene with three repeats, then the `locks` session | Both. With `--update-baseline` it refreshes both baselines. |
 
 Runs land in `perf/results/<timestamp>-<platform>/` with `<scene>.jsonl`, `summary.json` and the
 console log. The comparison prints one block per scene and exits non-zero on a regression (10 %
@@ -78,7 +97,16 @@ not: with the GPU idle most of the frame they follow its clock state, and one fr
 time measured 0.8 and 2.2 ms in consecutive runs of the same build. The comparer therefore judges
 GPU times only when the baseline shows the GPU busy for at least half the frame, and prints them
 as information otherwise; judge GPU cost on the headset, where the GPU is busy and run-to-run
-noise is under 10 %.
+noise is under 10 %. Small CPU times behave the same way (the cube scene's encode time measured
+0.2 and 0.8 ms in consecutive runs of the same build), so a per-system CPU mean is judged only
+when the baseline's value is at least 1 ms.
+
+A Mac is rarely idle. Each scene records how many CPU cores other processes used while it was
+recorded, and the console line says `MACHINE BUSY` from one core up. When even the quietest of the
+repeats was that busy, the comparer reports the scene's frame pacing as information instead of
+judging it, and says so at the end: skipped refreshes are then the machine's, not the engine's.
+Photo and media analysis daemons are the usual cause; they start on their own when the Mac sits on
+mains power. The CPU means of the heavier systems hold up under that load and are still judged.
 
 The app can also be opened in Xcode (`xcodegen generate`, then `PerfBench.xcodeproj`) and started
 from its Start button; it reads its configuration from the environment:
