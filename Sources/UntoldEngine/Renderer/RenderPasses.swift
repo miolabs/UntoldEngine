@@ -1382,11 +1382,11 @@ public enum RenderPasses {
 
                     for subMesh in mesh.submeshes {
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .shadow
                         )
                     }
@@ -1578,11 +1578,11 @@ public enum RenderPasses {
 
                 for subMesh in mesh.submeshes {
                     renderEncoder.drawIndexedPrimitivesTracked(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset,
                         category: .shadow
                     )
                 }
@@ -1711,11 +1711,11 @@ public enum RenderPasses {
 
                     for subMesh in mesh.submeshes {
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .shadow
                         )
                     }
@@ -2019,11 +2019,11 @@ public enum RenderPasses {
                         renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
 
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .opaque
                         )
                     }
@@ -2447,11 +2447,11 @@ public enum RenderPasses {
                         renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
 
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .opaque
                         )
                     }
@@ -3919,11 +3919,11 @@ public enum RenderPasses {
                     )
 
                     renderEncoder.drawIndexedPrimitivesTracked(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset,
                         category: .transparent
                     )
                 }
@@ -4041,11 +4041,11 @@ public enum RenderPasses {
 
                 for subMesh in mesh.submeshes where subMesh.material?.alphaMode != .blend {
                     renderEncoder.drawIndexedPrimitivesTracked(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset,
                         category: .opaque
                     )
                 }
@@ -4172,11 +4172,11 @@ public enum RenderPasses {
 
                 for subMesh in mesh.submeshes {
                     renderEncoder.drawIndexedPrimitives(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset
                     )
                 }
             }
@@ -4398,11 +4398,11 @@ public enum RenderPasses {
                     renderEncoder.setTriangleFillMode(.lines)
                     for subMesh in mesh.submeshes {
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .other
                         )
                     }
