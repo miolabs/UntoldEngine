@@ -615,6 +615,8 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     var entityAABBContainer: [EntityAABB] = []
     entityAABBContainer.reserveCapacity(entities.count) // Pre-allocate to avoid reallocation churn
 
+    let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
+
     for entityId in entities {
         guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
             handleError(.noRenderComponent, entityId)
@@ -638,6 +640,18 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
         if hasComponent(entityId: entityId, componentType: GizmoComponent.self) {
             continue
+        }
+
+        // Objects that would be a pixel or so tall are not worth a draw.
+        if let smallObjectCulling {
+            let (center, halfExtent) = worldAABB_CenterExtent(
+                localMin: localTransformComponent.boundingBox.min,
+                localMax: localTransformComponent.boundingBox.max,
+                worldMatrix: worldTransformComponent.space
+            )
+            if smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
+                continue
+            }
         }
 
         // In XR stereo mode, use a single AABB per entity.  The tighter sub-AABBs
@@ -677,6 +691,10 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     guard count > 0 else {
         HZBDebugMonitor.shared.recordCull(testedCount: 0, candidateCount: 0, visibleCount: 0, usedHZB: false, optimizedPath: false)
+        // Nothing to test is a result too: without it the frame would keep drawing the last set.
+        commandBuffer.addCompletedHandler { _ in
+            publishVisibleEntities(frame: submitFrameIndex, entities: [])
+        }
         return
     }
 
@@ -944,6 +962,8 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     var entityAABBContainer: [EntityAABB] = []
     entityAABBContainer.reserveCapacity(entities.count) // Pre-allocate to avoid reallocation churn
 
+    let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
+
     for entityId in entities {
         guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
             handleError(.noRenderComponent, entityId)
@@ -969,6 +989,18 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             continue
         }
 
+        // Objects that would be a pixel or so tall are not worth a draw.
+        if let smallObjectCulling {
+            let (center, halfExtent) = worldAABB_CenterExtent(
+                localMin: localTransformComponent.boundingBox.min,
+                localMax: localTransformComponent.boundingBox.max,
+                worldMatrix: worldTransformComponent.space
+            )
+            if smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
+                continue
+            }
+        }
+
         // get object AABB — elongated meshes are split into segments.
         let segments = makeSegmentedEntityAABBs(
             localMin: localTransformComponent.boundingBox.min,
@@ -989,6 +1021,10 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     guard count > 0 else {
         HZBDebugMonitor.shared.recordCull(testedCount: 0, candidateCount: 0, visibleCount: 0, usedHZB: false, optimizedPath: true)
+        // Nothing to test is a result too: without it the frame would keep drawing the last set.
+        commandBuffer.addCompletedHandler { _ in
+            publishVisibleEntities(frame: submitFrameIndex, entities: [])
+        }
         return
     }
 
