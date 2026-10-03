@@ -8,7 +8,18 @@
 #   scripts/perf/run_bench.sh ios     --device <udid|name> [options]
 #   scripts/perf/run_bench.sh visionos --device <udid|name> [options]
 #
+# Sessions (--session NAME) bundle the options for the three ways the benchmark is used:
+#   quick   four scenes (cube, primitives-1k, animation-16, stadium), 10 s each, three repeats,
+#           compared against the baseline. About three minutes: the one to run for every change.
+#   locks   the engine built with ENGINE_LOCK_DIAGNOSTICS, on primitives-1k and the three lock
+#           scenes (public API calls, loading, a second thread), two repeats, judged on lock calls
+#           and lock wait time per frame against the lock baseline.
+#   full    every scene, three repeats, then the locks session. With --update-baseline it refreshes
+#           both baselines.
+# An option given explicitly wins over what the session sets.
+#
 # Options:
+#   --session NAME        quick, locks or full (see above)
 #   --scenes a,b,c        scene ids (default: all)
 #   --seconds N           recorded seconds per scene (default: 15)
 #   --warmup N            warm-up seconds per scene (default: 3)
@@ -21,8 +32,8 @@
 #   --xctrace TEMPLATE    also record an Instruments trace, e.g. "Metal System Trace" (device runs)
 #   --lock-diagnostics    build the engine with ENGINE_LOCK_DIAGNOSTICS: every engine lock is counted
 #                         and timed, and each scene reports lock calls, contention, wait and hold
-#                         time. Frame times of such a build are not comparable with a normal one,
-#                         so the baseline comparison is skipped.
+#                         time. Frame times of such a build are not comparable with a normal one;
+#                         the run is compared against the lock baseline, on its lock numbers only.
 #   --no-compare          skip the baseline comparison
 #   --update-baseline     write this run as the new baseline for the device model
 #
@@ -32,7 +43,7 @@
 set -euo pipefail
 
 PLATFORM="${1:-}"
-[ -n "$PLATFORM" ] || { sed -n '2,24p' "$0"; exit 2; }
+[ -n "$PLATFORM" ] || { sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 2; }
 shift
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -51,25 +62,58 @@ COMPARE=1
 UPDATE_BASELINE=0
 REPEAT=1
 REFRESH=""
+SESSION=""
+SCENES_SET=0
+SECONDS_SET=0
+REPEAT_SET=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --scenes) SCENES="$2"; shift 2 ;;
-    --seconds) SECONDS_PER_SCENE="$2"; shift 2 ;;
+    --session) SESSION="$2"; shift 2 ;;
+    --scenes) SCENES="$2"; SCENES_SET=1; shift 2 ;;
+    --seconds) SECONDS_PER_SCENE="$2"; SECONDS_SET=1; shift 2 ;;
     --warmup) WARMUP="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
     --label) LABEL="$2"; shift 2 ;;
     --config) CONFIG="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
-    --repeat) REPEAT="$2"; shift 2 ;;
+    --repeat) REPEAT="$2"; REPEAT_SET=1; shift 2 ;;
     --refresh) REFRESH="$2"; shift 2 ;;
     --xctrace) XCTRACE_TEMPLATE="$2"; shift 2 ;;
-    --lock-diagnostics) LOCK_DIAGNOSTICS=1; COMPARE=0; shift ;;
+    --lock-diagnostics) LOCK_DIAGNOSTICS=1; shift ;;
     --no-compare) COMPARE=0; shift ;;
     --update-baseline) UPDATE_BASELINE=1; shift ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
 done
+
+case "$SESSION" in
+  "") ;;
+  quick)
+    [ "$SCENES_SET" = 1 ] || SCENES="cube,primitives-1k,animation-16,stadium"
+    [ "$SECONDS_SET" = 1 ] || SECONDS_PER_SCENE=10
+    [ "$REPEAT_SET" = 1 ] || REPEAT=3
+    ;;
+  locks)
+    LOCK_DIAGNOSTICS=1
+    [ "$SCENES_SET" = 1 ] || SCENES="primitives-1k,locks-api,locks-loading,locks-threads"
+    [ "$SECONDS_SET" = 1 ] || SECONDS_PER_SCENE=10
+    [ "$REPEAT_SET" = 1 ] || REPEAT=2
+    ;;
+  full)
+    # Two passes with their own builds: every scene in a normal build, then the locks session.
+    COMMON=(--out "$OUT_DIR" --config "$CONFIG" --label "$LABEL")
+    [ -z "$DEVICE" ] || COMMON+=(--device "$DEVICE")
+    [ -z "$REFRESH" ] || COMMON+=(--refresh "$REFRESH")
+    [ "$UPDATE_BASELINE" = 0 ] || COMMON+=(--update-baseline)
+    [ "$COMPARE" = 1 ] || COMMON+=(--no-compare)
+    STATUS=0
+    "$0" "$PLATFORM" --repeat "$([ "$REPEAT_SET" = 1 ] && echo "$REPEAT" || echo 3)" "${COMMON[@]}" || STATUS=$?
+    "$0" "$PLATFORM" --session locks "${COMMON[@]}" || STATUS=$?
+    exit "$STATUS"
+    ;;
+  *) echo "session must be quick, locks or full"; exit 2 ;;
+esac
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$PLATFORM"
 DERIVED="$BENCH_DIR/.build/DerivedData"

@@ -1,0 +1,514 @@
+{
+  "device": {
+    "gpuName": "Apple M4 Max",
+    "isLowPowerMode": false,
+    "model": "Mac16,5",
+    "osVersion": "Version 27.0 (Build 26A428)",
+    "physicalMemoryBytes": 137438953472,
+    "processorCount": 16,
+    "thermalStateAtStart": 0
+  },
+  "label": "v0.21.0-256-g45621f72-dirty",
+  "render": {
+    "antiAliasing": "fxaa",
+    "displayRefreshHz": 120,
+    "foveation": false,
+    "immersion": "none",
+    "layout": "single",
+    "lockDiagnostics": true,
+    "platform": "macOS",
+    "renderQuality": 1,
+    "viewCount": 1,
+    "viewportHeight": 1080,
+    "viewportWidth": 1920,
+    "vsync": true,
+    "xrFramePacing": false
+  },
+  "runIDs": [
+    "20261003-202938-macos-r1",
+    "20261003-203034-macos-r2"
+  ],
+  "scene": {
+    "file": "locks-loading.jsonl",
+    "id": "locks-loading",
+    "lastSnapshot": {
+      "batching": {
+        "batchGroupCount": 0,
+        "batchedMeshCount": 0,
+        "deferredByWorkBudget": 0,
+        "dirtyCellsAfterPrune": 0,
+        "dirtyCellsBeforePrune": 0,
+        "dispatchedBuilds": 0,
+        "lastRebuildCostMs": 0,
+        "lastRebuildInputMeshCount": 0,
+        "lastRebuildOutputBatchCount": 0,
+        "rebuildsThisSecond": 0,
+        "skippedByComplexityGuard": 0
+      },
+      "compositor": {
+        "deadlineMarginMs": 0,
+        "deadlineSampleCount": 0,
+        "earlyStartMs": 0,
+        "inputSlackMs": 0,
+        "missedDeadline": false,
+        "missedDeadlineCount": 0,
+        "missingAnchorCount": 0,
+        "presentationMarginMs": 0,
+        "submissionMs": 0,
+        "updateMs": 0,
+        "viewCount": 0,
+        "viewTextureHeight": 0,
+        "viewTextureWidth": 0
+      },
+      "culling": {
+        "frustumFailed": 0,
+        "frustumPassed": 1025,
+        "frustumTested": 1025,
+        "hzbIsValid": true,
+        "hzbMipCount": 10,
+        "occlusionFailed": 0,
+        "occlusionPassed": 1025,
+        "occlusionTested": 1025,
+        "optimizedFrustumPath": true,
+        "selectedHZBMipLevel": 0,
+        "selectedHZBMipSize": [
+          960,
+          540
+        ],
+        "usedHZB": true
+      },
+      "frameIndex": 1188,
+      "gpuPasses": {
+        "frameIndex": 1189,
+        "passes": [
+          {
+            "count": 1,
+            "label": "Mark Visible Pass",
+            "ms": 0.009958
+          },
+          {
+            "count": 1,
+            "label": "Local Scan Pass",
+            "ms": 0.012292
+          },
+          {
+            "count": 1,
+            "label": "Block Scan Pass",
+            "ms": 0.017458
+          },
+          {
+            "count": 1,
+            "label": "Compact and Stream Pass",
+            "ms": 0.010625
+          },
+          {
+            "count": 1,
+            "label": "HZB Occlusion Culling pass",
+            "ms": 0.033125
+          },
+          {
+            "count": 1,
+            "label": "Grid Pass",
+            "ms": 0.063375
+          },
+          {
+            "count": 1,
+            "label": "Shadow Cascade 0",
+            "ms": 0.097541
+          },
+          {
+            "count": 1,
+            "label": "Shadow Cascade 1",
+            "ms": 0.195833
+          },
+          {
+            "count": 1,
+            "label": "G-Buffer + Light Pass (TBDR)",
+            "ms": 0.788834
+          },
+          {
+            "count": 1,
+            "label": "Copy Opaque Depth for HZB",
+            "ms": 0.030875
+          },
+          {
+            "count": 1,
+            "label": "Transparency Pass",
+            "ms": 0.037708
+          },
+          {
+            "count": 1,
+            "label": "Pre Composite Pass",
+            "ms": 0.094334
+          },
+          {
+            "count": 2,
+            "label": "Post-Processing Pass",
+            "ms": 0.226042
+          },
+          {
+            "count": 1,
+            "label": "Output Transform Pass",
+            "ms": 0.191
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 0",
+            "ms": 0.104708
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 1",
+            "ms": 0.02375
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 2",
+            "ms": 0.028667
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 3",
+            "ms": 0.012875
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 4",
+            "ms": 0.015125
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 5",
+            "ms": 0.047458
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 6",
+            "ms": 0.027667
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 7",
+            "ms": 0.013167
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 8",
+            "ms": 0.0115
+          },
+          {
+            "count": 1,
+            "label": "HZB Build Mip 9",
+            "ms": 0.011
+          }
+        ],
+        "passesSkipped": 0,
+        "totalMs": 2.1049170000000004
+      },
+      "hitches": {
+        "frameBudgetMs": 12.5,
+        "framesLastSecond": 120,
+        "framesOverBudget": 8,
+        "framesOverBudgetLastSecond": 0,
+        "framesSampled": 1189,
+        "histogram": [
+          0,
+          346,
+          832,
+          11,
+          0,
+          0,
+          0
+        ],
+        "worstFrameMsLastSecond": 10.547416284680367
+      },
+      "locks": [
+        {
+          "acquisitions": 73870,
+          "contended": 0,
+          "holdMs": 1.7474999999999998,
+          "instances": 1,
+          "maxHoldMs": 0.9971249999999999,
+          "name": "Globals.core",
+          "reentries": 10266,
+          "waitMs": 0
+        },
+        {
+          "acquisitions": 62715,
+          "contended": 0,
+          "holdMs": 0.5510833333333334,
+          "instances": 1,
+          "maxHoldMs": 0.031875,
+          "name": "ECS.componentIds",
+          "reentries": 0,
+          "waitMs": 0
+        },
+        {
+          "acquisitions": 12300,
+          "contended": 0,
+          "holdMs": 0.43966666666666665,
+          "instances": 1,
+          "maxHoldMs": 0.33325,
+          "name": "Scene.channelRenderMode",
+          "reentries": 0,
+          "waitMs": 0
+        },
+        {
+          "acquisitions": 1143,
+          "contended": 0,
+          "holdMs": 0.009625,
+          "instances": 1,
+          "maxHoldMs": 0.017958333333333333,
+          "name": "Globals.runtime",
+          "reentries": 0,
+          "waitMs": 0
+        }
+      ],
+      "memory": {
+        "availableMemoryBytes": 0,
+        "geometryBudgetBytes": 27707694120,
+        "gpuAllocatedBytes": 281985024,
+        "isUnderPressure": false,
+        "meshMemoryBytes": 12171812,
+        "textureBudgetBytes": 18471796080,
+        "textureMemoryBytes": 49152,
+        "thermalState": 0,
+        "trackedEntityCount": 1026,
+        "utilizationPercent": 0.0002646404900588095
+      },
+      "render": {
+        "drawCallsBatched": 0,
+        "drawCallsOpaque": 1025,
+        "drawCallsShadow": 1248,
+        "drawCallsTotal": 2279,
+        "drawCallsTransparent": 0,
+        "tileFullDrawsEstimate": 0,
+        "tileFullTrianglesEstimate": 0,
+        "tileFullVisibleInstances": 0,
+        "tileHLODDrawsEstimate": 0,
+        "tileHLODTrianglesEstimate": 0,
+        "tileHLODVisibleInstances": 0,
+        "tileLODDrawsEstimate": 0,
+        "tileLODTrianglesEstimate": 0,
+        "tileLODVisibleInstances": 0,
+        "trianglesTotal": 453396,
+        "visibleInstances": 1025
+      },
+      "streaming": {
+        "activeLoads": 0,
+        "activeTileRepresentationFades": 0,
+        "availableLoadSlots": 3,
+        "averageAsyncLoadMs": 0,
+        "blockedByGateMs": 0,
+        "cachedMeshResources": 0,
+        "evictionsPerformed": 0,
+        "fullAndFallbackResidentOverlapTiles": 0,
+        "fullAndHLODVisibleOverlapTiles": 0,
+        "fullAndLODVisibleOverlapTiles": 0,
+        "lastApplyLoadedMeshMs": 0,
+        "loadCandidates": 0,
+        "loadedStreamingEntities": 0,
+        "loadingStreamingEntities": 0,
+        "lod0VisibilityWarnings": 0,
+        "lod0VisibilityWarningsNoFallback": 0,
+        "lod0VisibilityWarningsWithFallback": 0,
+        "lodAndHLODVisibleOverlapTiles": 0,
+        "nearbyEntitiesQueried": 1026,
+        "pendingLoadBacklog": 0,
+        "pendingUploadCount": 0,
+        "residentFullTileRepresentations": 0,
+        "residentHLODRepresentations": 0,
+        "residentLODRepresentations": 0,
+        "residentMeshEntities": 0,
+        "tileRepresentationGapWarnings": 0,
+        "tileSwapWarnings": 0,
+        "tilesSkippedByHierarchyGate": 0,
+        "unloadedStreamingEntities": 0,
+        "updateTriggered": false,
+        "updateWorkMs": 0,
+        "visibleFullTileRepresentations": 0,
+        "visibleHLODRepresentations": 0,
+        "visibleLODRepresentations": 0,
+        "waitingTileRepresentationFades": 0
+      },
+      "timestampSeconds": 846232.0628657918,
+      "timing": {
+        "animationMs": 0.0008333008736371994,
+        "batchingRebuildMs": 0,
+        "batchingTickMs": 0.0007916241884231567,
+        "cullingMs": 0.31341658905148506,
+        "customSystemsMs": 0.0003332970663905144,
+        "encodeMs": 6.67449994944036,
+        "extensionsUpdateMs": 0.0005833571776747704,
+        "frameTotalMs": 8.662499487400055,
+        "gameUpdateMs": 0.01804158091545105,
+        "geometryStreamingMs": 0.0011667143553495407,
+        "gpuExecutionMs": 1.6307500191032887,
+        "gpuFrameCadenceMs": 8.694083313457668,
+        "lodMs": 0.0014583347365260124,
+        "physicsMs": 0.0007917406037449837,
+        "physicsStepCount": 1,
+        "renderPrepMs": 0.317083322443068,
+        "renderTotalMs": 7.586458348669112,
+        "scenegraphMs": 0.16179168596863747,
+        "scriptingMs": 0.0002916203811764717,
+        "semaphoreWaitMs": 0.000125030055642128,
+        "smoothedFrameMs": 8.321183314546943,
+        "streamingRegionMs": 0.0012082746252417564,
+        "submitMs": 0.007666647434234619,
+        "updateMs": 0.19041658379137516
+      }
+    },
+    "measureSeconds": 10,
+    "notes": "redplayer.untold loaded asynchronously, destroyed and loaded again for the whole scene; measures contention between the loader and the frame.",
+    "runs": 2,
+    "summary": {
+      "deadlineSamples": 0,
+      "durationSeconds": 9.984420958324336,
+      "frameBudgetMs": 12.5,
+      "frames": 2377,
+      "framesOverBudget": 9,
+      "gpuPassMeanMs": {
+        "Block Scan Pass": 0.021567883838383733,
+        "Compact and Stream Pass": 0.016208478114478016,
+        "Copy Opaque Depth for HZB": 0.04074316232127838,
+        "G-Buffer + Light Pass (TBDR)": 0.6713346904962145,
+        "Grid Pass": 0.08303633137089979,
+        "HZB Build Mip 0": 0.1470732331649835,
+        "HZB Build Mip 1": 0.04448928114478121,
+        "HZB Build Mip 2": 0.032058304457527435,
+        "HZB Build Mip 3": 0.020011199494949516,
+        "HZB Build Mip 4": 0.02129016498316504,
+        "HZB Build Mip 5": 0.04214987973086621,
+        "HZB Build Mip 6": 0.026269628259041205,
+        "HZB Build Mip 7": 0.017020920941968054,
+        "HZB Build Mip 8": 0.014700827586206845,
+        "HZB Build Mip 9": 0.01424673423044569,
+        "HZB Occlusion Culling pass": 0.03732831707317065,
+        "Local Scan Pass": 0.032016691337258284,
+        "Mark Visible Pass": 0.017438583333333306,
+        "Output Transform Pass": 0.20270860774410768,
+        "Post-Processing Pass": 0.24165509932659937,
+        "Pre Composite Pass": 0.1035579343434342,
+        "Shadow Cascade 0": 0.1644881833473507,
+        "Shadow Cascade 1": 0.22171170731707318,
+        "Transparency Pass": 0.05109611531986527
+      },
+      "gpuPassMinMs": {
+        "Block Scan Pass": 0.006666,
+        "Compact and Stream Pass": 0.00425,
+        "Copy Opaque Depth for HZB": 0.011917,
+        "G-Buffer + Light Pass (TBDR)": 0.240583,
+        "Grid Pass": 0.025541,
+        "HZB Build Mip 0": 0.046416,
+        "HZB Build Mip 1": 0.008708,
+        "HZB Build Mip 2": 0.005833,
+        "HZB Build Mip 3": 0.004458,
+        "HZB Build Mip 4": 0.005375,
+        "HZB Build Mip 5": 0.004875,
+        "HZB Build Mip 6": 0.004375,
+        "HZB Build Mip 7": 0.004208,
+        "HZB Build Mip 8": 0.004125,
+        "HZB Build Mip 9": 0.004083,
+        "HZB Occlusion Culling pass": 0.013292,
+        "Local Scan Pass": 0.005208,
+        "Mark Visible Pass": 0.005042,
+        "Output Transform Pass": 0.064833,
+        "Post-Processing Pass": 0.076792,
+        "Pre Composite Pass": 0.042917,
+        "Shadow Cascade 0": 0.059833,
+        "Shadow Cascade 1": 0.078917,
+        "Transparency Pass": 0.00525
+      },
+      "lockCallsPerFrame": {
+        "ECS.componentIds": 65241.442388561816,
+        "Globals.core": 88307.56265769554,
+        "Globals.runtime": 1140.6425567703952,
+        "Scene.channelRenderMode": 12298.228763666946
+      },
+      "lockContended": {
+        "ECS.componentIds": 0,
+        "Globals.core": 54,
+        "Globals.runtime": 17,
+        "Scene.channelRenderMode": 0
+      },
+      "lockHoldMsPerFrame": {
+        "ECS.componentIds": 0.5746017661900757,
+        "Globals.core": 1.806828812727783,
+        "Globals.runtime": 0.009987314269694413,
+        "Scene.channelRenderMode": 0.4465776562938041
+      },
+      "lockPerFrame": {
+        "ECS.componentIds": {
+          "calls": 65241.442388561816,
+          "contended": 0.0,
+          "holdMs": 0.5746017661900757,
+          "waitMs": 0.0
+        },
+        "Globals.core": {
+          "calls": 88307.56265769554,
+          "contended": 0.037037037037037035,
+          "holdMs": 1.806828812727783,
+          "waitMs": 0.007789246632996632
+        },
+        "Globals.runtime": {
+          "calls": 1140.641414141414,
+          "contended": 0.014297729184188394,
+          "holdMs": 0.009948793490460153,
+          "waitMs": 1.9414073451079336e-05
+        },
+        "Scene.channelRenderMode": {
+          "calls": 12298.19696969697,
+          "contended": 0.0,
+          "holdMs": 0.4454857603815933,
+          "waitMs": 0.0
+        }
+      },
+      "lockWaitMs": {
+        "ECS.componentIds": 0,
+        "Globals.core": 9.975041666666666,
+        "Globals.runtime": 0.02308333333333333,
+        "Scene.channelRenderMode": 0
+      },
+      "meanFrameMs": 8.412510574512542,
+      "meanGPUExecutionMs": 1.7430722970778671,
+      "minGPUExecutionMs": 0.7899167248979211,
+      "missedDeadlineRate": 0.0,
+      "missedDeadlines": 0,
+      "overBudgetRate": 0.0008417508417508417,
+      "p50FrameMs": 8.267874829471111,
+      "p95FrameMs": 9.820041246712208,
+      "p99FrameMs": 10.534625500440598,
+      "peakGPUAllocatedBytes": 282034176,
+      "timingMeanMs": {
+        "animationMs": 0.0007401539296337894,
+        "batchingTickMs": 0.000903454273970464,
+        "compositorDeadlineMarginMs": 0,
+        "compositorEarlyStartMs": 0,
+        "compositorInputSlackMs": 0,
+        "compositorSubmissionMs": 0,
+        "compositorUpdateMs": 0,
+        "cullingMs": 0.32143229632375997,
+        "customSystemsMs": 0.00016533540948736658,
+        "encodeMs": 6.8484303100122395,
+        "extensionsUpdateMs": 0.0006849602408412628,
+        "gameUpdateMs": 0.016564325357376525,
+        "geometryStreamingMs": 0.08324105521861577,
+        "lodMs": 0.001243826962994907,
+        "physicsMs": 0.0003594635658104111,
+        "renderPrepMs": 0.3253837973560865,
+        "renderTotalMs": 7.735627453697452,
+        "scenegraphMs": 0.16175971506790632,
+        "scriptingMs": 0.00022007391339244715,
+        "semaphoreWaitMs": 8.96408748198097e-05,
+        "streamingRegionMs": 0.0010107689762883115,
+        "submitMs": 0.008049244331572242,
+        "updateMs": 0.18888036828246657
+      },
+      "worstFrameMs": 14.713332988321781,
+      "worstThermalState": 0
+    },
+    "title": "1024 primitives while an asset loads over and over",
+    "warmupSeconds": 3
+  }
+}
