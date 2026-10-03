@@ -206,6 +206,65 @@ print("Entity has \(count) LOD levels")
 
 ---
 
+## Automatic LOD Chains for Packs
+
+A `.untoldpack` can carry a LOD chain for each of its models, so a scene exported
+from Blender gets its levels without anybody authoring them. `untoldengine
+export` builds the chains when it writes a pack, and `untoldengine bake-lods`
+builds them for a pack that is already cooked (see [Using the UntoldEngine
+CLI](UsingUntoldEngineCLI.md#lod-chains-for-packs)).
+
+Nothing changes in how the pack is loaded:
+
+```swift
+let site = createEntity()
+setEntityMeshAsync(entityId: site, filename: "site", withExtension: "untoldpack")
+```
+
+For every model that has a chain, each entity the model creates gets an
+`LODComponent` whose level 0 is the model itself, followed by the levels of the
+chain:
+
+- **The levels are built once.** Placements of the same model share the GPU
+  buffers of every level, as they share those of the model.
+- **Each placement switches by its size on screen.** The manifest gives every
+  level a screen size: the share of the viewport height the model's bounding
+  sphere covers when the level becomes detailed enough. The engine compares it
+  with the size the placement has in the frame being drawn, from the model's
+  bounds, the placement's scale and the field of view (see [Selecting by Screen
+  Size](#selecting-by-screen-size)). A small prop and a large tree therefore
+  both switch where their triangles are a few pixels each, although their
+  distances differ by orders of magnitude, and they keep doing so when a
+  placement is scaled or the camera zooms. The parts of a model that has
+  several change level together, at the size of the whole model.
+- **The materials belong to the entity.** The levels are drawn with the model's
+  materials, and a material that is edited or streamed while one level is on
+  screen stays when another takes its place (`LODComponent.levelsShareMaterials`).
+
+`setLOD(.distanceBias(...))` moves all switches together, and `forcedLOD` pins
+a level, as for any other LOD entity. Each level also carries, in
+`maxDistance`, the distance its switch falls at as the pack loads; it is what
+an orthographic view uses.
+
+The manifest records the chains under `lodChains`, by model path:
+
+```json
+"lodChains": {
+  "site/Tree/Tree.untold": [
+    { "path": "site/Tree/Tree_LOD1.untold", "triangles": 926291, "screenSize": 1.7823, "error": 0.037319 },
+    { "path": "site/Tree/Tree_LOD2.untold", "triangles": 299523, "screenSize": 1.0135, "error": 0.068814 },
+    { "path": "site/Tree/Tree_LOD3.untold", "triangles": 83611, "screenSize": 0.53547, "error": 0.155 }
+  ]
+}
+```
+
+`screenSize` is a share of the viewport height: the cook chooses it so that the
+level's triangles are about four pixels each on a viewport 1080 pixels high.
+`error` is the largest deviation from the model in model units. To build chains from your own
+tools, call `UntoldMeshLODCooker.cookChains(forPackAt:options:)`.
+
+---
+
 ## Advanced Usage
 
 ### Custom Distance Thresholds
@@ -232,7 +291,9 @@ Configure global LOD behavior:
 setLOD(.distanceBias(1.5))  // Performance mode
 setLOD(.distanceBias(0.75)) // Quality mode
 
-// Adjust hysteresis to prevent flickering
+// Adjust hysteresis to prevent flickering. It never takes more than a tenth of
+// a level's own switch distance, so levels that switch close to the camera
+// still switch back.
 setLOD(.hysteresis(10.0))
 
 // Enable dithered cross-fade transitions between LOD representations
@@ -252,6 +313,37 @@ setLOD(.distanceThresholds([25.0, 75.0, 200.0]))
 `LODSystem.update()` doesn't re-evaluate every entity every frame — the full pass is throttled to once every `updateFrameInterval` frames, with an early-out that forces an immediate pass if the camera moved more than `minimumCameraDisplacement` units since the last one. Lowering `updateFrameInterval` (e.g. to `1`) trades performance for LOD responsiveness; raising `minimumCameraDisplacement` makes fast camera movement less likely to force an off-cycle update. See [`docs/Architecture/lodSystem.md`](../Architecture/lodSystem.md) for the full throttling behavior.
 
 The older `LODConfig.shared` values remain available for compatibility and advanced tuning. New code should prefer `setLOD(...)` so LOD settings follow the same style as scene channels, rendering, and PostFX.
+
+### Selecting by Screen Size
+
+A distance suits one size of object under one field of view. An entity can
+instead choose its level by how large it is on screen:
+
+```swift
+if let lodComponent = scene.get(component: LODComponent.self, for: tree) {
+    lodComponent.lodLevels[1].screenPercentage = 0.5   // LOD1 from half the viewport height down
+    lodComponent.lodLevels[2].screenPercentage = 0.2   // LOD2 from a fifth down
+    lodComponent.selectsByScreenSize = true
+}
+```
+
+`screenPercentage` is the size at which a level takes over from the one before
+it: the share of the viewport height (1 is the whole height) covered by the
+sphere around the entity's bounding box. The size is read as each LOD pass
+runs, so it follows the entity's scale and the field of view:
+
+- The size is a share of the viewport, whatever its resolution: a denser
+  display draws the same levels as a coarser one. `setLOD(.distanceBias(...))`
+  moves every switch where a platform needs more or less detail, and
+  `setLOD(.hysteresis(...))` acts as it does on distances.
+- A level whose `screenPercentage` is 0 takes over at the `maxDistance` of the
+  level before it, and so does every level under an orthographic projection.
+- `LODComponent.screenSizeRadius` replaces the sphere around the bounding box
+  with one of that radius, in the entity's own space. The parts of a model
+  loaded from a pack carry the radius of the whole model.
+
+The levels of [automatic LOD chains](#automatic-lod-chains-for-packs) are
+selected this way.
 
 ### Forced LOD Override
 
