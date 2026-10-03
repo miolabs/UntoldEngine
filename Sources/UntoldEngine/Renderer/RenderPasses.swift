@@ -613,7 +613,12 @@ public enum RenderPasses {
     }
 
     private static func shadowCasterEntityIds(for cascadeIdx: Int) -> [EntityID] {
-        ensureShadowCacheConfigured()
+        let table = RenderEntityTable.shared
+        return shadowCasterRows(for: cascadeIdx).map { table.rows[$0].entityId }
+    }
+
+    /// The rows of `RenderEntityTable` that cast into the cascade.
+    private static func shadowCasterRows(for cascadeIdx: Int) -> [Int] {
         guard let frustum = shadowFrustum(for: cascadeIdx) else { return [] }
 
         // Conservative, direction-agnostic pre-reject: a caster farther than the engine's
@@ -625,80 +630,50 @@ public enum RenderPasses {
         let cascadeCenter = shadowSystem.cascadeWorldCenters[cascadeIdx]
         let cascadeReach = shadowSystem.cascadeWorldRadii[cascadeIdx] + RenderPasses.maxShadowCastingDistance
 
-        // Rebuild candidate list if dirty. At most one rebuild per dirty event, shared
-        // across all cascade invocations in the same frame.
-        runtimeState.lock.lock()
-        let dirty = runtimeState.shadowCacheDirty
-        runtimeState.lock.unlock()
-        if dirty {
-            rebuildShadowEntityCache()
-        }
-
-        runtimeState.lock.lock()
-        let candidates = runtimeState.shadowEntityCandidates
-        runtimeState.lock.unlock()
-
-        var result: [EntityID] = []
-        result.reserveCapacity(candidates.count / 4)
-
+        let table = RenderEntityTable.shared
+        table.refreshIfNeeded()
+        let batchingEnabled = BatchingSystem.shared.isEnabled()
         // An object too small to be drawn casts a shadow about as small.
         let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
+        let rootMatrix = SceneRootTransform.shared.matrix
+        let rootIsIdentity = rootMatrix == matrix_identity_float4x4
+        var renderModes = SceneChannelRenderModeMemo()
 
-        for entityId in candidates {
-            guard scene.mask(for: entityId) != nil else { continue }
-            if shouldHideSceneEntity(entityId: entityId) { continue }
-            if shouldRenderSceneEntityAsWireframe(entityId: entityId) { continue }
-            if BatchingSystem.shared.isEnabled() {
+        var result: [Int] = []
+        result.reserveCapacity(table.rows.count / 4)
+
+        for (rowIndex, row) in table.rows.enumerated() {
+            if !row.flags.isDisjoint(with: .notGeometry) { continue }
+            guard row.render.castsShadow else { continue }
+            let renderMode = renderModes.mode(of: row)
+            if renderMode.isHidden || renderMode.isWireframe { continue }
+            if batchingEnabled {
                 // Batch-eligible entities (StaticBatchComponent present) are always drawn
                 // via shadowCasterBatchGroups — whether or not the batch rebuild has landed
-                // yet.  Skipping them here prevents O(n_loaded_tiles) shadow draw calls that
-                // scale with the scene and eventually overflow the GPU command buffer budget.
-                // During the brief batch-rebuild window their shadow is absent; this is
-                // preferable to the alternative of the app freezing at ~300+ loaded tiles.
-                // The exception is a mesh carrying an occluder shell or fade: it stays out of
-                // its batch for as long as the component is there, so it casts on its own.
-                if scene.get(component: StaticBatchComponent.self, for: entityId) != nil,
-                   !isEntityInMeshOccluderOrFade(entityId)
-                { continue }
-                if BatchingSystem.shared.isBatched(entityId: entityId) { continue }
+                // yet. The exception is a mesh carrying an occluder shell or fade: it stays
+                // out of its batch for as long as the component is there, so it casts on its own.
+                if row.flags.contains(.staticBatch), row.flags.isDisjoint(with: [.meshOccluder, .meshFade]) { continue }
+                if BatchingSystem.shared.isBatched(entityId: row.entityId) { continue }
             }
+            guard row.render.isVisible else { continue }
 
-            guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId),
-                  renderComponent.isVisible,
-                  let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId),
-                  let localTransformComponent = scene.get(component: LocalTransformComponent.self, for: entityId)
-            else { continue }
-
-            let (worldMin, worldMax) = worldAABB_MinMax(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space
-            )
+            let localMin = row.local.boundingBox.min
+            let localMax = row.local.boundingBox.max
+            let (worldMin, worldMax) = worldAABB_MinMax(localMin: localMin, localMax: localMax, worldMatrix: row.world.space)
             if let smallObjectCulling, smallObjectCulling.culls(worldMin: worldMin, worldMax: worldMax) { continue }
-            // Directional-light caster relevance cannot be determined from camera
-            // distance or the cascade receiver split — a caster outside a cascade's
-            // camera-depth interval can still project a shadow into that interval.
-            // The world-space distance reject above stays correct for any light
-            // direction; the fitted light-space cascade frustum below is the
-            // correctness-preserving cull for what actually lands in the map.
-            //
-            // cascadeCenter/cascadeReach are in visual-world space (they come from the
-            // camera-frustum-derived cascade bounds), while worldMin/worldMax above are
-            // scene-local (needed as-is for the frustum test below, since `frustum` is built
-            // from a matrix that folds the scene-root transform back in). Fold the root
-            // transform into a second, visual-world copy of the bounds just for this check.
-            let (visualWorldMin, visualWorldMax) = worldAABB_MinMax(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: simd_mul(SceneRootTransform.shared.matrix, worldTransformComponent.space)
-            )
+            // cascadeCenter/cascadeReach are in visual-world space, while worldMin/worldMax
+            // are scene-local (needed as-is for the frustum test below): fold the root
+            // transform into a second copy of the bounds just for the distance check.
+            let visualBounds = rootIsIdentity
+                ? (min: worldMin, max: worldMax)
+                : worldAABB_MinMax(localMin: localMin, localMax: localMax, worldMatrix: simd_mul(rootMatrix, row.world.space))
             if shadowEntityBeyondMaxDistance(
-                worldMin: visualWorldMin, worldMax: visualWorldMax,
+                worldMin: visualBounds.min, worldMax: visualBounds.max,
                 cameraPosition: cascadeCenter,
                 maxDistance: cascadeReach
             ) { continue }
             if isAABBInFrustum(frustum, min: worldMin, max: worldMax) {
-                result.append(entityId)
+                result.append(rowIndex)
             }
         }
 
@@ -1341,13 +1316,15 @@ public enum RenderPasses {
                 index: Int(shadowPassLightMatrixUniform.rawValue)
             )
 
-            let shadowCasterIds = shadowCasterEntityIds(for: cascadeIdx)
-            for entityId in shadowCasterIds {
-                guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else { continue }
-                guard let transformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else { continue }
-                guard scene.get(component: LocalTransformComponent.self, for: entityId) != nil else { continue }
+            let table = RenderEntityTable.shared
+            let cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+            let projectionMatrix = renderInfo.perspectiveSpace
+            for rowIndex in shadowCasterRows(for: cascadeIdx) {
+                let row = table.rows[rowIndex]
+                let entityId = row.entityId
+                let transformComponent = row.world
 
-                for mesh in renderComponent.mesh {
+                for mesh in row.render.mesh {
                     var modelUniforms = Uniforms()
                     var modelMatrix = simd_mul(transformComponent.space, mesh.localSpace)
                     let modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
@@ -1358,14 +1335,19 @@ public enum RenderPasses {
                     modelUniforms.normalMatrix = normalMatrix
                     modelUniforms.viewMatrix = viewMatrix
                     modelUniforms.modelMatrix = modelMatrix
-                    modelUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
-                    modelUniforms.projectionMatrix = renderInfo.perspectiveSpace
+                    modelUniforms.cameraPosition = cameraPosition
+                    modelUniforms.projectionMatrix = projectionMatrix
 
                     renderEncoder.setVertexBytes(
                         &modelUniforms, length: MemoryLayout<Uniforms>.stride,
                         index: Int(shadowPassModelUniform.rawValue)
                     )
-                    renderEncoder.bindShadowVertexStreams(mesh: mesh, entityId: entityId)
+                    renderEncoder.bindShadowVertexStreams(
+                        mesh: mesh,
+                        entityId: entityId,
+                        hasDeformation: row.flags.contains(.deformation),
+                        hasSkeleton: row.flags.contains(.skeleton)
+                    )
 
                     for subMesh in mesh.submeshes {
                         renderEncoder.drawIndexedPrimitivesTracked(

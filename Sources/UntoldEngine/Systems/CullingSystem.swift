@@ -624,47 +624,32 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     let frustumReadBuffer = frustumTripleBuffer.bufferForRead(frame: submitFrameIndex)
 
-    let transformId = getComponentId(for: WorldTransformComponent.self)
-    let renderId = getComponentId(for: RenderComponent.self)
-    let entities = queryEntitiesWithComponentIds([transformId, renderId], in: scene)
+    let table = RenderEntityTable.shared
+    table.refreshIfNeeded()
 
     var entityAABBContainer: [EntityAABB] = []
-    entityAABBContainer.reserveCapacity(entities.count) // Pre-allocate to avoid reallocation churn
+    entityAABBContainer.reserveCapacity(table.rows.count) // Pre-allocate to avoid reallocation churn
 
     let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
+    let isXRStereoMode = renderInfo.isXRStereoMode
 
-    for entityId in entities {
-        guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
-            handleError(.noRenderComponent, entityId)
-            continue
-        }
-
+    for row in table.rows {
         // Skip entities that are hidden (e.g., during bulk loading)
-        if !renderComponent.isVisible {
+        if !row.render.isVisible {
             continue
         }
 
-        guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else {
-            handleError(.noWorldTransformComponent, entityId)
+        if row.flags.contains(.gizmo) {
             continue
         }
 
-        guard let localTransformComponent = scene.get(component: LocalTransformComponent.self, for: entityId) else {
-            handleError(.noLocalTransformComponent, entityId)
-            continue
-        }
-
-        if hasComponent(entityId: entityId, componentType: GizmoComponent.self) {
-            continue
-        }
+        let localMin = row.local.boundingBox.min
+        let localMax = row.local.boundingBox.max
+        let worldMatrix = row.world.space
 
         // Objects that would be a pixel or so tall are not worth a draw.
         if let smallObjectCulling {
-            let (center, halfExtent) = worldAABB_CenterExtent(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space
-            )
+            let (center, halfExtent) = worldAABB_CenterExtent(localMin: localMin, localMax: localMax, worldMatrix: worldMatrix)
             if smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
                 continue
             }
@@ -675,24 +660,24 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         // tracking drift and cause segment-level occlusion popping.  The unsegmented
         // AABB has a conservative nearDepth (closest corner of the full entity) that
         // is far less likely to fall behind a stale occluder in the HZB.
-        if renderInfo.isXRStereoMode {
+        if isXRStereoMode {
             let singleAABB = makeObjectAABB(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space,
-                index: getEntityIndex(entityId),
-                version: getEntityVersion(entityId)
+                localMin: localMin,
+                localMax: localMax,
+                worldMatrix: worldMatrix,
+                index: getEntityIndex(row.entityId),
+                version: getEntityVersion(row.entityId)
             )
             entityAABBContainer.append(singleAABB)
         } else {
             // get object AABB — elongated meshes are split into segments so a solid
             // occluder covering only part of the entity cannot falsely cull the whole entity.
             let segments = makeSegmentedEntityAABBs(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space,
-                index: getEntityIndex(entityId),
-                version: getEntityVersion(entityId)
+                localMin: localMin,
+                localMax: localMax,
+                worldMatrix: worldMatrix,
+                index: getEntityIndex(row.entityId),
+                version: getEntityVersion(row.entityId)
             )
             entityAABBContainer.append(contentsOf: segments)
         }
@@ -969,47 +954,31 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     let frustumReadBuffer = frustumTripleBuffer.bufferForRead(frame: submitFrameIndex)
 
-    let transformId = getComponentId(for: WorldTransformComponent.self)
-    let renderId = getComponentId(for: RenderComponent.self)
-    let entities = queryEntitiesWithComponentIds([transformId, renderId], in: scene)
+    let table = RenderEntityTable.shared
+    table.refreshIfNeeded()
 
     var entityAABBContainer: [EntityAABB] = []
-    entityAABBContainer.reserveCapacity(entities.count) // Pre-allocate to avoid reallocation churn
+    entityAABBContainer.reserveCapacity(table.rows.count) // Pre-allocate to avoid reallocation churn
 
     let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
 
-    for entityId in entities {
-        guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
-            handleError(.noRenderComponent, entityId)
-            continue
-        }
-
+    for row in table.rows {
         // Skip entities that are hidden (e.g., during bulk loading)
-        if !renderComponent.isVisible {
+        if !row.render.isVisible {
             continue
         }
 
-        guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else {
-            handleError(.noWorldTransformComponent, entityId)
+        if row.flags.contains(.light) {
             continue
         }
 
-        guard let localTransformComponent = scene.get(component: LocalTransformComponent.self, for: entityId) else {
-            handleError(.noLocalTransformComponent, entityId)
-            continue
-        }
-
-        if hasComponent(entityId: entityId, componentType: LightComponent.self) {
-            continue
-        }
+        let localMin = row.local.boundingBox.min
+        let localMax = row.local.boundingBox.max
+        let worldMatrix = row.world.space
 
         // Objects that would be a pixel or so tall are not worth a draw.
         if let smallObjectCulling {
-            let (center, halfExtent) = worldAABB_CenterExtent(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space
-            )
+            let (center, halfExtent) = worldAABB_CenterExtent(localMin: localMin, localMax: localMax, worldMatrix: worldMatrix)
             if smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
                 continue
             }
@@ -1017,11 +986,11 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
         // get object AABB — elongated meshes are split into segments.
         let segments = makeSegmentedEntityAABBs(
-            localMin: localTransformComponent.boundingBox.min,
-            localMax: localTransformComponent.boundingBox.max,
-            worldMatrix: worldTransformComponent.space,
-            index: getEntityIndex(entityId),
-            version: getEntityVersion(entityId)
+            localMin: localMin,
+            localMax: localMax,
+            worldMatrix: worldMatrix,
+            index: getEntityIndex(row.entityId),
+            version: getEntityVersion(row.entityId)
         )
         entityAABBContainer.append(contentsOf: segments)
     }
