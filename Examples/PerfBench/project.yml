@@ -1,0 +1,116 @@
+name: PerfBench
+
+# The engine is referenced by path so the benchmark always measures the checkout it sits in.
+packages:
+  UntoldEngine:
+    path: ../..
+
+options:
+  bundleIdPrefix: com.untoldengine.perfbench
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+    visionOS: "2.0"
+
+settings:
+  base:
+    # The engine uses Float16/simd_half types that do not exist on x86_64; build arm64 only.
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: "YES"
+    SWIFT_VERSION: 5.0
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    MTL_HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../../Sources/UntoldEngineShaderSupport/include"
+  configs:
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: -Onone
+      DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+    Release:
+      SWIFT_COMPILATION_MODE: wholemodule
+      SWIFT_OPTIMIZATION_LEVEL: -O
+      DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+
+# Benchmark assets come straight from the engine's render-test resources; the engine looks for
+# Models/<name>/<name>.<ext> and Animations/<name>/<name>.<ext> inside the bundle, and finds a
+# file at the bundle root by name.
+targetTemplates:
+  BenchApp:
+    type: application
+    sources:
+      - path: Sources/PerfBenchCore
+      - path: ../../Tests/UntoldEngineRenderTests/Resources/Models
+        type: folder
+        buildPhase: resources
+      - path: ../../Tests/UntoldEngineRenderTests/Resources/Animations
+        type: folder
+        buildPhase: resources
+      - path: ../../Tests/UntoldEngineRenderTests/Resources/Guassians/test_gaussians.ply
+        buildPhase: resources
+    dependencies:
+      - package: UntoldEngine
+        product: UntoldEngine
+      - package: UntoldEngine
+        product: UntoldEngineShaderSupport
+
+targets:
+  PerfBench-macOS:
+    templates: [BenchApp]
+    platform: macOS
+    sources:
+      - path: Sources/macOS
+        excludes: ["Info.plist"]
+    settings:
+      base:
+        PRODUCT_NAME: PerfBench
+        PRODUCT_BUNDLE_IDENTIFIER: com.untoldengine.perfbench.macos
+        INFOPLIST_FILE: Sources/macOS/Info.plist
+
+  PerfBench-iOS:
+    templates: [BenchApp]
+    platform: iOS
+    sources:
+      - path: Sources/iOS
+        excludes: ["Info.plist"]
+    settings:
+      base:
+        PRODUCT_NAME: PerfBench
+        PRODUCT_BUNDLE_IDENTIFIER: com.untoldengine.perfbench.ios
+        INFOPLIST_FILE: Sources/iOS/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTED_INTERFACE_ORIENTATIONS: UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+
+  PerfBench-visionOS:
+    templates: [BenchApp]
+    platform: visionOS
+    sources:
+      - path: Sources/visionOS
+        excludes: ["Info.plist"]
+    dependencies:
+      - package: UntoldEngine
+        product: UntoldEngineXR
+    settings:
+      base:
+        PRODUCT_NAME: PerfBench
+        PRODUCT_BUNDLE_IDENTIFIER: com.untoldengine.perfbench.visionos
+        INFOPLIST_FILE: Sources/visionOS/Info.plist
+
+schemes:
+  PerfBench-macOS:
+    build:
+      targets:
+        PerfBench-macOS: all
+    run:
+      config: Release
+  PerfBench-iOS:
+    build:
+      targets:
+        PerfBench-iOS: all
+    run:
+      config: Release
+  PerfBench-visionOS:
+    build:
+      targets:
+        PerfBench-visionOS: all
+    run:
+      config: Release

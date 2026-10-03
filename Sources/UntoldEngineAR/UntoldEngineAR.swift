@@ -109,6 +109,7 @@
                 commandBufferSemaphore.signal()
                 return
             }
+            GPUPassTimer.shared.beginFrame(commandBuffer: commandBuffer)
 
             commandBuffer.label = "AR Command Buffer"
 
@@ -156,6 +157,7 @@
 
             // Finalize rendering here & push the command buffer to the GPU
             commandBuffer.commit()
+            GPUPassTimer.shared.endFrame()
         }
 
         func updateARStates(currentFrame: ARFrame) {
