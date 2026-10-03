@@ -153,18 +153,28 @@ macOS location and is not available on `PATH`.
 If the source `.blend` scene contains more than one independent model (more
 than one object with no parent among the exported objects), the exporter
 writes a `<name>.untoldpack` manifest next to `--output` instead of a single
-`.untold` file, plus one self-contained `.untold` per model under its own
-subfolder:
+`.untold` file, plus one `.untold` per model under its own subfolder and one
+`Textures/` folder the models share:
 
 ```bash
 untoldengine export \
   --input warehouse.blend \
   --output warehouse.untold \
   --convert-orientation --optimize
-# → warehouse.untoldpack, Shelf/Shelf.untold, Forklift/Forklift.untold, ...
+# → warehouse.untoldpack, Shelf/Shelf.untold, Forklift/Forklift.untold, ..., Textures/
 ```
 
-`--optimize` bakes textures for every model in the pack. Load the result with
+A model placed more than once (a shelf copied fifty times, a tree planted all
+over a site) is written once: every placement in the manifest points at the
+same `.untold`, with its own transform. Copies are found by content: the same
+geometry, materials and hierarchy, wherever they stand and whatever their
+names; meshes with no material all get the same default one, so their copies
+count as well. Skinned models and models with morph targets are always written
+on their own. Objects that share one mesh datablock in Blender (linked
+duplicates) and have no modifiers are also split and extracted once, which is
+most of the export time on scenes full of copies.
+
+`--optimize` bakes the shared textures once for the whole pack. Load the result with
 `setEntityMeshAsync(entityId:filename:)`, leaving `withExtension` out —
 the engine probes for `.untoldpack` then `.untold` automatically, so the same
 call works whether the scene exported as one file or a pack, placing each
@@ -277,6 +287,9 @@ re-export from the source tool as v2/v3, or convert through `.ply` instead.
 | `--assets-dir <path>` | Folder for the textures and per-model folders the result references (default: the `--output` folder) |
 | `--include-hidden` | Also export objects hidden in the viewport or disabled in renders |
 | `--no-lods` | Do not build the [LOD chains](#lod-chains-for-packs) of a pack's models |
+| `--no-material-bake` | Do not bake procedural materials into textures and values |
+| `--material-bake-size <texels>` | Size of a baked material texture (default `1024`) |
+| `--material-bake-tile <metres>` | Longest stretch of surface one repeat of a baked texture covers (default `2`) |
 | `--validate` | Write a companion validation JSON file |
 | `--color-grade-lut <path>` | Stage an externally-authored `.cube` 3D LUT and apply it as a post-tonemap creative grade (no Blender render, no conversion) — see [Using Color Management](UsingColorManagement.md) |
 

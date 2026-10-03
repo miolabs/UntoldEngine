@@ -44,11 +44,12 @@ struct ExportCommand: ParsableCommand {
         If the source .blend scene contains more than one independent model
         (more than one object with no parent among the exported objects), the
         exporter writes a <name>.untoldpack manifest next to --output instead
-        of a single .untold file, plus one self-contained .untold per model
-        under its own subfolder. --optimize bakes textures for every model
-        in the pack. Each model of a pack that is detailed enough also gets
-        its LOD chain (simplified copies the engine switches to with
-        distance, see `untoldengine bake-lods`); --no-lods leaves them out.
+        of a single .untold file, plus one .untold per model under its own
+        subfolder; copies of a model share one file, and the models share one
+        Textures folder. --optimize bakes those textures for the whole pack.
+        Each model of a pack that is detailed enough also gets its LOD chain
+        (simplified copies the engine switches to with distance, see
+        `untoldengine bake-lods`); --no-lods leaves them out.
 
         Example:
           untoldengine export --input model.usdz --output model.untold --convert-orientation --optimize
@@ -88,6 +89,15 @@ struct ExportCommand: ParsableCommand {
 
     @Option(name: .customLong("assets-dir"), help: "Folder for the textures and per-model folders the result references (default: the --output folder)")
     var assetsDir: String?
+
+    @Flag(name: .customLong("no-material-bake"), help: "Do not bake procedural materials (noise, bricks, node math with no image texture behind it) into textures and values")
+    var noMaterialBake = false
+
+    @Option(name: .customLong("material-bake-size"), help: "Texels along a baked material texture (default: 1024; smooth patterns are written smaller)")
+    var materialBakeSize: Int?
+
+    @Option(name: .customLong("material-bake-tile"), help: "The longest stretch of surface, in metres, one repeat of a baked material texture covers (default: 2)")
+    var materialBakeTile: Double?
 
     @Flag(name: .long, help: "Write a companion validation JSON file")
     var validate = false
@@ -195,6 +205,9 @@ struct ExportCommand: ParsableCommand {
         if includeHidden { exporterArguments.append("--include-hidden") }
         let assetsURL = assetsDir.map { resolvePath($0).standardizedFileURL }
         if let assetsURL { exporterArguments += ["--assets-dir", assetsURL.path] }
+        if noMaterialBake { exporterArguments.append("--no-material-bake") }
+        if let materialBakeSize { exporterArguments += ["--material-bake-size", String(materialBakeSize)] }
+        if let materialBakeTile { exporterArguments += ["--material-bake-tile", String(materialBakeTile)] }
         if validate { exporterArguments.append("--validate") }
         if compressGeometry || optimize { exporterArguments.append("--compress-geometry") }
         if animation { exporterArguments.append("--animation") }
@@ -277,9 +290,20 @@ struct ExportCommand: ParsableCommand {
                 printInfo("  \(model.displayName ?? model.path) -> \(model.path)")
             }
             if optimize {
+                // Several placements can share one .untold, so each file is handled once.
+                var modelURLs: [URL] = []
                 for model in pack.models {
-                    let modelURL = packURL.deletingLastPathComponent().appendingPathComponent(model.path)
-                    try optimizeTextures(outputURL: modelURL)
+                    let modelURL = packURL.deletingLastPathComponent().appendingPathComponent(model.path).standardizedFileURL
+                    if !modelURLs.contains(modelURL) { modelURLs.append(modelURL) }
+                }
+                let sharedTextures = (assetsURL ?? packURL.deletingLastPathComponent()).appendingPathComponent("Textures")
+                if validateDirectory(sharedTextures) {
+                    try optimizeSharedTextures(texturesDir: sharedTextures, packURL: packURL, modelURLs: modelURLs)
+                } else {
+                    // An exporter that predates the shared Textures/ folder gives each model its own.
+                    for modelURL in modelURLs {
+                        try optimizeTextures(outputURL: modelURL)
+                    }
                 }
             }
 
@@ -534,6 +558,26 @@ struct ExportCommand: ParsableCommand {
 
         printInfo("Patching texture references: \(outputURL.path)")
         try runPython(python3URL, [texbakeScriptURL.path, "--patch-refs", outputURL.path])
+
+        printSuccess("Optimized textures: \(texturesDir.path)")
+    }
+
+    /// A pack's Textures/ folder, shared by its models: baked once, with the pack's
+    /// model files read for slot hints, then each model's references patched.
+    private func optimizeSharedTextures(texturesDir: URL, packURL: URL, modelURLs: [URL]) throws {
+        let python3URL = try resolvePython3()
+        let texbakeScriptURL = try resolveTexbakeScript()
+
+        printInfo("Baking textures: \(texturesDir.path)")
+        // The pack's manifest, from which texbake takes the models it lists: naming each
+        // file would overflow the command line on a large pack, and naming their folder
+        // would bring in whatever else an assets folder holds.
+        try runPython(python3URL, [texbakeScriptURL.path, "--dir", texturesDir.path, "--untold", packURL.path])
+
+        for modelURL in modelURLs {
+            printInfo("Patching texture references: \(modelURL.path)")
+            try runPython(python3URL, [texbakeScriptURL.path, "--patch-refs", modelURL.path])
+        }
 
         printSuccess("Optimized textures: \(texturesDir.path)")
     }
