@@ -91,6 +91,10 @@ To apply the same emissive value to an entity and all of its scenegraph descenda
 updateMaterialEmmisive(entityId: rootEntity, emmissive: simd_float3(1.0, 0.5, 0.0), recursive: true)
 ```
 
+> When the material has an emissive texture, the value multiplies it: the texture gives the color of the glow and the value its strength. A material loaded with an emissive texture and no value of its own starts at white, so the texture shows as painted.
+
+> On a material with the blend alpha mode the glow fades with the surface: at half opacity it gives off half the light.
+
 > **Spelling note:** The API currently uses `getMaterialEmmissive` / `updateMaterialEmmisive` (with double-m). Use these exact names when calling the functions.
 
 ---
@@ -170,6 +174,45 @@ Or specify exact indices:
 ```swift
 updateMaterialOpacity(entityId: entity, opacity: 0.5, meshIndex: 0, submeshIndex: 1)
 ```
+
+---
+
+## Transmission (Glass)
+
+How much of the surface is glass, from `0.0` (a solid surface, the default) to `1.0`. Glass shows what is behind it, tinted by its base color, and keeps its reflections and its glow whole: a clear pane is all but invisible seen straight on and a mirror seen at a slant.
+
+Opacity is not glass. Opacity says how much of the surface is there at all, so a surface at 10 % opacity shows a tenth of its reflections too. The two combine: the part of the surface that is there filters what is behind it by its transmission.
+
+### Get Transmission
+
+```swift
+let transmission = getMaterialTransmission(entityId: entity)
+```
+
+### Set Transmission
+
+```swift
+updateMaterialTransmission(entityId: entity, transmission: 1.0)
+updateMaterialColor(entityId: entity, color: Color(red: 0.6, green: 0.8, blue: 0.7)) // green glass
+```
+
+The value is clamped to `0.0 ... 1.0`. The alpha mode stays as it is: a material that lets light through is drawn after the solid surfaces, with the blended ones, whatever its mode.
+
+What takes from the transmission:
+
+- **The base color** tints what crosses the glass, each of red, green and blue by its own share. It is the tint of a pane seen through both of its faces (each face takes the square root of it, as in Blender), so model a pane with its two faces. Black glass lets nothing through and is a black mirror.
+- **Metal** lets nothing through: the metallic share of the surface reflects instead.
+- **Roughness.** Nothing is bent or blurred behind glass. Rough glass shows less of what is behind it instead, and glows with the light that comes from behind it: the environment straight through the glass, blurred, and the sun when it is on the far side. Glass is clear up to a roughness of 0.05 and shows nothing of what is behind it at 0.5, going smoothly from one to the other in between. The glow reads the environment and not the scene, so an object right behind frosted glass does not show in it.
+
+A material that lets nothing through by its values (all metal, or a roughness of 0.5 and more) is drawn as a solid surface.
+
+How glass is drawn:
+
+- Its faces turned away from the viewer first, then the ones turned towards the viewer over them, so the far side of a pane or a bottle never comes out over its near side. Each face is lit on the side the viewer sees.
+- It casts no shadow, since the light crosses it. (A blended material casts the shadow of a solid one.)
+- Like the blended materials, it writes no depth and is left out of static batches.
+
+> On a device whose GPU cannot blend with two sources, tinted glass darkens what is behind it by the brightness of its color and does not color it. This is also how the simulator draws it.
 
 ---
 
@@ -304,6 +347,8 @@ in the Inspector while watching the `pomOffsetDebug` render debug view works too
 - `getMaterialOpacity(entityId:meshIndex:submeshIndex:)` → `Float`
 - `updateMaterialOpacity(entityId:opacity:applyToAllSubmeshes:recursive:)`
 - `updateMaterialOpacity(entityId:opacity:meshIndex:submeshIndex:)`
+- `getMaterialTransmission(entityId:meshIndex:submeshIndex:)` → `Float`
+- `updateMaterialTransmission(entityId:transmission:meshIndex:submeshIndex:)`
 - `updateMaterialTexture(entityId:textureType:path:meshIndex:submeshIndex:)`
 - `removeMaterialTexture(entityId:textureType:meshIndex:submeshIndex:)`
 - `getMaterialTextureURL(entityId:type:meshIndex:submeshIndex:)` → `URL?`

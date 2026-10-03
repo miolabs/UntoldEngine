@@ -57,6 +57,13 @@ struct LightContribution {
     float3 spec = float3(0.0);
 };
 
+// The light of the environment on a surface, in the two parts a see-through surface
+// treats differently: what it scatters and what it reflects.
+struct EnvironmentLight {
+    float3 diff = float3(0.0);
+    float3 spec = float3(0.0);
+};
+
 constant uint MAX_POINT_LIGHTS = 1024;
 
 struct PointLightBlock{
@@ -89,6 +96,11 @@ float calculateAttenuation(float distance, simd_float4 attenuation, float source
 float mod(float x, float y);
 
 float selectTextureChannel(float4 sample, int channel);
+
+/// A tangent-space normal with the material's normal strength applied: mixed with the
+/// surface's own normal (0, 0, 1) by `strength`, as Blender's Normal Map node does, and
+/// brought back to unit length. 1 is the map as authored, 0 the flat surface.
+float3 applyNormalStrength(float3 tangentSpaceNormal, float strength);
 
 void transformToLogDepth(thread simd_float4 &position, float far);
 
@@ -153,6 +165,10 @@ float4 specularImportanceMap(float2 texCoords, texture2d<float> environmentTextu
 
 float4 BRDFIntegrationMap(float roughness, float NoV);
 
+float3 environmentReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap);
+
+float3 blurredEnvironment(float3 direction, float roughness, texture2d<float> specularMap, float3 rotationAxis, float rotationAngle);
+
 // adapted from "Real Shading in Unreal Engine 4", Brian Karis, Epic Games
 // https://cdn2.unrealengine.com/Resources/files/2013SiggraphPresentationsNotes-26915738.pdf
 float3 specularIBL(float3 F0 , float roughness, float3 N, float3 V, texture2d<float> specularMap, texture2d<float> brdfMap, float3 rotationAxis, float rotationAngle);
@@ -164,6 +180,17 @@ float computeCSMShadow(depth2d_array<float> shadowArray,
                        float3 worldPos,
                        float3 normal,
                        float3 lightDir);
+
+EnvironmentLight computeIBLParts(texture2d<float> irradianceTexture,
+                                 texture2d<float> specularTexture,
+                                 texture2d<float> iblBRDFTexture,
+                                 constant float &iblRotationAngle,
+                                 constant IBLParamsUniform &iblParam,
+                                 float4 inBaseColor,
+                                 float3 normalMap,
+                                 float3 viewVector,
+                                 float roughness,
+                                 float metallic);
 
 float3 computeIBLContribution(texture2d<float> irradianceTexture,
                               texture2d<float> specularTexture,

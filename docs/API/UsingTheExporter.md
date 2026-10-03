@@ -73,7 +73,7 @@ untoldengine export \
 Common options:
 
 - `--input <path>`: required source `.usd`, `.usda`, `.usdc`, `.usdz`, or `.blend`
-- `--output <path>`: required destination `.untold` (or `.untoldanim` with `--animation`)
+- `--output <path>`: required destination `.untold` (or `.untoldanim` with `--animation`). A scene with several models is written as a `.untoldpack` of the same name; that name may be given as well
 - `--file-type <tile|lod|hlod|shared|animation>`: optional, defaults to `tile`
 - `--mesh-name <name>`: optional, export only one mesh from a multi-mesh asset
 - `--convert-orientation`: optional, convert the export into engine space
@@ -176,11 +176,42 @@ Transparency becomes the engine's blended alpha mode:
 - An Alpha fed by another texture, or through colour nodes, is written into the
   alpha channel of the base color texture (a white one when the base color is a
   constant), since the engine reads alpha from the base color texture.
-- Glass is approximated, since the engine has no transmission: a Principled BSDF
-  with Transmission keeps 10 % opacity at full transmission, and Transparent BSDFs
-  mixed in by a Mix Shader lower the opacity by their share. A mix driven by
-  Geometry > Backfacing takes its front-face side. The material fidelity report
-  lists these approximations.
+- Transparent BSDFs mixed in by a Mix Shader lower the opacity by their share. A
+  mix driven by Geometry > Backfacing takes its front-face side.
+
+Glass is the material's transmission, not its alpha:
+
+- A Principled BSDF's Transmission Weight exports as the material's transmission
+  (see [Using Materials](UsingMaterials.md#transmission-glass)). The surface
+  itself stays whole, so glass keeps its reflections, and the engine tints what
+  crosses it by the base color, texel by texel.
+- The engine bends and blurs nothing behind glass. A flat pane looks as it does
+  in Blender; through a thick or curved piece of glass the view is not distorted.
+  Rough glass shows less of what is behind it the rougher it is (all of it up to
+  a roughness of 0.05, none of it from 0.5) and glows with the light that comes
+  from behind it instead, and the material fidelity report says so.
+- A surface through which next to nothing would be seen exports as a solid one:
+  less than 5 % of what is behind it, counting its transmission, the brightness
+  of its base color, its metallic share (metal lets nothing through) and its
+  roughness. Black glass is the black mirror it is in Blender, and a metal or a
+  rough, dark paint with Transmission left on (an imported car's, for example)
+  stays the solid surface it looks like. A base color, a metallic value or a
+  roughness that comes from a texture counts as clear, as no metal and as
+  polished. The report lists the surfaces kept solid.
+- A Transmission driven by a texture exports its slider value for the whole
+  surface.
+
+A height texture drives the engine's parallax occlusion mapping:
+
+- The image on a Displacement node's Height input exports as the height texture,
+  with the node's Scale as its depth, and failing that the image on the Height
+  input of a Bump node that feeds the Normal input, with its Distance.
+- The engine's depth is a share of the texture's width, not a distance, so a
+  small Scale (0.02 to 0.1) carries over well and may need tuning after import.
+- A Scale or Distance above 0.2 is not a depth parallax can show. Blender leaves
+  both at 1, a metre, and with its default "Bump Only" displacement draws the
+  shading of a bump from them. Such a height is left out of the export, and the
+  material fidelity report says so; the surface keeps its normal map.
 
 Lights and cameras follow the same rules as objects: never from collections
 excluded from the view layer, and hidden ones only with `--include-hidden`.
