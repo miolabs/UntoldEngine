@@ -2287,27 +2287,48 @@ public enum RenderPasses {
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
         renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
 
+        // What every draw of the pass shares, read once.
+        let table = RenderEntityTable.shared
+        table.refreshIfNeeded()
+        let batchingEnabled = BatchingSystem.shared.isEnabled()
+        let lodFadesEnabled = LODConfig.shared.enableFadeTransitions
+        let cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let projectionMatrix = renderInfo.perspectiveSpace
+        let pomQualityUniform = Self.currentPOMQualityUniform()
+        let ghostsInPassthrough = renderInfo.immersionStyle == .mixed
+        let colorsByLOD = SpatialDebugVisualization.shared.colorRenderablesByLOD
+        let colorsByStreamingTier = SpatialDebugVisualization.shared.colorRenderablesByStreamingTier
+        var renderModes = SceneChannelRenderModeMemo()
+
         for entityId in visibleEntityIds {
-            if scene.mask(for: entityId) == nil { continue }
-            if shouldHideSceneEntity(entityId: entityId) { continue }
-            if shouldRenderSceneEntityAsWireframe(entityId: entityId) { continue }
-            if BatchingSystem.shared.isEnabled(),
+            guard let rowIndex = table.rowIndex(for: entityId) else { continue }
+            let row = table.rows[rowIndex]
+            let renderMode = renderModes.mode(of: row)
+            if renderMode.isHidden || renderMode.isWireframe { continue }
+            if batchingEnabled,
                BatchingSystem.shared.isBatched(entityId: entityId),
                !isEntityInActiveLODFade(entityId),
                !isEntityInActiveTileRepresentationFade(entityId),
                !isEntityInMeshOccluderOrFade(entityId)
             { continue }
-            if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { continue }
-            if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
-            if hasComponent(entityId: entityId, componentType: GizmoComponent.self) { continue }
-            if hasComponent(entityId: entityId, componentType: LightComponent.self) { continue }
-            if meshSkipsColor(entityId) { continue }
+            if !row.flags.isDisjoint(with: .notGeometry) { continue }
+            if row.flags.contains(.meshOccluder), meshSkipsColor(entityId) { continue }
 
-            guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else { continue }
-            guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else { continue }
-            guard scene.get(component: LocalTransformComponent.self, for: entityId) != nil else { continue }
+            let renderComponent = row.render
+            let worldTransformComponent = row.world
+            let hasDeformation = row.flags.contains(.deformation)
+            let hasSkeleton = row.flags.contains(.skeleton)
+            var passthroughAlpha: Float = 1.0
+            if ghostsInPassthrough, case let .passthroughGhost(opacity) = renderMode {
+                passthroughAlpha = opacity
+            }
 
-            for lodDraw in opaqueLODDraws(entityId: entityId, renderComponent: renderComponent) {
+            // Two draws only while a LOD fade is running; otherwise the entity's meshes.
+            let fadeDraws = lodFadesEnabled && row.flags.contains(.lod)
+                ? opaqueLODDraws(entityId: entityId, renderComponent: renderComponent)
+                : nil
+            for drawIndex in 0 ..< (fadeDraws?.count ?? 1) {
+                let lodDraw = fadeDraws?[drawIndex] ?? LODDitherDraw(meshes: renderComponent.mesh, threshold: 1.0, mode: 0.0)
                 for mesh in lodDraw.meshes {
                     var modelUniforms = Uniforms()
                     let modelMatrix = simd_mul(worldTransformComponent.space, mesh.localSpace)
@@ -2318,12 +2339,12 @@ public enum RenderPasses {
                     modelUniforms.normalMatrix = normalMatrix
                     modelUniforms.viewMatrix = viewMatrix
                     modelUniforms.modelMatrix = modelMatrix
-                    modelUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
-                    modelUniforms.projectionMatrix = renderInfo.perspectiveSpace
+                    modelUniforms.cameraPosition = cameraPosition
+                    modelUniforms.projectionMatrix = projectionMatrix
 
                     renderEncoder.setVertexBytes(&modelUniforms, length: MemoryLayout<Uniforms>.stride, index: Int(modelPassUniformIndex.rawValue))
 
-                    renderEncoder.bindModelVertexStreams(mesh: mesh, entityId: entityId)
+                    renderEncoder.bindModelVertexStreams(mesh: mesh, entityId: entityId, hasDeformation: hasDeformation, hasSkeleton: hasSkeleton)
 
                     renderEncoder.setFragmentBytes(&modelUniforms, length: MemoryLayout<Uniforms>.stride, index: Int(modelPassFragmentUniformIndex.rawValue))
 
@@ -2333,7 +2354,7 @@ public enum RenderPasses {
 
                         var stScale: Float = material.stScale
                         renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
-                        var pomQuality = Self.currentPOMQualityUniform()
+                        var pomQuality = pomQualityUniform
                         renderEncoder.setFragmentBytes(&pomQuality, length: MemoryLayout<POMQualityUniform>.stride, index: Int(modelPassFragmentPOMQualityIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue))
                         renderEncoder.setFragmentSamplerState(material.baseColor.sampler, index: Int(modelPassBaseSamplerIndex.rawValue))
@@ -2361,16 +2382,24 @@ public enum RenderPasses {
                         materialParameters.ior = material.ior
                         materialParameters.edgeTint = material.edgeTint
                         materialParameters.alphaCutoff = material.alphaCutoff
-                        materialParameters.passthroughAlpha = passthroughGhostAlpha(for: entityId)
+                        materialParameters.passthroughAlpha = passthroughAlpha
                         materialParameters.alphaMode = Int32(material.alphaMode.rawValue)
                         materialParameters.interactWithLight = material.interactWithLight
                         materialParameters.emmissive = material.emissiveValue
                         applyMaterialTextureState(material: material, materialParameters: &materialParameters)
-                        applyLODDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
-                        applyStreamingTierDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
+                        if colorsByLOD {
+                            applyLODDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
+                        }
+                        if colorsByStreamingTier {
+                            applyStreamingTierDebugColorOverride(entityId: entityId, materialParameters: &materialParameters)
+                        }
                         applyLODDither(draw: lodDraw, materialParameters: &materialParameters)
-                        applyTileRepresentationDither(entityId: entityId, materialParameters: &materialParameters)
-                        applyMeshFadeDither(entityId: entityId, materialParameters: &materialParameters)
+                        if row.flags.contains(.tileRepresentationFade) {
+                            applyTileRepresentationDither(entityId: entityId, materialParameters: &materialParameters)
+                        }
+                        if row.flags.contains(.meshFade) {
+                            applyMeshFadeDither(entityId: entityId, materialParameters: &materialParameters)
+                        }
 
                         renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
@@ -3657,28 +3686,27 @@ public enum RenderPasses {
         // Build and sort transparent draw items back-to-front for correct alpha blending.
         var transparentEntities: [(entityId: EntityID, render: RenderComponent, world: WorldTransformComponent, distanceSq: Float)] = []
 
+        let transparencyTable = RenderEntityTable.shared
+        transparencyTable.refreshIfNeeded()
+        let transparencyBatchingEnabled = BatchingSystem.shared.isEnabled()
+        var transparencyRenderModes = SceneChannelRenderModeMemo()
+
         for entityId in visibleEntityIds {
-            if scene.mask(for: entityId) == nil { continue }
-            if shouldHideSceneEntity(entityId: entityId) { continue }
-            if shouldRenderSceneEntityAsWireframe(entityId: entityId) { continue }
+            guard let rowIndex = transparencyTable.rowIndex(for: entityId) else { continue }
+            let row = transparencyTable.rows[rowIndex]
+            let renderMode = transparencyRenderModes.mode(of: row)
+            if renderMode.isHidden || renderMode.isWireframe { continue }
 
-            if BatchingSystem.shared.isEnabled(), BatchingSystem.shared.isBatched(entityId: entityId) {
+            if transparencyBatchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) {
                 continue
             }
 
-            if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { continue }
-            if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
-            if hasComponent(entityId: entityId, componentType: GizmoComponent.self) { continue }
-            if hasComponent(entityId: entityId, componentType: LightComponent.self) { continue }
+            if !row.flags.isDisjoint(with: .notGeometry) { continue }
             // Blend submeshes go with the colour (there is no dither path here).
-            if meshSkipsColor(entityId) { continue }
+            if row.flags.contains(.meshOccluder), meshSkipsColor(entityId) { continue }
 
-            guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
-                continue
-            }
-            guard let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId) else {
-                continue
-            }
+            let renderComponent = row.render
+            let worldTransformComponent = row.world
 
             let hasTransparentSubmesh = renderComponent.mesh.contains { mesh in
                 mesh.submeshes.contains { submesh in
@@ -3867,9 +3895,11 @@ public enum RenderPasses {
             return
         }
 
+        let shellTable = RenderEntityTable.shared
+        shellTable.refreshIfNeeded()
         let shellEntityIds = visibleEntityIds.filter { entityId in
-            guard scene.mask(for: entityId) != nil,
-                  scene.get(component: MeshOccluderComponent.self, for: entityId) != nil
+            guard let rowIndex = shellTable.rowIndex(for: entityId),
+                  shellTable.rows[rowIndex].flags.contains(.meshOccluder)
             else { return false }
             if shouldHideSceneEntity(entityId: entityId) || shouldRenderSceneEntityAsWireframe(entityId: entityId) {
                 return false
@@ -3982,13 +4012,12 @@ public enum RenderPasses {
         let wireframeSettings = wireframeRenderState
         wireframeRenderStateLock.unlock()
 
-        let renderId = getComponentId(for: RenderComponent.self)
-        let transformId = getComponentId(for: WorldTransformComponent.self)
-        let localTransformId = getComponentId(for: LocalTransformComponent.self)
-        let wireframeEntityIds = queryEntitiesWithComponentIds([renderId, transformId, localTransformId], in: scene).filter { entityId in
-            if scene.mask(for: entityId) == nil { return false }
-            if shouldHideSceneEntity(entityId: entityId) { return false }
-            if !shouldRenderSceneEntityAsWireframe(entityId: entityId) { return false }
+        let occlusionTable = RenderEntityTable.shared
+        occlusionTable.refreshIfNeeded()
+        var occlusionRenderModes = SceneChannelRenderModeMemo()
+        let wireframeEntityIds = occlusionTable.rows.compactMap { row -> EntityID? in
+            occlusionRenderModes.mode(of: row).isWireframe ? row.entityId : nil
+        }.filter { entityId in
             if BatchingSystem.shared.isEnabled(), BatchingSystem.shared.isBatched(entityId: entityId) { return false }
             if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { return false }
             if scene.get(component: CameraComponent.self, for: entityId) != nil { return false }
@@ -4171,10 +4200,13 @@ public enum RenderPasses {
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
         let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
 
+        let wireframeTable = RenderEntityTable.shared
+        wireframeTable.refreshIfNeeded()
+        var wireframeRenderModes = SceneChannelRenderModeMemo()
         let wireframeEntityIds = visibleEntityIds.filter { entityId in
-            if scene.mask(for: entityId) == nil { return false }
-            if shouldHideSceneEntity(entityId: entityId) { return false }
-            if !shouldRenderSceneEntityAsWireframe(entityId: entityId) { return false }
+            guard let rowIndex = wireframeTable.rowIndex(for: entityId),
+                  wireframeRenderModes.mode(of: wireframeTable.rows[rowIndex]).isWireframe
+            else { return false }
             if BatchingSystem.shared.isEnabled(), BatchingSystem.shared.isBatched(entityId: entityId) { return false }
             if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { return false }
             if scene.get(component: CameraComponent.self, for: entityId) != nil { return false }

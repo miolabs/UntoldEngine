@@ -396,13 +396,18 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             var summary = TileRenderCostSummary()
             let loadedFullTiles = Set(GeometryStreamingSystem.shared.loadedTileEntitiesSnapshot())
 
+            let table = RenderEntityTable.shared
+            table.refreshIfNeeded()
             for entityId in visibleEntityIds {
-                guard scene.exists(entityId),
-                      let render = scene.get(component: RenderComponent.self, for: entityId)
-                else { continue }
+                guard let rowIndex = table.rowIndex(for: entityId) else { continue }
+                let row = table.rows[rowIndex]
+                // Neither a tile's LOD mesh nor, with no full tile loaded, a tile's child:
+                // nothing of this entity goes into the summary.
+                let hasTileTag = row.flags.contains(.tileLODTag)
+                if !hasTileTag, loadedFullTiles.isEmpty { continue }
 
-                let cost = tileRenderCost(for: render)
-                if let tag = scene.get(component: TileLODTagComponent.self, for: entityId) {
+                let cost = tileRenderCost(for: row.render)
+                if hasTileTag, let tag = scene.get(component: TileLODTagComponent.self, for: entityId) {
                     if tag.levelIndex == 5 {
                         summary.hlodVisibleInstances += 1
                         summary.hlodDrawsEstimate += cost.draws
