@@ -590,42 +590,31 @@ struct ShadowSystem {
     }
 
     private func collectShadowCasterBounds() -> [ShadowCasterBounds] {
-        let transformId = getComponentId(for: WorldTransformComponent.self)
-        let localTransformId = getComponentId(for: LocalTransformComponent.self)
-        let renderId = getComponentId(for: RenderComponent.self)
-        let entities = queryEntitiesWithComponentIds([transformId, localTransformId, renderId], in: scene)
+        let table = RenderEntityTable.shared
+        table.refreshIfNeeded()
         let batchingEnabled = BatchingSystem.shared.isEnabled()
+        // Fold the scene-root transform into the caster's world matrix so these bounds land in
+        // the same visual-world space as the cascade corners above -- see the comment on
+        // `invView` in updateCascades().
+        let rootMatrix = SceneRootTransform.shared.matrix
+        let rootIsIdentity = rootMatrix == matrix_identity_float4x4
+        var renderModes = SceneChannelRenderModeMemo()
 
         var bounds: [ShadowCasterBounds] = []
-        bounds.reserveCapacity(entities.count)
+        bounds.reserveCapacity(table.rows.count)
 
-        for entityId in entities {
-            guard scene.mask(for: entityId) != nil else { continue }
-            if scene.get(component: SceneCameraComponent.self, for: entityId) != nil { continue }
-            if scene.get(component: CameraComponent.self, for: entityId) != nil { continue }
-            if scene.get(component: LightComponent.self, for: entityId) != nil { continue }
-            if scene.get(component: GizmoComponent.self, for: entityId) != nil { continue }
-            if shouldHideSceneEntity(entityId: entityId) { continue }
-            if shouldRenderSceneEntityAsWireframe(entityId: entityId) { continue }
-            if batchingEnabled, scene.get(component: StaticBatchComponent.self, for: entityId) != nil { continue }
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) { continue }
+        for row in table.rows {
+            if !row.flags.isDisjoint(with: .notGeometry) { continue }
+            let renderMode = renderModes.mode(of: row)
+            if renderMode.isHidden || renderMode.isWireframe { continue }
+            if batchingEnabled, row.flags.contains(.staticBatch) { continue }
+            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: row.entityId) { continue }
+            guard row.render.isVisible else { continue }
 
-            guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId),
-                  renderComponent.isVisible,
-                  let worldTransformComponent = scene.get(component: WorldTransformComponent.self, for: entityId),
-                  let localTransformComponent = scene.get(component: LocalTransformComponent.self, for: entityId)
-            else {
-                continue
-            }
-
-            // Fold the scene-root transform into the caster's world matrix so these bounds land in
-            // the same visual-world space as the cascade corners above -- see the comment on
-            // `invView` in updateCascades().
-            let combinedMatrix = simd_mul(SceneRootTransform.shared.matrix, worldTransformComponent.space)
             let (worldMin, worldMax) = worldAABB_MinMax(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: combinedMatrix
+                localMin: row.local.boundingBox.min,
+                localMax: row.local.boundingBox.max,
+                worldMatrix: rootIsIdentity ? row.world.space : simd_mul(rootMatrix, row.world.space)
             )
             bounds.append(ShadowCasterBounds(min: worldMin, max: worldMax))
         }

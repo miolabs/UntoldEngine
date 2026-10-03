@@ -10,10 +10,21 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
+import os
 
 @inline(__always)
 private func enforceSceneMainActor() {
     // Scene mutations are synchronized through lock-backed global state.
+}
+
+/// A scene starts counting where no scene before it can have been, so that a cache built
+/// for one scene is never taken for current when another replaces it.
+private let sceneStructureGenerationSeed = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+func nextSceneStructureGenerationSeed() -> UInt64 {
+    sceneStructureGenerationSeed.withLock { seed in
+        seed &+= 1 << 40
+        return seed
+    }
 }
 
 public struct EntityDesc {
@@ -48,6 +59,7 @@ public struct Scene {
         let componentId = getComponentId(for: T.self)
         entities[Int(entityIndex)].mask.reset(componentId)
         componentIndex[componentId]?.remove(entityId)
+        structureGeneration &+= 1
     }
 
     public mutating func removeAllComponents(from entityId: EntityID) {
@@ -68,6 +80,7 @@ public struct Scene {
             componentIndex[componentId]?.remove(entityId)
         }
         entities[Int(entityIndex)].mask.resetAll()
+        structureGeneration &+= 1
     }
 
     /// Phase A: mark entity for destroy
@@ -81,6 +94,7 @@ public struct Scene {
             return
         }
         entities[Int(idx)].pendingDestroy = true
+        structureGeneration &+= 1
     }
 
     public mutating func markDestroyAll() {
@@ -120,6 +134,7 @@ public struct Scene {
         entities[entityIndexInt].pendingDestroy = false
         entities[entityIndexInt].freed = true
         freeEntities.append(idx)
+        structureGeneration &+= 1
     }
 
     public mutating func newEntity() -> EntityID {
@@ -180,6 +195,7 @@ public struct Scene {
         // Set the bit for this component to true
         entities[Int(entityIndex)].mask.set(componentId)
         componentIndex[componentId, default: []].insert(entityId)
+        structureGeneration &+= 1
 
         return typedPointer.pointee
     }
@@ -235,6 +251,11 @@ public struct Scene {
         guard e.entityId == entityId, !e.freed, !e.pendingDestroy else { return nil }
         return e.mask
     }
+
+    /// Counts every change to which components an entity has: a component assigned or
+    /// removed, an entity marked for destruction or freed. Caches of component objects
+    /// (`RenderEntityTable`) are valid while it stays the same.
+    var structureGeneration: UInt64 = nextSceneStructureGenerationSeed()
 
     // data
     var componentPool: [Int: ComponentPool] = [:]

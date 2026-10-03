@@ -29,7 +29,13 @@ import simd
 /// and tangent buffers and vertex-shader skinning is disabled.
 extension MTLRenderCommandEncoder {
     func bindModelVertexStreams(mesh: Mesh, entityId: EntityID) {
-        let deformed = deformedStreams(mesh: mesh, entityId: entityId)
+        bindModelVertexStreams(mesh: mesh, entityId: entityId, hasDeformation: true, hasSkeleton: nil)
+    }
+
+    /// `hasDeformation` false and `hasSkeleton` tell what the caller already knows about
+    /// the entity's components, so that they are not looked up for every mesh.
+    func bindModelVertexStreams(mesh: Mesh, entityId: EntityID, hasDeformation: Bool, hasSkeleton: Bool?) {
+        let deformed = hasDeformation ? deformedStreams(mesh: mesh, entityId: entityId) : nil
 
         setVertexBuffer(
             deformed?.positions ?? mesh.metalKitMesh.vertexBuffers[Int(modelPassVerticesIndex.rawValue)].buffer,
@@ -65,13 +71,18 @@ extension MTLRenderCommandEncoder {
             mesh: mesh,
             entityId: entityId,
             skinnedInCompute: deformed != nil,
+            hasSkeleton: hasSkeleton,
             hasArmatureIndex: Int(modelPassHasArmature.rawValue),
             jointTransformIndex: Int(modelPassJointTransformIndex.rawValue)
         )
     }
 
     func bindShadowVertexStreams(mesh: Mesh, entityId: EntityID) {
-        let deformed = deformedStreams(mesh: mesh, entityId: entityId)
+        bindShadowVertexStreams(mesh: mesh, entityId: entityId, hasDeformation: true, hasSkeleton: nil)
+    }
+
+    func bindShadowVertexStreams(mesh: Mesh, entityId: EntityID, hasDeformation: Bool, hasSkeleton: Bool?) {
+        let deformed = hasDeformation ? deformedStreams(mesh: mesh, entityId: entityId) : nil
 
         setVertexBuffer(
             deformed?.positions ?? mesh.metalKitMesh.vertexBuffers[Int(modelPassVerticesIndex.rawValue)].buffer,
@@ -92,6 +103,7 @@ extension MTLRenderCommandEncoder {
             mesh: mesh,
             entityId: entityId,
             skinnedInCompute: deformed != nil,
+            hasSkeleton: hasSkeleton,
             hasArmatureIndex: Int(shadowPassHasArmature.rawValue),
             jointTransformIndex: Int(shadowPassJointTransformIndex.rawValue)
         )
@@ -111,6 +123,7 @@ extension MTLRenderCommandEncoder {
         mesh: Mesh,
         entityId: EntityID,
         skinnedInCompute: Bool,
+        hasSkeleton: Bool? = nil,
         hasArmatureIndex: Int,
         jointTransformIndex: Int
     ) {
@@ -118,8 +131,8 @@ extension MTLRenderCommandEncoder {
         // exists and skinning did not already happen in compute.
         let jointTransformBuffer = mesh.skin?.jointTransformsBuffer
         var hasArmature = !skinnedInCompute
-            && getEntityComponent(entityId: entityId, componentType: SkeletonComponent.self) != nil
             && jointTransformBuffer != nil
+            && (hasSkeleton ?? (getEntityComponent(entityId: entityId, componentType: SkeletonComponent.self) != nil))
         setVertexBytes(&hasArmature, length: MemoryLayout<Bool>.stride, index: hasArmatureIndex)
 
         if hasArmature, let jointTransformBuffer {
