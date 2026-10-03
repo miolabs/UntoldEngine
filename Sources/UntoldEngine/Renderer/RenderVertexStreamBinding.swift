@@ -7,6 +7,14 @@
 //  render passes.
 //
 
+//
+//  RenderVertexStreamBinding.swift
+//  UntoldEngine
+//
+//  Shared per-mesh vertex-stream binding for the model-family and shadow-family
+//  render passes.
+//
+
 import CShaderTypes
 import Metal
 import MetalKit
