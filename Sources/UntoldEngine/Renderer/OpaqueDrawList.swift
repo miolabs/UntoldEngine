@@ -84,6 +84,7 @@ struct OpaqueDrawList {
         meshLists.reserveCapacity(expectedEntities)
         draws.reserveCapacity(expectedEntities)
         keys.reserveCapacity(expectedEntities)
+        meshNumbers.reserveCapacity(expectedEntities)
     }
 
     /// Adds an entity and returns its index for `add(meshes:...)`.
