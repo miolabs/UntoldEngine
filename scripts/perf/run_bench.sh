@@ -17,6 +17,10 @@
 #   --config Debug|Release (default: Release)
 #   --repeat N            run the whole scene set N times and aggregate (min of times, mean of rates)
 #   --xctrace TEMPLATE    also record an Instruments trace, e.g. "Metal System Trace" (device runs)
+#   --lock-diagnostics    build the engine with ENGINE_LOCK_DIAGNOSTICS: every engine lock is counted
+#                         and timed, and each scene reports lock calls, contention, wait and hold
+#                         time. Frame times of such a build are not comparable with a normal one,
+#                         so the baseline comparison is skipped.
 #   --no-compare          skip the baseline comparison
 #   --update-baseline     write this run as the new baseline for the device model
 #
@@ -40,6 +44,7 @@ LABEL="$(git -C "$REPO" describe --always --dirty 2>/dev/null || echo unknown)"
 CONFIG=Release
 DEVICE=""
 XCTRACE_TEMPLATE=""
+LOCK_DIAGNOSTICS=0
 COMPARE=1
 UPDATE_BASELINE=0
 REPEAT=1
@@ -55,6 +60,7 @@ while [ $# -gt 0 ]; do
     --device) DEVICE="$2"; shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
     --xctrace) XCTRACE_TEMPLATE="$2"; shift 2 ;;
+    --lock-diagnostics) LOCK_DIAGNOSTICS=1; COMPARE=0; shift ;;
     --no-compare) COMPARE=0; shift ;;
     --update-baseline) UPDATE_BASELINE=1; shift ;;
     *) echo "unknown option $1"; exit 2 ;;
@@ -63,6 +69,13 @@ done
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$PLATFORM"
 DERIVED="$BENCH_DIR/.build/DerivedData"
+EXTRA_BUILD_SETTINGS=()
+if [ "$LOCK_DIAGNOSTICS" -eq 1 ]; then
+  # A separate build folder, so switching modes does not rebuild the engine each time. A build
+  # setting given on the command line reaches the engine package's targets as well.
+  DERIVED="$BENCH_DIR/.build/DerivedData-lockdiag"
+  EXTRA_BUILD_SETTINGS+=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) ENGINE_LOCK_DIAGNOSTICS')
+fi
 mkdir -p "$OUT_DIR"
 
 case "$PLATFORM" in
@@ -84,6 +97,7 @@ xcodebuild build \
   -derivedDataPath "$DERIVED" \
   -allowProvisioningUpdates \
   ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+  ${EXTRA_BUILD_SETTINGS[@]+"${EXTRA_BUILD_SETTINGS[@]}"} \
   -quiet
 
 SUMMARIES=()

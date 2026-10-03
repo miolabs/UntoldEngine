@@ -71,6 +71,9 @@ public struct BenchRenderSettings: Codable, Sendable {
     /// Whether the visionOS frame pacer may start the submission phase ahead of the compositor's
     /// optimal input time. Always false off visionOS.
     public var xrFramePacing: Bool = false
+    /// Whether the engine was compiled with `ENGINE_LOCK_DIAGNOSTICS`. Such a build counts and
+    /// times every engine lock, so its frame and CPU times are not comparable with a normal one.
+    public var lockDiagnostics: Bool = false
 
     public init(platform: String) {
         self.platform = platform
@@ -128,10 +131,17 @@ public struct BenchRunSummary: Codable, Sendable {
             let miss = s.deadlineSamples > 0
                 ? String(format: " deadlineMiss %.2f%%", Double(s.missedDeadlines) / Double(s.deadlineSamples) * 100)
                 : ""
+            let lockCalls = s.lockCallsPerFrame.values.reduce(0.0, +)
+            let locks = s.lockCallsPerFrame.isEmpty
+                ? ""
+                : String(
+                    format: " | locks %.0f/frame, contended %d, wait %.2f ms",
+                    lockCalls, s.lockContended.values.reduce(0, +), s.lockWaitMs.values.reduce(0.0, +)
+                )
             lines.append(String(
-                format: "  %@: frames %d | mean %.2f p95 %.2f p99 %.2f worst %.2f ms | over budget %d | gpu %.2f ms%@ | thermal %d",
+                format: "  %@: frames %d | mean %.2f p95 %.2f p99 %.2f worst %.2f ms | over budget %d | gpu %.2f ms%@ | thermal %d%@",
                 scene.id, s.frames, s.meanFrameMs, s.p95FrameMs, s.p99FrameMs, s.worstFrameMs,
-                s.framesOverBudget, s.meanGPUExecutionMs, miss, s.worstThermalState
+                s.framesOverBudget, s.meanGPUExecutionMs, miss, s.worstThermalState, locks
             ))
         }
         return lines.joined(separator: "\n")

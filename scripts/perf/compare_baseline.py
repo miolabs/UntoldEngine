@@ -49,7 +49,7 @@ def rate(numerator, denominator):
 def config_key(render):
     return (render["platform"], render.get("layout"), render.get("foveation"), render.get("viewportWidth"),
             render.get("viewportHeight"), render.get("viewCount"), render.get("antiAliasing", "fxaa"),
-            render.get("xrFramePacing", False))
+            render.get("xrFramePacing", False), render.get("lockDiagnostics", False))
 
 
 def aggregate(scenes):

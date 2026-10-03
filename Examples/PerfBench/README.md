@@ -49,6 +49,7 @@ scripts/perf/run_bench.sh ios --device <udid>
 scripts/perf/run_bench.sh macos --scenes primitives-1k,postfx --seconds 10
 scripts/perf/run_bench.sh macos --update-baseline                # store this run as the baseline
 scripts/perf/run_bench.sh visionos --device <udid> --xctrace "Metal System Trace"
+scripts/perf/run_bench.sh macos --lock-diagnostics               # count and time every engine lock
 ```
 
 Runs land in `perf/results/<timestamp>-<platform>/` with `<scene>.jsonl`, `summary.json` and the
