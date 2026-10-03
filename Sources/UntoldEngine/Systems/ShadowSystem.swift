@@ -65,9 +65,9 @@ struct CSMUniforms {
     var cameraViewMatrix: simd_float4x4 = matrix_identity_float4x4
     var cascadeSplits: (Float, Float, Float) = (0, 0, 0)
     var cascadeCount: Int32 = .init(csmCascadeCount)
-    var _pad0: Float = 0
-    var _pad1: Float = 0
-    var _pad2: Float = 0
+    var cascadeWorldTexelSizes: (Float, Float, Float) = (1, 1, 1)
+    var cascadeDepthSpans: (Float, Float, Float) = (1, 1, 1)
+    var cascadeBlendStarts: (Float, Float, Float) = (0, 0, 0)
     var shadowSoftnessNear: Float = 1.0
     var shadowSoftnessFar: Float = 2.25
     var shadowSoftnessDepthScale: Float = 1.0
@@ -257,6 +257,20 @@ struct ShadowSystem {
     // Per-frame cascade outputs
     var cascadeLightSpaceMatrices: [simd_float4x4] = Array(repeating: matrix_identity_float4x4, count: csmCascadeCount)
     var cascadeSplitDistances: [Float] = Array(repeating: 0, count: csmCascadeCount)
+    var cascadeWorldTexelSizes: [Float] = Array(repeating: 1, count: csmCascadeCount)
+    var cascadeDepthSpans: [Float] = Array(repeating: 1, count: csmCascadeCount)
+    /// World-space centroid and bounding-sphere radius of each cascade's camera-frustum
+    /// slice. Used by the renderer to reject shadow casters that are farther than the
+    /// engine's own shadow-distance horizon from anything this cascade could possibly
+    /// receive — a cull that stays correct for any light direction, unlike a camera-depth
+    /// cutoff (see RenderPasses.shadowCasterEntityIds).
+    var cascadeWorldCenters: [simd_float3] = Array(repeating: .zero, count: csmCascadeCount)
+    var cascadeWorldRadii: [Float] = Array(repeating: 0, count: csmCascadeCount)
+    /// Camera-depth distance at which each cascade begins cross-fading into the next.
+    /// Computed once per frame by `cascadeBlendStart` and uploaded to the shader — see
+    /// that function's doc comment for why this is the single source of truth for the
+    /// blend boundary shared by the CPU frustum widening and the GPU cross-fade.
+    var cascadeBlendStarts: [Float] = Array(repeating: 0, count: csmCascadeCount)
     var softnessSettings: ShadowSoftnessSettings = .init()
     var isActive: Bool = false
 
@@ -265,22 +279,64 @@ struct ShadowSystem {
         isActive ? cascadeLightSpaceMatrices[0] : nil
     }
 
+    /// Camera-depth distance at which cascade `cascadeIdx` begins cross-fading its
+    /// visibility into the next cascade. This is the single source of truth for the
+    /// blend boundary: it is computed once per frame here on the CPU, used directly to
+    /// widen the *next* cascade's frustum-fitting near plane (`cascadeNearDistance`
+    /// below), and uploaded via `makeUniforms()` so the shader reads the same value
+    /// instead of re-deriving it from `cascadeSplits` — eliminating the CPU/GPU-duplicated
+    /// formula that previously had to be kept in sync by hand.
+    /// Internal — exposed for testing via @testable import.
+    static func cascadeBlendStart(
+        cascadeIdx: Int,
+        splits: [Float],
+        blendFraction: Float
+    ) -> Float {
+        guard cascadeIdx >= 0, cascadeIdx < splits.count else { return 0 }
+        // Match the shader's first interval, which begins at camera depth zero.
+        let intervalNear: Float = cascadeIdx > 0 ? splits[cascadeIdx - 1] : 0
+        let intervalLength = max(splits[cascadeIdx] - intervalNear, 0.001)
+        let blendWidth = intervalLength * simd_clamp(blendFraction, 0.0, 0.5)
+        return splits[cascadeIdx] - blendWidth
+    }
+
+    /// Near-plane distance for cascade `cascadeIdx`'s frustum-fitting sub-frustum.
+    /// Cascades after the first begin at the preceding cascade's blend-start distance,
+    /// so both cascades' fitted frustums cover the receiver positions the shader
+    /// cross-fades over.
+    /// Internal — exposed for testing via @testable import.
+    static func cascadeNearDistance(
+        cascadeIdx: Int,
+        splits: [Float],
+        cameraNear: Float,
+        blendFraction: Float
+    ) -> Float {
+        guard cascadeIdx > 0 else { return cameraNear }
+        return max(cameraNear, cascadeBlendStart(cascadeIdx: cascadeIdx - 1, splits: splits, blendFraction: blendFraction))
+    }
+
+    /// Fills the 3 fixed GPU slots from a per-cascade array, padding unused slots
+    /// (beyond csmCascadeCount) with `fallback` so the shader's cascadeCount field
+    /// controls which slots are actually read.
+    private static func pack3<T>(_ values: [T], fallback: T) -> (T, T, T) {
+        (
+            values[0],
+            csmCascadeCount > 1 ? values[1] : fallback,
+            csmCascadeCount > 2 ? values[2] : fallback
+        )
+    }
+
     /// Pack into the GPU-ready uniform struct.
     /// CSMUniforms always carries 3 slots (GPU layout is fixed); unused slots are
     /// left as identity/zero so the shader's cascadeCount field controls which are read.
     func makeUniforms() -> CSMUniforms {
         var u = CSMUniforms()
-        u.lightSpaceMatrices = (
-            cascadeLightSpaceMatrices[0],
-            csmCascadeCount > 1 ? cascadeLightSpaceMatrices[1] : matrix_identity_float4x4,
-            csmCascadeCount > 2 ? cascadeLightSpaceMatrices[2] : matrix_identity_float4x4
-        )
-        u.cascadeSplits = (
-            cascadeSplitDistances[0],
-            csmCascadeCount > 1 ? cascadeSplitDistances[1] : 0,
-            csmCascadeCount > 2 ? cascadeSplitDistances[2] : 0
-        )
+        u.lightSpaceMatrices = Self.pack3(cascadeLightSpaceMatrices, fallback: matrix_identity_float4x4)
+        u.cascadeSplits = Self.pack3(cascadeSplitDistances, fallback: 0)
         u.cascadeCount = Int32(csmCascadeCount)
+        u.cascadeWorldTexelSizes = Self.pack3(cascadeWorldTexelSizes, fallback: cascadeWorldTexelSizes[0])
+        u.cascadeDepthSpans = Self.pack3(cascadeDepthSpans, fallback: cascadeDepthSpans[0])
+        u.cascadeBlendStarts = Self.pack3(cascadeBlendStarts, fallback: cascadeBlendStarts[0])
         let softness = Self.sanitizedSoftnessSettings(softnessSettings)
         let xrScale = renderInfo.isXRStereoMode ? softness.xrRadiusScale : 1.0
         u.shadowSoftnessNear = softness.nearRadiusTexels * xrScale
@@ -328,15 +384,29 @@ struct ShadowSystem {
         }
         guard directionalLight.castsShadow else { return }
 
-        let lightForward = getLightEmissionDirection(entityId: lightEntity)
+        // Rotate into visual-world space to match the root-rotation-aware corners/caster bounds
+        // below -- the light entity's own transform is scene-local, same as every other entity.
+        // Uses getMatrix4x4FromQuaternion (not simd_quatf.act) because SceneRootTransform's default
+        // `rotation` is the zero quaternion, not simd's true identity (0,0,0,1) -- this codebase's
+        // own quaternion-to-matrix formula reduces to the identity matrix for that zero value, but
+        // simd's built-in `act(_:)` expects a unit quaternion and returns NaN for it.
+        let rootRotation = matrix3x3_upper_left(getMatrix4x4FromQuaternion(q: SceneRootTransform.shared.rotation))
+        let lightForward = rootRotation * getLightEmissionDirection(entityId: lightEntity)
 
         // Get camera
         guard let camEntity = CameraSystem.shared.activeCamera,
               let cameraComponent = scene.get(component: CameraComponent.self, for: camEntity)
         else { return }
 
-        let effectiveView = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let invView = effectiveView.inverse
+        // Corners are derived from the raw (root-uncorrected) camera view so they land in
+        // real/visual-world space. `cascadeLightSpaceMatrices` is consumed everywhere through
+        // `SceneRootTransform.shared.effectiveLightMatrix(...)`, which right-multiplies by the
+        // scene-root matrix to map scene-local model/G-buffer positions into this same visual-world
+        // space before projecting into light space. Using the root-corrected view here instead would
+        // put these corners in scene-local space, and every consumer would apply the root transform
+        // a second time -- harmless when the root is at unit scale, but collapsing shadows to
+        // sub-texel size under a shrunk root scale (e.g. AR tabletop placement).
+        let invView = cameraComponent.viewSpace.inverse
 
         // Extract tangent-of-half-FOV from the current perspective projection matrix.
         // proj[0][0] = f/aspect  → tanHalfFovX = 1/proj[0][0]
@@ -357,6 +427,11 @@ struct ShadowSystem {
         // Practical split scheme (blend of log and uniform, λ=0.5).
         let splits = computeCascadeSplits(cameraNear: near, cameraFar: cameraFar)
         cascadeSplitDistances = splits
+        for i in 0 ..< csmCascadeCount {
+            cascadeBlendStarts[i] = Self.cascadeBlendStart(
+                cascadeIdx: i, splits: splits, blendFraction: csmCascadeBlendFraction
+            )
+        }
 
         // Light view: look along lightForward using a stable up vector.
         let lightUp: simd_float3 = abs(lightForward.y) < 0.99
@@ -367,16 +442,23 @@ struct ShadowSystem {
             lightSpaceBounds(for: $0, lightView: lightView)
         }
 
-        var prevNear: Float = near
         for i in 0 ..< csmCascadeCount {
             let cascadeFar = splits[i]
+            let cascadeNear = Self.cascadeNearDistance(
+                cascadeIdx: i,
+                splits: splits,
+                cameraNear: near,
+                blendFraction: csmCascadeBlendFraction
+            )
 
             // 8 corners of the cascade sub-frustum in world space.
+            // Farther cascades begin inside the preceding cascade so both maps
+            // cover the receiver positions used by the transition blend.
             let corners = cascadeFrustumCornersWorldSpace(
                 invViewMatrix: invView,
                 tanHalfFovX: tanHalfFovX,
                 tanHalfFovY: tanHalfFovY,
-                nearDist: prevNear,
+                nearDist: cascadeNear,
                 farDist: cascadeFar,
                 xrIPDExpansion: xrExpansion
             )
@@ -399,6 +481,9 @@ struct ShadowSystem {
 
             let diameter = max(ceil(radius * 2.0), 0.001)
             let texelSize = diameter / Float(shadowResolution.x)
+            cascadeWorldTexelSizes[i] = texelSize
+            cascadeWorldCenters[i] = center
+            cascadeWorldRadii[i] = radius
 
             var centerLS = lightView * simd_float4(center, 1.0)
             centerLS.x = floor(centerLS.x / texelSize) * texelSize
@@ -446,11 +531,10 @@ struct ShadowSystem {
             // the largest (least-negative) Z, which becomes nearZ; farthest becomes farZ.
             let orthoNearZ = -maxZ
             let orthoFarZ = -minZ
+            cascadeDepthSpans[i] = max(orthoFarZ - orthoNearZ, 0.001)
 
             let ortho = matrix_ortho_right_hand(minX, maxX, minY, maxY, orthoNearZ, farZ: orthoFarZ)
             cascadeLightSpaceMatrices[i] = simd_mul(ortho, lightView)
-
-            prevNear = cascadeFar
         }
 
         isActive = true
@@ -498,6 +582,13 @@ struct ShadowSystem {
         return corners
     }
 
+    /// Internal — exposed for testing via @testable import. Lets tests check caster bounds
+    /// directly, since their effect on cascade output (e.g. cascadeDepthSpans) can otherwise be
+    /// masked by other, already-correct mechanisms like camera-frustum culling.
+    func collectShadowCasterBoundsForTesting() -> [(min: simd_float3, max: simd_float3)] {
+        collectShadowCasterBounds().map { (min: $0.min, max: $0.max) }
+    }
+
     private func collectShadowCasterBounds() -> [ShadowCasterBounds] {
         let transformId = getComponentId(for: WorldTransformComponent.self)
         let localTransformId = getComponentId(for: LocalTransformComponent.self)
@@ -527,17 +618,26 @@ struct ShadowSystem {
                 continue
             }
 
+            // Fold the scene-root transform into the caster's world matrix so these bounds land in
+            // the same visual-world space as the cascade corners above -- see the comment on
+            // `invView` in updateCascades().
+            let combinedMatrix = simd_mul(SceneRootTransform.shared.matrix, worldTransformComponent.space)
             let (worldMin, worldMax) = worldAABB_MinMax(
                 localMin: localTransformComponent.boundingBox.min,
                 localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space
+                worldMatrix: combinedMatrix
             )
             bounds.append(ShadowCasterBounds(min: worldMin, max: worldMax))
         }
 
         if batchingEnabled {
             for group in BatchingSystem.shared.batchGroups where shouldRenderSceneChannelsOpaque(group.sceneChannels) {
-                bounds.append(ShadowCasterBounds(min: group.boundingBox.min, max: group.boundingBox.max))
+                let (worldMin, worldMax) = worldAABB_MinMax(
+                    localMin: group.boundingBox.min,
+                    localMax: group.boundingBox.max,
+                    worldMatrix: SceneRootTransform.shared.matrix
+                )
+                bounds.append(ShadowCasterBounds(min: worldMin, max: worldMax))
             }
         }
 
@@ -594,4 +694,9 @@ public func setShadowSoftness(_ settings: ShadowSoftnessSettings) {
 
 public func getShadowSoftness() -> ShadowSoftnessSettings {
     shadowSystem.softnessSettings
+}
+
+/// Current value set via `setRendering(.maxShadowCastingDistance(_:))`.
+public func getMaxShadowCastingDistance() -> Float {
+    RenderPasses.maxShadowCastingDistance
 }

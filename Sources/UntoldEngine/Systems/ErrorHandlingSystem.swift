@@ -97,6 +97,7 @@ public enum ErrorHandlingSystem: Int, Error, CustomStringConvertible {
     case manifestNotFound = 1085
     case manifestDecodeFailed = 1086
     case assetIsAnimationOnly = 1087
+    case physicsPoseJointCountMismatch = 1088
 
     public var description: String {
         switch self {
@@ -272,6 +273,8 @@ public enum ErrorHandlingSystem: Int, Error, CustomStringConvertible {
             return "Failed to decode scene manifest — check JSON format"
         case .assetIsAnimationOnly:
             return "This is a .untoldanim animation clip, not a mesh — use setEntityAnimations instead of setEntityMeshAsync"
+        case .physicsPoseJointCountMismatch:
+            return "Physics pose joint count does not match the skeleton"
         }
     }
 }
@@ -296,6 +299,23 @@ public func handleError(_ error: ErrorHandlingSystem, _ argument: String, _ name
 public func handleError(_ error: ErrorHandlingSystem, _ argument: String, _ entityId: EntityID) {
     let name = getEntityName(entityId: entityId)
     handleError(error, argument, name)
+}
+
+/// Describes a thrown error for a diagnostic message.
+///
+/// Errors thrown by Foundation or Metal are `NSError`s whose `localizedDescription`
+/// carries the useful text (for example Metal's "This library is using a deployment
+/// target ... that is not supported"), and a `LocalizedError` provides its own. A
+/// plain Swift error has neither; its `localizedDescription` is only "The operation
+/// couldn't be completed", so its Swift description is used instead.
+func failureReason(for error: any Error) -> String {
+    if let localized = error as? LocalizedError, let description = localized.errorDescription {
+        return description
+    }
+    if type(of: error) is NSError.Type {
+        return error.localizedDescription
+    }
+    return String(describing: error)
 }
 
 /// warnings

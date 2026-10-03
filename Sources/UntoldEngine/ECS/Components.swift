@@ -113,6 +113,20 @@ public class GaussianComponent: Component {
     var gaussianVisibleCount: [MTLBuffer?] = Array(repeating: nil, count: maxInFlightCommandBuffers)
     var visibleSplatCountForRendering: UInt = 0
     var splatCount: UInt = 0
+    /// A chunked entity's most recent stale readback (two or three frames old, like
+    /// `visibleSplatCountForRendering`) of which chunk indices passed `gaussianChunkCull`'s
+    /// frustum/HZB test this frame. Debug-view only: populated only while
+    /// `SpatialDebugVisualization.shared.showGaussianChunkBounds` is on, and read by
+    /// `SpatialDebugBoundsCollector` to color each chunk's drawn wireframe box green (in this
+    /// set) or red (not).
+    var visibleChunkIndicesForRendering: Set<UInt32> = []
+    /// A chunked entity with coarse levels' most recent stale readback of every chunk's drawn
+    /// level (0 fine, 1, 2 — `GaussianChunkLevelState.level`), indexed by chunk index, one entry
+    /// per chunk in the whole entity (not just the currently-visible subset). Debug-view only:
+    /// populated only while `SpatialDebugVisualization.shared.showGaussianChunkBounds` is on and
+    /// its `gaussianChunkColorMode` is `.level`. Empty for an entity with no coarse levels at all
+    /// (`chunkTable.coarse == nil`) — every chunk is trivially fine then.
+    var chunkLevelsForRendering: [UInt8] = []
     /// The `.untoldgs` chunk table (decode constants on the GPU, index on the CPU), kept from
     /// the load so the frame can cull whole chunks before it looks at their splats. nil for a
     /// `.ply` or a CPU-decoded asset, which keep the per-splat cull over the whole buffer.
@@ -332,6 +346,213 @@ public class SkeletonComponent: Component {
     }
 }
 
+/// How a `DeformationComponent` entity's skin vertices are deformed each frame.
+/// - `lbs`: linear blend skinning (compute-pass port of the legacy path).
+/// - `dqs`: dual-quaternion skinning — fixes candy-wrapper collapse and
+///   volume loss at twisting joints.
+/// - `ddm`: Direct Delta Mush — smoothed rigid fit per vertex; needs a
+///   one-time per-mesh bake that runs in the background, falling back to
+///   `lbs` until ready.
+public enum SkinningMode: String, CaseIterable, Sendable {
+    case lbs
+    case dqs
+    case ddm
+}
+
+/// GPU-written deformed vertex streams for one mesh, produced by the
+/// deformation compute pass and consumed by the render passes in place of the
+/// base position/normal/tangent streams.
+final class MeshDeformationBuffers {
+    let positions: MTLBuffer
+    let normals: MTLBuffer
+    let tangents: MTLBuffer
+    let vertexCount: Int
+
+    init?(device: MTLDevice, vertexCount: Int, label: String) {
+        let length = vertexCount * MemoryLayout<simd_float4>.stride
+        guard vertexCount > 0,
+              let positions = device.makeBuffer(length: length, options: .storageModePrivate),
+              let normals = device.makeBuffer(length: length, options: .storageModePrivate),
+              let tangents = device.makeBuffer(length: length, options: .storageModePrivate)
+        else {
+            return nil
+        }
+        positions.label = "\(label) deformed positions"
+        normals.label = "\(label) deformed normals"
+        tangents.label = "\(label) deformed tangents"
+        self.positions = positions
+        self.normals = normals
+        self.tangents = tangents
+        self.vertexCount = vertexCount
+    }
+}
+
+/// Externally supplied deformed positions and normals for some vertices of
+/// a mesh (see `setEntityDeformationOverride`), triple-buffered so the CPU
+/// writes never race the frame the GPU is reading. Safe from any thread:
+/// `write` and `current` take the override's own lock.
+final class MeshDeformationOverride {
+    static let ringCount = 3
+    let capacity: Int
+    let indices: [MTLBuffer]
+    let positions: [MTLBuffer]
+    let normals: [MTLBuffer]
+    private var count = 0
+    private var slot = 0
+    private let lock = NSLock()
+
+    init?(device: MTLDevice, capacity: Int, label: String) {
+        guard capacity > 0 else { return nil }
+        var indices: [MTLBuffer] = []
+        var positions: [MTLBuffer] = []
+        var normals: [MTLBuffer] = []
+        for ring in 0 ..< Self.ringCount {
+            guard let i = device.makeBuffer(length: capacity * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+                  let p = device.makeBuffer(length: capacity * MemoryLayout<simd_float4>.stride, options: .storageModeShared),
+                  let n = device.makeBuffer(length: capacity * MemoryLayout<simd_float4>.stride, options: .storageModeShared)
+            else { return nil }
+            i.label = "\(label) override indices \(ring)"
+            p.label = "\(label) override positions \(ring)"
+            n.label = "\(label) override normals \(ring)"
+            indices.append(i)
+            positions.append(p)
+            normals.append(n)
+        }
+        self.capacity = capacity
+        self.indices = indices
+        self.positions = positions
+        self.normals = normals
+    }
+
+    /// The slot written last and how many entries it holds.
+    func current() -> (slot: Int, count: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (slot, count)
+    }
+
+    /// Writes the next slot; entries beyond the capacity are dropped.
+    func write(indices newIndices: [UInt32], positions newPositions: [simd_float3], normals newNormals: [simd_float3]) {
+        lock.lock()
+        defer { lock.unlock() }
+        let count = min(newIndices.count, newPositions.count, newNormals.count, capacity)
+        let next = (slot + 1) % Self.ringCount
+        let indexPointer = indices[next].contents().bindMemory(to: UInt32.self, capacity: capacity)
+        let positionPointer = positions[next].contents().bindMemory(to: simd_float4.self, capacity: capacity)
+        let normalPointer = normals[next].contents().bindMemory(to: simd_float4.self, capacity: capacity)
+        for i in 0 ..< count {
+            indexPointer[i] = newIndices[i]
+            positionPointer[i] = simd_float4(newPositions[i], 1)
+            normalPointer[i] = simd_float4(newNormals[i], 0)
+        }
+        slot = next
+        self.count = count
+    }
+}
+
+/// Opts an entity's skinned meshes into the deformation compute pass.
+/// Entities without this component keep the legacy vertex-shader skinning path.
+public class DeformationComponent: Component {
+    public var skinningMode: SkinningMode = .lbs
+
+    /// Active morph-target weights by target name (see
+    /// `setEntityMorphTargetWeight`); zero-weight targets are removed.
+    var morphWeights: [String: Float] = [:]
+
+    /// Pose-space deformation: when enabled, morph targets authored with a
+    /// driver get their weight from the current pose each frame (see
+    /// `PoseDriverEvaluation`), overriding any manual weight for that target.
+    public var poseDriversEnabled: Bool = true
+    var drivenMorphWeights: [String: Float] = [:]
+
+    /// Deformed streams per mesh, keyed by the mesh's MTKMesh identity and
+    /// filled lazily by the deformation pass. Nil entries (pass not run yet,
+    /// e.g. a graph without the deformation node) leave draws on the legacy
+    /// vertex-shader path.
+    var meshDeformations: [ObjectIdentifier: MeshDeformationBuffers] = [:]
+    /// Per mesh (keyed like `meshDeformations`): vertices whose deformed
+    /// position and normal come from outside the pass.
+    var meshOverrides: [ObjectIdentifier: MeshDeformationOverride] = [:]
+    let meshOverrideLock = NSLock()
+
+    /// Volumetric muscle simulation (XPBD tet cages wrapped onto the skin);
+    /// needs a muscle rig on the skeleton. See `setEntityMuscleSimulation`.
+    public var musclesEnabled: Bool = false
+    /// Manual per-muscle activations for muscles without a driver.
+    var muscleActivations: [String: Float] = [:]
+    /// When set, every muscle uses this activation.
+    var muscleActivationOverride: Float?
+    /// Muscles that keep simulating but no longer move the skin.
+    var disabledMuscles: Set<String> = []
+    /// Model-space gravity on free muscle particles.
+    var muscleGravity = simd_float3(0, -2.0, 0)
+    var muscleSim: MuscleSimState?
+    var muscleResetRequested = false
+    var muscleBakeFailed = false
+
+    /// ML deformer: a trained network predicting the muscle skin deltas from
+    /// the pose (see `setEntityMLDeformer`).
+    public var mlDeformerEnabled: Bool = false
+    var mlDeformerWeight: Float = 1
+    var mlDeformerURL: URL?
+    /// The deformation pass reads the load state and the background load
+    /// writes it: both go through the accessors below, under one lock.
+    private var mlDeformerState: MLDeformerLoadState?
+    /// Counts the resets: a load that finishes after one is dropped.
+    private var mlDeformerLoadID = 0
+    private let mlDeformerLock = NSLock()
+
+    public required init() {}
+
+    var mlDeformerLoadState: MLDeformerLoadState? {
+        mlDeformerLock.lock()
+        defer { mlDeformerLock.unlock() }
+        return mlDeformerState
+    }
+
+    /// Marks the load as started when none has been: the token to finish
+    /// it with, or nil when a load is running, done or failed already.
+    func beginMLDeformerLoad() -> Int? {
+        mlDeformerLock.lock()
+        defer { mlDeformerLock.unlock() }
+        guard mlDeformerState == nil else { return nil }
+        mlDeformerState = .loading
+        return mlDeformerLoadID
+    }
+
+    /// Ends the load begun with `token`; false (and nothing kept) when the
+    /// state was reset meanwhile.
+    @discardableResult
+    func finishMLDeformerLoad(_ token: Int, as state: MLDeformerLoadState) -> Bool {
+        mlDeformerLock.lock()
+        defer { mlDeformerLock.unlock() }
+        guard token == mlDeformerLoadID else { return false }
+        mlDeformerState = state
+        return true
+    }
+
+    /// Forgets the model and any load under way (another payload, or the
+    /// component going away).
+    func resetMLDeformerLoad() {
+        mlDeformerLock.lock()
+        mlDeformerState = nil
+        mlDeformerLoadID += 1
+        mlDeformerLock.unlock()
+    }
+
+    func cleanUp() {
+        meshDeformations.removeAll()
+        morphWeights.removeAll()
+        drivenMorphWeights.removeAll()
+        muscleActivations.removeAll()
+        muscleActivationOverride = nil
+        disabledMuscles.removeAll()
+        muscleSim = nil
+        muscleBakeFailed = false
+        resetMLDeformerLoad()
+    }
+}
+
 /// Per-entity animation control policy.
 ///
 /// Layered animation control (see upstream discussion #801): the global
@@ -351,7 +572,29 @@ public enum AnimationPolicy: String, CaseIterable, Sendable {
 }
 
 public class AnimationComponent: Component {
-    var animationClips: [String: AnimationClip] = [:]
+    /// didSet prunes compiledClips whenever a clip is replaced or removed:
+    /// registerRuntimeAnimationClips overwrites entries in this dictionary
+    /// directly (not through removeAnimationClip), and CompiledAnimationClip
+    /// holds no reference back to its source AnimationClip. Without pruning,
+    /// a replaced clip's stale ObjectIdentifier key would linger in
+    /// compiledClips and could later be reassigned to an unrelated clip if
+    /// Swift reuses the freed address, silently serving the wrong pose data.
+    var animationClips: [String: AnimationClip] = [:] {
+        didSet {
+            let live = Set(animationClips.values.map(ObjectIdentifier.init))
+            compiledClips = compiledClips.filter { live.contains($0.key) }
+            hiddenClipAliases = hiddenClipAliases.filter { animationClips[$0] != nil }
+        }
+    }
+
+    /// Keys in `animationClips` that are internal aliases rather than
+    /// logical/display clip names. registerRuntimeAnimationClips adds an
+    /// alias when an asset's embedded clip name differs from the caller's
+    /// preferred name, so both names keep working as lookup keys (e.g. for
+    /// changeAnimation) while getAllAnimationClips() reports only the
+    /// preferred name — otherwise one logical animation shows up twice.
+    var hiddenClipAliases: Set<String> = []
+
     var currentAnimation: AnimationClip?
     public var animationsFilenames: [URL] = []
     var pause: Bool = false
@@ -361,8 +604,12 @@ public class AnimationComponent: Component {
 
     // Compiled sampling state (see docs/Architecture/animationPoseLayer.md):
     // clips resolved against this entity's skeleton, plus the per-entity
-    // sampler cursors and local pose the frame update writes into.
-    var compiledClips: [String: CompiledAnimationClip] = [:]
+    // sampler cursors and local pose the frame update writes into. Keyed by
+    // clip identity rather than AnimationClip.name: that name comes from the
+    // asset file (e.g. the source Blender action) and independently exported
+    // clips commonly share it, which previously made two distinct clips
+    // collide on one cache slot and serve each other's compiled pose data.
+    var compiledClips: [ObjectIdentifier: CompiledAnimationClip] = [:]
     var sampler = ClipSampler()
     var localPose = PoseBuffer()
 
@@ -379,12 +626,16 @@ public class AnimationComponent: Component {
     var footIK = FootIKState()
     var motionMatching = MotionMatchingState()
     var poseLayer = PoseLayerState()
+    /// Pose driven from outside the clip pipeline (see `setEntityExternalPose`).
+    var externalPose = ExternalPoseState()
     var reachIK = ReachIKState()
+    var physicsPose = PhysicsPoseState()
 
     public required init() {}
 
     func cleanUp() {
         animationClips.removeAll()
+        hiddenClipAliases.removeAll()
         currentAnimation?.cleanUp()
         currentAnimation = nil
         compiledClips.removeAll()
@@ -399,26 +650,40 @@ public class AnimationComponent: Component {
         footIK = FootIKState()
         motionMatching = MotionMatchingState()
         poseLayer = PoseLayerState()
+        externalPose = ExternalPoseState()
         reachIK = ReachIKState()
+        physicsPose = PhysicsPoseState()
     }
 
+    /// One display name per logical animation: hidden aliases (see
+    /// `hiddenClipAliases`) are excluded so an asset whose embedded clip
+    /// name differs from its preferred name is listed once, not twice.
     func getAllAnimationClips() -> [String] {
-        Array(animationClips.keys)
+        Array(animationClips.keys.filter { hiddenClipAliases.contains($0) == false })
     }
 
+    /// Removes the logical clip named `animationClip` along with every
+    /// other key (aliases) referencing the same `AnimationClip` instance,
+    /// so removing either the preferred name or the embedded-name alias
+    /// removes the whole animation rather than leaving the other name
+    /// dangling.
     func removeAnimationClip(animationClip: String) {
-        animationClips.removeValue(forKey: animationClip)
-        compiledClips.removeValue(forKey: animationClip)
+        guard let clip = animationClips[animationClip] else { return }
+        let keysToRemove = animationClips.compactMap { key, value in value === clip ? key : nil }
+        for key in keysToRemove {
+            animationClips.removeValue(forKey: key)
+        }
     }
 
     /// Returns the compiled form of `clip` resolved against `skeleton`,
     /// compiling and caching it on first use.
     func compiledClip(for clip: AnimationClip, skeleton: Skeleton) -> CompiledAnimationClip {
-        if let cached = compiledClips[clip.name], cached.jointCount == skeleton.jointPaths.count {
+        let key = ObjectIdentifier(clip)
+        if let cached = compiledClips[key], cached.jointCount == skeleton.jointPaths.count {
             return cached
         }
         let compiled = CompiledAnimationClip(clip: clip, skeleton: skeleton)
-        compiledClips[clip.name] = compiled
+        compiledClips[key] = compiled
         return compiled
     }
 }
