@@ -26,8 +26,12 @@ struct SmallObjectCulling {
     /// everything. Set with `setRendering(.smallObjectCulling(pixels:))`.
     // Try-out only: UNTOLD_SMALL_OBJECT_PIXELS in the environment sets the size without
     // an editor setting. Not part of the change that goes upstream.
-    nonisolated(unsafe) static var minimumPixels: Float = ProcessInfo.processInfo.environment["UNTOLD_SMALL_OBJECT_PIXELS"]
-        .flatMap(Float.init).map { $0.isFinite ? max($0, 0) : 1.0 } ?? 1.0
+    nonisolated(unsafe) static var minimumPixels: Float = {
+        let pixels = ProcessInfo.processInfo.environment["UNTOLD_SMALL_OBJECT_PIXELS"]
+            .flatMap(Float.init).map { $0.isFinite ? max($0, 0) : 1.0 } ?? 1.0
+        print("[Try-out] Small-object culling: objects under \(pixels) pixel(s) tall are not drawn (UNTOLD_SMALL_OBJECT_PIXELS)")
+        return pixels
+    }()
 
     /// The camera, in the space the entities' world transforms are in.
     let cameraPosition: simd_float3
