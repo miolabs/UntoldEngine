@@ -33,7 +33,9 @@ let maxAreaLights: Int = 100
 private final class CoreRuntimeGlobals: @unchecked Sendable {
     static let shared = CoreRuntimeGlobals()
 
-    let lock = NSRecursiveLock()
+    /// Recursive on purpose: a `_modify` accessor holds it across the caller's mutation, which
+    /// reads other globals of this store.
+    let lock = EngineRecursiveLock("Globals.core")
     var scene = Scene()
     var shadowSystem: ShadowSystem!
     var pointShadowState: PointShadowState!
@@ -1062,7 +1064,7 @@ var environmentMesh: MTKMesh! {
 private final class RuntimeGlobalsStore: @unchecked Sendable {
     static let shared = RuntimeGlobalsStore()
 
-    private let lock = NSRecursiveLock()
+    private let lock = EngineRecursiveLock("Globals.runtime")
     private var componentCounterValue: Int = 0
     private var globalEntityCounterValue: UInt32 = 0
     private var timeSinceLastUpdatePreviousTimeValue: TimeInterval?

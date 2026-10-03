@@ -17,6 +17,10 @@ import XCTest
 /// Counts every `NSLock` / `NSRecursiveLock` acquisition made while a frame runs and
 /// attributes it to the engine function that took the lock.
 ///
+/// Locks already moved to the engine's own lock types (`EngineLock`, `EngineProtected`,
+/// `EngineRecursiveLock`) are invisible to this hook; build with `-Xswiftc -DENGINE_LOCK_DIAGNOSTICS`
+/// and the test also prints their counts and timings from `EngineLockDiagnostics`.
+///
 /// Opt-in: runs only with `UNTOLD_LOCK_CENSUS=1`. Pipe the output through
 /// `xcrun swift-demangle` to read the function names.
 ///
@@ -153,6 +157,36 @@ final class LockCensusTests: BaseRenderSetup {
             renderer.draw(in: renderer.metalView)
         }
         let plainMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 / Double(frames)
+
+        // The engine's own lock types are not NSLocks, so the hook below does not see them. A
+        // build with ENGINE_LOCK_DIAGNOSTICS counts them itself; UNTOLD_LOCK_SITES=1 adds the
+        // source location of every call.
+        if EngineLockDiagnostics.isCompiledIn {
+            EngineLockDiagnostics.reset()
+            for _ in 0 ..< frames {
+                renderer.draw(in: renderer.metalView)
+            }
+            print("=== ENGINE LOCKS: renderer.draw, \(entityCount) cubes + test scene")
+            print(EngineLockDiagnostics.report(per: frames, unit: "frame", top: 40))
+
+            EngineLockDiagnostics.reset()
+            for (i, entity) in entities.enumerated() {
+                translateTo(entityId: entity, position: simd_float3(Float(i % side) * 0.4, Float(i / side) * 0.4, -20.5))
+            }
+            print("=== ENGINE LOCKS: translateTo(entityId:position:)")
+            print(EngineLockDiagnostics.report(per: entities.count, unit: "call", top: 12))
+
+            EngineLockDiagnostics.reset()
+            var checksum: Float = 0
+            for entity in entities {
+                if let transform = scene.get(component: LocalTransformComponent.self, for: entity) {
+                    checksum += transform.position.x
+                }
+            }
+            XCTAssertFalse(checksum.isNaN)
+            print("=== ENGINE LOCKS: scene.get(component:for:)")
+            print(EngineLockDiagnostics.report(per: entities.count, unit: "call", top: 12))
+        }
 
         LockCensus.install()
 

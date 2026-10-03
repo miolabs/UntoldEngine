@@ -1,6 +1,6 @@
 # Actors and Locks in the Engine — Benchmark, Lock Census and Rules (Research)
 
-Status: research with measurements, no engine change. Measured 2026-10-03 on `develop` (`108169ce`), Mac16,5 (M4 Max, 12 performance + 4 efficiency cores), macOS 27.0, Xcode 27.0 / Swift 6.4, release builds. Nothing here was measured on a Vision Pro or an iPhone.
+Status: research with measurements; the review of section 6 has started on the fork branch `feature/perf_locks` (section 9). The research itself was measured 2026-10-03 on `develop` (`108169ce`), Mac16,5 (M4 Max, 12 performance + 4 efficiency cores), macOS 27.0, Xcode 27.0 / Swift 6.4, release builds. Nothing here was measured on a Vision Pro or an iPhone.
 
 Two questions:
 
@@ -24,8 +24,8 @@ Everything below can be re-run: the benchmark is `Examples/ConcurrencyBench`, th
 - No actor may own state that the update, render or XR thread reads or writes.
 - An actor is allowed when every caller is already `async` and the calls are per asset or per request, never per entity or per frame.
 - When the frame needs to see state owned by an actor, the actor publishes it through a lock-protected snapshot. `AssetLoadingState` (actor) with `AssetLoadingGate` (lock) is the existing example.
-- Default lock: `OSAllocatedUnfairLock` (macOS 13, iOS 16, visionOS 1). `Synchronization.Mutex` is as fast but needs macOS 15 and iOS 18, above the engine's minimums (macOS 14, iOS 17, visionOS 2).
-- `NSRecursiveLock` only where re-entry is real, and never on a per-entity path.
+- Default lock: `EngineLock`, or `EngineProtected<State>` when the lock owns the state (`Utils/EngineLock.swift`). Both are an `os_unfair_lock` and compile down to the bare call; built with `ENGINE_LOCK_DIAGNOSTICS` they count and time themselves (section 9). `Synchronization.Mutex` is as fast but needs macOS 15 and iOS 18, above the engine's minimums (macOS 14, iOS 17, visionOS 2).
+- `EngineRecursiveLock` only where re-entry is real, and never on a per-entity path. No new `NSLock`, `NSRecursiveLock` or bare `OSAllocatedUnfairLock`: a lock outside the engine types cannot be measured with the others.
 - A serial or concurrent `DispatchQueue` is not a lock: `queue.sync` costs 170 ns uncontended, 50 times an unfair lock.
 - Per-frame code reads shared state once per system or pass, not once per entity.
 
@@ -170,11 +170,73 @@ swift run -c release --package-path Examples/ConcurrencyBench ConcurrencyBench 4
 # Lock census of the frame (opt-in test, skipped otherwise)
 UNTOLD_LOCK_CENSUS=1 UNTOLD_LOCK_CENSUS_ENTITIES=4000 UNTOLD_LOCK_CENSUS_FRAMES=120 CI=true \
     swift test -c release -Xswiftc -enable-testing --filter LockCensusTests 2>&1 | xcrun swift-demangle --simplified
+
+# Counts, contention, wait and hold time of the engine lock types (diagnostics build mode)
+UNTOLD_LOCK_CENSUS=1 UNTOLD_LOCK_SITES=1 UNTOLD_LOCK_CENSUS_ENTITIES=1000 UNTOLD_LOCK_CENSUS_FRAMES=120 \
+    swift test -c release -Xswiftc -enable-testing -Xswiftc -DENGINE_LOCK_DIAGNOSTICS --filter LockCensusTests
+scripts/perf/run_bench.sh macos --lock-diagnostics               # the same numbers per PerfBench scene
+
+# Cost of the lock types against the primitives they replace
+UNTOLD_LOCK_COST=1 swift test -c release -Xswiftc -enable-testing --filter EngineLockTests/test_cost
 ```
 
 ## 8. Limits
 
 - One machine, macOS only. The ratios should hold on iOS and visionOS (same runtime, same lock implementations); the absolute numbers will not. The pool-saturation result depends on core count: fewer cores saturate sooner.
 - The census scene is static cubes plus the render-test scene: no animation, physics, streaming load or XR. Those paths are reviewed from the source only.
-- The census counts `NSLock` and `NSRecursiveLock`. It does not count `OSAllocatedUnfairLock` (3 sites) or dispatch queues.
+- The census counts `NSLock` and `NSRecursiveLock`. It does not count `OSAllocatedUnfairLock` (3 sites), dispatch queues or the engine lock types; the last are counted by the diagnostics build mode instead (section 9).
 - The frame times are the wall time of `renderer.draw` in a headless test, which includes command encoding but not presentation.
+
+## 9. Status of the review (fork branch `feature/perf_locks`, 2026-10-03)
+
+**The lock types.** `EngineLock`, `EngineProtected<State>` and `EngineRecursiveLock` (`Utils/EngineLock.swift`) are the engine's locks from here on. Uncontended lock and unlock, release build, M4 Max:
+
+| | ns |
+|---|---|
+| `os_unfair_lock` (the primitive) | 1.73 |
+| `EngineLock` | 1.74 |
+| `EngineProtected` | 1.75 |
+| `EngineRecursiveLock` | 2.91 |
+| `NSLock` | 5.88 |
+| `NSRecursiveLock` | 11.25 |
+
+The recursive lock keeps an owner word next to an unfair lock. A thread reads it without the lock to recognise its own re-entry, through C11 atomics (`Sources/CEngineAtomics`), so it is clean under Thread Sanitizer.
+
+**Diagnostics are a build mode.** Compiled with `ENGINE_LOCK_DIAGNOSTICS`, the same types count acquisitions and re-entries, detect contention with a trylock, and time the wait and the hold, per named lock and optionally per source location. The numbers land in `EngineStatsSnapshot.locks`, so PerfBench reports them per scene (`run_bench.sh --lock-diagnostics`). A normal build carries none of it. A runtime switch was rejected: at half a million lock calls per frame, a one-nanosecond check is half a millisecond.
+
+**Moved so far**: the four locks of items 1, 2, 3 and 5.
+
+| Lock name | What | Was |
+|---|---|---|
+| `Globals.core` | `CoreRuntimeGlobals` (`scene`, `renderInfo`, the pipelines) | `NSRecursiveLock` |
+| `Globals.runtime` | `RuntimeGlobalsStore` (the scalar globals) | `NSRecursiveLock` |
+| `ECS.componentIds` | component type to id map | `OSAllocatedUnfairLock` since batch one, `NSLock` before |
+| `Scene.channelRenderMode` | `SceneChannelVisibilityState` | `NSLock` |
+
+What the diagnostics build reports for `renderer.draw` at 1,000 cubes (120 frames):
+
+| Lock | Taken per frame | Re-entries per frame | Contended | Top source location |
+|---|---|---|---|---|
+| `Globals.core` | 55,747 | 10,068 | 0 | `scene` getter 62,973; `renderInfo` getter 2,636 |
+| `ECS.componentIds` | 48,599 | 0 | 0 | `componentTypeInfo(for:)` |
+| `Scene.channelRenderMode` | 10,398 | 0 | 0 | `renderMode(for:)` |
+| `Globals.runtime` | 851 | 0 | 5 | `pomQualitySettings` getter 730 |
+
+That is 125,663 lock calls per frame, against 3,273 left on `NSLock` (per-entity reads of per-frame constants in the model pass and `opaqueLODDraws`, item 4). `translateTo(entityId:position:)` takes 20 lock calls and `scene.get(component:for:)` takes 2. A PerfBench run of `primitives-1k` reports 169,612 lock calls per frame, none contended.
+
+Three things the counts show that the census could not:
+
+- `Globals.runtime` is never re-entered in the frame, which supports item 5 (it does not need to be recursive). To confirm on the loading and editor paths before changing it.
+- `Globals.core` is re-entered 10,000 times per frame: a `_modify` on one global holds the lock while its body reads `scene`. Those are the callers the scene borrow has to restructure.
+- Nothing on the frame path is contended. Every one of these calls protects against a thread that is not there.
+
+**Frame time, normal release build**, `renderer.draw` wall time in the census harness, before (batch one, component ids already behind an unfair lock) and after, runs interleaved on an idle machine:
+
+| Scene | Before (ms) | After (ms) | Best against best |
+|---|---|---|---|
+| 1,000 cubes | 6.51 / 6.55 / 6.73 | 6.39 / 6.41 / 6.50 | 1.8 % |
+| 4,000 cubes | 26.39 / 26.75 / 27.20 / 27.41 / 31.96 | 25.49 / 25.62 / 25.64 / 25.78 / 25.88 / 26.27 / 27.10 | 3.4 % |
+
+A small gain, as section 5 predicted for a better primitive: the calls are cheaper, there are just as many. The large one is still to remove them.
+
+**Next, in this order** (each with its own before and after): component ids without a lock (a per-type static id; the current check-then-register is also not atomic across threads); a lock-free fast path for the scene-channel check when no channel is overridden; per-frame constants read once per pass (the 3,273 remaining `NSLock` calls); `Globals.runtime` as a plain lock; then the scene borrow, which needs a design. The remaining 100 or so `NSLock` declarations move to the engine types in slices, hot paths first. Once they have, `LockCensusTests` is redundant.

@@ -58,7 +58,7 @@ public enum SceneChannelProperty: Sendable {
 private final class SceneChannelVisibilityState: @unchecked Sendable {
     static let shared = SceneChannelVisibilityState()
 
-    private let lock = NSLock()
+    private let lock = EngineLock("Scene.channelRenderMode")
     private var renderModesByChannelRawValue: [UInt64: SceneChannelRenderMode] = [:]
 
     func setVisible(_ channel: SceneChannel, visible: Bool) {

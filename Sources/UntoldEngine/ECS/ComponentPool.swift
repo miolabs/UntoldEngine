@@ -10,7 +10,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
-import os
 
 struct TypeInfo {
     var id: Int
@@ -28,8 +27,8 @@ public struct ComponentTypeRegistration: Equatable, Sendable {
 }
 
 /// Component type → id map. Read on every component access and written only when a new type
-/// registers, so it sits behind an unfair lock rather than an NSLock.
-private let componentIDState = OSAllocatedUnfairLock<[ObjectIdentifier: TypeInfo]>(initialState: [:])
+/// registers.
+private let componentIDState = EngineProtected<[ObjectIdentifier: TypeInfo]>("ECS.componentIds", [:])
 
 @inline(__always)
 func componentTypeInfosSnapshot() -> [ObjectIdentifier: TypeInfo] {
