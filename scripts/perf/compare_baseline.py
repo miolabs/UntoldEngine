@@ -5,13 +5,22 @@ Baselines live in perf/baselines/<model>/<platform>/<scene>.json and hold the sc
 app wrote it, so a baseline is only ever compared with the same platform, layout, foveation and
 viewport. Exit status 1 means at least one metric regressed past its threshold.
 
-Several summaries may be given (repeated runs): time metrics are aggregated by their minimum
-across runs, rates by their mean. On a lightly loaded machine CPU and GPU clocks drift between
-runs and only ever inflate a time, so the minimum over a few runs is the stable number.
+Several summaries may be given (repeated runs): every time metric and every rate is aggregated by
+its minimum across runs. On a lightly loaded machine CPU and GPU clocks drift between runs, and
+other activity on the machine makes it skip refreshes; both only ever inflate a time or a rate, so
+the minimum over a few runs is the stable number, and a real regression raises it in every run.
+
+GPU times of a scene that leaves the GPU mostly idle follow the GPU's clock state more than the
+workload (the same build measured 0.8 and 2.2 ms for one frame in consecutive runs). They are
+judged only when the baseline shows the GPU busy for at least --gpu-busy-fraction of the frame, as
+it is on a headset, and reported as information otherwise. A GPU or CPU time also only counts as
+changed when it moves by more than the relative tolerance and by more than an absolute slack.
 
     compare_baseline.py perf/results/<run>/summary.json [more summary.json ...]
                         [--baselines DIR] [--update]
                         [--time-tolerance 0.10] [--rate-tolerance 0.005] [--pass-tolerance 0.20]
+                        [--gpu-slack-ms 0.5] [--pass-slack-ms 0.25] [--cpu-slack-ms 0.1]
+                        [--gpu-busy-fraction 0.5]
 """
 import argparse
 import json
@@ -46,14 +55,47 @@ def rate(numerator, denominator):
     return (numerator / denominator) if denominator else 0.0
 
 
+# Render settings a baseline must share with a run to be compared with it, with the value assumed
+# for records written before the field existed.
+CONFIG_FIELDS = [
+    ("platform", None), ("layout", None), ("foveation", None), ("viewportWidth", None),
+    ("viewportHeight", None), ("viewCount", None), ("antiAliasing", "fxaa"),
+    # Frames are display-paced, and the GPU stretches its work over the slack a slower display
+    # leaves, so times taken at different refresh rates are not comparable.
+    ("displayRefreshHz", 0.0),
+    # visionOS: whether the frame pacer may start the submission phase early. It moves the deadline
+    # margin and the miss rate, which are judged.
+    ("xrFramePacing", False),
+]
+
+
 def config_key(render):
-    return (render["platform"], render.get("layout"), render.get("foveation"), render.get("viewportWidth"),
-            render.get("viewportHeight"), render.get("viewCount"), render.get("antiAliasing", "fxaa"),
-            render.get("xrFramePacing", False))
+    return tuple(render.get(name, default) for name, default in CONFIG_FIELDS)
+
+
+def config_difference(a, b):
+    """The render settings in which two records differ, as text."""
+    parts = []
+    for name, default in CONFIG_FIELDS:
+        left, right = a.get(name, default), b.get(name, default)
+        if left != right:
+            parts.append(f"{name} {left} vs {right}")
+    return ", ".join(parts)
+
+
+def scene_rates(summary):
+    """(over-budget rate, missed-deadline rate) of a scene summary, single run or aggregate."""
+    over = summary.get("overBudgetRate")
+    if over is None:
+        over = rate(summary.get("framesOverBudget", 0), summary.get("frames", 0))
+    missed = summary.get("missedDeadlineRate")
+    if missed is None:
+        missed = rate(summary.get("missedDeadlines", 0), summary.get("deadlineSamples", 0))
+    return over, missed
 
 
 def aggregate(scenes):
-    """Fold the same scene from several runs into one record: min of times, mean of rates."""
+    """Fold the same scene from several runs into one record: min of times and of rates."""
     first = json.loads(json.dumps(scenes[0]))
     s = first["summary"]
     for key, _ in FRAME_METRICS + INFO_METRICS:
@@ -64,6 +106,9 @@ def aggregate(scenes):
     s["framesOverBudget"] = sum(x["summary"].get("framesOverBudget", 0) for x in scenes)
     s["missedDeadlines"] = sum(x["summary"].get("missedDeadlines", 0) for x in scenes)
     s["deadlineSamples"] = sum(x["summary"].get("deadlineSamples", 0) for x in scenes)
+    # The counts above are totals, for the record; the rates that are judged are the best run's.
+    s["overBudgetRate"] = min(scene_rates(x["summary"])[0] for x in scenes)
+    s["missedDeadlineRate"] = min(scene_rates(x["summary"])[1] for x in scenes)
     for field in ("gpuPassMeanMs", "gpuPassMinMs", "timingMeanMs"):
         merged = {}
         for x in scenes:
@@ -83,6 +128,11 @@ def main():
     ap.add_argument("--time-tolerance", type=float, default=0.10, help="relative slack for frame and system time metrics")
     ap.add_argument("--rate-tolerance", type=float, default=0.005, help="absolute slack for over-budget and missed-deadline rates")
     ap.add_argument("--pass-tolerance", type=float, default=0.20, help="relative slack for per-pass GPU minimums")
+    ap.add_argument("--gpu-slack-ms", type=float, default=0.5, help="a frame's minimum GPU time must also move by more than this")
+    ap.add_argument("--pass-slack-ms", type=float, default=0.25, help="a per-pass GPU minimum must also move by more than this")
+    ap.add_argument("--cpu-slack-ms", type=float, default=0.1, help="a per-system CPU mean must also move by more than this")
+    ap.add_argument("--gpu-busy-fraction", type=float, default=0.5,
+                    help="judge GPU times only when the baseline's mean GPU time is at least this fraction of its mean frame time")
     args = ap.parse_args()
 
     runs = [load(p) for p in args.summaries]
@@ -118,8 +168,7 @@ def main():
     for scene in scenes:
         path = os.path.join(base_dir, f"{scene['id']}.json")
         s = scene["summary"]
-        over = rate(s.get("framesOverBudget", 0), s.get("frames", 0))
-        missed = rate(s.get("missedDeadlines", 0), s.get("deadlineSamples", 0))
+        over, missed = scene_rates(s)
         head = (f"{scene['id']}: frames {s.get('frames',0)} p95 {s.get('p95FrameMs',0):.2f} p99 {s.get('p99FrameMs',0):.2f} "
                 f"gpu {s.get('meanGPUExecutionMs',0):.2f} overBudget {over*100:.2f}% missed {missed*100:.2f}%")
         if not os.path.exists(path):
@@ -127,20 +176,27 @@ def main():
             continue
         base = load(path)
         if config_key(base["render"]) != config_key(first["render"]):
-            print(f"{head}  [baseline has a different render configuration, skipped]")
+            difference = config_difference(base["render"], first["render"])
+            print(f"{head}  [baseline has a different render configuration ({difference}), skipped]")
             continue
         b = base["scene"]["summary"]
-        bover = rate(b.get("framesOverBudget", 0), b.get("frames", 0))
-        bmissed = rate(b.get("missedDeadlines", 0), b.get("deadlineSamples", 0))
+        bover, bmissed = scene_rates(b)
         print(head)
 
-        def judge(label, now, ref, tolerance, unit="ms", relative=True):
+        # With the GPU idle most of the frame its times follow the clock state, not the workload.
+        gpu_busy = rate(b.get("meanGPUExecutionMs", 0.0), b.get("meanFrameMs", 0.0)) >= args.gpu_busy_fraction
+
+        def judge(label, now, ref, tolerance, unit="ms", relative=True, slack=0.0, informational=False):
             nonlocal regressions
             if relative:
                 if ref <= 0:
                     return
                 delta = (now - ref) / ref
-                flag = "REGRESSION" if delta > tolerance else ("better" if delta < -tolerance else "ok")
+                if informational:
+                    print(f"    {label:28s} {now:9.3f} vs {ref:9.3f} {unit} {delta*100:+7.1f}%  (info, GPU mostly idle)")
+                    return
+                moved = abs(now - ref) > slack
+                flag = "REGRESSION" if delta > tolerance and moved else ("better" if delta < -tolerance and moved else "ok")
                 print(f"    {label:28s} {now:9.3f} vs {ref:9.3f} {unit} {delta*100:+7.1f}%  {flag}")
             else:
                 delta = now - ref
@@ -150,7 +206,9 @@ def main():
                 regressions += 1
 
         for key, label in FRAME_METRICS:
-            judge(label, s.get(key, 0.0), b.get(key, 0.0), args.time_tolerance)
+            is_gpu = key == "minGPUExecutionMs"
+            judge(label, s.get(key, 0.0), b.get(key, 0.0), args.time_tolerance,
+                  slack=args.gpu_slack_ms if is_gpu else 0.0, informational=is_gpu and not gpu_busy)
         for key, label in INFO_METRICS:
             now, ref = s.get(key, 0.0), b.get(key, 0.0)
             if ref > 0:
@@ -160,11 +218,12 @@ def main():
         tnow, tref = s.get("timingMeanMs", {}), b.get("timingMeanMs", {})
         for field in TIMING_FIELDS:
             if field in tnow and field in tref and tref[field] >= 0.02:
-                judge(f"cpu {field}", tnow[field], tref[field], args.time_tolerance)
+                judge(f"cpu {field}", tnow[field], tref[field], args.time_tolerance, slack=args.cpu_slack_ms)
         pnow, pref = s.get("gpuPassMinMs", {}), b.get("gpuPassMinMs", {})
         for label in sorted(pref):
             if label in pnow and pref[label] >= 0.05:
-                judge(f"gpu min {label[:20]}", pnow[label], pref[label], args.pass_tolerance)
+                judge(f"gpu min {label[:20]}", pnow[label], pref[label], args.pass_tolerance,
+                      slack=args.pass_slack_ms, informational=not gpu_busy)
     if regressions:
         print(f"{regressions} regression(s)")
         return 1

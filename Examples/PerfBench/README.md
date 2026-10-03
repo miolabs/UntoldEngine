@@ -37,6 +37,14 @@ per-system CPU times in the snapshots; frame time and the over-budget count beco
 when a scene no longer fits. A frame counts as over budget when it took more than one and a half
 refresh intervals, that is when a refresh was skipped.
 
+On a Mac with several displays the bench opens on the fastest one, whichever screen has the
+keyboard focus, or on one running at the rate given with `--refresh`. Times taken at different
+refresh rates are not comparable (the GPU stretches its work over the slack a slower display
+leaves), so the refresh rate is part of a baseline's configuration and the comparer skips a
+baseline recorded at another rate. The Mac16,5 baseline is recorded at 120 Hz, on the built-in
+display. The window shows the fixed 1920 by 1080 drawable one drawable pixel per device pixel, so
+the window server does not rescale it on the GPU that is being measured.
+
 ## Running
 
 ```bash
@@ -54,14 +62,23 @@ scripts/perf/run_bench.sh visionos --device <udid> --xctrace "Metal System Trace
 Runs land in `perf/results/<timestamp>-<platform>/` with `<scene>.jsonl`, `summary.json` and the
 console log. The comparison prints one block per scene and exits non-zero on a regression (10 %
 on frame-time, GPU-time and per-system CPU metrics, 0.5 points on the over-budget and
-missed-deadline rates, 20 % on a per-pass GPU minimum).
+missed-deadline rates, 20 % on a per-pass GPU minimum). A GPU or CPU time also has to move by
+more than an absolute slack to count (0.5 ms for a frame's minimum GPU time, 0.25 ms for a pass,
+0.1 ms for a per-system CPU mean).
 
 Single runs are noisy on a machine that idles most of each frame: CPU and GPU clocks drift between
-runs and the same build can differ by 20 to 50 % in a per-pass or per-system time. `--repeat 3`
-runs the scene set three times and the comparer aggregates by the minimum of each time metric (a
-clock drift only ever inflates a time) and the mean of each rate; record the baseline the same way.
-The CPU-bound scenes (`primitives-10k`) are the least noisy; for the others read
-`timingMeanMs` and `gpuPassMinMs` rather than frame time.
+runs, other activity makes the window server skip refreshes, and the same build can differ by 20
+to 50 % in a per-pass or per-system time. `--repeat 3` runs the scene set three times and the
+comparer aggregates by the minimum of each time metric and of each rate (interference only ever
+inflates them, and a real regression raises them in every run); record the baseline the same way.
+
+What to trust on a Mac: the per-system CPU means (`timingMeanMs`) repeat within a few percent, and
+so does everything in the CPU-bound scenes (`primitives-10k`). GPU times of the light scenes do
+not: with the GPU idle most of the frame they follow its clock state, and one frame's minimum GPU
+time measured 0.8 and 2.2 ms in consecutive runs of the same build. The comparer therefore judges
+GPU times only when the baseline shows the GPU busy for at least half the frame, and prints them
+as information otherwise; judge GPU cost on the headset, where the GPU is busy and run-to-run
+noise is under 10 %.
 
 The app can also be opened in Xcode (`xcodegen generate`, then `PerfBench.xcodeproj`) and started
 from its Start button; it reads its configuration from the environment:
@@ -79,6 +96,7 @@ from its Start button; it reads its configuration from the environment:
 | `UNTOLD_BENCH_IMMERSION` | `full` or `mixed` (visionOS) | `full` |
 | `UNTOLD_BENCH_PER_FRAME` | `0` writes one line per second instead of per frame | per frame |
 | `UNTOLD_BENCH_AA` | `fxaa`, `smaa`, `msaa` or `none` for every scene (the post-FX scene keeps SMAA) | engine default, FXAA |
+| `UNTOLD_BENCH_REFRESH` | macOS: run on a connected display with this maximum refresh rate (`run_bench.sh --refresh`) | the fastest connected display |
 | `UNTOLD_XR_PACER` | visionOS only: `0` keeps the submission phase at the compositor's optimal input time instead of letting the frame pacer start it early (recorded as `render.xrFramePacing`) | pacer on |
 
 On a device the app exits when the run is done so that `devicectl ... --console` returns; the run
