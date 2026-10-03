@@ -49,7 +49,7 @@ TileRenderCost: visible full/lod/hlod 18/5/1 | draws full/lod/hlod 22/6/1 | tris
 Batching: groups 132 | batchedMeshes 916 | dirty 0→0 | defWork 0 skipComplex 2 | dispatched 0→0 groups | rebuilds/s 0 | rebuildMs 0.00
 Memory: mesh 312/512mb | tex 198/512mb | total 50% | entities 847 | gpuAlloc 910mb | avail 2400mb | thermal nominal
 Hitches: budget 11.11ms | over 3/5400 (0.06%) | lastSec 0/90 over, worst 9.80ms | hist <4 0 | <8 1200 | <11.2 4190 | <16.8 8 | <33.4 2 | <100 0 | >=100 0
-Compositor: views 2 @ 2048x1984 | update 2.10ms | inputSlack 1.45ms | submit 3.20ms | semWait 0.00ms | deadlineMargin 2.35ms | presentMargin 6.80ms | missed 3/5400 (0.06%) | noAnchor 0
+Compositor: views 2 @ 2048x1984 | update 2.10ms | inputSlack 1.45ms | earlyStart 0.00ms | submit 3.20ms | semWait 0.00ms | deadlineMargin 2.35ms | presentMargin 6.80ms | missed 3/5400 (0.06%) | noAnchor 0
 ```
 
 **Compositor line** (visionOS only, absent elsewhere) — how the frame did against the Compositor Services deadlines. This is the number that matters on Apple Vision Pro: a frame whose GPU work finishes after the rendering deadline is reprojected by the compositor and felt as judder, whatever the average frame rate says.
@@ -59,6 +59,7 @@ Compositor: views 2 @ 2048x1984 | update 2.10ms | inputSlack 1.45ms | submit 3.2
 | `views W@HxV` | Views (eyes) rendered and the per-view drawable size. Changes with foveation and render quality. |
 | `update` | CPU time between `startUpdate()` and `endUpdate()`: game update, input, streaming ticks. |
 | `inputSlack` | Time left until the compositor's `optimalInputTime` when the update phase ended. Negative means the update ran late and the submission started behind schedule. |
+| `earlyStart` | How far ahead of `optimalInputTime` the submission phase started. Zero while frames make their deadline; otherwise `XRFramePacer` grows it to cover the miss plus a target margin (see the XR rendering system doc). It cannot exceed `inputSlack`. |
 | `submit` | CPU time from `startSubmission()` to the command buffer commit, both eyes. Includes `semWait`. |
 | `semWait` | Time spent waiting for a free in-flight command buffer. Persistently non-zero means the GPU is pacing the CPU. Also reported on macOS and iOS as `timing.semaphoreWaitMs`. |
 | `deadlineMargin` | Time between the GPU finishing the most recently completed frame and that frame's `renderingDeadline`. Negative (and `MISSED`) means the compositor did not get the frame in time. Comes from the command buffer completion handler, so it can lag the CPU frame by one or two frames. |

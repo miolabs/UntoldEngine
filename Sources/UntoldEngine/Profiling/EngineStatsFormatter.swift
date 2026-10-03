@@ -117,7 +117,7 @@ private func compositorStatsLine(_ snapshot: EngineStatsSnapshot) -> String {
     guard c.viewCount > 0 else { return "" }
     let missRate = String(format: "%.2f%%", c.missedDeadlineRate * 100)
     let missed = c.missedDeadline ? " MISSED" : ""
-    return "\nCompositor: views \(c.viewCount) @ \(c.viewTextureWidth)x\(c.viewTextureHeight) | update \(formatMs(c.updateMs))ms | inputSlack \(formatMs(c.inputSlackMs))ms | submit \(formatMs(c.submissionMs))ms | semWait \(formatMs(snapshot.timing.semaphoreWaitMs))ms | deadlineMargin \(formatMs(c.deadlineMarginMs))ms\(missed) | presentMargin \(formatMs(c.presentationMarginMs))ms | missed \(c.missedDeadlineCount)/\(c.deadlineSampleCount) (\(missRate)) | noAnchor \(c.missingAnchorCount)"
+    return "\nCompositor: views \(c.viewCount) @ \(c.viewTextureWidth)x\(c.viewTextureHeight) | update \(formatMs(c.updateMs))ms | inputSlack \(formatMs(c.inputSlackMs))ms | earlyStart \(formatMs(c.earlyStartMs))ms | submit \(formatMs(c.submissionMs))ms | semWait \(formatMs(snapshot.timing.semaphoreWaitMs))ms | deadlineMargin \(formatMs(c.deadlineMarginMs))ms\(missed) | presentMargin \(formatMs(c.presentationMarginMs))ms | missed \(c.missedDeadlineCount)/\(c.deadlineSampleCount) (\(missRate)) | noAnchor \(c.missingAnchorCount)"
 }
 
 private func formatMB(_ bytes: Int) -> String {

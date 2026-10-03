@@ -63,6 +63,9 @@ CONFIG_FIELDS = [
     # Frames are display-paced, and the GPU stretches its work over the slack a slower display
     # leaves, so times taken at different refresh rates are not comparable.
     ("displayRefreshHz", 0.0),
+    # visionOS: whether the frame pacer may start the submission phase early. It moves the deadline
+    # margin and the miss rate, which are judged.
+    ("xrFramePacing", False),
 ]
 
 

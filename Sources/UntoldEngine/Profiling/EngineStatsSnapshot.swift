@@ -113,6 +113,9 @@ public struct EngineCompositorStats: Codable, Sendable {
     /// Time left until `optimalInputTime` when the update phase ended.
     /// Negative means the update phase ran past the compositor's optimal input time.
     public var inputSlackMs: Double = 0.0
+    /// How far ahead of `optimalInputTime` the submission phase started (the frame pacer's early start).
+    /// Zero when the loop waited for the optimal input time exactly.
+    public var earlyStartMs: Double = 0.0
     /// CPU time between `startSubmission()` and the command buffer commit.
     public var submissionMs: Double = 0.0
     /// Time between the GPU finishing the frame and the compositor's rendering deadline.
@@ -143,6 +146,7 @@ public struct EngineCompositorStats: Codable, Sendable {
     public init(
         updateMs: Double = 0.0,
         inputSlackMs: Double = 0.0,
+        earlyStartMs: Double = 0.0,
         submissionMs: Double = 0.0,
         deadlineMarginMs: Double = 0.0,
         presentationMarginMs: Double = 0.0,
@@ -156,6 +160,7 @@ public struct EngineCompositorStats: Codable, Sendable {
     ) {
         self.updateMs = updateMs
         self.inputSlackMs = inputSlackMs
+        self.earlyStartMs = earlyStartMs
         self.submissionMs = submissionMs
         self.deadlineMarginMs = deadlineMarginMs
         self.presentationMarginMs = presentationMarginMs
