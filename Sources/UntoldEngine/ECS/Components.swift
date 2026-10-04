@@ -61,8 +61,31 @@ public class RenderComponent: Component {
             if instancedShadowDraws != nil {
                 instancedShadowDraws = nil
             }
+            blendedSubmeshes = nil
         }
     }
+
+    /// Whether any submesh of `mesh` is blended or lets light through: what the
+    /// transparency pass draws of the entity. Most entities have none, and the pass asks
+    /// every visible one each frame, so the answer is kept until the meshes change.
+    var hasBlendedSubmeshes: Bool {
+        if let known = blendedSubmeshes {
+            return known
+        }
+        var found = false
+        search: for meshIndex in mesh.indices {
+            for submeshIndex in mesh[meshIndex].submeshes.indices
+                where mesh[meshIndex].submeshes[submeshIndex].material?.hasTransparency == true
+            {
+                found = true
+                break search
+            }
+        }
+        blendedSubmeshes = found
+        return found
+    }
+
+    private var blendedSubmeshes: Bool?
 
     /// What `mesh` draws, as a number the renderer groups instanced draws by: see
     /// `RenderInstanceKeyTable`. Any change to `mesh` clears it.
