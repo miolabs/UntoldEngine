@@ -535,6 +535,9 @@ public class BatchingSystem: @unchecked Sendable {
     private var entityToCellMembership: [EntityID: BatchCellID] = [:] // Track candidate cell membership
     private var cellToEntities: [BatchCellID: Set<EntityID>] = [:] // Candidate entities by cell
     private var batchingEnabled: Bool = false
+    /// Whether loading a pack marks as static the parts of the models it places once
+    /// (`setBatching(.packSinglePlacements(_:))`).
+    public var marksPackSinglePlacements: Bool = true
 
     // Dirty tracking for incremental updates
     private var dirtyCells: Set<BatchCellID> = []
