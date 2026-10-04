@@ -762,7 +762,12 @@ public class GeometryStreamingSystem: @unchecked Sendable {
             )
         }
 
-        let nearbyEntities = OctreeSystem.shared.queryNear(point: effectiveCameraPosition, radius: maxQueryRadius)
+        // Everything below concerns entities that stream (a StreamingComponent) or are
+        // tiles (a TileComponent). The query returns every entity within its radius, and
+        // in a scene loaded whole none of them is either: narrowing the list once keeps
+        // the passes from asking the scene about each of them, six times over.
+        let queriedEntities = OctreeSystem.shared.queryNear(point: effectiveCameraPosition, radius: maxQueryRadius)
+        let nearbyEntities = entitiesThatStream(among: queriedEntities)
 
         // Build a padded frustum once per tick for the load-gate test.
         // nil when no camera is available; the gate is simply skipped that tick.
@@ -1371,7 +1376,15 @@ public class GeometryStreamingSystem: @unchecked Sendable {
 
         // Also check loaded entities that might now be out of range
         // (they may not be in the octree query if they're far away)
-        let nearbySet = Set(nearbyEntities) // O(1) lookup
+        // Whether the query returned an entity, streaming or not. The set is only made if
+        // one of the passes below has an entity to ask about.
+        var queriedSet: Set<EntityID>?
+        func wasQueried(_ entityId: EntityID) -> Bool {
+            if queriedSet == nil {
+                queriedSet = Set(queriedEntities)
+            }
+            return queriedSet?.contains(entityId) ?? false
+        }
 
         // ── Tile unload pass ───────────────────────────────────────────────────
         // Grace period: both .parsed and .parsing tiles stay resident for
@@ -1417,7 +1430,7 @@ public class GeometryStreamingSystem: @unchecked Sendable {
         var staleTileIds: [EntityID] = []
         let tileSnapshot = loadedTileEntitiesSnapshot()
         for entityId in tileSnapshot {
-            if nearbySet.contains(entityId) { continue } // already handled in pass 1
+            if wasQueried(entityId) { continue } // already handled in pass 1
             guard scene.exists(entityId) else {
                 staleTileIds.append(entityId)
                 continue
@@ -1448,7 +1461,7 @@ public class GeometryStreamingSystem: @unchecked Sendable {
         //    approaching camera does not cancel a parse it is about to need.
         let loadingTileSnapshot = loadingTileEntitiesSnapshot()
         for entityId in loadingTileSnapshot {
-            if nearbySet.contains(entityId) { continue } // already handled in pass 1
+            if wasQueried(entityId) { continue } // already handled in pass 1
             guard scene.exists(entityId) else {
                 unmarkLoadingTileEntity(entityId)
                 continue
@@ -1480,7 +1493,7 @@ public class GeometryStreamingSystem: @unchecked Sendable {
         // appear in nearbyEntities so the HLOD pass above cannot reach them.
         let hlodSnapshot = loadedHLODEntitiesSnapshot()
         for entityId in hlodSnapshot {
-            if nearbySet.contains(entityId) { continue } // already handled above
+            if wasQueried(entityId) { continue } // already handled above
             guard scene.exists(entityId) else {
                 unmarkLoadedHLODEntity(entityId)
                 continue
@@ -1493,7 +1506,7 @@ public class GeometryStreamingSystem: @unchecked Sendable {
         // the octree query radius are cleaned up here.
         let lodSnapshot = loadedLODEntitiesSnapshot()
         for entityId in lodSnapshot {
-            if nearbySet.contains(entityId) { continue }
+            if wasQueried(entityId) { continue }
             guard scene.exists(entityId) else {
                 unmarkLoadedLODEntity(entityId)
                 continue
@@ -1506,7 +1519,7 @@ public class GeometryStreamingSystem: @unchecked Sendable {
         let trackedLoadedSnapshot = loadedStreamingEntitiesSnapshot()
         for entityId in trackedLoadedSnapshot {
             // Skip if already processed via octree query
-            if nearbySet.contains(entityId) { continue }
+            if wasQueried(entityId) { continue }
 
             // Check if entity still exists first (handles destroyed/recreated entities)
             guard scene.exists(entityId) else {
@@ -1731,7 +1744,7 @@ public class GeometryStreamingSystem: @unchecked Sendable {
             diagnostics.updateFrame = currentFrame
             diagnostics.updateTriggered = true
             diagnostics.updateWorkMs = updateWorkMs
-            diagnostics.nearbyEntitiesQueried = nearbyEntities.count
+            diagnostics.nearbyEntitiesQueried = queriedEntities.count
             diagnostics.unloadCandidates = unloadCandidates.count
             diagnostics.processedUnloads = processedUnloads
             diagnostics.loadCandidates = loadCandidates.count
@@ -2508,6 +2521,19 @@ public class GeometryStreamingSystem: @unchecked Sendable {
                 message: "[TileStreaming][LOD0] Tile '\(tileId)' promoted parsedFrame=\(currentFrame) render=\(renderEntityIds.count) renderVisible=\(renderVisibleCount) visibleSet=\(visibleSetCount) fallbackAtParse={\(fallbackSummary)}",
                 category: LogCategory.tileStreaming.rawValue
             )
+        }
+    }
+
+    /// The entities of `entities` that still exist and stream or are tiles: the ones the
+    /// passes of `update` look for when they ask the scene for a StreamingComponent or a
+    /// TileComponent. One read of the scene answers for all of them.
+    private func entitiesThatStream(among entities: [EntityID]) -> [EntityID] {
+        let currentScene = scene
+        let streamingId = getComponentId(for: StreamingComponent.self)
+        let tileId = getComponentId(for: TileComponent.self)
+        return entities.filter { entityId in
+            guard let mask = currentScene.mask(for: entityId) else { return false }
+            return mask.test(streamingId) || mask.test(tileId)
         }
     }
 
