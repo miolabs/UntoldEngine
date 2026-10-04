@@ -287,6 +287,9 @@ re-export from the source tool as v2/v3, or convert through `.ply` instead.
 | `--assets-dir <path>` | Folder for the textures and per-model folders the result references (default: the `--output` folder) |
 | `--include-hidden` | Also export objects hidden in the viewport or disabled in renders |
 | `--no-lods` | Do not build the [LOD chains](#lod-chains-for-packs) of a pack's models |
+| `--no-material-bake` | Do not bake procedural materials into textures and values |
+| `--material-bake-size <texels>` | Size of a baked material texture (default `1024`) |
+| `--material-bake-tile <metres>` | Longest stretch of surface one repeat of a baked texture covers (default `2`) |
 | `--validate` | Write a companion validation JSON file |
 | `--color-grade-lut <path>` | Stage an externally-authored `.cube` 3D LUT and apply it as a post-tonemap creative grade (no Blender render, no conversion) — see [Using Color Management](UsingColorManagement.md) |
 
