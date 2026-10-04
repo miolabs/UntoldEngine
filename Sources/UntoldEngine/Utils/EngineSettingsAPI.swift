@@ -86,6 +86,13 @@ public enum RenderingProperty: Sendable {
     /// frustum keeps. In scene units; the default is 0.5. See
     /// `getOcclusionCullingMaxCameraStep()` to read the current value.
     case occlusionCullingMaxCameraStep(Float)
+
+    /// Whether entities that draw the same meshes with the same materials are encoded as
+    /// one instanced draw in the opaque pass and the shadow cascades. A scene that places
+    /// a model many times then costs a draw per model, not per placement. Enabled by
+    /// default; disabled, every entity is encoded on its own. What is drawn is the same
+    /// either way. See `getInstancedDrawsEnabled()` to read the current value.
+    case instancedDraws(RenderingToggle)
 }
 
 public enum RenderingToggle: Sendable {
@@ -148,6 +155,10 @@ public func setRendering(_ property: RenderingProperty) {
         SmallObjectCulling.minimumPixels = pixels.isFinite ? max(pixels, 0) : 0
     case let .occlusionCullingMaxCameraStep(step):
         HZBOcclusionCulling.maxCameraStep = step.isFinite ? max(step, 0) : 0
+    case .instancedDraws(.enabled):
+        InstancedDrawing.isEnabled = true
+    case .instancedDraws(.disabled):
+        InstancedDrawing.isEnabled = false
     }
 }
 
