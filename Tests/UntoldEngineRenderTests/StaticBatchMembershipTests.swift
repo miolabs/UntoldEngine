@@ -233,4 +233,15 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
         XCTAssertTrue(isBatched(other))
         try assertSameFrame(as: unbatched)
     }
+
+    func testMaterialsThatDifferInTheirClearCoatAreNotMerged() {
+        let plain = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let coated = place(cube(material(red, clearCoat: 1)), at: simd_float3(11, 0, 0))
+
+        enableBatching(true)
+        generateBatches()
+
+        XCTAssertFalse(isBatched(plain), "a batch draws all of its entities with the material of one")
+        XCTAssertFalse(isBatched(coated))
+    }
 }
