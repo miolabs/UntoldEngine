@@ -682,6 +682,11 @@ public enum BatchingProperty: Sendable {
     case runtimeCellLimits(vertices: Int, indices: Int, bytes: Int)
     case quiescenceFramesBeforeBuild(Int)
     case recentVisibilityWindowFrames(Int)
+    /// Whether loading a `.untoldpack` marks as static the parts of the models it places
+    /// a single time and that have no LOD chain, so that batching merges them by material
+    /// (a model placed several times is drawn with instancing instead). On by default;
+    /// the marks only take effect while batching is enabled.
+    case packSinglePlacements(Bool)
 }
 
 public func setBatching(_ property: BatchingProperty) {
@@ -720,6 +725,8 @@ public func setBatching(_ property: BatchingProperty) {
         batching.setQuiescenceFramesBeforeBatchBuild(value)
     case let .recentVisibilityWindowFrames(value):
         batching.setRecentVisibilityWindowFrames(value)
+    case let .packSinglePlacements(value):
+        batching.marksPackSinglePlacements = value
     }
 }
 

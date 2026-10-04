@@ -185,6 +185,7 @@ setBatching(.maxDirtyCellsPerTick(8))
 setBatching(.visibilityGatedBuild(true))
 setBatching(.backgroundArtifactBuild(true))
 setBatching(.runtimeTuning(.visionOSBalanced))
+setBatching(.packSinglePlacements(true))   // a pack's parts placed once are marked static (default)
 ```
 
 Entity tagging and rebuild commands remain explicit:

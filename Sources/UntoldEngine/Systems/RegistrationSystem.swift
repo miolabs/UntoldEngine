@@ -2885,6 +2885,13 @@ private final class PackLoadDispatcher: @unchecked Sendable {
     private var nextIndex = 0
     private var remaining: Int
     private var overallSuccess = true
+    /// How many times the pack places each model file. A file placed several times is
+    /// drawn with instancing; the parts of one placed a single time are marked static, so
+    /// that the batching system merges them by material (`markStaticParts(of:)`).
+    private let placementCounts: [String: Int]
+    private let marksSinglePlacements: Bool
+    /// The parts marked static so far, handed to the batching system when the pack is in.
+    private var staticParts: [EntityID] = []
     /// One parse and one GPU build per distinct .untold for the duration of the pack
     /// load; dropped with the dispatcher, after which the entities' copies keep the
     /// shared buffers alive.
@@ -2905,6 +2912,8 @@ private final class PackLoadDispatcher: @unchecked Sendable {
         self.rootEntityId = rootEntityId
         self.completionBox = completionBox
         remaining = models.count
+        placementCounts = models.reduce(into: [:]) { counts, model in counts[model.path, default: 0] += 1 }
+        marksSinglePlacements = BatchingSystem.shared.marksPackSinglePlacements
     }
 
     func start() {
@@ -2934,6 +2943,9 @@ private final class PackLoadDispatcher: @unchecked Sendable {
         let lodLevels = (lodChains[model.path] ?? []).map {
             PackLODChain.Level(url: packDir.appendingPathComponent($0.path), screenSize: $0.screenSize)
         }
+        // A model with a LOD chain changes its meshes as the camera moves, which a batch
+        // cannot follow without being rebuilt each time.
+        let isStatic = marksSinglePlacements && placementCounts[model.path] == 1 && lodLevels.isEmpty
 
         withWorldMutationGate {
             var lodChain: PackLODChain?
@@ -2956,6 +2968,7 @@ private final class PackLoadDispatcher: @unchecked Sendable {
                 sharedBuilds: builds,
                 lodChain: lodChain
             ) { success in
+                var staticParts: [EntityID] = []
                 withWorldMutationGate {
                     translateTo(entityId: childId, position: position)
                     scaleTo(entityId: childId, scale: scale)
@@ -2968,26 +2981,70 @@ private final class PackLoadDispatcher: @unchecked Sendable {
                     // Failed child loads also keep this placement so fallback cubes mark the
                     // broken pack model's intended location.
                     setEntityName(entityId: childId, name: displayName)
+                    if success, isStatic {
+                        staticParts = markStaticParts(of: childId)
+                    }
                 }
-                self.recordCompletionAndAdvance(success)
+                self.recordCompletionAndAdvance(success, staticParts: staticParts)
             }
         }
     }
 
-    private func recordCompletionAndAdvance(_ success: Bool) {
+    private func recordCompletionAndAdvance(_ success: Bool, staticParts newStaticParts: [EntityID]) {
         lock.lock()
         overallSuccess = overallSuccess && success
+        staticParts.append(contentsOf: newStaticParts)
         remaining -= 1
         let isDone = remaining <= 0
         let result = overallSuccess
+        let placedParts = isDone ? staticParts : []
         lock.unlock()
 
         if isDone {
+            // With batching disabled the marks wait for `generateBatches()`.
+            if !placedParts.isEmpty {
+                withWorldMutationGate {
+                    BatchingSystem.shared.notifyStaticEntitiesPlaced(placedParts)
+                }
+            }
             completionBox?.call(result)
         } else {
             startNext()
         }
     }
+}
+
+/// Marks the parts of a pack placement as static and returns the ones it marked.
+///
+/// Left unmarked is what no batch takes (`BatchingSystem.resolveBatchCandidate`): a part
+/// with a transparent material, one with a skeleton or an animation, and one that keeps
+/// its identity (`shouldPreserveSceneEntityIdentity`). Must run inside the world mutation
+/// gate.
+private func markStaticParts(of placementId: EntityID) -> [EntityID] {
+    var marked: [EntityID] = []
+    var queue: [EntityID] = [placementId]
+    var index = 0
+    while index < queue.count {
+        let entityId = queue[index]
+        index += 1
+        queue.append(contentsOf: getEntityChildren(parentId: entityId))
+
+        guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId),
+              !renderComponent.mesh.isEmpty,
+              !renderComponent.mesh.contains(where: { mesh in
+                  mesh.submeshes.contains { $0.material?.hasTransparency ?? false }
+              }),
+              scene.get(component: SkeletonComponent.self, for: entityId) == nil,
+              scene.get(component: AnimationComponent.self, for: entityId) == nil,
+              !shouldPreserveSceneEntityIdentity(entityId: entityId)
+        else { continue }
+
+        if !hasComponent(entityId: entityId, componentType: StaticBatchComponent.self) {
+            registerComponent(entityId: entityId, componentType: StaticBatchComponent.self)
+        }
+        marked.append(entityId)
+    }
+    return marked
 }
 
 /// Loads every model referenced by a `.untoldpack` manifest as a child entity under
