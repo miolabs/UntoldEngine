@@ -16,7 +16,7 @@ import MetalKit
 
 public enum RenderPasses {
     /// Count of unbatched shadow-caster entities from the most recent frame.
-    /// Updated by shadowCasters(for:in:) (main thread); read by the streaming heartbeat (main thread).
+    /// Updated by the shadow pass for each cascade (main thread); read by the streaming heartbeat (main thread).
     public nonisolated(unsafe) static var lastShadowCasterCount: Int = 0
     public typealias RenderPassExecution = @Sendable (MTLCommandBuffer) -> Void
 
@@ -673,8 +673,10 @@ public enum RenderPasses {
     /// Rebuilds the shadow entity candidate list from the current ECS state.
     ///
     /// Only filters by stable properties (component presence). Per-frame culls — isVisible,
-    /// scene-channel visibility, distance, cascade frustum — are applied per-cascade in
-    /// shadowCasters(for:in:) so this scan runs at most once per dirty event, not every frame.
+    /// scene-channel visibility, distance, light frustum — are applied by the spot and point
+    /// shadow passes that read the list, so this scan runs at most once per dirty event,
+    /// not every frame. The directional pass does not use the list: it walks the scene once
+    /// a frame for the fit of its cascades, and finds its casters on the way.
     private static func rebuildShadowEntityCache() {
         let sceneSnapshot = RenderSceneSnapshot()
 
@@ -729,101 +731,147 @@ public enum RenderPasses {
         return runtimeState.shadowEntityCandidates
     }
 
-    private static func shadowCasters(for cascadeIdx: Int, in sceneSnapshot: RenderSceneSnapshot) -> [ShadowCaster] {
-        ensureShadowCacheConfigured()
-        guard let frustum = shadowFrustum(for: cascadeIdx) else { return [] }
+    /// A caster of the directional light, with the bounds the cascades test it by.
+    private struct DirectionalShadowCaster {
+        let caster: ShadowCaster
+        /// The box around the caster in the scene's own space: what a cascade's frustum,
+        /// which has the scene root folded in, is tested against.
+        let worldMin: simd_float3
+        let worldMax: simd_float3
+        /// The same box with the scene root's transform applied: the space the cascades'
+        /// centres and radii are in.
+        let visualMin: simd_float3
+        let visualMax: simd_float3
+    }
 
-        // Conservative, direction-agnostic pre-reject: a caster farther than the engine's
-        // own shadow-distance horizon (maxShadowCastingDistance) from anything this cascade's
-        // camera-frustum slice could see cannot matter to this cascade, regardless of light
-        // direction — unlike a camera-depth cutoff, this never excludes the far/shallow-angle
-        // casters that motivated removing the old per-cascade distance cull, since it is
-        // measured from the cascade's own world-space bounding sphere, not the camera.
-        let cascadeCenter = shadowSystem.cascadeWorldCenters[cascadeIdx]
-        let cascadeReach = shadowSystem.cascadeWorldRadii[cascadeIdx] + RenderPasses.maxShadowCastingDistance
+    /// What a frame's directional shadows are made from, found in one walk of the scene.
+    ///
+    /// The cascades are fitted to the bounds of everything that is drawn (`fitBounds`),
+    /// and each cascade then draws the casters that reach it (`casters`). Both used to walk
+    /// the scene on their own, the casters once per cascade: with tens of thousands of
+    /// entities those walks were a fifth of the frame even when no shadow was drawn.
+    private struct DirectionalShadowWalk {
+        var fitBounds: [ShadowCasterBounds] = []
+        var casters: [DirectionalShadowCaster] = []
+    }
 
-        // Rebuild candidate list if dirty. At most one rebuild per dirty event, shared
-        // across all cascade invocations in the same frame.
-        runtimeState.lock.lock()
-        let dirty = runtimeState.shadowCacheDirty
-        runtimeState.lock.unlock()
-        if dirty {
-            rebuildShadowEntityCache()
-        }
-
-        runtimeState.lock.lock()
-        let candidates = runtimeState.shadowEntityCandidates
-        runtimeState.lock.unlock()
-
-        var result: [ShadowCaster] = []
-        result.reserveCapacity(candidates.count / 4)
+    /// Walks the scene once for the directional light: see `DirectionalShadowWalk`.
+    ///
+    /// Whether an entity casts is read from its render component as the walk passes it,
+    /// so a caster made or switched on since the last frame is there without the
+    /// candidate cache of the spot and point passes having to be invalidated.
+    private static func gatherDirectionalShadowCasters(in sceneSnapshot: RenderSceneSnapshot) -> DirectionalShadowWalk {
+        var walk = DirectionalShadowWalk()
+        walk.fitBounds.reserveCapacity(sceneSnapshot.entityCapacity)
+        walk.casters.reserveCapacity(sceneSnapshot.entityCapacity / 4)
 
         // An object too small to be drawn casts a shadow about as small.
         let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
         let batchingEnabled = BatchingSystem.shared.isEnabled()
         let sceneRootMatrix = SceneRootTransform.shared.matrix
+        let sceneRootIsIdentity = sceneRootMatrix == matrix_identity_float4x4
         var renderModes = SceneChannelRenderModeMemo()
 
-        for entityId in candidates {
-            guard let entity = sceneSnapshot.entity(entityId) else { continue }
+        sceneSnapshot.forEachEntity(with: .drawable) { entity in
+            if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .light, .gizmo]) { return }
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
-            if renderMode == .hidden || renderMode == .wireframe { continue }
-            if batchingEnabled {
-                // Batch-eligible entities (StaticBatchComponent present) are always drawn
-                // via shadowCasterBatchGroups — whether or not the batch rebuild has landed
-                // yet.  Skipping them here prevents O(n_loaded_tiles) shadow draw calls that
-                // scale with the scene and eventually overflow the GPU command buffer budget.
-                // During the brief batch-rebuild window their shadow is absent; this is
-                // preferable to the alternative of the app freezing at ~300+ loaded tiles.
-                // The exception is a mesh carrying an occluder shell or fade: it stays out of
-                // its batch for as long as the component is there, so it casts on its own.
-                if entity.traits.contains(.staticBatch),
-                   entity.traits.isDisjoint(with: meshOccluderOrFade)
-                { continue }
-                if BatchingSystem.shared.isBatched(entityId: entityId) { continue }
-            }
+            if renderMode == .hidden || renderMode == .wireframe { return }
+
+            // Batch-eligible entities (StaticBatchComponent present) are always drawn via
+            // shadowCasterBatchGroups, whether or not the batch rebuild has landed yet.
+            // Skipping them here prevents O(n_loaded_tiles) shadow draw calls that scale
+            // with the scene and eventually overflow the GPU command buffer budget. During
+            // the brief batch-rebuild window their shadow is absent; this is preferable to
+            // the alternative of the app freezing at ~300+ loaded tiles. The exception is a
+            // mesh carrying an occluder shell or fade: it stays out of its batch for as long
+            // as the component is there, so it casts on its own. The cascades are fitted to
+            // the batch groups' own bounds, not to those of their entities.
+            let batchEligible = batchingEnabled && entity.traits.contains(.staticBatch)
+            let batched = batchingEnabled && BatchingSystem.shared.isBatched(entityId: entity.entityId)
+            let fits = !batchEligible && !batched
+            let mayCast = !batched && !(batchEligible && entity.traits.isDisjoint(with: meshOccluderOrFade))
+            guard fits || mayCast else { return }
 
             guard let components = sceneSnapshot.drawComponents(of: entity),
                   components.render.isVisible
-            else { continue }
-            let worldTransformComponent = components.world
-            let localTransformComponent = components.local
+            else { return }
+            let casts = mayCast && components.render.castsShadow
+            guard fits || casts else { return }
 
+            let boundingBox = components.local.boundingBox
             let (worldMin, worldMax) = worldAABB_MinMax(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space
+                localMin: boundingBox.min,
+                localMax: boundingBox.max,
+                worldMatrix: components.world.space
             )
-            if let smallObjectCulling, smallObjectCulling.culls(worldMin: worldMin, worldMax: worldMax) { continue }
-            // Directional-light caster relevance cannot be determined from camera
-            // distance or the cascade receiver split — a caster outside a cascade's
-            // camera-depth interval can still project a shadow into that interval.
-            // The world-space distance reject above stays correct for any light
-            // direction; the fitted light-space cascade frustum below is the
-            // correctness-preserving cull for what actually lands in the map.
-            //
-            // cascadeCenter/cascadeReach are in visual-world space (they come from the
-            // camera-frustum-derived cascade bounds), while worldMin/worldMax above are
-            // scene-local (needed as-is for the frustum test below, since `frustum` is built
-            // from a matrix that folds the scene-root transform back in). Fold the root
-            // transform into a second, visual-world copy of the bounds just for this check.
-            let (visualWorldMin, visualWorldMax) = worldAABB_MinMax(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: simd_mul(sceneRootMatrix, worldTransformComponent.space)
-            )
-            if shadowEntityBeyondMaxDistance(
-                worldMin: visualWorldMin, worldMax: visualWorldMax,
-                cameraPosition: cascadeCenter,
-                maxDistance: cascadeReach
-            ) { continue }
-            if isAABBInFrustum(frustum, min: worldMin, max: worldMax) {
-                result.append(ShadowCaster(entity: entity, components: components))
+            // The cascades' centres, radii and corners are in visual-world space (they come
+            // from the camera's frustum), while worldMin/worldMax are scene-local (needed
+            // as they are for the frustum test, since a cascade's frustum is built from a
+            // matrix that folds the scene-root transform back in). With a scene root that
+            // is not the identity, the box is made a second time in visual-world space.
+            var visualMin = worldMin
+            var visualMax = worldMax
+            if !sceneRootIsIdentity {
+                (visualMin, visualMax) = worldAABB_MinMax(
+                    localMin: boundingBox.min,
+                    localMax: boundingBox.max,
+                    worldMatrix: simd_mul(sceneRootMatrix, components.world.space)
+                )
+            }
+
+            if fits {
+                walk.fitBounds.append(ShadowCasterBounds(min: visualMin, max: visualMax))
+            }
+            if casts {
+                if let smallObjectCulling, smallObjectCulling.culls(worldMin: worldMin, worldMax: worldMax) { return }
+                walk.casters.append(DirectionalShadowCaster(
+                    caster: ShadowCaster(entity: entity, components: components),
+                    worldMin: worldMin,
+                    worldMax: worldMax,
+                    visualMin: visualMin,
+                    visualMax: visualMax
+                ))
             }
         }
+        return walk
+    }
 
-        lastShadowCasterCount = result.count
-        return result
+    /// The test a cascade puts each caster of the frame to.
+    private struct CascadeCasterTest {
+        let frustum: Frustum
+        let center: simd_float3
+        let reach: Float
+
+        init?(cascadeIdx: Int) {
+            guard let frustum = shadowFrustum(for: cascadeIdx) else { return nil }
+            self.frustum = frustum
+            // Conservative, direction-agnostic pre-reject: a caster farther than the
+            // engine's own shadow-distance horizon (maxShadowCastingDistance) from
+            // anything this cascade's camera-frustum slice could see cannot matter to this
+            // cascade, regardless of light direction. Unlike a camera-depth cutoff, this
+            // never excludes the far/shallow-angle casters that motivated removing the old
+            // per-cascade distance cull, since it is measured from the cascade's own
+            // world-space bounding sphere, not the camera.
+            center = shadowSystem.cascadeWorldCenters[cascadeIdx]
+            reach = shadowSystem.cascadeWorldRadii[cascadeIdx] + RenderPasses.maxShadowCastingDistance
+        }
+
+        /// Whether `caster` can cast into the cascade.
+        ///
+        /// Directional-light caster relevance cannot be determined from camera distance or
+        /// the cascade receiver split: a caster outside a cascade's camera-depth interval
+        /// can still project a shadow into that interval. The world-space distance reject
+        /// stays correct for any light direction; the fitted light-space cascade frustum
+        /// is the correctness-preserving cull for what actually lands in the map.
+        @inline(__always)
+        func accepts(_ caster: borrowing DirectionalShadowCaster) -> Bool {
+            if shadowEntityBeyondMaxDistance(
+                worldMin: caster.visualMin, worldMax: caster.visualMax,
+                cameraPosition: center,
+                maxDistance: reach
+            ) { return false }
+            return isAABBInFrustum(frustum, min: caster.worldMin, max: caster.worldMax)
+        }
     }
 
     private static func shadowCasterBatchGroups(for cascadeIdx: Int) -> [BatchGroup] {
@@ -1459,7 +1507,14 @@ public enum RenderPasses {
             return
         }
 
-        shadowSystem.updateCascades()
+        // One walk of the scene serves the fit of the cascades and the casters of each.
+        // The cascades ask for it only when a directional light casts shadows.
+        let sceneSnapshot = RenderSceneSnapshot()
+        var shadowWalk = DirectionalShadowWalk()
+        shadowSystem.updateCascades(entityCasterBounds: {
+            shadowWalk = gatherDirectionalShadowCasters(in: sceneSnapshot)
+            return shadowWalk.fitBounds
+        })
         guard shadowSystem.isActive else { return }
         guard !renderInfo.csmRenderPassDescriptors.isEmpty else { return }
 
@@ -1472,7 +1527,6 @@ public enum RenderPasses {
 
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
         // What every draw of the pass shares, read once.
-        let sceneSnapshot = RenderSceneSnapshot()
         let cameraPosition = shadingCameraPosition(cameraComponent)
         let projectionMatrix = renderInfo.perspectiveSpace
 
@@ -1520,7 +1574,12 @@ public enum RenderPasses {
                 index: Int(shadowPassLightMatrixUniform.rawValue)
             )
 
-            for caster in shadowCasters(for: cascadeIdx, in: sceneSnapshot) {
+            var casterCount = 0
+            let cascadeTest = CascadeCasterTest(cascadeIdx: cascadeIdx)
+            for casterIndex in shadowWalk.casters.indices {
+                guard let cascadeTest, cascadeTest.accepts(shadowWalk.casters[casterIndex]) else { continue }
+                casterCount += 1
+                let caster = shadowWalk.casters[casterIndex].caster
                 let transformComponent = caster.components.world
                 let deformation = sceneSnapshot.deformation(of: caster.entity)
                 let hasSkeleton = caster.entity.traits.contains(.skeleton)
@@ -1566,6 +1625,8 @@ public enum RenderPasses {
                     }
                 }
             }
+
+            lastShadowCasterCount = casterCount
 
             if let instancedPipeline {
                 let counts = encodeInstancedShadowDraws(
