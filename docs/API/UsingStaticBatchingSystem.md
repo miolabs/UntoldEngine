@@ -39,6 +39,18 @@ setEntityMeshAsync(entityId: building, filename: "office_building", withExtensio
 }
 ```
 
+To add static content to a scene that is already running, tell the batching system about the new entities instead of rebuilding everything. Their cells are built in the background over the next frames, and each entity is drawn by itself until its batch is ready:
+
+```swift
+setEntityMeshAsync(entityId: crate, filename: "crate", withExtension: "untold") { success in
+    guard success else { return }
+    setEntityStaticBatchComponent(entityId: crate)
+    BatchingSystem.shared.notifyStaticEntitiesPlaced([crate])
+}
+```
+
+Pass the entities that draw a mesh: the entity itself for a model of one node, as here, and its descendants that have a `RenderComponent` for a model of several. Entities without the mark are skipped, and the call does nothing while batching is disabled.
+
 ## Shadows
 
 An entity in a batch casts through its batch. A marked entity that no batch took (it is alone with its material in its cell) casts its own shadow, from the sun and from spot and point lights. The one exception is a streamed tile that has just come in: its entities cast nothing for the few frames until their batch is built.
@@ -120,6 +132,14 @@ setBatching(.cellSize(32.0))
 setBatching(.maxDirtyCellsPerTick(8))
 setBatching(.visibilityGatedBuild(true))
 setBatching(.backgroundArtifactBuild(true))
+```
+
+### `BatchingSystem.shared.notifyStaticEntitiesPlaced(_:)`
+
+Hands marked entities that are loaded and in place to the batching system. Their cells are built in the background, without waiting to be seen and without the per-cell size limits of streamed tiles.
+
+```swift
+BatchingSystem.shared.notifyStaticEntitiesPlaced(entities)
 ```
 
 ### `generateBatches()`

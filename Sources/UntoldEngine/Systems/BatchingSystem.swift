@@ -566,6 +566,15 @@ public class BatchingSystem: @unchecked Sendable {
     /// The entities of `pendingTileResidentQueue` that the tick has not drained yet, for
     /// `awaitsBatch(entityId:)` to ask in constant time.
     private var tileResidentsAwaitingDrain: Set<EntityID> = []
+    /// Cells that hold entities placed in the scene to stay (the parts of a pack, an entity
+    /// that moved and came to rest), as opposed to tiles that the streaming system brings
+    /// in and takes away. Their batches are built as soon as the budgets of a tick allow:
+    /// whether or not the cell has been seen and whatever its size, as `generateBatches()`
+    /// builds them.
+    private var ungatedCells: Set<BatchCellID> = []
+    /// Entities handed to `notifyStaticEntitiesPlaced(_:)` that the next tick registers.
+    /// The cell each one lands in joins `ungatedCells`.
+    private var placedEntities: Set<EntityID> = []
     private var isSubscribed: Bool = false
     private var batchCellSize: Float = 32.0
     /// Maps each cell to the UUIDs of its current batch groups.
@@ -659,6 +668,24 @@ public class BatchingSystem: @unchecked Sendable {
         tileResidentsAwaitingDrain.formUnion(entityIds)
     }
 
+    /// Hands marked entities that are loaded and in place to the batching system: their
+    /// cells are built in the background over the next ticks, without waiting for a cell
+    /// to be seen and without the size limits that guard the cells of streamed tiles.
+    ///
+    /// For entities that are in the scene to stay, like the parts of a pack. Until its
+    /// batch is built an entity is drawn by itself, in the shadow pass too. While batching
+    /// is disabled this does nothing, and `generateBatches()` picks the marks up later.
+    public func notifyStaticEntitiesPlaced(_ entityIds: some Sequence<EntityID>) {
+        guard batchingEnabled else { return }
+        for entityId in entityIds {
+            guard scene.exists(entityId),
+                  scene.get(component: StaticBatchComponent.self, for: entityId) != nil
+            else { continue }
+            pendingEntityAdditions.insert(entityId)
+            placedEntities.insert(entityId)
+        }
+    }
+
     /// Whether the shadow passes draw a marked entity by itself.
     ///
     /// An entity in a batch is drawn with it. One in a streamed cell that waits for its
@@ -687,8 +714,12 @@ public class BatchingSystem: @unchecked Sendable {
     /// Every other marked entity that no batch draws casts for itself: one whose cell was
     /// built without it (alone with its material, or in a cell over the runtime limits)
     /// and one that the system does not track at all.
+    /// So does one handed over with `notifyStaticEntitiesPlaced(_:)`: its cell is built
+    /// whether or not it is seen, so it is not left without a shadow for long or for good.
     public func awaitsBatch(entityId: EntityID) -> Bool {
+        if placedEntities.contains(entityId) { return false }
         if let cellId = entityToCellMembership[entityId] {
+            if ungatedCells.contains(cellId) { return false }
             if dirtyCells.contains(cellId) { return true }
             let state = cellLifecycle[cellId]?.state
             return state == .streaming || state == .batchPending
@@ -721,6 +752,7 @@ public class BatchingSystem: @unchecked Sendable {
         }
         pendingTileResidentQueueHead = 0
         tileResidentsAwaitingDrain.subtract(entityIds)
+        placedEntities.subtract(entityIds)
     }
 
     /// Full batching cleanup for tile entities that are about to be destroyed.
@@ -749,6 +781,7 @@ public class BatchingSystem: @unchecked Sendable {
         }
         pendingTileResidentQueueHead = 0
         tileResidentsAwaitingDrain.subtract(entityIds)
+        placedEntities.subtract(entityIds)
         // Queue removal from committed state.  removeEntityFromBatchingTracking is called
         // by the batch tick; it only manipulates BatchingSystem-internal dictionaries and
         // does not access ECS data, so it is safe to call after destroyEntity.
@@ -771,6 +804,7 @@ public class BatchingSystem: @unchecked Sendable {
         }
         pendingTileResidentQueueHead = 0
         tileResidentsAwaitingDrain.subtract(entityIds)
+        placedEntities.subtract(entityIds)
 
         var affectedCells: Set<BatchCellID> = []
         for entityId in entityIds {
@@ -1102,6 +1136,7 @@ public class BatchingSystem: @unchecked Sendable {
     private func registerEntityForBatching(entityId: EntityID, deferBatchBuild: Bool) {
         guard let candidate = resolveBatchCandidate(entityId: entityId) else {
             guard scene.exists(entityId) else {
+                placedEntities.remove(entityId)
                 removeEntityFromBatchingTracking(entityId: entityId)
                 return
             }
@@ -1111,6 +1146,7 @@ public class BatchingSystem: @unchecked Sendable {
             let hasWorld = scene.get(component: WorldTransformComponent.self, for: entityId) != nil
             let hasLocal = scene.get(component: LocalTransformComponent.self, for: entityId) != nil
             Logger.log(message: "[Batching] resolveBatchCandidate FAILED entity=\(entityId) staticBatch=\(hasStatic) render=\(hasRender) meshEmpty=\(meshEmpty) world=\(hasWorld) local=\(hasLocal)")
+            placedEntities.remove(entityId)
             removeEntityFromBatchingTracking(entityId: entityId)
             return
         }
@@ -1136,6 +1172,9 @@ public class BatchingSystem: @unchecked Sendable {
         cellToEntities[newCell, default: []].insert(entityId)
         dirtyCells.insert(newCell)
         markCellDirtyForFallback(cellId: newCell, deferBatchBuild: deferBatchBuild)
+        if placedEntities.remove(entityId) != nil, ungatedCells.insert(newCell).inserted {
+            shadowCastersChanged()
+        }
     }
 
     private func updateCellVisibilityHistory() -> Set<BatchCellID> {
@@ -1159,8 +1198,10 @@ public class BatchingSystem: @unchecked Sendable {
             guard var record = cellLifecycle[cellId] else { continue }
             guard record.state == .renderableUnbatched || record.state == .streaming else { continue }
             guard cellToEntities[cellId]?.isEmpty == false else { continue }
-            guard !runtimeBatchIneligibleCells.contains(cellId) else { continue }
-            if visibilityGatedBatchBuildEnabled {
+            // A cell of entities placed to stay is built unseen and whatever its size.
+            let ungated = ungatedCells.contains(cellId)
+            guard ungated || !runtimeBatchIneligibleCells.contains(cellId) else { continue }
+            if visibilityGatedBatchBuildEnabled, !ungated {
                 let lastVisibleFrame = cellLastVisibleFrame[cellId] ?? Int.min
                 let isVisibleNow = visibleCells.contains(cellId)
                 let isRecentlyVisible = isVisibleNow || (lastVisibleFrame != Int.min && (tickCounter - lastVisibleFrame) <= recentWindow)
@@ -1222,7 +1263,8 @@ public class BatchingSystem: @unchecked Sendable {
 
             let estimate = estimateCellWork(for: cellId)
             updateRuntimeCellEstimate(cellId: cellId, estimate: estimate)
-            if exceedsRuntimeComplexityGuard(estimate) {
+            let ungated = ungatedCells.contains(cellId)
+            if !ungated, exceedsRuntimeComplexityGuard(estimate) {
                 metrics.skippedByComplexityGuard += 1
                 runtimeBatchIneligibleCells.insert(cellId)
                 shadowCastersChanged()
@@ -1239,7 +1281,7 @@ public class BatchingSystem: @unchecked Sendable {
             let lastVisibleFrame = cellLastVisibleFrame[cellId] ?? Int.min
             let isVisibleNow = visibleCells.contains(cellId)
             let isRecentlyVisible = isVisibleNow || (lastVisibleFrame != Int.min && (tickCounter - lastVisibleFrame) <= recentWindow)
-            if visibilityGatedBatchBuildEnabled, !isRecentlyVisible {
+            if visibilityGatedBatchBuildEnabled, !ungated, !isRecentlyVisible {
                 metrics.deferredByVisibility += 1
                 continue
             }
@@ -1968,6 +2010,7 @@ public class BatchingSystem: @unchecked Sendable {
         }
 
         guard cellToEntities[cellId]?.isEmpty ?? true else { return }
+        ungatedCells.remove(cellId)
         if cellLifecycle[cellId]?.state == .unloaded {
             cellLifecycle.removeValue(forKey: cellId)
             cellLastVisibleFrame.removeValue(forKey: cellId)
@@ -2318,6 +2361,8 @@ public class BatchingSystem: @unchecked Sendable {
         pendingTileResidentQueue.removeAll()
         pendingTileResidentQueueHead = 0
         tileResidentsAwaitingDrain.removeAll()
+        ungatedCells.removeAll()
+        placedEntities.removeAll()
         cellLastVisibleFrame.removeAll()
         cellBuildGeneration.removeAll()
         runtimeBatchIneligibleCells.removeAll()
@@ -2380,6 +2425,7 @@ public class BatchingSystem: @unchecked Sendable {
             pendingTileResidentQueue.removeAll()
             pendingTileResidentQueueHead = 0
             tileResidentsAwaitingDrain.removeAll()
+            placedEntities.removeAll()
             runtimeBatchIneligibleCells.removeAll()
             clearPendingBuildArtifacts()
             for cellId in cellToEntities.keys {

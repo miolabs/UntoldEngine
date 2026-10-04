@@ -26,6 +26,16 @@ When your 100 entities load, each one that has a `StaticBatchComponent` gets reg
 - If eligible → it gets assigned to a cell and added to `cellToEntities[cellId]`.
 - The cell is marked **dirty** and its state becomes `renderableUnbatched`.
 
+An entity reaches registration in one of three ways:
+
+| Who tells the batching system | Call | How its cell is built |
+|---|---|---|
+| The tile streaming system, when a tile comes in | `notifyTileEntitiesResident(_:)` and residency events | Once the cell has been seen, and only if it is under the per-cell limits (2c and 2d below) |
+| Whoever placed entities that are in the scene to stay: the pack loader, or your own code | `notifyStaticEntitiesPlaced(_:)` | As soon as the per-tick budgets allow: unseen cells too, and whatever their size |
+| Nobody: you call `generateBatches()` | | All at once, in the call |
+
+A cell that received placed entities stays **ungated** for as long as it has entities: later rebuilds of it (an entity moved out, a material changed) do not wait for it to be seen either.
+
 ---
 
 ## Step 2: Per-Frame Tick — The Pipeline
@@ -59,7 +69,7 @@ This is the core build loop:
 
 2. **Gather `batchPending` cells** and build rebuild candidates. For each:
    - Estimate the work: count total vertices + indices + bytes across all entities in the cell.
-   - If a cell **exceeds the per-cell complexity guard** (>160K verts, >300K indices, >8MB), it's flagged `runtimeIneligibleCells` and stays unbatched.
+   - If a cell **exceeds the per-cell complexity guard** (>160K verts, >300K indices, >8MB), it's flagged `runtimeIneligibleCells` and stays unbatched. Ungated cells skip this guard and the visibility check.
    - Otherwise it becomes a `CellRebuildCandidate`.
 
 3. **Sort candidates** by priority:
@@ -128,6 +138,7 @@ Batch groups cast in the directional, spot and point shadow passes. A marked ent
 | Is in a batch | The batch group |
 | Is in a streamed cell that waits for its batches, or belongs to a tile that is fading in or out | Nobody, for that short while. A tile that has just come in would otherwise add a shadow draw per entity |
 | Was left out when its cell was built (alone with its material, or the cell is over the per-cell limits) | Itself |
+| Is in an ungated cell whose batch is not built yet | Itself |
 | Carries an occluder shell or a fade, or is not known to the batching system | Itself |
 
 ---
