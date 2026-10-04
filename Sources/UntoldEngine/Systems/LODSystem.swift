@@ -29,7 +29,11 @@ public class LODSystem: @unchecked Sendable {
     public func update(deltaTime: Float) {
         frameCounter &+= 1
 
-        if LODConfig.shared.enableFadeTransitions {
+        // One copy for the whole pass: reading the shared configuration takes a lock,
+        // and a scene can hold tens of thousands of LOD entities.
+        let config = LODConfig.shared
+
+        if config.enableFadeTransitions {
             advanceActiveTransitions(deltaTime: deltaTime)
         }
 
@@ -43,14 +47,17 @@ public class LODSystem: @unchecked Sendable {
         guard lodShouldRunThisFrame(
             frameCounter: frameCounter,
             hasRunOnce: hasRunOnce,
-            interval: LODConfig.shared.lodUpdateFrameInterval,
+            interval: config.lodUpdateFrameInterval,
             cameraPosition: cameraPosition,
             lastCameraPosition: lastCameraPosition,
-            displacementThreshold: LODConfig.shared.minimumCameraDisplacementForLODUpdate
+            displacementThreshold: config.minimumCameraDisplacementForLODUpdate
         ) else { return }
 
         hasRunOnce = true
         lastCameraPosition = cameraPosition
+
+        // What a size on screen is worth in distance, for the view being drawn.
+        let screenSizeReach = lodScreenSizeReach(projection: renderInfo.perspectiveSpace)
 
         // Query entities with LOD components
         let lodId = getComponentId(for: LODComponent.self)
@@ -58,7 +65,7 @@ public class LODSystem: @unchecked Sendable {
         let entities = queryEntitiesWithComponentIds([lodId, transformId], in: scene)
 
         for entityId in entities {
-            updateEntityLOD(entityId: entityId, cameraPosition: cameraPosition, deltaTime: deltaTime)
+            updateEntityLOD(entityId: entityId, cameraPosition: cameraPosition, screenSizeReach: screenSizeReach, config: config)
         }
     }
 
@@ -101,28 +108,49 @@ public class LODSystem: @unchecked Sendable {
         }
     }
 
-    private func updateEntityLOD(entityId: EntityID, cameraPosition: simd_float3, deltaTime: Float) {
+    private func updateEntityLOD(entityId: EntityID, cameraPosition: simd_float3, screenSizeReach: Float?, config: LODConfig) {
         guard let lodComponent = scene.get(component: LODComponent.self, for: entityId) else { return }
 
         // Skip if no LOD levels loaded yet (async loading may still be in progress)
         guard !lodComponent.lodLevels.isEmpty else { return }
 
         if shouldDeferLODSelectionDuringTransition(
-            fadeTransitionsEnabled: LODConfig.shared.enableFadeTransitions,
+            fadeTransitionsEnabled: config.enableFadeTransitions,
             previousLOD: lodComponent.previousLOD
         ) {
             return
         }
 
-        // Calculate distance
-        let distance = entityDistanceToCamera(entityId: entityId, cameraPosition: cameraPosition)
+        let desiredLOD: Int
+        if lodComponent.selectsByScreenSize, let screenSizeReach {
+            // Select by the size of the entity on screen, as it is now
+            let (distance, radius) = entityDistanceAndRadius(
+                entityId: entityId,
+                cameraPosition: cameraPosition,
+                localRadius: lodComponent.screenSizeRadius
+            )
+            desiredLOD = selectLODIndex(
+                levels: lodComponent.lodLevels,
+                distance: distance,
+                reach: radius * screenSizeReach,
+                currentLOD: lodComponent.desiredLOD,
+                forcedLOD: lodComponent.forcedLOD,
+                lodBias: config.lodBias,
+                hysteresis: config.hysteresis,
+                globalDistances: config.lodDistances
+            )
+        } else {
+            // Calculate distance
+            let distance = entityDistanceToCamera(entityId: entityId, cameraPosition: cameraPosition)
 
-        // Select desired LOD level based on distance
-        let desiredLOD = selectLODLevel(
-            distance: distance,
-            lodComponent: lodComponent,
-            currentLOD: lodComponent.desiredLOD
-        )
+            // Select desired LOD level based on distance
+            desiredLOD = selectLODLevel(
+                distance: distance,
+                lodComponent: lodComponent,
+                currentLOD: lodComponent.desiredLOD,
+                config: config
+            )
+        }
 
         lodComponent.desiredLOD = desiredLOD
 
@@ -134,7 +162,7 @@ public class LODSystem: @unchecked Sendable {
         )
 
         // Apply the LOD (handles transitions, updates render component)
-        applyLOD(entityId: entityId, newLOD: actualLOD, deltaTime: deltaTime)
+        applyLOD(entityId: entityId, lodComponent: lodComponent, newLOD: actualLOD, config: config)
     }
 
     /// Resolve desired LOD to actual LOD, falling back if mesh not resident
@@ -161,33 +189,31 @@ public class LODSystem: @unchecked Sendable {
         return lodComponent.currentLOD
     }
 
-    private func selectLODLevel(distance: Float, lodComponent: LODComponent, currentLOD: Int) -> Int {
+    private func selectLODLevel(distance: Float, lodComponent: LODComponent, currentLOD: Int, config: LODConfig) -> Int {
         selectLODIndex(
             levels: lodComponent.lodLevels,
             distance: distance,
             currentLOD: currentLOD,
             forcedLOD: lodComponent.forcedLOD,
-            lodBias: LODConfig.shared.lodBias,
-            hysteresis: LODConfig.shared.hysteresis,
-            globalDistances: LODConfig.shared.lodDistances
+            lodBias: config.lodBias,
+            hysteresis: config.hysteresis,
+            globalDistances: config.lodDistances
         )
     }
 
-    private func applyLOD(entityId: EntityID, newLOD: Int, deltaTime _: Float) {
-        guard let lodComponent = scene.get(component: LODComponent.self, for: entityId),
-              let renderComponent = scene.get(component: RenderComponent.self, for: entityId)
-        else { return }
-
+    private func applyLOD(entityId: EntityID, lodComponent: LODComponent, newLOD: Int, config: LODConfig) {
         let previousLODIndex = lodComponent.currentLOD
 
-        // No change needed
+        // No change needed: the usual case, so it comes before any other lookup.
         if newLOD == previousLODIndex, lodComponent.previousLOD == nil {
             return
         }
 
+        guard let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else { return }
+
         withWorldMutationGate {
             // Handle fade transitions
-            if LODConfig.shared.enableFadeTransitions {
+            if config.enableFadeTransitions {
                 if newLOD != previousLODIndex {
                     // Start transition
                     lodComponent.previousLOD = previousLODIndex
@@ -203,6 +229,15 @@ public class LODSystem: @unchecked Sendable {
 
             // Update render component with new LOD meshes
             if newLOD >= 0, newLOD < lodComponent.lodLevels.count {
+                if lodComponent.levelsShareMaterials, !lodComponent.lodLevels[newLOD].mesh.isEmpty {
+                    // The materials are the entity's: the level that leaves keeps those it
+                    // was drawn with (a fade still draws it) and the one that arrives takes them.
+                    let drawnMeshes = renderComponent.mesh
+                    if previousLODIndex != newLOD, previousLODIndex >= 0, previousLODIndex < lodComponent.lodLevels.count {
+                        carryLODMaterials(from: drawnMeshes, to: &lodComponent.lodLevels[previousLODIndex].mesh)
+                    }
+                    carryLODMaterials(from: drawnMeshes, to: &lodComponent.lodLevels[newLOD].mesh)
+                }
                 let lodLevel = lodComponent.lodLevels[newLOD]
                 // Skip placeholder LODs (empty mesh arrays)
                 if !lodLevel.mesh.isEmpty {
@@ -297,12 +332,64 @@ func entityDistanceToCamera(entityId: EntityID, cameraPosition: simd_float3) -> 
     return simd_distance(cameraPosition, simd_float3(worldCenter.x, worldCenter.y, worldCenter.z))
 }
 
+/// The distance from the camera to the center of an entity's bounds and the radius, in
+/// world space, of the sphere its size on screen is measured by: `localRadius` under the
+/// entity's world transform, or the sphere around its bounding box when `localRadius`
+/// is 0.
+func entityDistanceAndRadius(entityId: EntityID, cameraPosition: simd_float3, localRadius: Float) -> (distance: Float, radius: Float) {
+    guard let worldTransform = scene.get(component: WorldTransformComponent.self, for: entityId),
+          let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId)
+    else { return (0.0, 0.0) }
+
+    let boundingBox = localTransform.boundingBox
+    let localCenter = (boundingBox.min + boundingBox.max) * 0.5
+    let worldCenter = worldTransform.space * simd_float4(localCenter, 1.0)
+    let radius = localRadius > 0 ? localRadius : simd_length(boundingBox.max - boundingBox.min) * 0.5
+    return (
+        simd_distance(cameraPosition, simd_float3(worldCenter.x, worldCenter.y, worldCenter.z)),
+        radius * largestAxisScale(of: worldTransform.space)
+    )
+}
+
+/// The distance, per unit of radius, at which a sphere covers a screen size of 1 (the
+/// whole height of the viewport) in the view that `projection` draws: a sphere of radius
+/// r covers the screen size s at the distance r * reach / s. Nil when the projection has
+/// no perspective, where the size on screen does not depend on the distance.
+///
+/// A screen size is a share of the viewport height, whatever that height is in pixels:
+/// the switches follow the field of view and not the resolution, so a denser display
+/// draws the same levels as a coarser one.
+func lodScreenSizeReach(projection: simd_float4x4) -> Float? {
+    // A perspective projection has no constant term in w; its [1][1] is 1 / tan(fovY / 2).
+    let perspectiveScale = projection.columns.1.y
+    guard projection.columns.3.w == 0, perspectiveScale > 0, perspectiveScale.isFinite else { return nil }
+    return perspectiveScale
+}
+
+/// The share of a level's switch distance that `selectLODIndex` lets the hysteresis reach.
+let lodHysteresisDistanceShare: Float = 0.1
+
+/// Copies the materials of `source` onto `destination`, mesh for mesh and submesh for
+/// submesh. Does nothing unless the two have the same layout.
+func carryLODMaterials(from source: [Mesh], to destination: inout [Mesh]) {
+    guard source.count == destination.count,
+          zip(source, destination).allSatisfy({ $0.submeshes.count == $1.submeshes.count })
+    else { return }
+    for meshIndex in destination.indices {
+        for submeshIndex in destination[meshIndex].submeshes.indices {
+            destination[meshIndex].submeshes[submeshIndex].material = source[meshIndex].submeshes[submeshIndex].material
+        }
+    }
+}
+
 /// Shared by `LODSystem.selectLODLevel` and `GaussianLODSystem.selectDesiredLOD` — walks
 /// `levels` in distance order and returns the first whose threshold isn't yet exceeded by
 /// `distance * lodBias`. Applies `hysteresis` when a candidate level would mean switching to
 /// higher detail (lower index) than `currentLOD`, so a distance oscillating right at a
-/// threshold doesn't flip the selection every re-evaluation. Falls back to
-/// `globalDistances[index]` when a level's own `maxDistance` is unset (0).
+/// threshold doesn't flip the selection every re-evaluation. The hysteresis never takes more
+/// than `lodHysteresisDistanceShare` of a threshold: a fixed distance larger than a level's
+/// own switch distance would otherwise keep a small object from ever returning to that level.
+/// Falls back to `globalDistances[index]` when a level's own `maxDistance` is unset (0).
 func selectLODIndex(
     levels: [some LODDistanceLevel],
     distance: Float,
@@ -312,27 +399,86 @@ func selectLODIndex(
     hysteresis: Float,
     globalDistances: [Float]
 ) -> Int {
+    selectLODIndex(
+        levelCount: levels.count,
+        distance: distance,
+        currentLOD: currentLOD,
+        forcedLOD: forcedLOD,
+        lodBias: lodBias,
+        hysteresis: hysteresis
+    ) { index in
+        lodDistanceThreshold(of: levels[index], at: index, globalDistances: globalDistances)
+    }
+}
+
+/// `selectLODIndex` for an entity whose levels are chosen by its size on screen
+/// (`LODComponent.selectsByScreenSize`). A level ends at the distance where the entity
+/// covers the screen size of the next one, `reach / screenPercentage`, with `reach` the
+/// distance at which the entity covers a screen size of 1: its world radius times
+/// `lodScreenSizeReach`. The bias and the hysteresis act on that distance as they do on
+/// a `maxDistance`. A level whose successor has no screen size, the last level, and an
+/// entity without a size end at their own `maxDistance` instead.
+func selectLODIndex(
+    levels: [LODLevel],
+    distance: Float,
+    reach: Float,
+    currentLOD: Int,
+    forcedLOD: Int?,
+    lodBias: Float,
+    hysteresis: Float,
+    globalDistances: [Float]
+) -> Int {
+    selectLODIndex(
+        levelCount: levels.count,
+        distance: distance,
+        currentLOD: currentLOD,
+        forcedLOD: forcedLOD,
+        lodBias: lodBias,
+        hysteresis: hysteresis
+    ) { index in
+        if reach > 0, reach.isFinite, index + 1 < levels.count, levels[index + 1].screenPercentage > 0 {
+            return reach / levels[index + 1].screenPercentage
+        }
+        return lodDistanceThreshold(of: levels[index], at: index, globalDistances: globalDistances)
+    }
+}
+
+/// Where a level hands over to the next one by distance: its own `maxDistance`, or
+/// `globalDistances[index]` when that is unset (0). Nil when neither says.
+private func lodDistanceThreshold(of level: some LODDistanceLevel, at index: Int, globalDistances: [Float]) -> Float? {
+    if level.maxDistance > 0 {
+        return level.maxDistance
+    }
+    return index < globalDistances.count ? globalDistances[index] : nil
+}
+
+/// The walk behind `selectLODIndex`: the first level, finest first, whose
+/// `switchDistance` the biased distance has not passed. A level without one is skipped.
+private func selectLODIndex(
+    levelCount: Int,
+    distance: Float,
+    currentLOD: Int,
+    forcedLOD: Int?,
+    lodBias: Float,
+    hysteresis: Float,
+    switchDistance: (Int) -> Float?
+) -> Int {
     if let forced = forcedLOD, forced >= 0 {
-        return min(forced, levels.count - 1)
+        return min(forced, levelCount - 1)
     }
 
     let adjustedDistance = distance * lodBias
 
-    for (index, level) in levels.enumerated() {
-        let baseThreshold: Float
-        if level.maxDistance > 0 {
-            baseThreshold = level.maxDistance
-        } else if index < globalDistances.count {
-            baseThreshold = globalDistances[index]
-        } else {
-            continue
-        }
+    for index in 0 ..< levelCount {
+        guard let baseThreshold = switchDistance(index) else { continue }
 
-        let threshold = index < currentLOD ? baseThreshold - hysteresis : baseThreshold
+        let threshold = index < currentLOD
+            ? baseThreshold - min(hysteresis, baseThreshold * lodHysteresisDistanceShare)
+            : baseThreshold
         if adjustedDistance <= threshold {
             return index
         }
     }
 
-    return levels.count - 1
+    return levelCount - 1
 }
