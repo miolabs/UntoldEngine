@@ -2834,6 +2834,21 @@ public class BatchingSystem: @unchecked Sendable {
         components.append("\(material.metallicChannel.rawValue)")
         components.append(String(format: "%.2f", material.specular))
         components.append(String(format: "%.2f", material.ior))
+        // The rest of what the opaque pass sends per material: a batch draws all of its
+        // meshes with the material of one, so two that differ in any of it are two.
+        components.append(String(format: "%.2f,%.2f,%.2f,%.2f",
+                                 material.edgeTint.x,
+                                 material.edgeTint.y,
+                                 material.edgeTint.z,
+                                 material.edgeTint.w))
+        components.append(String(format: "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
+                                 material.specularTint,
+                                 material.subsurface,
+                                 material.anisotropic,
+                                 material.sheen,
+                                 material.sheenTint,
+                                 material.clearCoat,
+                                 material.clearCoatGloss))
         components.append(String(format: "%.2f", material.stScale))
         components.append(String(format: "%.2f", material.normalScale))
         // What the material gives off: two lamps alike in all but their glow are two materials.
