@@ -126,13 +126,47 @@ struct InstancedSubmeshDraw {
         var draws: [InstancedSubmeshDraw] = []
         for meshIndex in meshes.indices {
             for submeshIndex in meshes[meshIndex].submeshes.indices {
+                // A material that is blended or lets light through belongs to the
+                // transparency pass.
                 guard let material = meshes[meshIndex].submeshes[submeshIndex].material,
-                      material.alphaMode != .blend
+                      !material.hasTransparency
                 else { continue }
                 draws.append(InstancedSubmeshDraw(
                     meshIndex: meshIndex,
                     submesh: meshes[meshIndex].submeshes[submeshIndex],
                     material: material
+                ))
+            }
+        }
+        return draws
+    }
+}
+
+/// One draw of an instanced group in a shadow pass: the index data of a submesh that
+/// casts. Glass casts no shadow, so its submeshes are not among them.
+struct InstancedShadowDraw {
+    let meshIndex: Int32
+    let primitiveType: MTLPrimitiveType
+    let indexCount: Int
+    let indexType: MTLIndexType
+    let indexBuffer: MTLBuffer
+    let indexBufferOffset: Int
+
+    /// The shadow draws of `meshes`, in the order they are encoded.
+    static func draws(of meshes: [Mesh]) -> [InstancedShadowDraw] {
+        var draws: [InstancedShadowDraw] = []
+        for meshIndex in meshes.indices {
+            for submeshIndex in meshes[meshIndex].submeshes.indices {
+                if let material = meshes[meshIndex].submeshes[submeshIndex].material, material.transmitsLight {
+                    continue
+                }
+                draws.append(InstancedShadowDraw(
+                    meshIndex: Int32(meshIndex),
+                    primitiveType: meshes[meshIndex].submeshes[submeshIndex].primitiveType,
+                    indexCount: meshes[meshIndex].submeshes[submeshIndex].indexCount,
+                    indexType: meshes[meshIndex].submeshes[submeshIndex].indexType,
+                    indexBuffer: meshes[meshIndex].submeshes[submeshIndex].indexBuffer,
+                    indexBufferOffset: meshes[meshIndex].submeshes[submeshIndex].indexBufferOffset
                 ))
             }
         }
@@ -174,9 +208,11 @@ struct MeshListDescription {
                     words.append(Self.noMaterial)
                     continue
                 }
-                // The transparency pass draws a blended submesh, entity by entity.
-                if material.alphaMode == .blend {
-                    words.append(Self.blendedMaterial)
+                // The transparency pass draws a blended submesh and one that lets light
+                // through, entity by entity. The second casts no shadow, which two
+                // components that share a shadow draw have to agree on.
+                if material.hasTransparency {
+                    words.append(material.transmitsLight ? Self.transmittingMaterial : Self.blendedMaterial)
                     continue
                 }
                 words.append(Self.opaqueMaterial)
@@ -203,6 +239,7 @@ struct MeshListDescription {
     private static let noMaterial: UInt64 = 0
     private static let blendedMaterial: UInt64 = 1
     private static let opaqueMaterial: UInt64 = 2
+    private static let transmittingMaterial: UInt64 = 3
 
     /// Everything of the material that `draw` binds. A value left out here would let two
     /// different materials share a draw: `RenderInstanceKeyTests` checks the parameter
@@ -234,6 +271,7 @@ struct MeshListDescription {
         add(draw.parameters.heightScale, draw.parameters.heightMidlevel)
         add(draw.parameters.heightRemapMin, draw.parameters.heightRemapMax)
         add(draw.parameters.normalScale, draw.parameters.interactWithLight ? 1 : 0)
+        add(draw.parameters.transmission, 0)
         words.append(
             UInt64(UInt32(bitPattern: draw.parameters.alphaMode))
                 | (UInt64(UInt32(bitPattern: draw.parameters.hasEmissiveTexture)) << 32)

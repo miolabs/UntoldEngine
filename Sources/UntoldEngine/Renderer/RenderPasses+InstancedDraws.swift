@@ -229,31 +229,44 @@ extension RenderPasses {
         var drawCount = 0
         for groupIndex in draws.groups.indices {
             let group = draws.groups[groupIndex]
-            let meshes = draws.groupComponents[groupIndex].mesh
+            let component = draws.groupComponents[groupIndex]
+            let meshes = component.mesh
 
-            for meshIndex in meshes.indices where !meshes[meshIndex].submeshes.isEmpty {
-                renderEncoder.setVertexBuffer(
-                    meshes[meshIndex].vertexBuffers[Int(modelPassVerticesIndex.rawValue)],
-                    offset: 0,
-                    index: Int(shadowPassModelPositionIndex.rawValue)
-                )
-                let baseInstance = draws.baseInstance(of: group, meshIndex: meshIndex)
-
-                // Every submesh casts, as when the caster is drawn on its own.
-                for submeshIndex in meshes[meshIndex].submeshes.indices {
-                    renderEncoder.drawIndexedPrimitivesTracked(
-                        type: meshes[meshIndex].submeshes[submeshIndex].primitiveType,
-                        indexCount: meshes[meshIndex].submeshes[submeshIndex].indexCount,
-                        indexType: meshes[meshIndex].submeshes[submeshIndex].indexType,
-                        indexBuffer: meshes[meshIndex].submeshes[submeshIndex].indexBuffer,
-                        indexBufferOffset: meshes[meshIndex].submeshes[submeshIndex].indexBufferOffset,
-                        instanceCount: Int(group.instanceCount),
-                        baseInstance: baseInstance,
-                        category: .shadow
-                    )
-                    drawCount += 1
-                }
+            // The submeshes that cast are listed once per component, not per frame.
+            let shadowDraws: [InstancedShadowDraw]
+            if let prepared = component.instancedShadowDraws {
+                shadowDraws = prepared
+            } else {
+                shadowDraws = InstancedShadowDraw.draws(of: meshes)
+                component.instancedShadowDraws = shadowDraws
             }
+
+            var boundMesh: Int32 = -1
+            var baseInstance = 0
+            for drawIndex in shadowDraws.indices {
+                let meshIndex = shadowDraws[drawIndex].meshIndex
+                if meshIndex != boundMesh {
+                    renderEncoder.setVertexBuffer(
+                        meshes[Int(meshIndex)].vertexBuffers[Int(modelPassVerticesIndex.rawValue)],
+                        offset: 0,
+                        index: Int(shadowPassModelPositionIndex.rawValue)
+                    )
+                    baseInstance = draws.baseInstance(of: group, meshIndex: Int(meshIndex))
+                    boundMesh = meshIndex
+                }
+
+                renderEncoder.drawIndexedPrimitivesTracked(
+                    type: shadowDraws[drawIndex].primitiveType,
+                    indexCount: shadowDraws[drawIndex].indexCount,
+                    indexType: shadowDraws[drawIndex].indexType,
+                    indexBuffer: shadowDraws[drawIndex].indexBuffer,
+                    indexBufferOffset: shadowDraws[drawIndex].indexBufferOffset,
+                    instanceCount: Int(group.instanceCount),
+                    baseInstance: baseInstance,
+                    category: .shadow
+                )
+            }
+            drawCount += shadowDraws.count
         }
 
         return InstancedDrawCounts(groups: draws.groups.count, instances: draws.instanceCount, draws: drawCount)

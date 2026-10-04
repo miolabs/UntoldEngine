@@ -286,6 +286,7 @@ final class RenderInstanceKeyTests: BaseRenderSetup {
             "subsurface", "metallic", "specularTint", "anisotropic", "sheen", "sheenTint", "clearCoat",
             "clearCoatGloss", "ior", "alphaCutoff", "alphaMode", "interactWithLight", "heightScale",
             "heightMidlevel", "heightRemapMin", "heightRemapMax", "normalScale", "hasEmissiveTexture",
+            "transmission",
         ]
         // The instance's own: its record carries the opacity, and it has no dither.
         let ofTheInstance = ["passthroughAlpha", "lodDither"]

@@ -443,6 +443,38 @@ final class InstancedDrawRenderTests: BaseRenderSetup {
         XCTAssertEqual(fromAfar.opaque, RenderPasses.InstancedDrawCounts(groups: 1, instances: 6, draws: 1), "six spheres")
     }
 
+    func testGlassAmongInstancesLooksTheSameDrawnBothWays() throws {
+        let sun = createEntity()
+        createDirLight(entityId: sun)
+        setSunElevationAzimuth(entityId: sun, elevation: 50, azimuth: 30)
+
+        let ground = meshes(BasicPrimitives.createCube(extent: 1), with: material(baseColor: simd_float4(0.7, 0.7, 0.7, 1)))
+        place(ground, at: simd_float3(0, -1.2, 0), scale: simd_float3(40, 0.2, 40))
+
+        // A post with a glass ball on top, six times: the post is drawn instanced and
+        // casts; the ball goes to the transparency pass and casts no shadow.
+        var glass = material(baseColor: simd_float4(0.6, 0.9, 1.0, 1), roughness: 0.0)
+        glass.transmission = 1
+        XCTAssertTrue(glass.transmitsLight)
+        var lamp = meshes(BasicPrimitives.createCube(extent: 1), with: material(baseColor: simd_float4(0.8, 0.3, 0.2, 1)))
+            + meshes(BasicPrimitives.createSphere(extent: 1), with: glass)
+        lamp[0].localSpace = matrix4x4Translation(0, 0, 0)
+        lamp[0].worldSpace = lamp[0].localSpace
+        lamp[1].localSpace = matrix4x4Translation(0, 1.4, 0)
+        lamp[1].worldSpace = lamp[1].localSpace
+        for index in 0 ..< 6 {
+            place(lamp, at: simd_float3(Float(index % 3) * 4 - 4, 0, Float(index / 3) * -4 + 2))
+        }
+        RenderPasses.invalidateShadowEntityCache()
+
+        let instanced = try assertSamePictureBothWays()
+
+        // The ground, and the posts of the lamps: the glass is in neither pass's groups.
+        XCTAssertEqual(instanced.opaque, RenderPasses.InstancedDrawCounts(groups: 2, instances: 7, draws: 2))
+        XCTAssertGreaterThan(instanced.shadow.instances, 0)
+        XCTAssertEqual(instanced.shadow.draws, instanced.shadow.groups, "a lamp casts with its post alone")
+    }
+
     // MARK: - When nothing is instanced
 
     func testADebugColouringDrawsEveryEntityOnItsOwn() throws {

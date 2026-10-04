@@ -58,6 +58,9 @@ public class RenderComponent: Component {
             if instancedSubmeshDraws != nil {
                 instancedSubmeshDraws = nil
             }
+            if instancedShadowDraws != nil {
+                instancedShadowDraws = nil
+            }
             blendedSubmeshes = nil
         }
     }
@@ -72,7 +75,7 @@ public class RenderComponent: Component {
         var found = false
         search: for meshIndex in mesh.indices {
             for submeshIndex in mesh[meshIndex].submeshes.indices
-                where mesh[meshIndex].submeshes[submeshIndex].material?.alphaMode == .blend
+                where mesh[meshIndex].submeshes[submeshIndex].material?.hasTransparency == true
             {
                 found = true
                 break search
@@ -92,6 +95,11 @@ public class RenderComponent: Component {
     /// first time the component stands for its group in an instanced draw. Any change
     /// to `mesh` clears them.
     var instancedSubmeshDraws: [InstancedSubmeshDraw]?
+
+    /// The draws of `mesh` in a shadow pass, prepared the first time the component
+    /// stands for its group there: every submesh but those of glass, which casts no
+    /// shadow. Any change to `mesh` clears them.
+    var instancedShadowDraws: [InstancedShadowDraw]?
     var assetURL: URL = .init(fileURLWithPath: "")
     var assetName: String = ""
     public var isVisible: Bool = true // Visibility flag for bulk loading
