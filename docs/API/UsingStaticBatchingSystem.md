@@ -51,6 +51,17 @@ setEntityMeshAsync(entityId: crate, filename: "crate", withExtension: "untold") 
 
 Pass the entities that draw a mesh: the entity itself for a model of one node, as here, and its descendants that have a `RenderComponent` for a model of several. Entities without the mark are skipped, and the call does nothing while batching is disabled.
 
+## Static Entities That Move
+
+A batch holds its entities where they stood when it was built. You do not have to unmark an entity before moving it:
+
+- An entity moved with the transform functions leaves its batch before the next frame is drawn, together with every descendant that moves with it. Its neighbours go back to one draw each until their cell is rebuilt.
+- It keeps its mark. Thirty frames after it stops, it is batched again where it stands.
+- An entity that never stops moving stays out of batching. It costs nothing more than an unmarked entity, but it gains nothing either, so do not mark what moves all the time.
+- An entity that is destroyed, or that loses its mark, leaves its batch the same way.
+
+To move a whole scene without touching its batches, move the scene root instead (see [Transform System](UsingTransformSystem.md)).
+
 ## Shadows
 
 An entity in a batch casts through its batch. A marked entity that no batch took (it is alone with its material in its cell) casts its own shadow, from the sun and from spot and point lights. The one exception is a streamed tile that has just come in: its entities cast nothing for the few frames until their batch is built.

@@ -26,8 +26,10 @@ func syncWorldTransformAndMarkOctreeDirty(entityId: EntityID) {
 
     // Keep world transforms and octree bounds current for the whole hierarchy.
     // Imported multi-mesh assets usually have renderable children under a non-render root.
+    // A batch holds its entities where they stood: what moves leaves it.
     guard scene.get(component: ScenegraphComponent.self, for: entityId) != nil else {
         OctreeSystem.shared.markDirty(entityId)
+        BatchingSystem.shared.notifyEntityMoved(entityId: entityId)
         return
     }
 
@@ -45,6 +47,7 @@ func syncWorldTransformAndMarkOctreeDirty(entityId: EntityID) {
         }
 
         OctreeSystem.shared.markDirty(current)
+        BatchingSystem.shared.notifyEntityMoved(entityId: current)
         queue.append(contentsOf: getEntityChildren(parentId: current))
     }
 }

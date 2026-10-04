@@ -575,6 +575,19 @@ public class BatchingSystem: @unchecked Sendable {
     /// Entities handed to `notifyStaticEntitiesPlaced(_:)` that the next tick registers.
     /// The cell each one lands in joins `ungatedCells`.
     private var placedEntities: Set<EntityID> = []
+    /// Marked entities that left their batch because they moved, with the tick of their
+    /// last move. One that has been at rest for `restFramesBeforeRebatch` is placed again.
+    private var movedEntities: [EntityID: Int] = [:]
+    /// Ticks without a move after which a marked entity that moved is batched where it
+    /// stands. Long enough for the pauses of a drag not to rebuild its cells each time.
+    var restFramesBeforeRebatch: Int = 30
+    /// The entities whose transform changed since `releaseMovedEntities()` last ran. The
+    /// transform functions are called from any thread, so this is the one piece of the
+    /// system behind a lock; it is only filled while there is something to move out of.
+    private let movedInboxLock = NSLock()
+    private var movedInbox: [EntityID] = []
+    private var movedInboxIsOpen = false
+    private var drainedMoves: [EntityID] = []
     private var isSubscribed: Bool = false
     private var batchCellSize: Float = 32.0
     /// Maps each cell to the UUIDs of its current batch groups.
@@ -681,8 +694,86 @@ public class BatchingSystem: @unchecked Sendable {
             guard scene.exists(entityId),
                   scene.get(component: StaticBatchComponent.self, for: entityId) != nil
             else { continue }
+            movedEntities.removeValue(forKey: entityId)
             pendingEntityAdditions.insert(entityId)
             placedEntities.insert(entityId)
+        }
+    }
+
+    /// The place of an entity in the world changed.
+    ///
+    /// A batch holds the vertices of its entities where they stood when it was built, so
+    /// an entity that moves leaves its batch at once: its cell goes back to a draw per
+    /// entity and is rebuilt without it. The entity keeps its mark, and is batched again
+    /// where it comes to rest.
+    ///
+    /// Called by the transform functions, from whatever thread they run on: the entity is
+    /// only noted here. `releaseMovedEntities()` acts on it, in the tick and once more
+    /// before the frame is drawn.
+    func notifyEntityMoved(entityId: EntityID) {
+        movedInboxLock.lock()
+        if movedInboxIsOpen {
+            movedInbox.append(entityId)
+        }
+        movedInboxLock.unlock()
+    }
+
+    /// Takes the entities that moved since the last call out of their batches.
+    func releaseMovedEntities() {
+        movedInboxLock.lock()
+        guard !movedInbox.isEmpty else {
+            movedInboxLock.unlock()
+            return
+        }
+        swap(&movedInbox, &drainedMoves)
+        movedInboxLock.unlock()
+
+        if batchingEnabled {
+            for entityId in drainedMoves {
+                if let cellId = entityToCellMembership[entityId] {
+                    removeEntityFromBatchingTracking(entityId: entityId)
+                    if cellToEntities[cellId]?.isEmpty == false {
+                        ungatedCells.insert(cellId)
+                    }
+                    movedEntities[entityId] = tickCounter
+                } else if movedEntities[entityId] != nil {
+                    movedEntities[entityId] = tickCounter
+                }
+            }
+        }
+        drainedMoves.removeAll(keepingCapacity: true)
+    }
+
+    /// Moves are only noted while there is an entity they could take out of a batch.
+    private func refreshMovedInbox() {
+        let isOpen = batchingEnabled && !(entityToCellMembership.isEmpty && movedEntities.isEmpty)
+        movedInboxLock.lock()
+        movedInboxIsOpen = isOpen
+        if !isOpen {
+            movedInbox.removeAll(keepingCapacity: true)
+        }
+        movedInboxLock.unlock()
+    }
+
+    /// An entity lost its mark, or is being destroyed: it leaves its batch at once, and
+    /// its cell is rebuilt without it.
+    func notifyEntityUnmarked(entityId: EntityID) {
+        movedEntities.removeValue(forKey: entityId)
+        placedEntities.remove(entityId)
+        pendingEntityAdditions.remove(entityId)
+        newlyResidentEntities.remove(entityId)
+
+        shadowCastersChanged()
+        guard let cellId = entityToCellMembership[entityId] else { return }
+        removeEntityFromBatchingTracking(entityId: entityId)
+        guard batchingEnabled else {
+            // Nothing is built while batching is off; enabling it again starts from
+            // `generateBatches()` or from the next change.
+            dirtyCells.remove(cellId)
+            return
+        }
+        if cellToEntities[cellId]?.isEmpty == false {
+            ungatedCells.insert(cellId)
         }
     }
 
@@ -753,6 +844,9 @@ public class BatchingSystem: @unchecked Sendable {
         pendingTileResidentQueueHead = 0
         tileResidentsAwaitingDrain.subtract(entityIds)
         placedEntities.subtract(entityIds)
+        for entityId in entityIds {
+            movedEntities.removeValue(forKey: entityId)
+        }
     }
 
     /// Full batching cleanup for tile entities that are about to be destroyed.
@@ -782,6 +876,9 @@ public class BatchingSystem: @unchecked Sendable {
         pendingTileResidentQueueHead = 0
         tileResidentsAwaitingDrain.subtract(entityIds)
         placedEntities.subtract(entityIds)
+        for entityId in entityIds {
+            movedEntities.removeValue(forKey: entityId)
+        }
         // Queue removal from committed state.  removeEntityFromBatchingTracking is called
         // by the batch tick; it only manipulates BatchingSystem-internal dictionaries and
         // does not access ECS data, so it is safe to call after destroyEntity.
@@ -805,6 +902,9 @@ public class BatchingSystem: @unchecked Sendable {
         pendingTileResidentQueueHead = 0
         tileResidentsAwaitingDrain.subtract(entityIds)
         placedEntities.subtract(entityIds)
+        for entityId in entityIds {
+            movedEntities.removeValue(forKey: entityId)
+        }
 
         var affectedCells: Set<BatchCellID> = []
         for entityId in entityIds {
@@ -981,6 +1081,10 @@ public class BatchingSystem: @unchecked Sendable {
             return
         }
 
+        // What moved since the last frame leaves its batch before anything is built.
+        releaseMovedEntities()
+        defer { refreshMovedInbox() }
+
         // Drain deferred tile-resident entities at a controlled rate.
         // notifyTileEntitiesResident enqueues entity IDs here instead of processing
         // them immediately inside withWorldMutationGate.  Each tick we take at most
@@ -1016,6 +1120,16 @@ public class BatchingSystem: @unchecked Sendable {
                 pendingTileResidentQueue = Array(pendingTileResidentQueue[pendingTileResidentQueueHead...])
                 pendingTileResidentQueueHead = 0
             }
+        }
+
+        // A marked entity that moved and has come to rest is batched where it stands.
+        if !movedEntities.isEmpty {
+            let restFrames = max(1, restFramesBeforeRebatch)
+            let atRest = movedEntities.filter { tickCounter - $0.value > restFrames }.map(\.key)
+            for entityId in atRest {
+                movedEntities.removeValue(forKey: entityId)
+            }
+            notifyStaticEntitiesPlaced(atRest)
         }
 
         // A cell built in the background is applied by a later tick, which may be one
@@ -2168,6 +2282,7 @@ public class BatchingSystem: @unchecked Sendable {
                 setCellState(batchGroup.cellId, .renderableBatched)
             }
 
+            refreshMovedInbox()
             shadowCastersChanged()
 
             Logger.log(message: "✅ Created \(batchGroups.count) batch groups")
@@ -2363,6 +2478,7 @@ public class BatchingSystem: @unchecked Sendable {
         tileResidentsAwaitingDrain.removeAll()
         ungatedCells.removeAll()
         placedEntities.removeAll()
+        movedEntities.removeAll()
         cellLastVisibleFrame.removeAll()
         cellBuildGeneration.removeAll()
         runtimeBatchIneligibleCells.removeAll()
@@ -2371,6 +2487,7 @@ public class BatchingSystem: @unchecked Sendable {
         lastTickDiagnostics = .init()
         batchIndexNeedsRebuild = false
         tickCounter = 0
+        refreshMovedInbox()
         shadowCastersChanged()
     }
 
@@ -2426,12 +2543,14 @@ public class BatchingSystem: @unchecked Sendable {
             pendingTileResidentQueueHead = 0
             tileResidentsAwaitingDrain.removeAll()
             placedEntities.removeAll()
+            movedEntities.removeAll()
             runtimeBatchIneligibleCells.removeAll()
             clearPendingBuildArtifacts()
             for cellId in cellToEntities.keys {
                 setCellState(cellId, .renderableUnbatched)
             }
         }
+        refreshMovedInbox()
         shadowCastersChanged()
     }
 
