@@ -187,6 +187,66 @@ vertex VertexOutModel vertexModelShader(
 }
 
 
+// Instanced model draws: entities that draw the same meshes with the same materials are
+// encoded as one draw. Each instance reads what is its own (ModelInstanceUniform) from a
+// buffer the pass writes once; `uniforms` carries only what the pass shares (projection,
+// view, camera). Meshes drawn this way have no skeleton, so the stage takes only the four
+// streams every mesh has. The arithmetic is that of vertexModelShader, so an entity looks
+// the same whichever way it is drawn.
+typedef struct {
+    float4 position [[attribute(modelPassVerticesIndex)]];
+    float4 normals [[attribute(modelPassNormalIndex)]];
+    float2 uv [[attribute(modelPassUVIndex)]];
+    float4 tangent [[attribute(modelPassTangentIndex)]];
+} VertexInModelInstanced;
+
+typedef struct {
+    float4 position [[position]];
+    float4 vPosition;
+    float3 normal;
+    float3 tbNormal; //used in tbn
+    float4 tangent;
+    float2 uvCoords;
+    // Index of the instance's record, for the fragment stage.
+    uint instance [[flat]];
+} VertexOutModelInstanced;
+
+vertex VertexOutModelInstanced vertexModelInstancedShader(
+    VertexInModelInstanced in [[stage_in]],
+    constant Uniforms &uniforms [[buffer(modelPassUniformIndex)]],
+    const device ModelInstanceUniform *instances [[buffer(modelPassInstanceIndex)]],
+    uint instanceId [[instance_id]]
+) {
+    const device ModelInstanceUniform &instance = instances[instanceId];
+
+    VertexOutModelInstanced out;
+
+    float4 position = in.position;
+    float4 normals = in.normals;
+
+    out.vPosition = position;
+    out.position = uniforms.projectionMatrix * instance.modelViewMatrix * position;
+    out.normal = normals.xyz;
+    out.uvCoords = in.uv;
+
+    // See vertexModelShader: tangents take the model matrix's linear part, normals the
+    // inverse-transpose.
+    float3x3 modelLinear = float3x3(
+        instance.modelMatrix.columns[0].xyz,
+        instance.modelMatrix.columns[1].xyz,
+        instance.modelMatrix.columns[2].xyz
+    );
+    simd_float3 T = normalize(modelLinear * in.tangent.xyz);
+    simd_float3 N = normalize(instance.normalMatrix * normals.xyz);
+
+    out.tangent = float4(T, in.tangent.w);
+    out.tbNormal = N;
+    out.instance = instanceId;
+
+    return out;
+}
+
+
 // Depth-only occluder shell of a mesh (MeshOccluderComponent): the same vertex streams and
 // skinning as vertexModelShader, but every vertex is pushed `shrinkMeters` along its world-space
 // normal, away from the camera, so the shell sits just behind the surface the camera sees.
@@ -239,23 +299,30 @@ vertex MeshOccluderShellVertexOut vertexMeshOccluderShellShader(
 }
 
 
-fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
-                                        constant Uniforms & uniforms [[ buffer(modelPassFragmentUniformIndex) ]],
-                                 texture2d<float> baseColor [[texture(modelPassBaseTextureIndex)]],
-                                  texture2d<float> roughnessTexture [[texture(modelPassRoughnessTextureIndex)]],
-                                  texture2d<float> metallicTexture [[texture(modelPassMetallicTextureIndex)]],
-                                  texture2d<float> normalTexture [[texture(modelPassNormalTextureIndex)]],
-                                  texture2d<float> heightTexture [[texture(modelPassHeightTextureIndex)]],
-                                  texture2d<float> emissiveTexture [[texture(modelPassEmissiveTextureIndex)]],
-                                        constant bool &hasNormal[[buffer(modelPassFragmentHasNormalTextureIndex)]],
-                                        constant MaterialParametersUniform &materialParameter [[buffer(modelPassFragmentMaterialParameterIndex)]],
-                                  sampler baseColorSampler [[sampler(modelPassBaseSamplerIndex)]],
-                                  sampler normalSampler [[sampler(modelPassNormalSamplerIndex)]],
-                                  sampler materialSampler [[sampler(modelPassMaterialSamplerIndex)]],
-                                  sampler heightSampler [[sampler(modelPassHeightSamplerIndex)]],
-                                        constant float &stScale [[buffer(modelPassFragmentSTScaleIndex)]],
-                                        constant POMQualityUniform &pomQuality [[buffer(modelPassFragmentPOMQualityIndex)]],
-                                        constant bool &normalIsPackedXY [[buffer(modelPassFragmentNormalIsPackedXYIndex)]])
+// The G-buffer of one fragment of a model surface. fragmentModelShader and
+// fragmentModelInstancedShader both end here: they differ only in where the transform of
+// the surface and its ghost opacity come from (the draw's uniforms, or the record of the
+// instance), so a surface shades the same whichever way its entity is drawn.
+static inline GBufferOut shadeModelSurface(VertexOutModel in,
+                                           float4x4 surfaceModelMatrix,
+                                           float3x3 surfaceNormalMatrix,
+                                           float3 cameraPosition,
+                                           float surfacePassthroughAlpha,
+                                           texture2d<float> baseColor,
+                                           texture2d<float> roughnessTexture,
+                                           texture2d<float> metallicTexture,
+                                           texture2d<float> normalTexture,
+                                           texture2d<float> heightTexture,
+                                           texture2d<float> emissiveTexture,
+                                           bool hasNormal,
+                                           constant MaterialParametersUniform &materialParameter,
+                                           sampler baseColorSampler,
+                                           sampler normalSampler,
+                                           sampler materialSampler,
+                                           sampler heightSampler,
+                                           float stScale,
+                                           constant POMQualityUniform &pomQuality,
+                                           bool normalIsPackedXY)
 {
 
     // Base Color and Normal Maps: Linear filtering, mipmaps, repeat wrapping
@@ -285,8 +352,8 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
     float2 stDx = dfdx(st);
     float2 stDy = dfdy(st);
 
-    float4 verticesInWorldSpace=uniforms.modelMatrix*in.vPosition;
-    float3 normalVectorInWorldSpace=uniforms.normalMatrix*in.normal;
+    float4 verticesInWorldSpace=surfaceModelMatrix*in.vPosition;
+    float3 normalVectorInWorldSpace=surfaceNormalMatrix*in.normal;
 
     //construct tbn matrix TBN (world-space basis built in the vertex stage)
     simd_float3 N=normalize(in.tbNormal);
@@ -311,13 +378,13 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
         // so distant fragments skip the TBN-to-tangent-space work and the ray march entirely,
         // not just fade the visual result. Smooth (smoothstep) so there's no popping at the
         // cutoff distance as the camera moves.
-        float distanceToCamera = distance(uniforms.cameraPosition, verticesInWorldSpace.xyz);
+        float distanceToCamera = distance(cameraPosition, verticesInWorldSpace.xyz);
         float distanceFade = 1.0 - smoothstep(pomQuality.fadeStartDistance, pomQuality.maxDistance, distanceToCamera);
 
         if (distanceFade > 0.0) {
             // transpose(TBN) rotates a world-space vector into tangent space — TBN's columns
             // are the orthonormal tangent/bitangent/normal axes expressed in world space.
-            float3 viewWorld = normalize(uniforms.cameraPosition - verticesInWorldSpace.xyz);
+            float3 viewWorld = normalize(cameraPosition - verticesInWorldSpace.xyz);
             float3 viewTangent = normalize(transpose(TBN) * viewWorld);
 
             // `st` (what POM marches in) is sampled with V flipped (st.y = 1 - uv.y, above) to
@@ -390,7 +457,7 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
         }
     }
 
-    float passthroughAlpha = clamp(materialParameter.passthroughAlpha, 0.0, 1.0);
+    float passthroughAlpha = clamp(surfacePassthroughAlpha, 0.0, 1.0);
 
     //normal map is in Tangent space
     float4 normalSample = hasHeight
@@ -453,4 +520,82 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
     return gBufferOut;
 
 
+}
+
+
+fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
+                                        constant Uniforms & uniforms [[ buffer(modelPassFragmentUniformIndex) ]],
+                                 texture2d<float> baseColor [[texture(modelPassBaseTextureIndex)]],
+                                  texture2d<float> roughnessTexture [[texture(modelPassRoughnessTextureIndex)]],
+                                  texture2d<float> metallicTexture [[texture(modelPassMetallicTextureIndex)]],
+                                  texture2d<float> normalTexture [[texture(modelPassNormalTextureIndex)]],
+                                  texture2d<float> heightTexture [[texture(modelPassHeightTextureIndex)]],
+                                  texture2d<float> emissiveTexture [[texture(modelPassEmissiveTextureIndex)]],
+                                        constant bool &hasNormal[[buffer(modelPassFragmentHasNormalTextureIndex)]],
+                                        constant MaterialParametersUniform &materialParameter [[buffer(modelPassFragmentMaterialParameterIndex)]],
+                                  sampler baseColorSampler [[sampler(modelPassBaseSamplerIndex)]],
+                                  sampler normalSampler [[sampler(modelPassNormalSamplerIndex)]],
+                                  sampler materialSampler [[sampler(modelPassMaterialSamplerIndex)]],
+                                  sampler heightSampler [[sampler(modelPassHeightSamplerIndex)]],
+                                        constant float &stScale [[buffer(modelPassFragmentSTScaleIndex)]],
+                                        constant POMQualityUniform &pomQuality [[buffer(modelPassFragmentPOMQualityIndex)]],
+                                        constant bool &normalIsPackedXY [[buffer(modelPassFragmentNormalIsPackedXYIndex)]])
+{
+    return shadeModelSurface(in,
+                             uniforms.modelMatrix,
+                             uniforms.normalMatrix,
+                             uniforms.cameraPosition,
+                             materialParameter.passthroughAlpha,
+                             baseColor, roughnessTexture, metallicTexture, normalTexture, heightTexture, emissiveTexture,
+                             hasNormal,
+                             materialParameter,
+                             baseColorSampler, normalSampler, materialSampler, heightSampler,
+                             stScale,
+                             pomQuality,
+                             normalIsPackedXY);
+}
+
+// The fragment stage of an instanced model draw (see vertexModelInstancedShader). The
+// material is the draw's; the transform and the ghost opacity are the instance's.
+fragment GBufferOut fragmentModelInstancedShader(VertexOutModelInstanced in [[stage_in]],
+                                                 constant Uniforms &uniforms [[buffer(modelPassFragmentUniformIndex)]],
+                                                 const device ModelInstanceUniform *instances [[buffer(modelPassFragmentInstanceIndex)]],
+                                                 texture2d<float> baseColor [[texture(modelPassBaseTextureIndex)]],
+                                                 texture2d<float> roughnessTexture [[texture(modelPassRoughnessTextureIndex)]],
+                                                 texture2d<float> metallicTexture [[texture(modelPassMetallicTextureIndex)]],
+                                                 texture2d<float> normalTexture [[texture(modelPassNormalTextureIndex)]],
+                                                 texture2d<float> heightTexture [[texture(modelPassHeightTextureIndex)]],
+                                                 texture2d<float> emissiveTexture [[texture(modelPassEmissiveTextureIndex)]],
+                                                 constant bool &hasNormal [[buffer(modelPassFragmentHasNormalTextureIndex)]],
+                                                 constant MaterialParametersUniform &materialParameter [[buffer(modelPassFragmentMaterialParameterIndex)]],
+                                                 sampler baseColorSampler [[sampler(modelPassBaseSamplerIndex)]],
+                                                 sampler normalSampler [[sampler(modelPassNormalSamplerIndex)]],
+                                                 sampler materialSampler [[sampler(modelPassMaterialSamplerIndex)]],
+                                                 sampler heightSampler [[sampler(modelPassHeightSamplerIndex)]],
+                                                 constant float &stScale [[buffer(modelPassFragmentSTScaleIndex)]],
+                                                 constant POMQualityUniform &pomQuality [[buffer(modelPassFragmentPOMQualityIndex)]],
+                                                 constant bool &normalIsPackedXY [[buffer(modelPassFragmentNormalIsPackedXYIndex)]])
+{
+    const device ModelInstanceUniform &instance = instances[in.instance];
+
+    VertexOutModel surface;
+    surface.position = in.position;
+    surface.vPosition = in.vPosition;
+    surface.normal = in.normal;
+    surface.tbNormal = in.tbNormal;
+    surface.tangent = in.tangent;
+    surface.uvCoords = in.uvCoords;
+
+    return shadeModelSurface(surface,
+                             instance.modelMatrix,
+                             instance.normalMatrix,
+                             uniforms.cameraPosition,
+                             instance.parameters.x,
+                             baseColor, roughnessTexture, metallicTexture, normalTexture, heightTexture, emissiveTexture,
+                             hasNormal,
+                             materialParameter,
+                             baseColorSampler, normalSampler, materialSampler, heightSampler,
+                             stScale,
+                             pomQuality,
+                             normalIsPackedXY);
 }
