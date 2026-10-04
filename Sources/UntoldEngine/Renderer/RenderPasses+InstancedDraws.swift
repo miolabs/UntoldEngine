@@ -122,15 +122,17 @@ extension RenderPasses {
                 let baseInstance = draws.baseInstance(of: group, meshIndex: meshIndex)
 
                 for submeshIndex in meshes[meshIndex].submeshes.indices {
-                    guard let material = meshes[meshIndex].submeshes[submeshIndex].material,
-                          material.alphaMode != .blend
+                    // The material is read where it is: a copy of a Material retains and
+                    // releases every texture it holds.
+                    guard let alphaMode = meshes[meshIndex].submeshes[submeshIndex].material?.alphaMode,
+                          alphaMode != .blend
                     else { continue }
 
                     if !boundStreams {
                         bindInstancedModelStreams(of: meshes[meshIndex], renderEncoder: renderEncoder)
                         boundStreams = true
                     }
-                    bindInstancedMaterial(material, renderEncoder: renderEncoder)
+                    bindInstancedMaterial(meshes[meshIndex].submeshes[submeshIndex].material!, renderEncoder: renderEncoder)
 
                     renderEncoder.drawIndexedPrimitivesTracked(
                         type: meshes[meshIndex].submeshes[submeshIndex].primitiveType,
@@ -153,7 +155,7 @@ extension RenderPasses {
     /// The four vertex streams an instanced model draw reads. A mesh drawn instanced has
     /// no skeleton and no deformed copy of its vertices.
     @inline(__always)
-    private static func bindInstancedModelStreams(of mesh: Mesh, renderEncoder: MTLRenderCommandEncoder) {
+    private static func bindInstancedModelStreams(of mesh: borrowing Mesh, renderEncoder: MTLRenderCommandEncoder) {
         let positions = Int(modelPassVerticesIndex.rawValue)
         let normals = Int(modelPassNormalIndex.rawValue)
         let textureCoordinates = Int(modelPassUVIndex.rawValue)
@@ -169,7 +171,7 @@ extension RenderPasses {
     /// ghost opacity is in the instance's record; an instance has no dither).
     /// `MeshListDescription` lists the same values: keep the two in step.
     @inline(__always)
-    private static func bindInstancedMaterial(_ material: Material, renderEncoder: MTLRenderCommandEncoder) {
+    private static func bindInstancedMaterial(_ material: borrowing Material, renderEncoder: MTLRenderCommandEncoder) {
         var stScale: Float = material.stScale
         renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
 

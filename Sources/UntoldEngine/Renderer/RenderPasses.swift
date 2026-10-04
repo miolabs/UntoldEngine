@@ -927,7 +927,7 @@ public enum RenderPasses {
     /// `MaterialParametersUniform` and filled here reaches both ways of drawing; add it to
     /// `MeshListDescription` too, which decides whether two materials are the same.
     @inline(__always)
-    static func opaqueMaterialParameters(of material: Material) -> MaterialParametersUniform {
+    static func opaqueMaterialParameters(of material: borrowing Material) -> MaterialParametersUniform {
         var materialParameters = MaterialParametersUniform()
         materialParameters.specular = material.specular
         materialParameters.specularTint = material.specularTint
@@ -952,14 +952,17 @@ public enum RenderPasses {
 
     @inline(__always)
     private static func applyMaterialTextureState(
-        material: Material,
+        material: borrowing Material,
         materialParameters: inout MaterialParametersUniform
     ) {
+        // Read apart: `&&` would capture the borrowed material in its closure.
+        let hasHeightMap = material.hasHeightMap
+        let heightEnabled = material.heightEnabled
         materialParameters.hasTexture = simd_int4(
             Int32(material.hasBaseMap ? 1 : 0),
             Int32(material.hasRoughMap ? 1 : 0),
             Int32(material.hasMetalMap ? 1 : 0),
-            Int32((material.hasHeightMap && material.heightEnabled) ? 1 : 0)
+            Int32((hasHeightMap && heightEnabled) ? 1 : 0)
         )
         materialParameters.textureChannels = simd_int4(
             Int32(material.roughnessChannel.rawValue),
