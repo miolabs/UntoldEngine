@@ -132,6 +132,8 @@ typedef enum{
     modelPassJointTransformIndex,
     modelPassHasArmature,
     modelPassOccluderShrinkIndex,
+    // The ModelInstanceUniform records of an instanced draw (vertexModelInstancedShader).
+    modelPassInstanceIndex,
 }ModelPassBufferIndices;
 typedef enum{
     modelPassFragmentUniformIndex,
@@ -140,7 +142,20 @@ typedef enum{
     modelPassFragmentSTScaleIndex,
     modelPassFragmentPOMQualityIndex,
     modelPassFragmentNormalIsPackedXYIndex,
+    // The same records, for fragmentModelInstancedShader.
+    modelPassFragmentInstanceIndex,
 }ModelPassFragmentBufferIndices;
+
+// What one instance of an instanced model draw has of its own. Draws that share their
+// meshes and materials are encoded once, with a record per instance; the draw's base
+// instance is the index of its first record.
+typedef struct
+{
+    matrix_float4x4 modelViewMatrix;
+    matrix_float4x4 modelMatrix;
+    matrix_float3x3 normalMatrix;
+    simd_float4 parameters; // x=passthroughAlpha (see MaterialParametersUniform)
+} ModelInstanceUniform;
 
 typedef enum{
     deformationPassInPositionIndex,
@@ -583,6 +598,8 @@ typedef enum{
     shadowPassLightPositionUniform,
     shadowPassJointTransformIndex,
     shadowPassHasArmature,
+    // The model matrix of each instance of an instanced shadow draw (vertexShadowInstancedShader).
+    shadowPassInstanceIndex,
 }ShadowBufferIndices;
 
 typedef struct{
