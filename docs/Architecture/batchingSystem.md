@@ -55,7 +55,7 @@ Cells flagged by tile promotion skip the quiescence check and advance directly t
 
 This is the core build loop:
 
-1. **Apply completed background artifacts first** — results from previous frames' async builds are swapped in (up to `maxArtifactAppliesPerTick = 4` per frame).
+1. **Apply completed background artifacts first** — results from previous frames' async builds are swapped in (up to `maxArtifactAppliesPerTick = 4` per frame). A tick with nothing else to do still runs this step while an artifact is waiting: the last cell of a scene that then stands still is applied like any other.
 
 2. **Gather `batchPending` cells** and build rebuild candidates. For each:
    - Estimate the work: count total vertices + indices + bytes across all entities in the cell.
