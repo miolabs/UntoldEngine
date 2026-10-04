@@ -79,7 +79,7 @@ This is the core build loop:
 
 For each `CellBuildInput`, on the background thread:
 
-- Iterate material groups. **Skip any group with < 2 meshes** (no point batching a single mesh).
+- Iterate material groups. **Skip any group with < 2 meshes** (no point batching a single mesh): its entity goes on drawing it. The exception is a lone mesh of an entity that is in a batch for another of its meshes. The render passes draw an entity either through its batches or by itself, so that mesh gets a batch of its own.
 - For each group that qualifies, call `createBatchGroup`:
   - Loop through all meshes in the group.
   - For each mesh, extract positions, normals, UVs, tangents from the Metal buffers.
