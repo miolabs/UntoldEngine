@@ -50,13 +50,96 @@ struct RenderInstanceKey: Equatable {
     static let unresolved = RenderInstanceKey(generation: 0, id: notInstanced)
 }
 
+/// One draw of an instanced group in the opaque pass: a submesh, with everything the
+/// encoder is handed for it.
+///
+/// It is made from the submesh's material once, when a component first stands for its
+/// group, and kept by the component until its meshes change. Two things read it: the
+/// encoder, which binds exactly these values, and `MeshListDescription`, which decides
+/// from the same values whether two materials are the same. A value an instanced draw
+/// binds therefore has one place to be added: here.
+struct InstancedSubmeshDraw {
+    let meshIndex: Int32
+
+    let primitiveType: MTLPrimitiveType
+    let indexCount: Int
+    let indexType: MTLIndexType
+    let indexBuffer: MTLBuffer
+    let indexBufferOffset: Int
+
+    let baseColorTexture: MTLTexture?
+    let roughnessTexture: MTLTexture?
+    let metallicTexture: MTLTexture?
+    let normalTexture: MTLTexture?
+    let heightTexture: MTLTexture?
+    let emissiveTexture: MTLTexture?
+    let baseColorSampler: MTLSamplerState?
+    /// The sampler of the roughness and metallic textures.
+    let materialSampler: MTLSamplerState?
+    let normalSampler: MTLSamplerState?
+    let heightSampler: MTLSamplerState?
+
+    var stScale: Float
+    var hasNormal: Bool
+    var normalIsPackedXY: Bool
+    /// The material's parameter block. Its `passthroughAlpha` and `lodDither` are not
+    /// used: an instance takes its opacity from its record and has no dither.
+    var parameters: MaterialParametersUniform
+
+    /// The draw of `submesh`, whose material is `material`: one the opaque pass draws.
+    init(meshIndex: Int, submesh: borrowing SubMesh, material: borrowing Material) {
+        self.meshIndex = Int32(meshIndex)
+        primitiveType = submesh.primitiveType
+        indexCount = submesh.indexCount
+        indexType = submesh.indexType
+        indexBuffer = submesh.indexBuffer
+        indexBufferOffset = submesh.indexBufferOffset
+
+        baseColorTexture = material.baseColor.texture
+        roughnessTexture = material.roughness.texture
+        metallicTexture = material.metallic.texture
+        normalTexture = material.normal.texture
+        heightTexture = material.height.texture
+        emissiveTexture = material.emissive.texture
+        baseColorSampler = material.baseColor.sampler
+        materialSampler = material.roughness.sampler
+        normalSampler = material.normal.sampler
+        heightSampler = material.height.sampler
+
+        stScale = material.stScale
+        hasNormal = material.normal.texture != nil
+        normalIsPackedXY = material.normalIsPackedXY
+        parameters = RenderPasses.opaqueMaterialParameters(of: material)
+    }
+
+    /// The draws of `meshes` in the opaque pass, in the order they are encoded: every
+    /// submesh that has a material and is not blended.
+    static func draws(of meshes: [Mesh]) -> [InstancedSubmeshDraw] {
+        var draws: [InstancedSubmeshDraw] = []
+        for meshIndex in meshes.indices {
+            for submeshIndex in meshes[meshIndex].submeshes.indices {
+                guard let material = meshes[meshIndex].submeshes[submeshIndex].material,
+                      material.alphaMode != .blend
+                else { continue }
+                draws.append(InstancedSubmeshDraw(
+                    meshIndex: meshIndex,
+                    submesh: meshes[meshIndex].submeshes[submeshIndex],
+                    material: material
+                ))
+            }
+        }
+        return draws
+    }
+}
+
 /// What a mesh list sends to the GPU in an opaque draw, as a list of words that two mesh
 /// lists have in common exactly when their entities can share a draw.
 ///
 /// The words name the Metal meshes, their local transforms and, for every submesh, its
-/// index data and what the pass binds for its material: the textures and samplers by
-/// identity, the values bit for bit. What differs between two entities that share a draw
-/// (the world transform, the opacity of a ghost channel) is not part of it.
+/// index data and what the pass binds for its material (`InstancedSubmeshDraw`): the
+/// textures and samplers by identity, the values bit for bit. What differs between two
+/// entities that share a draw (the world transform, the opacity of a ghost channel) is
+/// not part of it.
 struct MeshListDescription {
     private(set) var words: [UInt64] = []
 
@@ -77,6 +160,7 @@ struct MeshListDescription {
             words.append(UInt64(meshes[meshIndex].submeshes.count))
 
             for submeshIndex in meshes[meshIndex].submeshes.indices {
+                // The index data, which a shadow draw reads for every submesh.
                 add(identityOf: meshes[meshIndex].submeshes[submeshIndex].metalKitSubmesh)
                 guard let material = meshes[meshIndex].submeshes[submeshIndex].material else {
                     words.append(Self.noMaterial)
@@ -88,7 +172,11 @@ struct MeshListDescription {
                     continue
                 }
                 words.append(Self.opaqueMaterial)
-                add(material)
+                addMaterial(of: InstancedSubmeshDraw(
+                    meshIndex: meshIndex,
+                    submesh: meshes[meshIndex].submeshes[submeshIndex],
+                    material: material
+                ))
                 drawsOpaque = true
             }
         }
@@ -108,39 +196,40 @@ struct MeshListDescription {
     private static let blendedMaterial: UInt64 = 1
     private static let opaqueMaterial: UInt64 = 2
 
-    /// Everything `RenderPasses.bindInstancedMaterial` hands to the encoder for `material`.
-    /// The two must stay in step: a value the draw binds and this leaves out would let two
-    /// different materials share a draw. `RenderInstanceKeyTests` checks the size of the
-    /// parameter block against the one this was written for.
-    private mutating func add(_ material: Material) {
-        add(identityOf: material.baseColor.texture)
-        add(identityOf: material.roughness.texture)
-        add(identityOf: material.metallic.texture)
-        add(identityOf: material.normal.texture)
-        add(identityOf: material.height.texture)
-        add(identityOf: material.emissive.texture)
-        add(identityOf: material.baseColor.sampler)
-        add(identityOf: material.roughness.sampler)
-        add(identityOf: material.normal.sampler)
-        add(identityOf: material.height.sampler)
-        add(material.stScale, material.normalIsPackedXY ? 1 : 0)
+    /// Everything of the material that `draw` binds. A value left out here would let two
+    /// different materials share a draw: `RenderInstanceKeyTests` checks the parameter
+    /// block against the list below, field by field.
+    private mutating func addMaterial(of draw: borrowing InstancedSubmeshDraw) {
+        add(identityOf: draw.baseColorTexture)
+        add(identityOf: draw.roughnessTexture)
+        add(identityOf: draw.metallicTexture)
+        add(identityOf: draw.normalTexture)
+        add(identityOf: draw.heightTexture)
+        add(identityOf: draw.emissiveTexture)
+        add(identityOf: draw.baseColorSampler)
+        add(identityOf: draw.materialSampler)
+        add(identityOf: draw.normalSampler)
+        add(identityOf: draw.heightSampler)
+        add(draw.stScale, (draw.hasNormal ? 1 : 0) + (draw.normalIsPackedXY ? 2 : 0))
 
-        let parameters = RenderPasses.opaqueMaterialParameters(of: material)
-        add(parameters.baseColor)
-        add(parameters.hasTexture)
-        add(parameters.textureChannels)
-        add(parameters.edgeTint)
-        add(simd_float4(parameters.emmissive, 0))
-        add(parameters.roughness, parameters.specular)
-        add(parameters.subsurface, parameters.metallic)
-        add(parameters.specularTint, parameters.anisotropic)
-        add(parameters.sheen, parameters.sheenTint)
-        add(parameters.clearCoat, parameters.clearCoatGloss)
-        add(parameters.ior, parameters.alphaCutoff)
-        add(parameters.heightScale, parameters.heightMidlevel)
-        add(parameters.heightRemapMin, parameters.heightRemapMax)
-        add(parameters.normalScale, parameters.interactWithLight ? 1 : 0)
-        words.append(UInt64(UInt32(bitPattern: parameters.alphaMode)) | (UInt64(UInt32(bitPattern: parameters.hasEmissiveTexture)) << 32))
+        add(draw.parameters.baseColor)
+        add(draw.parameters.hasTexture)
+        add(draw.parameters.textureChannels)
+        add(draw.parameters.edgeTint)
+        add(simd_float4(draw.parameters.emmissive, 0))
+        add(draw.parameters.roughness, draw.parameters.specular)
+        add(draw.parameters.subsurface, draw.parameters.metallic)
+        add(draw.parameters.specularTint, draw.parameters.anisotropic)
+        add(draw.parameters.sheen, draw.parameters.sheenTint)
+        add(draw.parameters.clearCoat, draw.parameters.clearCoatGloss)
+        add(draw.parameters.ior, draw.parameters.alphaCutoff)
+        add(draw.parameters.heightScale, draw.parameters.heightMidlevel)
+        add(draw.parameters.heightRemapMin, draw.parameters.heightRemapMax)
+        add(draw.parameters.normalScale, draw.parameters.interactWithLight ? 1 : 0)
+        words.append(
+            UInt64(UInt32(bitPattern: draw.parameters.alphaMode))
+                | (UInt64(UInt32(bitPattern: draw.parameters.hasEmissiveTexture)) << 32)
+        )
         // Not here: passthroughAlpha and lodDither, which an instanced draw does not take
         // from the material's parameter block.
     }

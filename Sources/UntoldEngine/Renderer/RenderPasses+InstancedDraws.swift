@@ -115,38 +115,41 @@ extension RenderPasses {
         var drawCount = 0
         for groupIndex in draws.groups.indices {
             let group = draws.groups[groupIndex]
-            let meshes = draws.groupComponents[groupIndex].mesh
+            let component = draws.groupComponents[groupIndex]
+            let meshes = component.mesh
 
-            for meshIndex in meshes.indices {
-                var boundStreams = false
-                let baseInstance = draws.baseInstance(of: group, meshIndex: meshIndex)
-
-                for submeshIndex in meshes[meshIndex].submeshes.indices {
-                    // The material is read where it is: a copy of a Material retains and
-                    // releases every texture it holds.
-                    guard let alphaMode = meshes[meshIndex].submeshes[submeshIndex].material?.alphaMode,
-                          alphaMode != .blend
-                    else { continue }
-
-                    if !boundStreams {
-                        bindInstancedModelStreams(of: meshes[meshIndex], renderEncoder: renderEncoder)
-                        boundStreams = true
-                    }
-                    bindInstancedMaterial(meshes[meshIndex].submeshes[submeshIndex].material!, renderEncoder: renderEncoder)
-
-                    renderEncoder.drawIndexedPrimitivesTracked(
-                        type: meshes[meshIndex].submeshes[submeshIndex].primitiveType,
-                        indexCount: meshes[meshIndex].submeshes[submeshIndex].indexCount,
-                        indexType: meshes[meshIndex].submeshes[submeshIndex].indexType,
-                        indexBuffer: meshes[meshIndex].submeshes[submeshIndex].indexBuffer,
-                        indexBufferOffset: meshes[meshIndex].submeshes[submeshIndex].indexBufferOffset,
-                        instanceCount: Int(group.instanceCount),
-                        baseInstance: baseInstance,
-                        category: .opaque
-                    )
-                    drawCount += 1
-                }
+            // What the group's draws bind is prepared once per component, not per frame.
+            let submeshDraws: [InstancedSubmeshDraw]
+            if let prepared = component.instancedSubmeshDraws {
+                submeshDraws = prepared
+            } else {
+                submeshDraws = InstancedSubmeshDraw.draws(of: meshes)
+                component.instancedSubmeshDraws = submeshDraws
             }
+
+            var boundMesh: Int32 = -1
+            var baseInstance = 0
+            for drawIndex in submeshDraws.indices {
+                let meshIndex = submeshDraws[drawIndex].meshIndex
+                if meshIndex != boundMesh {
+                    bindInstancedModelStreams(of: meshes, meshIndex: Int(meshIndex), renderEncoder: renderEncoder)
+                    baseInstance = draws.baseInstance(of: group, meshIndex: Int(meshIndex))
+                    boundMesh = meshIndex
+                }
+                bindMaterial(of: submeshDraws, drawIndex, renderEncoder: renderEncoder)
+
+                renderEncoder.drawIndexedPrimitivesTracked(
+                    type: submeshDraws[drawIndex].primitiveType,
+                    indexCount: submeshDraws[drawIndex].indexCount,
+                    indexType: submeshDraws[drawIndex].indexType,
+                    indexBuffer: submeshDraws[drawIndex].indexBuffer,
+                    indexBufferOffset: submeshDraws[drawIndex].indexBufferOffset,
+                    instanceCount: Int(group.instanceCount),
+                    baseInstance: baseInstance,
+                    category: .opaque
+                )
+            }
+            drawCount += submeshDraws.count
         }
 
         return InstancedDrawCounts(groups: draws.groups.count, instances: draws.instanceCount, draws: drawCount)
@@ -155,45 +158,45 @@ extension RenderPasses {
     /// The four vertex streams an instanced model draw reads. A mesh drawn instanced has
     /// no skeleton and no deformed copy of its vertices.
     @inline(__always)
-    private static func bindInstancedModelStreams(of mesh: borrowing Mesh, renderEncoder: MTLRenderCommandEncoder) {
+    private static func bindInstancedModelStreams(of meshes: [Mesh], meshIndex: Int, renderEncoder: MTLRenderCommandEncoder) {
         let positions = Int(modelPassVerticesIndex.rawValue)
         let normals = Int(modelPassNormalIndex.rawValue)
         let textureCoordinates = Int(modelPassUVIndex.rawValue)
         let tangents = Int(modelPassTangentIndex.rawValue)
-        renderEncoder.setVertexBuffer(mesh.vertexBuffers[positions], offset: 0, index: positions)
-        renderEncoder.setVertexBuffer(mesh.vertexBuffers[normals], offset: 0, index: normals)
-        renderEncoder.setVertexBuffer(mesh.vertexBuffers[textureCoordinates], offset: 0, index: textureCoordinates)
-        renderEncoder.setVertexBuffer(mesh.vertexBuffers[tangents], offset: 0, index: tangents)
+        renderEncoder.setVertexBuffer(meshes[meshIndex].vertexBuffers[positions], offset: 0, index: positions)
+        renderEncoder.setVertexBuffer(meshes[meshIndex].vertexBuffers[normals], offset: 0, index: normals)
+        renderEncoder.setVertexBuffer(meshes[meshIndex].vertexBuffers[textureCoordinates], offset: 0, index: textureCoordinates)
+        renderEncoder.setVertexBuffer(meshes[meshIndex].vertexBuffers[tangents], offset: 0, index: tangents)
     }
 
-    /// Everything of `material` an instanced opaque draw hands to the encoder: what the
-    /// pass binds for an entity it draws on its own, less what belongs to the entity (the
-    /// ghost opacity is in the instance's record; an instance has no dither).
-    /// `MeshListDescription` lists the same values: keep the two in step.
+    /// Hands the encoder the material of `draws[index]`: what the pass binds for an
+    /// entity it draws on its own, less what belongs to the entity (the ghost opacity is
+    /// in the instance's record; an instance has no dither). The values are read where
+    /// they are, without a copy of the draw.
     @inline(__always)
-    private static func bindInstancedMaterial(_ material: borrowing Material, renderEncoder: MTLRenderCommandEncoder) {
-        var stScale: Float = material.stScale
+    private static func bindMaterial(of draws: [InstancedSubmeshDraw], _ index: Int, renderEncoder: MTLRenderCommandEncoder) {
+        var stScale = draws[index].stScale
         renderEncoder.setFragmentBytes(&stScale, length: MemoryLayout<Float>.stride, index: Int(modelPassFragmentSTScaleIndex.rawValue))
 
-        renderEncoder.setFragmentTexture(material.baseColor.texture, index: Int(modelPassBaseTextureIndex.rawValue))
-        renderEncoder.setFragmentSamplerState(material.baseColor.sampler, index: Int(modelPassBaseSamplerIndex.rawValue))
-        renderEncoder.setFragmentTexture(material.roughness.texture, index: Int(modelPassRoughnessTextureIndex.rawValue))
-        renderEncoder.setFragmentSamplerState(material.roughness.sampler, index: Int(modelPassMaterialSamplerIndex.rawValue))
-        renderEncoder.setFragmentTexture(material.metallic.texture, index: Int(modelPassMetallicTextureIndex.rawValue))
+        renderEncoder.setFragmentTexture(draws[index].baseColorTexture, index: Int(modelPassBaseTextureIndex.rawValue))
+        renderEncoder.setFragmentSamplerState(draws[index].baseColorSampler, index: Int(modelPassBaseSamplerIndex.rawValue))
+        renderEncoder.setFragmentTexture(draws[index].roughnessTexture, index: Int(modelPassRoughnessTextureIndex.rawValue))
+        renderEncoder.setFragmentSamplerState(draws[index].materialSampler, index: Int(modelPassMaterialSamplerIndex.rawValue))
+        renderEncoder.setFragmentTexture(draws[index].metallicTexture, index: Int(modelPassMetallicTextureIndex.rawValue))
 
-        var hasNormal = (material.normal.texture != nil)
+        var hasNormal = draws[index].hasNormal
         renderEncoder.setFragmentBytes(&hasNormal, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentHasNormalTextureIndex.rawValue))
-        var normalIsPackedXY = material.normalIsPackedXY
+        var normalIsPackedXY = draws[index].normalIsPackedXY
         renderEncoder.setFragmentBytes(&normalIsPackedXY, length: MemoryLayout<Bool>.stride, index: Int(modelPassFragmentNormalIsPackedXYIndex.rawValue))
 
-        var materialParameters = opaqueMaterialParameters(of: material)
+        var materialParameters = draws[index].parameters
         renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
 
-        renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
-        renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
-        renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
-        renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
-        renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
+        renderEncoder.setFragmentTexture(draws[index].normalTexture, index: Int(modelPassNormalTextureIndex.rawValue))
+        renderEncoder.setFragmentSamplerState(draws[index].normalSampler, index: Int(modelPassNormalSamplerIndex.rawValue))
+        renderEncoder.setFragmentTexture(draws[index].heightTexture, index: Int(modelPassHeightTextureIndex.rawValue))
+        renderEncoder.setFragmentSamplerState(draws[index].heightSampler, index: Int(modelPassHeightSamplerIndex.rawValue))
+        renderEncoder.setFragmentTexture(draws[index].emissiveTexture, index: Int(modelPassEmissiveTextureIndex.rawValue))
     }
 
     // MARK: - Shadow cascades
