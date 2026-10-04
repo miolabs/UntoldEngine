@@ -4069,6 +4069,15 @@ public enum RenderPasses {
 
         for entityId in visibleEntityIds {
             guard let entity = sceneSnapshot.entity(entityId) else { continue }
+            // Nearly every entity has nothing blended to draw: that is asked first, and
+            // the render component remembers the answer.
+            guard let renderComponent = sceneSnapshot.render(of: entity) else {
+                continue
+            }
+            if !renderComponent.hasBlendedSubmeshes {
+                continue
+            }
+
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
             if renderMode == .hidden || renderMode == .wireframe { continue }
 
@@ -4080,20 +4089,7 @@ public enum RenderPasses {
             // Blend submeshes go with the colour (there is no dither path here).
             if meshSkipsColor(entity, in: sceneSnapshot) { continue }
 
-            guard let renderComponent = sceneSnapshot.render(of: entity) else {
-                continue
-            }
             guard let worldTransformComponent = sceneSnapshot.worldTransform(of: entity) else {
-                continue
-            }
-
-            let hasTransparentSubmesh = renderComponent.mesh.contains { mesh in
-                mesh.submeshes.contains { submesh in
-                    submesh.material?.hasTransparency ?? false
-                }
-            }
-
-            if !hasTransparentSubmesh {
                 continue
             }
 
