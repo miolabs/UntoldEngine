@@ -875,7 +875,7 @@ public enum RenderPasses {
     }
 
     private static func shadowCasterBatchGroups(for cascadeIdx: Int) -> [BatchGroup] {
-        let groups = BatchingSystem.shared.batchGroups.filter { shouldRenderSceneChannelsOpaque($0.sceneChannels) }
+        let groups = BatchingSystem.shared.batchGroups.filter { $0.castsShadow && shouldRenderSceneChannelsOpaque($0.sceneChannels) }
         guard !groups.isEmpty, let frustum = shadowFrustum(for: cascadeIdx) else { return [] }
 
         return groups.filter {
@@ -1005,7 +1005,7 @@ public enum RenderPasses {
     }
 
     private static func pointShadowCasterBatchGroups() -> [BatchGroup] {
-        let groups = BatchingSystem.shared.batchGroups.filter { shouldRenderSceneChannelsOpaque($0.sceneChannels) }
+        let groups = BatchingSystem.shared.batchGroups.filter { $0.castsShadow && shouldRenderSceneChannelsOpaque($0.sceneChannels) }
         guard !groups.isEmpty,
               pointShadowState.isActive
         else { return [] }
@@ -1023,7 +1023,7 @@ public enum RenderPasses {
     }
 
     private static func spotShadowCasterBatchGroups() -> [BatchGroup] {
-        let groups = BatchingSystem.shared.batchGroups.filter { shouldRenderSceneChannelsOpaque($0.sceneChannels) }
+        let groups = BatchingSystem.shared.batchGroups.filter { $0.castsShadow && shouldRenderSceneChannelsOpaque($0.sceneChannels) }
         guard !groups.isEmpty,
               spotShadowState.isActive,
               let frustum = spotShadowState.frustum
