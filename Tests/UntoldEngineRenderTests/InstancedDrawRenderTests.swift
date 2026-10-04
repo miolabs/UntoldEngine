@@ -172,12 +172,16 @@ final class InstancedDrawRenderTests: BaseRenderSetup {
     /// Draws the scene one by one and instanced, and checks that both frames are the same
     /// picture and that the picture is not empty. Returns the instanced frame.
     @discardableResult
-    private func assertSamePictureBothWays(file: StaticString = #filePath, line: UInt = #line) throws -> Frame {
+    private func assertSamePictureBothWays(
+        coveringAtLeast coveredPixels: Int = 2000,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> Frame {
         let single = try frame(instanced: false)
         let instanced = try frame(instanced: true)
         let result = compare(single.pixels, instanced.pixels)
         XCTAssertEqual(result.different, 0, "pixels that differ between the two ways of drawing", file: file, line: line)
-        XCTAssertGreaterThan(result.covered, 2000, "the scene is on screen", file: file, line: line)
+        XCTAssertGreaterThan(result.covered, coveredPixels, "the scene is on screen", file: file, line: line)
         XCTAssertEqual(single.opaque, RenderPasses.InstancedDrawCounts(), "nothing is instanced when the setting is off", file: file, line: line)
         return instanced
     }
@@ -371,6 +375,72 @@ final class InstancedDrawRenderTests: BaseRenderSetup {
         XCTAssertGreaterThan(instanced.shadow.instances, 0, "the posts cast into a cascade")
         XCTAssertEqual(instanced.shadow.draws, instanced.shadow.groups, "a cube is one draw per group")
         XCTAssertLessThan(instanced.shadow.draws, instanced.shadow.instances, "casters share their draws")
+    }
+
+    func testLoadedModelsWithASkinnedOneAmongThemLookTheSameDrawnBothWays() async throws {
+        func load(_ file: String, at position: simd_float3) async -> EntityID {
+            let entity = createEntity()
+            let loaded = expectation(description: file)
+            setEntityMeshAsync(entityId: entity, filename: file, withExtension: "untold") { _ in loaded.fulfill() }
+            await fulfillment(of: [loaded], timeout: 60)
+            translateTo(entityId: entity, position: position)
+            return entity
+        }
+        _ = await load("stadium", at: .zero)
+        for index in 0 ..< 3 {
+            _ = await load("ball", at: simd_float3(Float(index) * 1.5 - 1.5, 0.3, 2))
+        }
+        // The player is posed by its skeleton: its vertices are its own, frame by frame.
+        let player = await load("redplayer", at: simd_float3(0, 0, 0))
+        setEntityAnimations(entityId: player, filename: "running", withExtension: "untold", name: "running")
+        changeAnimation(entityId: player, name: "running")
+        setAnimationPlaybackSpeed(entityId: player, speed: 0)
+        let camera = try XCTUnwrap(CameraSystem.shared.activeCamera)
+        cameraLookAt(entityId: camera, eye: simd_float3(0, 3, 7), target: .zero, up: simd_float3(0, 1, 0))
+
+        let instanced = try assertSamePictureBothWays()
+
+        let skeletonId = getComponentId(for: SkeletonComponent.self)
+        let renderId = getComponentId(for: RenderComponent.self)
+        let skinned = queryEntitiesWithComponentIds([skeletonId, renderId], in: scene)
+        XCTAssertFalse(skinned.isEmpty, "the player is drawn through its skeleton")
+        XCTAssertGreaterThan(instanced.opaque.instances, 0, "the stadium and the balls are drawn instanced")
+        for entity in skinned {
+            let render = try XCTUnwrap(scene.get(component: RenderComponent.self, for: entity))
+            XCTAssertNil(render.instancedSubmeshDraws, "a skinned entity never stands for a group")
+        }
+    }
+
+    func testEntitiesFollowTheirLevelOfDetailFromGroupToGroup() throws {
+        // Six entities with two levels, a cube up close and a sphere from 20 units on.
+        let shared = material(baseColor: simd_float4(0.9, 0.7, 0.2, 1))
+        let near = meshes(BasicPrimitives.createCube(extent: 1), with: shared)
+        let far = meshes(BasicPrimitives.createSphere(extent: 1), with: shared)
+        var entities: [EntityID] = []
+        for index in 0 ..< 6 {
+            // Three within reach of the first level, three beyond it.
+            let entity = place(near, at: simd_float3(Float(index % 3) * 3 - 3, 0, index < 3 ? 4 : -14))
+            registerComponent(entityId: entity, componentType: LODComponent.self)
+            let lod = try XCTUnwrap(scene.get(component: LODComponent.self, for: entity))
+            lod.lodLevels = [
+                LODLevel(mesh: near, maxDistance: 20),
+                LODLevel(mesh: far, maxDistance: .greatestFiniteMagnitude),
+            ]
+            entities.append(entity)
+        }
+        LODSystem.shared.reset()
+        LODSystem.shared.update(deltaTime: 0.1)
+
+        let instanced = try assertSamePictureBothWays()
+        XCTAssertEqual(instanced.opaque, RenderPasses.InstancedDrawCounts(groups: 2, instances: 6, draws: 2), "three cubes, three spheres")
+
+        // The camera backs away: every entity is past its first level now.
+        let camera = try XCTUnwrap(CameraSystem.shared.activeCamera)
+        cameraLookAt(entityId: camera, eye: simd_float3(0, 12, 40), target: .zero, up: simd_float3(0, 1, 0))
+        LODSystem.shared.update(deltaTime: 0.1)
+
+        let fromAfar = try assertSamePictureBothWays(coveringAtLeast: 500)
+        XCTAssertEqual(fromAfar.opaque, RenderPasses.InstancedDrawCounts(groups: 1, instances: 6, draws: 1), "six spheres")
     }
 
     // MARK: - When nothing is instanced
