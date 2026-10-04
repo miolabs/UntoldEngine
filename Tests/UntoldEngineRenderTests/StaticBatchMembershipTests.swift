@@ -46,9 +46,12 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
         // The scene stands around x = 8, clear of the border between two batch cells at 0.
         cameraLookAt(entityId: camera, eye: simd_float3(8, 6, 16), target: simd_float3(8, 0, 0), up: simd_float3(0, 1, 0))
 
+        // The light that casts: from this side the shadow of a post is 3,500 pixels of the
+        // frame, far more than the edge pixels a batch and an entity's own draw differ by.
         sun = createEntity()
         createDirLight(entityId: sun)
-        setSunElevationAzimuth(entityId: sun, elevation: 50, azimuth: 30)
+        setDirectionalLight(.active(sun))
+        setSunElevationAzimuth(entityId: sun, elevation: 50, azimuth: 135)
     }
 
     // MARK: - Helpers
