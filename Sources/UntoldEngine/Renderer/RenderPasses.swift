@@ -689,13 +689,15 @@ public enum RenderPasses {
             guard let renderComponent = sceneSnapshot.render(of: entity),
                   renderComponent.castsShadow
             else { return }
-            // Batch-eligible entities always cast shadows via shadowCasterBatchGroups.
+            // A marked entity that is in a batch casts via the batch groups, and one that
+            // waits for its batch casts nothing (see gatherDirectionalShadowCasters).
             // Excluding them here prevents O(n_loaded_tiles) individual shadow draw calls.
-            // A mesh carrying an occluder shell or fade is out of its batch and casts on its
-            // own (the system that adds or removes those components invalidates this cache).
+            // The others cast on their own: one that no batch took, and a mesh carrying an
+            // occluder shell or fade, which is out of its batch. The batching system, and
+            // the system that adds or removes those components, invalidate this cache.
             if batchingEnabled,
                entity.traits.contains(.staticBatch),
-               entity.traits.isDisjoint(with: meshOccluderOrFade)
+               !BatchingSystem.shared.castsShadowByItself(entity)
             { return }
             candidates.append(entity.entityId)
         }
@@ -777,26 +779,26 @@ public enum RenderPasses {
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
             if renderMode == .hidden || renderMode == .wireframe { return }
 
-            // Batch-eligible entities (StaticBatchComponent present) are always drawn via
-            // shadowCasterBatchGroups, whether or not the batch rebuild has landed yet.
-            // Skipping them here prevents O(n_loaded_tiles) shadow draw calls that scale
-            // with the scene and eventually overflow the GPU command buffer budget. During
-            // the brief batch-rebuild window their shadow is absent; this is preferable to
-            // the alternative of the app freezing at ~300+ loaded tiles. The exception is a
-            // mesh carrying an occluder shell or fade: it stays out of its batch for as long
-            // as the component is there, so it casts on its own. The cascades are fitted to
-            // the batch groups' own bounds, not to those of their entities.
-            let batchEligible = batchingEnabled && entity.traits.contains(.staticBatch)
-            let batched = batchingEnabled && BatchingSystem.shared.isBatched(entityId: entity.entityId)
-            let fits = !batchEligible && !batched
-            let mayCast = !batched && !(batchEligible && entity.traits.isDisjoint(with: meshOccluderOrFade))
-            guard fits || mayCast else { return }
+            // An entity in a batch is drawn via shadowCasterBatchGroups, and the cascades
+            // are fitted to the batch groups' own bounds, not to those of their entities.
+            // An entity of a streamed cell that waits for its batches is drawn by nobody:
+            // skipping it prevents O(n_loaded_tiles) shadow draw calls that scale with the
+            // scene and eventually overflow the GPU command buffer budget. During the brief
+            // batch-rebuild window its shadow is absent; this is preferable to the
+            // alternative of the app freezing at ~300+ loaded tiles. Any other marked
+            // entity has no batch to cast for it, so it casts on its own: one that its
+            // cell was built without (alone with its material) and a mesh carrying an
+            // occluder shell or fade, which stays out of its batch for as long as the
+            // component is there. BatchingSystem.castsShadowByItself holds the rule.
+            if batchingEnabled,
+               entity.traits.contains(.staticBatch),
+               !BatchingSystem.shared.castsShadowByItself(entity)
+            { return }
 
             guard let components = sceneSnapshot.drawComponents(of: entity),
                   components.render.isVisible
             else { return }
-            let casts = mayCast && components.render.castsShadow
-            guard fits || casts else { return }
+            let casts = components.render.castsShadow
 
             let boundingBox = components.local.boundingBox
             let (worldMin, worldMax) = worldAABB_MinMax(
@@ -819,9 +821,7 @@ public enum RenderPasses {
                 )
             }
 
-            if fits {
-                walk.fitBounds.append(ShadowCasterBounds(min: visualMin, max: visualMax))
-            }
+            walk.fitBounds.append(ShadowCasterBounds(min: visualMin, max: visualMax))
             if casts {
                 if let smallObjectCulling, smallObjectCulling.culls(worldMin: worldMin, worldMax: worldMax) { return }
                 walk.casters.append(DirectionalShadowCaster(
@@ -914,10 +914,11 @@ public enum RenderPasses {
             guard let entity = sceneSnapshot.entity(entityId) else { continue }
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
             if renderMode == .hidden || renderMode == .wireframe { continue }
-            if batchingEnabled {
-                if entity.traits.contains(.staticBatch) { continue }
-                if BatchingSystem.shared.isBatched(entityId: entityId) { continue }
-            }
+            // A candidate that a batch has taken since the list was made, or is about to.
+            if batchingEnabled,
+               entity.traits.contains(.staticBatch),
+               !BatchingSystem.shared.castsShadowByItself(entity)
+            { continue }
 
             guard let components = sceneSnapshot.drawComponents(of: entity),
                   components.render.isVisible
@@ -974,10 +975,11 @@ public enum RenderPasses {
             guard let entity = sceneSnapshot.entity(entityId) else { continue }
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
             if renderMode == .hidden || renderMode == .wireframe { continue }
-            if batchingEnabled {
-                if entity.traits.contains(.staticBatch) { continue }
-                if BatchingSystem.shared.isBatched(entityId: entityId) { continue }
-            }
+            // A candidate that a batch has taken since the list was made, or is about to.
+            if batchingEnabled,
+               entity.traits.contains(.staticBatch),
+               !BatchingSystem.shared.castsShadowByItself(entity)
+            { continue }
 
             guard let components = sceneSnapshot.drawComponents(of: entity),
                   components.render.isVisible
