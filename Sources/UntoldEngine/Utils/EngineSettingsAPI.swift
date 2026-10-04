@@ -78,6 +78,12 @@ public enum RenderingProperty: Sendable {
     /// long thin object goes only once its whole length is that small. The default is 1;
     /// 0 draws everything. See `getSmallObjectCullingPixels()` to read the current value.
     case smallObjectCulling(pixels: Float)
+    /// Whether entities that draw the same meshes with the same materials are encoded as
+    /// one instanced draw in the opaque pass and the shadow cascades. A scene that places
+    /// a model many times then costs a draw per model, not per placement. Enabled by
+    /// default; disabled, every entity is encoded on its own. What is drawn is the same
+    /// either way. See `getInstancedDrawsEnabled()` to read the current value.
+    case instancedDraws(RenderingToggle)
 }
 
 public enum RenderingToggle: Sendable {
@@ -138,6 +144,10 @@ public func setRendering(_ property: RenderingProperty) {
         RenderPasses.maxShadowCastingDistance = max(distance, 0.001)
     case let .smallObjectCulling(pixels):
         SmallObjectCulling.minimumPixels = pixels.isFinite ? max(pixels, 0) : 0
+    case .instancedDraws(.enabled):
+        InstancedDrawing.isEnabled = true
+    case .instancedDraws(.disabled):
+        InstancedDrawing.isEnabled = false
     }
 }
 
