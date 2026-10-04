@@ -67,6 +67,7 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
         setBatching(.backgroundArtifactBuild(false))
         setBatching(.maxBuildDispatchesPerTick(8))
         setBatching(.maxArtifactAppliesPerTick(8))
+        setBatching(.packSinglePlacements(true))
     }
 
     private func material(_ baseColor: simd_float4, clearCoat: Float = 0) -> Material {
