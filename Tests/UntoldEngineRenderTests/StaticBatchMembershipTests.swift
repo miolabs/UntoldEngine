@@ -46,9 +46,12 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
         // The scene stands around x = 8, clear of the border between two batch cells at 0.
         cameraLookAt(entityId: camera, eye: simd_float3(8, 6, 16), target: simd_float3(8, 0, 0), up: simd_float3(0, 1, 0))
 
+        // The light that casts: from this side the shadow of a post is 3,500 pixels of the
+        // frame, far more than the edge pixels a batch and an entity's own draw differ by.
         sun = createEntity()
         createDirLight(entityId: sun)
-        setSunElevationAzimuth(entityId: sun, elevation: 50, azimuth: 30)
+        setDirectionalLight(.active(sun))
+        setSunElevationAzimuth(entityId: sun, elevation: 50, azimuth: 135)
     }
 
     // MARK: - Helpers
@@ -473,6 +476,89 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
 
         XCTAssertEqual(batchedEntities, [second, third])
         XCTAssertEqual(try XCTUnwrap(batchedBounds).min.x, 7.5, accuracy: 0.01, "its vertices are gone with it")
+        try assertTheFrameIsTheOneWithoutBatches()
+    }
+
+    func testAHiddenEntityIsNotDrawnByItsBatch() throws {
+        placeGround()
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let second = place(cube(material(red)), at: simd_float3(8, 0, 0))
+        let third = place(cube(material(red)), at: simd_float3(11, 0, 0))
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+        XCTAssertEqual(batchedEntities, [first, second, third])
+
+        // What an editor does to hide an entity.
+        try XCTUnwrap(scene.get(component: RenderComponent.self, for: first)).isVisible = false
+        drawFrames()
+
+        XCTAssertEqual(batchedEntities, [second, third])
+        XCTAssertEqual(try XCTUnwrap(batchedBounds).min.x, 7.5, accuracy: 0.01, "its vertices are out of the batch")
+        let hidden = try litPixels()
+
+        try XCTUnwrap(scene.get(component: RenderComponent.self, for: first)).isVisible = true
+        drawFrames()
+        XCTAssertEqual(batchedEntities, [first, second, third], "shown again, it is batched again")
+        try XCTAssertGreaterThan(compare(hidden, litPixels()).different, 1000, "and seen again")
+
+        // The frame without the cube is the one drawn without batches.
+        try XCTUnwrap(scene.get(component: RenderComponent.self, for: first)).isVisible = false
+        drawFrames()
+        try assertTheFrameIsTheOneWithoutBatches()
+    }
+
+    func testEntitiesThatCastNoShadowAreBatchedApartFromTheOnesThatDo() throws {
+        placeGround()
+        let casting = [
+            place(cube(material(red)), at: simd_float3(4, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+            place(cube(material(red)), at: simd_float3(7, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+        ]
+        let notCasting = [
+            place(cube(material(red)), at: simd_float3(10, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+            place(cube(material(red)), at: simd_float3(13, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+        ]
+        for post in notCasting {
+            try XCTUnwrap(scene.get(component: RenderComponent.self, for: post)).castsShadow = false
+        }
+        let unbatched = try frameWithoutBatches()
+
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+
+        // One material, two batches: a batch casts for all of its entities or for none.
+        XCTAssertEqual(batchedEntities, Set(casting + notCasting))
+        XCTAssertEqual(BatchingSystem.shared.batchGroups.count, 2)
+        XCTAssertEqual(BatchingSystem.shared.batchGroups.filter(\.castsShadow).count, 1)
+        try assertSameFrame(as: unbatched)
+    }
+
+    func testAnEntityToldNotToCastLeavesTheBatchThatCasts() throws {
+        placeGround()
+        let first = place(cube(material(red)), at: simd_float3(5, 0.4, 0), scale: simd_float3(0.8, 3, 0.8))
+        let second = place(cube(material(red)), at: simd_float3(8, 0.4, 0), scale: simd_float3(0.8, 3, 0.8))
+        let third = place(cube(material(red)), at: simd_float3(11, 0.4, 0), scale: simd_float3(0.8, 3, 0.8))
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+        XCTAssertEqual(batchedEntities, [first, second, third])
+        let allCasting = try litPixels()
+
+        try XCTUnwrap(scene.get(component: RenderComponent.self, for: first)).castsShadow = false
+        drawFrames()
+
+        XCTAssertEqual(batchedEntities, [second, third], "alone among the ones that cast none, it draws itself")
+        try XCTAssertGreaterThan(compare(allCasting, litPixels()).different, 1000, "its shadow is gone")
+
+        // Told to cast again, it is back with the others.
+        try XCTUnwrap(scene.get(component: RenderComponent.self, for: first)).castsShadow = true
+        drawFrames()
+        XCTAssertEqual(batchedEntities, [first, second, third])
+        try XCTAssertLessThan(compare(allCasting, litPixels()).different, 150)
+
+        try XCTUnwrap(scene.get(component: RenderComponent.self, for: first)).castsShadow = false
+        drawFrames()
         try assertTheFrameIsTheOneWithoutBatches()
     }
 
