@@ -1353,9 +1353,10 @@ public class BatchingSystem: @unchecked Sendable {
         var totalVertices = 0
         var totalIndices = 0
         var totalBytes = 0
+        let batchedEntities = entitiesWithSharedGroups(in: input.materialGroups)
 
         for (batchKey, meshGroup) in input.materialGroups {
-            if meshGroup.count < 2 { continue }
+            if !isWorthABatch(meshGroup, batchedEntities: batchedEntities) { continue }
             let convertedGroup = meshGroup.map { item in
                 (entityId: item.entityId, mesh: item.mesh, meshIndex: item.meshIndex, transform: item.transform)
             }
@@ -1717,16 +1718,39 @@ public class BatchingSystem: @unchecked Sendable {
         }
     }
 
+    /// The entities that a build of `materialGroups` puts in a batch: those with a mesh
+    /// that shares its material with another.
+    private func entitiesWithSharedGroups(in materialGroups: [BatchBuildKey: [BatchMeshItem]]) -> Set<EntityID> {
+        var entities: Set<EntityID> = []
+        for meshGroup in materialGroups.values where meshGroup.count >= 2 {
+            for item in meshGroup {
+                entities.insert(item.entityId)
+            }
+        }
+        return entities
+    }
+
+    /// A mesh that is alone with its material gains nothing from a batch, and its entity
+    /// goes on drawing it. Unless the entity is in a batch for another of its meshes: the
+    /// passes draw an entity either through its batches or by itself, so the lone mesh
+    /// gets a batch of its own, or nothing would draw it.
+    private func isWorthABatch(_ meshGroup: [BatchMeshItem], batchedEntities: Set<EntityID>) -> Bool {
+        if meshGroup.count >= 2 { return true }
+        guard let only = meshGroup.first else { return false }
+        return batchedEntities.contains(only.entityId)
+    }
+
     @discardableResult
     private func appendBatchGroups(
         from materialGroups: [BatchBuildKey: [BatchMeshItem]]
     ) -> (createdGroups: Int, batchedMeshes: Int) {
         var createdGroups = 0
         var batchedMeshes = 0
+        let batchedEntities = entitiesWithSharedGroups(in: materialGroups)
 
         for (batchKey, meshGroup) in materialGroups {
             // Only batch if we have multiple meshes with same material+LOD
-            if meshGroup.count < 2 {
+            if !isWorthABatch(meshGroup, batchedEntities: batchedEntities) {
                 continue
             }
 
