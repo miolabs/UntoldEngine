@@ -143,6 +143,20 @@ Batch groups cast in the directional, spot and point shadow passes. A marked ent
 
 ---
 
+## An Entity That Stops Being Static
+
+A batch holds the vertices of its entities where they stood when it was built. Three things take an entity out of its batch at once, so that no frame draws it at its old place or draws it twice:
+
+- **It moves.** The transform functions (`translateTo`, `rotateTo`, `scaleTo` and the rest) note the entity and every descendant that moves with it. Before the next frame is drawn they are out of their batches, and their cells fall back to a draw per entity. The entity keeps its `StaticBatchComponent`: once it has been at rest for 30 frames it is registered again where it stands, in an ungated cell. An entity that moves every frame simply stays out.
+- **It loses its mark** (`removeEntityStaticBatchComponent`).
+- **It is destroyed.**
+
+In all three cases the cell is rebuilt without the entity through the normal tick, in the background.
+
+Moving the **scene root** (`translateSceneTo`, `rotateSceneToYaw`, ...) is not a move in this sense: batches are drawn through the scene root's transform and stay as they are.
+
+---
+
 ## Step 6: Retirement (Safe GPU Buffer Release)
 
 Old GPU buffers aren't freed immediately. They go into `retiringBatchArtifacts` with a `retireAfterFrame = currentFrame + 3`. After 3 frames, the system drops the Swift reference, allowing ARC to release the MTLBuffers — guaranteeing the GPU has finished with them.

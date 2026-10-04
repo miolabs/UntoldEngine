@@ -6103,6 +6103,7 @@ private func removeEntityStaticBatchComponentRecursive(entityId: EntityID) {
     // Remove from this entity if it has the component
     if let _ = scene.get(component: StaticBatchComponent.self, for: entityId) {
         scene.remove(component: StaticBatchComponent.self, from: entityId)
+        BatchingSystem.shared.notifyEntityUnmarked(entityId: entityId)
         Logger.log(message: "✅ StaticBatchComponent removed from entity \(entityId)")
     }
 
@@ -6117,6 +6118,7 @@ private func removeEntityStaticBatchComponentRecursive(entityId: EntityID) {
 func removeEntityStaticBatch(entityId: EntityID) {
     if scene.get(component: StaticBatchComponent.self, for: entityId) != nil {
         scene.remove(component: StaticBatchComponent.self, from: entityId)
+        BatchingSystem.shared.notifyEntityUnmarked(entityId: entityId)
     }
 }
 

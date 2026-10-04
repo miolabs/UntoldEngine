@@ -24,12 +24,16 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
     override func setUp() async throws {
         try await super.setUp()
         resetBatching()
+        // A moved entity is batched again after one frame at rest, so that a test does
+        // not have to draw the half second of frames the engine waits by default.
+        BatchingSystem.shared.restFramesBeforeRebatch = 1
         // Every entity of these scenes is meant to be drawn, however small on screen.
         setRendering(.smallObjectCulling(pixels: 0))
     }
 
     override func tearDown() async throws {
         resetBatching()
+        BatchingSystem.shared.restFramesBeforeRebatch = 30
         setRendering(.smallObjectCulling(pixels: 1))
         destroyAllEntities()
         try await super.tearDown()
@@ -358,6 +362,117 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
 
         XCTAssertTrue(isBatched(first), "after \(frames) frames")
         XCTAssertTrue(isBatched(second))
+    }
+
+    // MARK: - An entity that moves
+
+    func testAnEntityThatMovesLeavesItsBatchAndIsBatchedAgainWhereItStops() throws {
+        placeGround()
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let second = place(cube(material(red)), at: simd_float3(11, 0, 0))
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+        XCTAssertTrue(isBatched(first))
+        XCTAssertTrue(isBatched(second))
+        XCTAssertEqual(try XCTUnwrap(batchedBounds).min.x, 4.5, accuracy: 0.01)
+
+        translateTo(entityId: first, position: simd_float3(2, 0, 2))
+        renderer.draw(in: renderer.metalView)
+        renderInfo.lastCommandBuffer?.waitUntilCompleted()
+
+        XCTAssertFalse(isBatched(first), "the frame after the move is drawn without the batch")
+        XCTAssertFalse(isBatched(second), "its neighbour is alone now")
+        XCTAssertNotNil(scene.get(component: StaticBatchComponent.self, for: first), "it keeps its mark")
+
+        drawFrames()
+        XCTAssertTrue(isBatched(first), "at rest, it is batched where it stands")
+        XCTAssertTrue(isBatched(second))
+        XCTAssertEqual(try XCTUnwrap(batchedBounds).min.x, 1.5, accuracy: 0.01)
+
+        try assertTheFrameIsTheOneWithoutBatches()
+    }
+
+    func testAnEntityThatKeepsMovingStaysOutOfItsBatch() {
+        placeGround()
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let second = place(cube(material(red)), at: simd_float3(11, 0, 0))
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+        XCTAssertTrue(isBatched(first))
+
+        for step in 1 ... 8 {
+            translateTo(entityId: first, position: simd_float3(5 - Float(step) * 0.2, 0, 0))
+            renderer.draw(in: renderer.metalView)
+            renderInfo.lastCommandBuffer?.waitUntilCompleted()
+            XCTAssertFalse(isBatched(first), "step \(step)")
+            XCTAssertFalse(isBatched(second), "step \(step)")
+        }
+    }
+
+    func testEntitiesMovedWithTheirParentAreBatchedAgainWhereTheyStop() throws {
+        placeGround()
+        let parent = createEntity()
+        registerTransformComponent(entityId: parent)
+        registerSceneGraphComponent(entityId: parent)
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0), under: parent)
+        let second = place(cube(material(red)), at: simd_float3(11, 0, 0), under: parent)
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+        XCTAssertTrue(isBatched(first))
+        XCTAssertEqual(try XCTUnwrap(batchedBounds).max.y, 0.5, accuracy: 0.01)
+
+        translateTo(entityId: parent, position: simd_float3(0, 2, 0))
+        renderer.draw(in: renderer.metalView)
+        renderInfo.lastCommandBuffer?.waitUntilCompleted()
+        XCTAssertFalse(isBatched(first))
+        XCTAssertFalse(isBatched(second))
+
+        drawFrames()
+        XCTAssertTrue(isBatched(first))
+        XCTAssertTrue(isBatched(second))
+        XCTAssertEqual(try XCTUnwrap(batchedBounds).max.y, 2.5, accuracy: 0.01)
+        try assertTheFrameIsTheOneWithoutBatches()
+    }
+
+    // MARK: - An entity that stops being static
+
+    func testAnEntityThatLosesItsMarkLeavesItsBatch() throws {
+        placeGround()
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let second = place(cube(material(red)), at: simd_float3(8, 0, 0))
+        let third = place(cube(material(red)), at: simd_float3(11, 0, 0))
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+        XCTAssertEqual(batchedEntities, [first, second, third])
+
+        removeEntityStaticBatchComponent(entityId: first)
+        XCTAssertFalse(isBatched(first), "at once: the next frame draws it by itself")
+        drawFrames()
+
+        XCTAssertEqual(batchedEntities, [second, third])
+        try assertTheFrameIsTheOneWithoutBatches()
+    }
+
+    func testADestroyedEntityIsNotDrawnByItsBatch() throws {
+        placeGround()
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let second = place(cube(material(red)), at: simd_float3(8, 0, 0))
+        let third = place(cube(material(red)), at: simd_float3(11, 0, 0))
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+        XCTAssertEqual(batchedEntities, [first, second, third])
+
+        destroyEntity(entityId: first)
+        drawFrames()
+
+        XCTAssertEqual(batchedEntities, [second, third])
+        XCTAssertEqual(try XCTUnwrap(batchedBounds).min.x, 7.5, accuracy: 0.01, "its vertices are gone with it")
+        try assertTheFrameIsTheOneWithoutBatches()
     }
 
     // MARK: - Entities placed to stay
