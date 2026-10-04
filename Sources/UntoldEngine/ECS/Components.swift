@@ -94,8 +94,21 @@ public class RenderComponent: Component {
     var instancedSubmeshDraws: [InstancedSubmeshDraw]?
     var assetURL: URL = .init(fileURLWithPath: "")
     var assetName: String = ""
-    public var isVisible: Bool = true // Visibility flag for bulk loading
-    public var castsShadow: Bool = true
+    /// Whether the entity is drawn. A batch draws all of its entities, and casts a shadow
+    /// for all of them or for none, so the batching system is told when either flag
+    /// changes: a hidden entity leaves its batch, and one whose `castsShadow` changed
+    /// moves to a batch of entities that cast as it does.
+    public var isVisible: Bool = true { // Visibility flag for bulk loading
+        didSet {
+            if isVisible != oldValue { BatchingSystem.shared.noteRenderFlagsChanged() }
+        }
+    }
+
+    public var castsShadow: Bool = true {
+        didSet {
+            if castsShadow != oldValue { BatchingSystem.shared.noteRenderFlagsChanged() }
+        }
+    }
 
     public required init() {
         mesh = []
