@@ -22,7 +22,7 @@ cellId(x, y, z) = floor(worldCenter / cellSize)
 
 When your 100 entities load, each one that has a `StaticBatchComponent` gets registered:
 
-- **Eligibility check** (`resolveBatchCandidate`): the entity must have a `RenderComponent`, `WorldTransformComponent`, no skeleton/animation, no transparency, no gizmo/light component, no `.preserveIdentity` scene channel, and its mesh must already be resident in memory. The LOD index is derived from `LODComponent.currentLOD` (entity-level LOD), then `TileLODTagComponent.levelIndex` (per-tile LOD/HLOD children), defaulting to 0. `isLODBatch` on the resulting `BatchGroup` is true if any member entity has either component.
+- **Eligibility check** (`resolveBatchCandidate`): the entity must have a `RenderComponent` that is visible (a batch draws all of its entities), `WorldTransformComponent`, no skeleton/animation, no transparency, no gizmo/light component, no `.preserveIdentity` scene channel, and its mesh must already be resident in memory. The LOD index is derived from `LODComponent.currentLOD` (entity-level LOD), then `TileLODTagComponent.levelIndex` (per-tile LOD/HLOD children), defaulting to 0. `isLODBatch` on the resulting `BatchGroup` is true if any member entity has either component.
 - If eligible → it gets assigned to a cell and added to `cellToEntities[cellId]`.
 - The cell is marked **dirty** and its state becomes `renderableUnbatched`.
 
@@ -79,7 +79,7 @@ This is the core build loop:
 
 4. **Apply per-tick budgets**: up to 8 cells, 120K verts, 220K indices, 6MB total per tick. Once budgets are exhausted, remaining cells defer to next frame.
 
-5. **Snapshot build inputs** under a world mutation gate: for each selected cell, group its entities' meshes by `BatchBuildKey = (cellId, materialHash, lodIndex, sceneChannelsRawValue)`. This produces `CellBuildInput`.
+5. **Snapshot build inputs** under a world mutation gate: for each selected cell, group its entities' meshes by `BatchBuildKey = (cellId, materialHash, lodIndex, sceneChannelsRawValue, castsShadow)`. This produces `CellBuildInput`. `castsShadow` is the entity's `RenderComponent.castsShadow`: a batch casts a shadow for all of its entities or for none, so the ones that cast none get batches of their own, which the shadow passes skip.
 
 6. **Dispatch background builds** on `artifactBuildQueue` (a `.utility` DispatchQueue). The heavy work — actually merging vertex data — happens off the main thread.
 
@@ -145,13 +145,15 @@ Batch groups cast in the directional, spot and point shadow passes. A marked ent
 
 ## An Entity That Stops Being Static
 
-A batch holds the vertices of its entities where they stood when it was built. Three things take an entity out of its batch at once, so that no frame draws it at its old place or draws it twice:
+A batch holds the vertices of its entities where they stood when it was built, and draws all of them. Five things take an entity out of its batch at once, so that no frame draws it at its old place, draws it twice or draws it when it should not be seen:
 
 - **It moves.** The transform functions (`translateTo`, `rotateTo`, `scaleTo` and the rest) note the entity and every descendant that moves with it. Before the next frame is drawn they are out of their batches, and their cells fall back to a draw per entity. The entity keeps its `StaticBatchComponent`: once it has been at rest for 30 frames it is registered again where it stands, in an ungated cell. An entity that moves every frame simply stays out.
+- **It is hidden** (`RenderComponent.isVisible`). The component tells the batching system when the flag changes. The entity keeps its mark and is batched again when it is shown.
+- **Its `castsShadow` changes.** It moves to a batch of entities that cast as it does.
 - **It loses its mark** (`removeEntityStaticBatchComponent`).
 - **It is destroyed.**
 
-In all three cases the cell is rebuilt without the entity through the normal tick, in the background.
+In all five cases the cell is rebuilt without the entity through the normal tick, in the background.
 
 Moving the **scene root** (`translateSceneTo`, `rotateSceneToYaw`, ...) is not a move in this sense: batches are drawn through the scene root's transform and stay as they are.
 

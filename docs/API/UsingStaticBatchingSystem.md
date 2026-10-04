@@ -87,6 +87,8 @@ A batch holds its entities where they stood when it was built. You do not have t
 - An entity moved with the transform functions leaves its batch before the next frame is drawn, together with every descendant that moves with it. Its neighbours go back to one draw each until their cell is rebuilt.
 - It keeps its mark. Thirty frames after it stops, it is batched again where it stands.
 - An entity that never stops moving stays out of batching. It costs nothing more than an unmarked entity, but it gains nothing either, so do not mark what moves all the time.
+- An entity that is hidden (`isVisible = false`) leaves its batch too, and is batched again when it is shown: a batch draws all of its entities.
+- Entities that cast no shadow (`castsShadow = false`) are batched apart from the ones that do, and the shadow passes skip their batches. Changing the flag moves the entity from one batch to the other.
 - An entity that is destroyed, or that loses its mark, leaves its batch the same way.
 
 To move a whole scene without touching its batches, move the scene root instead (see [Transform System](UsingTransformSystem.md)).
