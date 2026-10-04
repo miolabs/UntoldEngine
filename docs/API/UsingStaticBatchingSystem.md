@@ -6,6 +6,7 @@ UntoldEngine supports two batching modes in practice:
 |---|---|
 | Manual batch generation | Always-resident static content |
 | Runtime cell-based batching | Tiled streaming scenes |
+| Automatic, for a `.untoldpack` | The parts of a pack that are placed once |
 
 ## Manual Batching for Always-Resident Content
 
@@ -50,6 +51,34 @@ setEntityMeshAsync(entityId: crate, filename: "crate", withExtension: "untold") 
 ```
 
 Pass the entities that draw a mesh: the entity itself for a model of one node, as here, and its descendants that have a `RenderComponent` for a model of several. Entities without the mark are skipped, and the call does nothing while batching is disabled.
+
+## Batching the Parts of a Pack
+
+A `.untoldpack` places many models. A model the pack places several times is drawn with instancing, which needs no setup. The models it places a **single time** have nothing to share a draw with, and there can be thousands of them: every wall, slab and fixture of a building. The pack loader marks their parts static for you, and when the pack is in it hands them to the batching system, which merges them by material in the background.
+
+All it takes is batching being enabled:
+
+```swift
+setBatching(.enabled(true))
+
+setEntityMeshAsync(entityId: site, filename: "Site", withExtension: "untoldpack") { success in
+    // The parts placed once are being merged; nothing to call.
+}
+```
+
+What the loader marks:
+
+- the parts of a model that the pack places once,
+- unless the model has a LOD chain (its meshes change with the distance, which a batch cannot follow),
+- and unless a part has a blended material, a skeleton or an animation.
+
+With batching disabled the marks are there and do nothing. Enable batching later and call `generateBatches()` to use them.
+
+To load packs without any marking:
+
+```swift
+setBatching(.packSinglePlacements(false))
+```
 
 ## Static Entities That Move
 
@@ -143,6 +172,7 @@ setBatching(.cellSize(32.0))
 setBatching(.maxDirtyCellsPerTick(8))
 setBatching(.visibilityGatedBuild(true))
 setBatching(.backgroundArtifactBuild(true))
+setBatching(.packSinglePlacements(true))
 ```
 
 ### `BatchingSystem.shared.notifyStaticEntitiesPlaced(_:)`
