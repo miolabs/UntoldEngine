@@ -926,6 +926,7 @@ public enum RenderPasses {
     /// dither, a debug colour). An instanced draw sends exactly this, so a value added to
     /// `MaterialParametersUniform` and filled here reaches both ways of drawing; add it to
     /// `MeshListDescription` too, which decides whether two materials are the same.
+    /// (`RenderInstanceKeyTests` fails until it is.)
     @inline(__always)
     static func opaqueMaterialParameters(of material: borrowing Material) -> MaterialParametersUniform {
         var materialParameters = MaterialParametersUniform()
