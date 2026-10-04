@@ -341,6 +341,22 @@ public func InitShadowPipeline() -> RenderPipeline? {
     )
 }
 
+/// The shadow pipeline of instanced draws (see `InstancedDrawList`): the depth state of
+/// `InitShadowPipeline`, a vertex stage that reads each instance's model matrix from a
+/// buffer and takes the position stream alone.
+public func InitShadowInstancedPipeline() -> RenderPipeline? {
+    CreatePipeline(
+        vertexShader: "vertexShadowInstancedShader",
+        fragmentShader: nil,
+        vertexDescriptor: createShadowInstancedVertexDescriptor(),
+        colorFormats: [.invalid],
+        depthFormat: renderInfo.depthPixelFormat,
+        depthCompareFunction: MTLCompareFunction.less,
+        reverseZCompatible: false,
+        name: "Shadow Instanced Pipeline"
+    )
+}
+
 // MARK: Model pipeline
 
 private var wf: WorkingColorFormats {
@@ -352,24 +368,50 @@ private var wf: WorkingColorFormats {
 /// Attachment 5 is the lit output (deferredColorMap) that only the light sub-pass
 /// writes — geometry must not touch it, so writeMask is disabled for slot 5.
 public func InitModelPipeline() -> RenderPipeline? {
+    makeModelGBufferPipeline(
+        vertexShader: "vertexModelShader",
+        fragmentShader: "fragmentModelShader",
+        vertexDescriptor: createModelVertexDescriptor(),
+        name: "Model Pipeline"
+    )
+}
+
+/// The model pipeline of instanced draws (see `InstancedDrawList`): the attachments and
+/// depth state of `InitModelPipeline`, stages that read each instance's transform from a
+/// buffer, and the four vertex streams every mesh has.
+public func InitModelInstancedPipeline() -> RenderPipeline? {
+    makeModelGBufferPipeline(
+        vertexShader: "vertexModelInstancedShader",
+        fragmentShader: "fragmentModelInstancedShader",
+        vertexDescriptor: createModelInstancedVertexDescriptor(),
+        name: "Model Instanced Pipeline"
+    )
+}
+
+private func makeModelGBufferPipeline(
+    vertexShader: String,
+    fragmentShader: String,
+    vertexDescriptor: MTLVertexDescriptor?,
+    name: String
+) -> RenderPipeline? {
     guard let library = renderInfo.library else {
         handleError(.metalLibraryNotFound)
         return nil
     }
-    guard let vertexFunction = library.makeFunction(name: "vertexModelShader") else {
-        handleError(.shaderCreationFailed, "vertexModelShader")
+    guard let vertexFunction = library.makeFunction(name: vertexShader) else {
+        handleError(.shaderCreationFailed, vertexShader)
         return nil
     }
-    guard let fragmentFunction = library.makeFunction(name: "fragmentModelShader") else {
-        handleError(.shaderCreationFailed, "fragmentModelShader")
+    guard let fragmentFunction = library.makeFunction(name: fragmentShader) else {
+        handleError(.shaderCreationFailed, fragmentShader)
         return nil
     }
 
     let desc = MTLRenderPipelineDescriptor()
-    desc.label = "Model Pipeline"
+    desc.label = name
     desc.vertexFunction = vertexFunction
     desc.fragmentFunction = fragmentFunction
-    desc.vertexDescriptor = createModelVertexDescriptor()
+    desc.vertexDescriptor = vertexDescriptor
     desc.depthAttachmentPixelFormat = renderInfo.depthPixelFormat
     desc.rasterSampleCount = max(1, renderInfo.opaqueSampleCount)
 
@@ -398,11 +440,11 @@ public func InitModelPipeline() -> RenderPipeline? {
             pipelineState: pipelineState,
             depthState: depthState,
             success: true,
-            name: "Model Pipeline",
+            name: name,
             rasterSampleCount: desc.rasterSampleCount
         )
     } catch {
-        handleError(.pipelineStateCreationFailed, "Model Pipeline")
+        handleError(.pipelineStateCreationFailed, name)
         return nil
     }
 }
@@ -1097,7 +1139,9 @@ public func DefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)
         (.grid, InitGridPipeline),
         (.sky, InitSkyPipeline),
         (.shadow, InitShadowPipeline),
+        (.shadowInstanced, InitShadowInstancedPipeline),
         (.model, InitModelPipeline),
+        (.modelInstanced, InitModelInstancedPipeline),
         (.light, InitLightPipeline),
         (.geometry, InitGeometryPipeline),
         (.highlight, InitHighlightPipeline),

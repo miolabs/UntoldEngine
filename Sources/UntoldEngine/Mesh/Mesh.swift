@@ -490,7 +490,8 @@ public struct SubMesh {
     public var material: Material?
 
     // What a draw of the submesh hands to Metal, read from `metalKitSubmesh` once when
-    // the submesh is made: asking MetalKit for them costs five Objective-C calls per draw.
+    // the submesh is made: asking MetalKit for them costs half a dozen Objective-C calls
+    // per draw.
     let primitiveType: MTLPrimitiveType
     let indexCount: Int
     let indexType: MTLIndexType

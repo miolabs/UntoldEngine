@@ -50,7 +50,17 @@ public class WorldTransformComponent: Component {
 }
 
 public class RenderComponent: Component {
-    public var mesh: [Mesh]
+    public var mesh: [Mesh] {
+        didSet {
+            // Whatever changed (a material, a texture, the level of detail), the
+            // renderer has to look again at what the component draws.
+            instanceKey = .unresolved
+        }
+    }
+
+    /// What `mesh` draws, as a number the renderer groups instanced draws by: see
+    /// `RenderInstanceKeyTable`. Any change to `mesh` clears it.
+    var instanceKey: RenderInstanceKey = .unresolved
     var assetURL: URL = .init(fileURLWithPath: "")
     var assetName: String = ""
     public var isVisible: Bool = true // Visibility flag for bulk loading
