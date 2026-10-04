@@ -26,6 +26,16 @@ When your 100 entities load, each one that has a `StaticBatchComponent` gets reg
 - If eligible → it gets assigned to a cell and added to `cellToEntities[cellId]`.
 - The cell is marked **dirty** and its state becomes `renderableUnbatched`.
 
+An entity reaches registration in one of three ways:
+
+| Who tells the batching system | Call | How its cell is built |
+|---|---|---|
+| The tile streaming system, when a tile comes in | `notifyTileEntitiesResident(_:)` and residency events | Once the cell has been seen, and only if it is under the per-cell limits (2c and 2d below) |
+| Whoever placed entities that are in the scene to stay: the pack loader, or your own code | `notifyStaticEntitiesPlaced(_:)` | As soon as the per-tick budgets allow: unseen cells too, and whatever their size |
+| Nobody: you call `generateBatches()` | | All at once, in the call |
+
+A cell that received placed entities stays **ungated** for as long as it has entities: later rebuilds of it (an entity moved out, a material changed) do not wait for it to be seen either.
+
 ---
 
 ## Step 2: Per-Frame Tick — The Pipeline
@@ -55,11 +65,11 @@ Cells flagged by tile promotion skip the quiescence check and advance directly t
 
 This is the core build loop:
 
-1. **Apply completed background artifacts first** — results from previous frames' async builds are swapped in (up to `maxArtifactAppliesPerTick = 4` per frame).
+1. **Apply completed background artifacts first** — results from previous frames' async builds are swapped in (up to `maxArtifactAppliesPerTick = 4` per frame). A tick with nothing else to do still runs this step while an artifact is waiting: the last cell of a scene that then stands still is applied like any other.
 
 2. **Gather `batchPending` cells** and build rebuild candidates. For each:
    - Estimate the work: count total vertices + indices + bytes across all entities in the cell.
-   - If a cell **exceeds the per-cell complexity guard** (>160K verts, >300K indices, >8MB), it's flagged `runtimeIneligibleCells` and stays unbatched.
+   - If a cell **exceeds the per-cell complexity guard** (>160K verts, >300K indices, >8MB), it's flagged `runtimeIneligibleCells` and stays unbatched. Ungated cells skip this guard and the visibility check.
    - Otherwise it becomes a `CellRebuildCandidate`.
 
 3. **Sort candidates** by priority:
@@ -79,7 +89,7 @@ This is the core build loop:
 
 For each `CellBuildInput`, on the background thread:
 
-- Iterate material groups. **Skip any group with < 2 meshes** (no point batching a single mesh).
+- Iterate material groups. **Skip any group with < 2 meshes** (no point batching a single mesh): its entity goes on drawing it. The exception is a lone mesh of an entity that is in a batch for another of its meshes. The render passes draw an entity either through its batches or by itself, so that mesh gets a batch of its own.
 - For each group that qualifies, call `createBatchGroup`:
   - Loop through all meshes in the group.
   - For each mesh, extract positions, normals, UVs, tangents from the Metal buffers.
@@ -117,7 +127,33 @@ The renderer uses **cluster-level frustum culling** to determine which batch gro
 
 For batch groups that survive the AABB test and scene-channel visibility filter, each `BatchGroup` is one draw call with its merged buffer. 100 entities sharing one material and channel mask = **1 draw call**, submitted only when the group's spatial bounds are within the frustum and its channels are visible.
 
-Per-entity batching membership (`entityToBatch`) is still maintained and used by non-batched rendering paths and by tests.
+Per-entity batching membership (`entityToBatch`) is still maintained and used by non-batched rendering paths and by tests. Only an entity with a `StaticBatchComponent` can be in a batch, so the passes look at the component first (a bit they already have) and ask the batching system only about marked entities.
+
+### Shadows
+
+Batch groups cast in the directional, spot and point shadow passes. A marked entity that is not in a batch is handled by `BatchingSystem.castsShadowByItself(_:)`:
+
+| The entity | Who draws its shadow |
+|---|---|
+| Is in a batch | The batch group |
+| Is in a streamed cell that waits for its batches, or belongs to a tile that is fading in or out | Nobody, for that short while. A tile that has just come in would otherwise add a shadow draw per entity |
+| Was left out when its cell was built (alone with its material, or the cell is over the per-cell limits) | Itself |
+| Is in an ungated cell whose batch is not built yet | Itself |
+| Carries an occluder shell or a fade, or is not known to the batching system | Itself |
+
+---
+
+## An Entity That Stops Being Static
+
+A batch holds the vertices of its entities where they stood when it was built. Three things take an entity out of its batch at once, so that no frame draws it at its old place or draws it twice:
+
+- **It moves.** The transform functions (`translateTo`, `rotateTo`, `scaleTo` and the rest) note the entity and every descendant that moves with it. Before the next frame is drawn they are out of their batches, and their cells fall back to a draw per entity. The entity keeps its `StaticBatchComponent`: once it has been at rest for 30 frames it is registered again where it stands, in an ungated cell. An entity that moves every frame simply stays out.
+- **It loses its mark** (`removeEntityStaticBatchComponent`).
+- **It is destroyed.**
+
+In all three cases the cell is rebuilt without the entity through the normal tick, in the background.
+
+Moving the **scene root** (`translateSceneTo`, `rotateSceneToYaw`, ...) is not a move in this sense: batches are drawn through the scene root's transform and stay as they are.
 
 ---
 

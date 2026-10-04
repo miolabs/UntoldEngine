@@ -178,6 +178,7 @@ This resets position/rotation/scale and refreshes root matrices immediately.
 - Use Scene-Level Translation for Batch-Safe Movement:
     - Use `translateSceneTo` / `translateSceneBy` instead of moving every entity individually.
     - This avoids breaking static batches and is ideal for spatial drag gestures on the whole scene.
+    - An entity marked static that you move by itself leaves its batch until it has stopped, and is batched again where it stands (see [Static Batching](UsingStaticBatchingSystem.md)).
 - Use Scene-Level Yaw Rotation for Batch-Safe Alignment:
     - Use `rotateSceneToYaw` / `rotateSceneByYaw` to rotate large scenes around world up.
     - This is ideal for scene alignment and calibration flows where static batching must stay active.
