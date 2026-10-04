@@ -359,4 +359,42 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
         XCTAssertTrue(isBatched(first), "after \(frames) frames")
         XCTAssertTrue(isBatched(second))
     }
+
+    // MARK: - Entities placed to stay
+
+    func testPlacedEntitiesAreBatchedUnseenAndWhateverTheirSize() {
+        // Behind the camera, in a cell of their own, and over the size a streamed cell may have.
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 200))
+        let second = place(cube(material(red)), at: simd_float3(11, 0, 200))
+        enableBatching(true)
+        setBatching(.visibilityGatedBuild(true))
+        setBatching(.runtimeCellLimits(vertices: 8, indices: 8, bytes: 64))
+
+        // Told of as a tile is, they wait to be seen.
+        BatchingSystem.shared.notifyTileEntitiesResident([first, second])
+        drawFrames()
+        XCTAssertFalse(isBatched(first))
+
+        BatchingSystem.shared.notifyStaticEntitiesPlaced([first, second])
+        XCTAssertFalse(BatchingSystem.shared.awaitsBatch(entityId: first), "it casts for itself until its batch is built")
+        drawFrames()
+
+        XCTAssertTrue(isBatched(first))
+        XCTAssertTrue(isBatched(second))
+    }
+
+    func testPlacingEntitiesDoesNothingWhileBatchingIsOff() {
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let second = place(cube(material(red)), at: simd_float3(11, 0, 0))
+
+        BatchingSystem.shared.notifyStaticEntitiesPlaced([first, second])
+        drawFrames()
+        XCTAssertFalse(isBatched(first))
+
+        // The marks are there for a later build.
+        enableBatching(true)
+        generateBatches()
+        XCTAssertTrue(isBatched(first))
+        XCTAssertTrue(isBatched(second))
+    }
 }
