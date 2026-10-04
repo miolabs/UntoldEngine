@@ -705,8 +705,12 @@ struct ShadowSystem {
             if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .light, .gizmo]) { return }
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
             if renderMode == .hidden || renderMode == .wireframe { return }
-            if batchingEnabled, entity.traits.contains(.staticBatch) { return }
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entity.entityId) { return }
+            // The cascades are fitted to what casts: a marked entity that is in a batch, or
+            // waits for one, is not drawn by itself (see gatherDirectionalShadowCasters).
+            if batchingEnabled,
+               entity.traits.contains(.staticBatch),
+               !BatchingSystem.shared.castsShadowByItself(entity)
+            { return }
 
             guard let components = sceneSnapshot.drawComponents(of: entity),
                   components.render.isVisible

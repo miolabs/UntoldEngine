@@ -39,6 +39,10 @@ setEntityMeshAsync(entityId: building, filename: "office_building", withExtensio
 }
 ```
 
+## Shadows
+
+An entity in a batch casts through its batch. A marked entity that no batch took (it is alone with its material in its cell) casts its own shadow, from the sun and from spot and point lights. The one exception is a streamed tile that has just come in: its entities cast nothing for the few frames until their batch is built.
+
 ## Runtime Batching in Tiled Scenes
 
 For tiled scenes, the flow is different:

@@ -563,6 +563,9 @@ public class BatchingSystem: @unchecked Sendable {
     /// Values < 1 are clamped to 1 at the drain site — 0 or negative would either
     /// silently stall the queue or crash on Array.removeFirst with a negative count.
     public var maxTileResidentDrainPerTick: Int = 16
+    /// The entities of `pendingTileResidentQueue` that the tick has not drained yet, for
+    /// `awaitsBatch(entityId:)` to ask in constant time.
+    private var tileResidentsAwaitingDrain: Set<EntityID> = []
     private var isSubscribed: Bool = false
     private var batchCellSize: Float = 32.0
     /// Maps each cell to the UUIDs of its current batch groups.
@@ -653,6 +656,44 @@ public class BatchingSystem: @unchecked Sendable {
         // the 1-frame quiescence window and reset the timer, so the cell rebuilds
         // once after the last slice — regardless of how many slices the tile produced.
         pendingTileResidentQueue.append(contentsOf: entityIds)
+        tileResidentsAwaitingDrain.formUnion(entityIds)
+    }
+
+    /// Whether the shadow passes draw a marked entity by itself.
+    ///
+    /// An entity in a batch is drawn with it. One in a streamed cell that waits for its
+    /// batches is drawn by nobody for that short while (see `awaitsBatch(entityId:)`),
+    /// and neither is one of a tile that is fading in or out, which the batching system
+    /// is told of when the fade ends. Any other casts for itself, and so does an entity
+    /// carrying a component that keeps it out of its batch (an occluder shell, a fade).
+    func castsShadowByItself(_ entity: RenderSceneSnapshot.Entity) -> Bool {
+        if entityToBatch[entity.entityId] != nil { return false }
+        if !entity.traits.isDisjoint(with: [.meshOccluder, .meshFade]) { return true }
+        if entity.traits.contains(.tileRepresentationFade) { return false }
+        return !awaitsBatch(entityId: entity.entityId)
+    }
+
+    /// The spot and point shadow passes keep a list of the entities that may cast, which
+    /// leaves out the marked ones that a batch draws or is about to. They are told when a
+    /// marked entity that was left out may have to cast for itself.
+    private func shadowCastersChanged() {
+        RenderPasses.invalidateShadowEntityCache()
+    }
+
+    /// Whether a marked entity that is in no batch is about to be taken by one.
+    ///
+    /// The shadow pass draws no entity of a streamed cell while the cell waits for its
+    /// batches, so that a tile that has just come in does not add a draw per entity.
+    /// Every other marked entity that no batch draws casts for itself: one whose cell was
+    /// built without it (alone with its material, or in a cell over the runtime limits)
+    /// and one that the system does not track at all.
+    public func awaitsBatch(entityId: EntityID) -> Bool {
+        if let cellId = entityToCellMembership[entityId] {
+            if dirtyCells.contains(cellId) { return true }
+            let state = cellLifecycle[cellId]?.state
+            return state == .streaming || state == .batchPending
+        }
+        return pendingEntityAdditions.contains(entityId) || tileResidentsAwaitingDrain.contains(entityId)
     }
 
     /// Removes the given entities from all pending batching queues immediately.
@@ -665,6 +706,7 @@ public class BatchingSystem: @unchecked Sendable {
     /// destroying tile geometry to also clean committed state.
     public func cancelPendingEntities(_ entityIds: Set<EntityID>) {
         guard !entityIds.isEmpty else { return }
+        shadowCastersChanged()
         pendingEntityAdditions.subtract(entityIds)
         pendingEntityRemovals.subtract(entityIds)
         newlyResidentEntities.subtract(entityIds)
@@ -678,6 +720,7 @@ public class BatchingSystem: @unchecked Sendable {
             pendingTileResidentQueue.removeAll(keepingCapacity: true)
         }
         pendingTileResidentQueueHead = 0
+        tileResidentsAwaitingDrain.subtract(entityIds)
     }
 
     /// Full batching cleanup for tile entities that are about to be destroyed.
@@ -705,6 +748,7 @@ public class BatchingSystem: @unchecked Sendable {
             pendingTileResidentQueue.removeAll(keepingCapacity: true)
         }
         pendingTileResidentQueueHead = 0
+        tileResidentsAwaitingDrain.subtract(entityIds)
         // Queue removal from committed state.  removeEntityFromBatchingTracking is called
         // by the batch tick; it only manipulates BatchingSystem-internal dictionaries and
         // does not access ECS data, so it is safe to call after destroyEntity.
@@ -726,6 +770,7 @@ public class BatchingSystem: @unchecked Sendable {
             pendingTileResidentQueue.removeAll(keepingCapacity: true)
         }
         pendingTileResidentQueueHead = 0
+        tileResidentsAwaitingDrain.subtract(entityIds)
 
         var affectedCells: Set<BatchCellID> = []
         for entityId in entityIds {
@@ -915,6 +960,7 @@ public class BatchingSystem: @unchecked Sendable {
 
             for i in pendingTileResidentQueueHead ..< drainEnd {
                 let entityId = pendingTileResidentQueue[i]
+                tileResidentsAwaitingDrain.remove(entityId)
                 guard scene.exists(entityId) else { continue }
                 guard scene.get(component: StaticBatchComponent.self, for: entityId) != nil else { continue }
                 pendingEntityAdditions.insert(entityId)
@@ -1036,6 +1082,7 @@ public class BatchingSystem: @unchecked Sendable {
         entityToBatch.removeValue(forKey: entityId)
 
         guard let oldCell = entityToCellMembership.removeValue(forKey: entityId) else { return }
+        shadowCastersChanged()
         if var members = cellToEntities[oldCell] {
             members.remove(entityId)
             if members.isEmpty {
@@ -1178,6 +1225,7 @@ public class BatchingSystem: @unchecked Sendable {
             if exceedsRuntimeComplexityGuard(estimate) {
                 metrics.skippedByComplexityGuard += 1
                 runtimeBatchIneligibleCells.insert(cellId)
+                shadowCastersChanged()
                 recordRuntimeCellComplexitySkip(cellId: cellId)
                 dirtyCells.remove(cellId)
                 setCellState(
@@ -1418,6 +1466,8 @@ public class BatchingSystem: @unchecked Sendable {
         }
 
         let removedExisting = removeBatchesForCell(cellId, queueForRetirement: true)
+        // Built: what the cell's batches did not take casts for itself from here on.
+        shadowCastersChanged()
         if artifact.builtGroups.isEmpty {
             setCellState(
                 cellId,
@@ -1843,6 +1893,7 @@ public class BatchingSystem: @unchecked Sendable {
 
         cellToGroupIds.removeValue(forKey: cellId)
         batchedCells.remove(cellId)
+        shadowCastersChanged()
 
         if queueForRetirement {
             enqueueRetiringBatchGroups(cellId: cellId, groups: removedGroups)
@@ -2074,6 +2125,8 @@ public class BatchingSystem: @unchecked Sendable {
                 setCellState(batchGroup.cellId, .renderableBatched)
             }
 
+            shadowCastersChanged()
+
             Logger.log(message: "✅ Created \(batchGroups.count) batch groups")
             let totalBatchedMeshes = batchGroups.reduce(0) { $0 + $1.entityIds.count }
             Logger.log(message: "📊 Batching Stats: \(totalBatchedMeshes) meshes → \(batchGroups.count) draw calls")
@@ -2264,6 +2317,7 @@ public class BatchingSystem: @unchecked Sendable {
         tileParsedEntityIds.removeAll()
         pendingTileResidentQueue.removeAll()
         pendingTileResidentQueueHead = 0
+        tileResidentsAwaitingDrain.removeAll()
         cellLastVisibleFrame.removeAll()
         cellBuildGeneration.removeAll()
         runtimeBatchIneligibleCells.removeAll()
@@ -2272,6 +2326,7 @@ public class BatchingSystem: @unchecked Sendable {
         lastTickDiagnostics = .init()
         batchIndexNeedsRebuild = false
         tickCounter = 0
+        shadowCastersChanged()
     }
 
     /// Check if an entity is part of a batch
@@ -2324,12 +2379,14 @@ public class BatchingSystem: @unchecked Sendable {
             tileParsedEntityIds.removeAll()
             pendingTileResidentQueue.removeAll()
             pendingTileResidentQueueHead = 0
+            tileResidentsAwaitingDrain.removeAll()
             runtimeBatchIneligibleCells.removeAll()
             clearPendingBuildArtifacts()
             for cellId in cellToEntities.keys {
                 setCellState(cellId, .renderableUnbatched)
             }
         }
+        shadowCastersChanged()
     }
 
     public func isEnabled() -> Bool {

@@ -218,6 +218,78 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
 
     // MARK: - An entity that no batch takes
 
+    func testAMarkedEntityThatNoBatchTakesCastsItsShadow() throws {
+        placeGround()
+        // Two posts with a material each: neither has anyone to share a batch with.
+        let redPost = place(cube(material(red)), at: simd_float3(5, 0.4, 0), scale: simd_float3(0.8, 3, 0.8))
+        let bluePost = place(cube(material(blue)), at: simd_float3(11, 0.4, 0), scale: simd_float3(0.8, 3, 0.8))
+        let unbatched = try frameWithoutBatches()
+        let castersWithoutBatches = RenderPasses.lastShadowInstancedDrawCounts.instances
+        XCTAssertGreaterThan(castersWithoutBatches, 0)
+
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+
+        XCTAssertFalse(isBatched(redPost))
+        XCTAssertFalse(isBatched(bluePost))
+        XCTAssertFalse(BatchingSystem.shared.awaitsBatch(entityId: redPost))
+        XCTAssertEqual(RenderPasses.lastShadowInstancedDrawCounts.instances, castersWithoutBatches, "the posts cast as they do without batching")
+        try assertSameFrame(as: unbatched)
+    }
+
+    func testAMarkedEntityThatNoBatchTakesCastsItsShadowFromAPointLight() throws {
+        setLight(entityId: sun, .directional(.castsShadow(false)))
+        let lamp = createEntity()
+        createPointLight(entityId: lamp)
+        translateTo(entityId: lamp, position: simd_float3(8, 4, 3))
+        setLight(entityId: lamp, .power(4000))
+        setLight(entityId: lamp, .point(.range(40)))
+        setLight(entityId: lamp, .point(.castsShadow(true)))
+
+        try assertThePostsCastTheSameWithBatchingOn()
+    }
+
+    func testAMarkedEntityThatNoBatchTakesCastsItsShadowFromASpotLight() throws {
+        setLight(entityId: sun, .directional(.castsShadow(false)))
+        let lamp = createEntity()
+        createSpotLight(entityId: lamp)
+        translateTo(entityId: lamp, position: simd_float3(8, 9, 3))
+        setLight(entityId: lamp, .power(8000))
+        setLight(entityId: lamp, .spot(.coneAngle(80)))
+        setLight(entityId: lamp, .spot(.range(40)))
+        setLight(entityId: lamp, .spot(.castsShadow(true)))
+
+        try assertThePostsCastTheSameWithBatchingOn()
+    }
+
+    /// Two posts with a material each, which no batch takes, on a floor: checks that the
+    /// light of the scene draws their shadows, and draws them the same with batching on.
+    private func assertThePostsCastTheSameWithBatchingOn(file: StaticString = #filePath, line: UInt = #line) throws {
+        placeGround()
+        let posts = [
+            place(cube(material(red)), at: simd_float3(5, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+            place(cube(material(blue)), at: simd_float3(11, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+        ]
+        // The posts have shadows to lose: the frame differs when they are told not to cast.
+        for post in posts {
+            try XCTUnwrap(scene.get(component: RenderComponent.self, for: post)).castsShadow = false
+        }
+        let withoutShadows = try frameWithoutBatches()
+        for post in posts {
+            try XCTUnwrap(scene.get(component: RenderComponent.self, for: post)).castsShadow = true
+        }
+        let unbatched = try frameWithoutBatches()
+        XCTAssertGreaterThan(compare(withoutShadows, unbatched).different, 1000, "the light draws the shadows of the posts", file: file, line: line)
+
+        enableBatching(true)
+        generateBatches()
+        drawFrames()
+
+        XCTAssertFalse(posts.contains(where: isBatched), file: file, line: line)
+        try assertSameFrame(as: unbatched, file: file, line: line)
+    }
+
     func testAnEntityWithOneMaterialInABatchAndOneOutIsDrawnWhole() throws {
         placeGround()
         // The first entity is a red cube and a blue one; only its red cube has company.
@@ -246,6 +318,28 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
     }
 
     // MARK: - An entity of a streamed cell
+
+    func testAnEntityOfAStreamedCellCastsNothingWhileItWaitsForItsBatch() {
+        placeGround()
+        let posts = [
+            place(cube(material(red)), at: simd_float3(5, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+            place(cube(material(red)), at: simd_float3(11, 0.4, 0), scale: simd_float3(0.8, 3, 0.8)),
+        ]
+        enableBatching(true)
+        drawFrames()
+        let castersOfTheScene = RenderPasses.lastShadowInstancedDrawCounts.instances
+        XCTAssertGreaterThan(castersOfTheScene, 0, "marked entities that the batching system was not told of cast")
+
+        // A tile comes in: its cell is not built before it has been still for a while.
+        setBatching(.quiescenceFramesBeforeBuild(1000))
+        BatchingSystem.shared.notifyTileEntitiesResident(Set(posts))
+        XCTAssertTrue(BatchingSystem.shared.awaitsBatch(entityId: posts[0]), "queued")
+        drawFrames()
+
+        XCTAssertFalse(isBatched(posts[0]))
+        XCTAssertTrue(BatchingSystem.shared.awaitsBatch(entityId: posts[0]), "in a cell that waits")
+        XCTAssertLessThan(RenderPasses.lastShadowInstancedDrawCounts.instances, castersOfTheScene, "the posts do not cast for now")
+    }
 
     func testACellBuiltInTheBackgroundIsAppliedWhenNothingElseChanges() {
         let first = place(cube(material(red)), at: simd_float3(5, 0, 0))

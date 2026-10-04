@@ -119,6 +119,17 @@ For batch groups that survive the AABB test and scene-channel visibility filter,
 
 Per-entity batching membership (`entityToBatch`) is still maintained and used by non-batched rendering paths and by tests.
 
+### Shadows
+
+Batch groups cast in the directional, spot and point shadow passes. A marked entity that is not in a batch is handled by `BatchingSystem.castsShadowByItself(_:)`:
+
+| The entity | Who draws its shadow |
+|---|---|
+| Is in a batch | The batch group |
+| Is in a streamed cell that waits for its batches, or belongs to a tile that is fading in or out | Nobody, for that short while. A tile that has just come in would otherwise add a shadow draw per entity |
+| Was left out when its cell was built (alone with its material, or the cell is over the per-cell limits) | Itself |
+| Carries an occluder shell or a fade, or is not known to the batching system | Itself |
+
 ---
 
 ## Step 6: Retirement (Safe GPU Buffer Release)
