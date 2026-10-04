@@ -63,25 +63,33 @@ public class LODSystem: @unchecked Sendable {
             ? lodScreenSizeReach(eyeProjections: [renderInfo.xrEye0Projection, renderInfo.xrEye1Projection])
             : lodScreenSizeReach(projection: renderInfo.perspectiveSpace)
 
-        // Query entities with LOD components
-        let lodId = getComponentId(for: LODComponent.self)
-        let transformId = getComponentId(for: WorldTransformComponent.self)
-        let entities = queryEntitiesWithComponentIds([lodId, transformId], in: scene)
-
-        for entityId in entities {
-            updateEntityLOD(entityId: entityId, cameraPosition: cameraPosition, screenSizeReach: screenSizeReach, config: config)
+        // The entities with levels are read through one snapshot of the scene: asking
+        // the scene for each component of each entity costs a lock and a copy every time,
+        // and a scene can hold tens of thousands of them.
+        let sceneSnapshot = RenderSceneSnapshot()
+        sceneSnapshot.forEachEntity(with: [.lod, .worldTransform]) { entity in
+            guard let lodComponent = sceneSnapshot.lod(of: entity) else { return }
+            updateEntityLOD(
+                entityId: entity.entityId,
+                lodComponent: lodComponent,
+                worldTransform: sceneSnapshot.worldTransform(of: entity),
+                localTransform: sceneSnapshot.localTransform(of: entity),
+                cameraPosition: cameraPosition,
+                screenSizeReach: screenSizeReach,
+                config: config
+            )
         }
     }
 
     private func advanceActiveTransitions(deltaTime: Float) {
-        let lodId = getComponentId(for: LODComponent.self)
-        let entities = queryEntitiesWithComponentIds([lodId], in: scene)
         let transitionDuration = max(LODConfig.shared.fadeTransitionTime, 0.001)
 
-        for entityId in entities {
-            guard let lodComponent = scene.get(component: LODComponent.self, for: entityId),
+        let sceneSnapshot = RenderSceneSnapshot()
+        sceneSnapshot.forEachEntity(with: .lod) { entity in
+            let entityId = entity.entityId
+            guard let lodComponent = sceneSnapshot.lod(of: entity),
                   lodComponent.previousLOD != nil
-            else { continue }
+            else { return }
 
             withWorldMutationGate {
                 lodComponent.transitionProgress += deltaTime / transitionDuration
@@ -112,9 +120,15 @@ public class LODSystem: @unchecked Sendable {
         }
     }
 
-    private func updateEntityLOD(entityId: EntityID, cameraPosition: simd_float3, screenSizeReach: Float?, config: LODConfig) {
-        guard let lodComponent = scene.get(component: LODComponent.self, for: entityId) else { return }
-
+    private func updateEntityLOD(
+        entityId: EntityID,
+        lodComponent: LODComponent,
+        worldTransform: WorldTransformComponent?,
+        localTransform: LocalTransformComponent?,
+        cameraPosition: simd_float3,
+        screenSizeReach: Float?,
+        config: LODConfig
+    ) {
         // Skip if no LOD levels loaded yet (async loading may still be in progress)
         guard !lodComponent.lodLevels.isEmpty else { return }
 
@@ -129,7 +143,8 @@ public class LODSystem: @unchecked Sendable {
         if lodComponent.selectsByScreenSize, let screenSizeReach {
             // Select by the size of the entity on screen, as it is now
             let (distance, radius) = entityDistanceAndRadius(
-                entityId: entityId,
+                worldTransform: worldTransform,
+                localTransform: localTransform,
                 cameraPosition: cameraPosition,
                 localRadius: lodComponent.screenSizeRadius
             )
@@ -145,7 +160,11 @@ public class LODSystem: @unchecked Sendable {
             )
         } else {
             // Calculate distance
-            let distance = entityDistanceToCamera(entityId: entityId, cameraPosition: cameraPosition)
+            let distance = entityDistanceToCamera(
+                worldTransform: worldTransform,
+                localTransform: localTransform,
+                cameraPosition: cameraPosition
+            )
 
             // Select desired LOD level based on distance
             desiredLOD = selectLODLevel(
@@ -326,9 +345,21 @@ func findFallbackLODLevel(_ levels: [some LODResidencyLevel], from desiredIndex:
 /// Shared by `LODSystem` and `GaussianLODSystem` — distance from the camera to an entity's
 /// local-space bounding-box center, in world space.
 func entityDistanceToCamera(entityId: EntityID, cameraPosition: simd_float3) -> Float {
-    guard let worldTransform = scene.get(component: WorldTransformComponent.self, for: entityId),
-          let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId)
-    else { return 0.0 }
+    entityDistanceToCamera(
+        worldTransform: scene.get(component: WorldTransformComponent.self, for: entityId),
+        localTransform: scene.get(component: LocalTransformComponent.self, for: entityId),
+        cameraPosition: cameraPosition
+    )
+}
+
+/// `entityDistanceToCamera(entityId:cameraPosition:)` for a caller that has the entity's
+/// transform components at hand. Zero when either is missing.
+func entityDistanceToCamera(
+    worldTransform: WorldTransformComponent?,
+    localTransform: LocalTransformComponent?,
+    cameraPosition: simd_float3
+) -> Float {
+    guard let worldTransform, let localTransform else { return 0.0 }
 
     let boundingBox = localTransform.boundingBox
     let localCenter = (boundingBox.min + boundingBox.max) * 0.5
@@ -341,9 +372,23 @@ func entityDistanceToCamera(entityId: EntityID, cameraPosition: simd_float3) -> 
 /// entity's world transform, or the sphere around its bounding box when `localRadius`
 /// is 0.
 func entityDistanceAndRadius(entityId: EntityID, cameraPosition: simd_float3, localRadius: Float) -> (distance: Float, radius: Float) {
-    guard let worldTransform = scene.get(component: WorldTransformComponent.self, for: entityId),
-          let localTransform = scene.get(component: LocalTransformComponent.self, for: entityId)
-    else { return (0.0, 0.0) }
+    entityDistanceAndRadius(
+        worldTransform: scene.get(component: WorldTransformComponent.self, for: entityId),
+        localTransform: scene.get(component: LocalTransformComponent.self, for: entityId),
+        cameraPosition: cameraPosition,
+        localRadius: localRadius
+    )
+}
+
+/// `entityDistanceAndRadius(entityId:cameraPosition:localRadius:)` for a caller that has
+/// the entity's transform components at hand. Zeros when either is missing.
+func entityDistanceAndRadius(
+    worldTransform: WorldTransformComponent?,
+    localTransform: LocalTransformComponent?,
+    cameraPosition: simd_float3,
+    localRadius: Float
+) -> (distance: Float, radius: Float) {
+    guard let worldTransform, let localTransform else { return (0.0, 0.0) }
 
     let boundingBox = localTransform.boundingBox
     let localCenter = (boundingBox.min + boundingBox.max) * 0.5
