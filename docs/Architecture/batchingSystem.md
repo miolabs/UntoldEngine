@@ -127,7 +127,7 @@ The renderer uses **cluster-level frustum culling** to determine which batch gro
 
 For batch groups that survive the AABB test and scene-channel visibility filter, each `BatchGroup` is one draw call with its merged buffer. 100 entities sharing one material and channel mask = **1 draw call**, submitted only when the group's spatial bounds are within the frustum and its channels are visible.
 
-Per-entity batching membership (`entityToBatch`) is still maintained and used by non-batched rendering paths and by tests.
+Per-entity batching membership (`entityToBatch`) is still maintained and used by non-batched rendering paths and by tests. Only an entity with a `StaticBatchComponent` can be in a batch, so the passes look at the component first (a bit they already have) and ask the batching system only about marked entities.
 
 ### Shadows
 

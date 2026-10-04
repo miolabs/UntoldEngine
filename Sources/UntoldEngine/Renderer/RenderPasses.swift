@@ -2106,6 +2106,7 @@ public enum RenderPasses {
             // Skip batched entities if batching is enabled
             let fadingLOD = pass.fadingLOD(of: entity)
             if pass.batchingEnabled,
+               traits.contains(.staticBatch),
                BatchingSystem.shared.isBatched(entityId: entityId),
                fadingLOD?.previousLOD == nil,
                !traits.contains(.tileRepresentationFade),
@@ -2715,6 +2716,7 @@ public enum RenderPasses {
             if renderMode == .hidden || renderMode == .wireframe { continue }
             let fadingLOD = pass.fadingLOD(of: entity)
             if pass.batchingEnabled,
+               traits.contains(.staticBatch),
                BatchingSystem.shared.isBatched(entityId: entityId),
                fadingLOD?.previousLOD == nil,
                !traits.contains(.tileRepresentationFade),
@@ -4083,7 +4085,7 @@ public enum RenderPasses {
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
             if renderMode == .hidden || renderMode == .wireframe { continue }
 
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) {
+            if batchingEnabled, entity.traits.contains(.staticBatch), BatchingSystem.shared.isBatched(entityId: entityId) {
                 continue
             }
 
@@ -4595,7 +4597,7 @@ public enum RenderPasses {
             // A hidden channel wins over a wireframe one, so the mode alone tells both.
             guard renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity)) == .wireframe else { return }
             let entityId = entity.entityId
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) { return }
+            if batchingEnabled, entity.traits.contains(.staticBatch), BatchingSystem.shared.isBatched(entityId: entityId) { return }
             if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .gizmo, .light]) { return }
             guard let components = sceneSnapshot.drawComponents(of: entity),
                   components.render.isVisible
@@ -4785,7 +4787,7 @@ public enum RenderPasses {
             guard let entity = sceneSnapshot.entity(entityId),
                   renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity)) == .wireframe
             else { return false }
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) { return false }
+            if batchingEnabled, entity.traits.contains(.staticBatch), BatchingSystem.shared.isBatched(entityId: entityId) { return false }
             if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .gizmo, .light]) { return false }
             guard let components = sceneSnapshot.drawComponents(of: entity) else { return false }
 
