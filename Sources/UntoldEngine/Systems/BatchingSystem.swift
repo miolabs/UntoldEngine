@@ -938,10 +938,13 @@ public class BatchingSystem: @unchecked Sendable {
             }
         }
 
+        // A cell built in the background is applied by a later tick, which may be one
+        // with nothing else to do: the last cell of a scene that then stands still.
         guard !pendingEntityRemovals.isEmpty ||
             !pendingEntityAdditions.isEmpty ||
             !dirtyCells.isEmpty ||
-            !retiringBatchArtifacts.isEmpty
+            !retiringBatchArtifacts.isEmpty ||
+            diagnostics.readyArtifactsQueued > 0
         else {
             diagnostics.dirtyCellsAfterPrune = dirtyCells.count
             lastTickDiagnostics = diagnostics

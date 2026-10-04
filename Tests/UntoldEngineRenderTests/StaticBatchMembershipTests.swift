@@ -244,4 +244,25 @@ final class StaticBatchMembershipTests: BaseRenderSetup {
         XCTAssertFalse(isBatched(plain), "a batch draws all of its entities with the material of one")
         XCTAssertFalse(isBatched(coated))
     }
+
+    // MARK: - An entity of a streamed cell
+
+    func testACellBuiltInTheBackgroundIsAppliedWhenNothingElseChanges() {
+        let first = place(cube(material(red)), at: simd_float3(5, 0, 0))
+        let second = place(cube(material(red)), at: simd_float3(11, 0, 0))
+        enableBatching(true)
+        setBatching(.backgroundArtifactBuild(true))
+
+        // The one cell of the scene is built on the batching system's own queue. Its
+        // batch is ready some frames later, when no cell is dirty any more.
+        BatchingSystem.shared.notifyTileEntitiesResident([first, second])
+        var frames = 0
+        while !isBatched(first), frames < 300 {
+            drawFrames(1)
+            frames += 1
+        }
+
+        XCTAssertTrue(isBatched(first), "after \(frames) frames")
+        XCTAssertTrue(isBatched(second))
+    }
 }
