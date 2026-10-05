@@ -199,7 +199,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             BatchingSystem.shared.applyRuntimeBatchingTuning(.macOSBalanced)
         #endif
 
-        Logger.log(message: "Untold Engine Starting. Version 0.21.0")
+        Logger.log(message: "Untold Engine Starting. Version 0.22.0")
     }
 
     public func initSizeableResources() {
@@ -441,7 +441,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
                     if material.alphaMode == .blend { continue }
 
                     draws += 1
-                    triangles += max(0, submesh.metalKitSubmesh.indexCount / 3)
+                    triangles += max(0, submesh.indexCount / 3)
                 }
             }
 

@@ -73,7 +73,7 @@ untoldengine export \
 Common options:
 
 - `--input <path>`: required source `.usd`, `.usda`, `.usdc`, `.usdz`, or `.blend`
-- `--output <path>`: required destination `.untold` (or `.untoldanim` with `--animation`)
+- `--output <path>`: required destination `.untold` (or `.untoldanim` with `--animation`). A scene with several models is written as a `.untoldpack` of the same name; that name may be given as well
 - `--file-type <tile|lod|hlod|shared|animation>`: optional, defaults to `tile`
 - `--mesh-name <name>`: optional, export only one mesh from a multi-mesh asset
 - `--convert-orientation`: optional, convert the export into engine space
@@ -144,11 +144,61 @@ Some material nodes are carried over instead of dropped:
   location, no rotation) is applied to the mesh's first UV map, so tiled textures
   keep their tiling. When textures use different Mapping nodes, the one most of
   them use is applied and the material fidelity report says so.
-- An Invert node at full strength between an image texture and its socket (for
-  example a glossiness map feeding Roughness) is written into the staged texture,
-  saved as `<name>_inverted.png`.
+- Colour nodes between an image texture and its socket are written into the
+  staged texture, with the same math Cycles uses: Invert, Gamma,
+  Bright/Contrast, Hue/Saturation/Value, RGB Curves and ColorRamp (its Color
+  output). They are applied to linear values, so an sRGB texture is decoded and
+  encoded again. The texture is saved as `<name>_inverted.png` for a lone Invert,
+  or as `<name>_adj<fingerprint>.png`. A node whose settings are themselves
+  linked to other nodes is still dropped, and the material fidelity report says
+  so.
 - A material whose surface is an Emission shader exports as an emissive material
   with a black base color.
+- A Base Color, Roughness, Metallic or Emission input driven by node math with no
+  texture behind it (Mix, Math, RGB Curves, ColorRamp, node groups, ...) exports
+  the value the chain gives for a surface seen straight on. View-dependent nodes
+  such as Layer Weight and Fresnel take their straight-on value; the engine's own
+  Fresnel then brightens the edges. A chain with an image or procedural texture
+  in the way keeps the input's slider value, as before.
+- Each mesh exports the material of the slot its faces use, which need not be the
+  first slot.
+- EXR textures used by a material (a normal or metallic map, for example) are
+  converted to PNG. Values above 1 are clipped.
+
+Transparency becomes the engine's blended alpha mode:
+
+- A constant Alpha below 1 blends the material at that opacity.
+- An Alpha fed by the base color image's own Alpha output uses that alpha.
+- An Alpha fed by another texture, or through colour nodes, is written into the
+  alpha channel of the base color texture (a white one when the base color is a
+  constant), since the engine reads alpha from the base color texture.
+- Glass is approximated, since the engine has no transmission: a Principled BSDF
+  with Transmission becomes a blended surface. Clear glass (a white base color)
+  keeps 10 % opacity at full transmission. The base color tints the light that
+  crosses glass, so tinted glass is more opaque by the light its color takes
+  (counted by its brightness), and black glass is exported opaque: the black
+  mirror it is in Blender. The metallic share of a surface lets no light
+  through, so a metal with Transmission left on is opaque as well. A rough
+  surface scatters what crosses it, so frosted glass is more opaque the rougher
+  it is. A base color, a metallic value or a roughness that comes from a texture
+  counts as clear, as no metal and as polished. Transparent BSDFs mixed in by a Mix Shader lower the opacity by their
+  share. A mix driven by Geometry > Backfacing takes its front-face side. The
+  material fidelity report lists these approximations.
+
+A height texture drives the engine's parallax occlusion mapping:
+
+- The image on a Displacement node's Height input exports as the height texture,
+  with the node's Scale as its depth, and failing that the image on the Height
+  input of a Bump node that feeds the Normal input, with its Distance.
+- The engine's depth is a share of the texture's width, not a distance, so a
+  small Scale (0.02 to 0.1) carries over well and may need tuning after import.
+- A Scale or Distance above 0.2 is not a depth parallax can show. Blender leaves
+  both at 1, a metre, and with its default "Bump Only" displacement draws the
+  shading of a bump from them. Such a height is left out of the export, and the
+  material fidelity report says so; the surface keeps its normal map.
+
+Lights and cameras follow the same rules as objects: never from collections
+excluded from the view layer, and hidden ones only with `--include-hidden`.
 
 ## Bake Textures To `.utex`
 
@@ -395,6 +445,11 @@ At runtime, `NM_` objects default to `.selectableGeometry` and `.preserveIdentit
 
 After exporting assets, use [Optimizations](Optimizations.md) for optional
 workflows such as ASTC texture compression and LZ4 geometry compression.
+
+The export scripts write a `.untoldpack` without LOD chains. `untoldengine
+export` adds them as its last step; for a pack written by `scripts/export-untold`
+or by the Blender add-on, run `untoldengine bake-lods --input <name>.untoldpack`
+afterwards (see [LOD chains for packs](UsingUntoldEngineCLI.md#lod-chains-for-packs)).
 
 ## Loading The Result In The Engine
 

@@ -641,6 +641,9 @@ public enum RenderPasses {
         var result: [EntityID] = []
         result.reserveCapacity(candidates.count / 4)
 
+        // An object too small to be drawn casts a shadow about as small.
+        let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
+
         for entityId in candidates {
             guard scene.mask(for: entityId) != nil else { continue }
             if shouldHideSceneEntity(entityId: entityId) { continue }
@@ -671,6 +674,7 @@ public enum RenderPasses {
                 localMax: localTransformComponent.boundingBox.max,
                 worldMatrix: worldTransformComponent.space
             )
+            if let smallObjectCulling, smallObjectCulling.culls(worldMin: worldMin, worldMax: worldMax) { continue }
             // Directional-light caster relevance cannot be determined from camera
             // distance or the cascade receiver split — a caster outside a cascade's
             // camera-depth interval can still project a shadow into that interval.
@@ -731,6 +735,7 @@ public enum RenderPasses {
 
         let lightPosition = shadowLight.light.position
         let maxDistance = max(shadowLight.light.attenuation.w, minimumSpotShadowDistance)
+        let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
         var result: [EntityID] = []
         result.reserveCapacity(candidates.count / 4)
 
@@ -754,6 +759,7 @@ public enum RenderPasses {
                 localMax: localTransformComponent.boundingBox.max,
                 worldMatrix: worldTransformComponent.space
             )
+            if let smallObjectCulling, smallObjectCulling.culls(worldMin: worldMin, worldMax: worldMax) { continue }
             if shadowEntityBeyondMaxDistance(
                 worldMin: worldMin,
                 worldMax: worldMax,
@@ -787,6 +793,7 @@ public enum RenderPasses {
 
         let lightPosition = shadowLight.light.position
         let maxDistance = max(shadowLight.light.radius, minimumPointShadowDistance)
+        let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
         var result: [EntityID] = []
         result.reserveCapacity(candidates.count / 4)
 
@@ -811,6 +818,7 @@ public enum RenderPasses {
                 localMax: localTransformComponent.boundingBox.max,
                 worldMatrix: worldTransformComponent.space
             )
+            if let smallObjectCulling, smallObjectCulling.culls(worldMin: worldMin, worldMax: worldMax) { continue }
             if shadowEntityBeyondMaxDistance(
                 worldMin: worldMin,
                 worldMax: worldMax,
@@ -897,6 +905,8 @@ public enum RenderPasses {
         materialParameters.heightMidlevel = material.heightMidlevel
         materialParameters.heightRemapMin = material.heightRemapMin
         materialParameters.heightRemapMax = material.heightRemapMax
+        materialParameters.normalScale = material.normalScale
+        materialParameters.hasEmissiveTexture = material.hasEmissiveMap ? 1 : 0
     }
 
     /// Builds the GPU-side POM quality uniform from the current global `POMQualitySettings`
@@ -1361,11 +1371,11 @@ public enum RenderPasses {
 
                     for subMesh in mesh.submeshes {
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .shadow
                         )
                     }
@@ -1554,11 +1564,11 @@ public enum RenderPasses {
 
                 for subMesh in mesh.submeshes {
                     renderEncoder.drawIndexedPrimitivesTracked(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset,
                         category: .shadow
                     )
                 }
@@ -1684,11 +1694,11 @@ public enum RenderPasses {
 
                     for subMesh in mesh.submeshes {
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .shadow
                         )
                     }
@@ -1978,13 +1988,14 @@ public enum RenderPasses {
                         )
 
                         renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
+                        renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
 
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .opaque
                         )
                     }
@@ -2204,6 +2215,7 @@ public enum RenderPasses {
             renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
             renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
             renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
+            renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
 
             // SINGLE DRAW CALL FOR ENTIRE BATCH
             // Logger.log(message: "✅ Drawing batch \(batchGroup.id): \(batchGroup.indexCount) indices, \(batchGroup.vertexCount) vertices")
@@ -2387,13 +2399,14 @@ public enum RenderPasses {
                         renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
                         renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
+                        renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
 
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .opaque
                         )
                     }
@@ -2484,6 +2497,7 @@ public enum RenderPasses {
                     renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
                     renderEncoder.setFragmentTexture(material.height.texture, index: Int(modelPassHeightTextureIndex.rawValue))
                     renderEncoder.setFragmentSamplerState(material.height.sampler, index: Int(modelPassHeightSamplerIndex.rawValue))
+                    renderEncoder.setFragmentTexture(material.emissive.texture, index: Int(modelPassEmissiveTextureIndex.rawValue))
 
                     renderEncoder.drawIndexedPrimitivesTracked(
                         type: .triangle,
@@ -3836,13 +3850,17 @@ public enum RenderPasses {
                         material.normal.sampler,
                         index: Int(transparencyPassNormalSamplerIndex.rawValue)
                     )
+                    renderEncoder.setFragmentTexture(
+                        material.emissive.texture,
+                        index: Int(transparencyPassEmissiveTextureIndex.rawValue)
+                    )
 
                     renderEncoder.drawIndexedPrimitivesTracked(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset,
                         category: .transparent
                     )
                 }
@@ -3958,11 +3976,11 @@ public enum RenderPasses {
 
                 for subMesh in mesh.submeshes where subMesh.material?.alphaMode != .blend {
                     renderEncoder.drawIndexedPrimitivesTracked(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset,
                         category: .opaque
                     )
                 }
@@ -4092,11 +4110,11 @@ public enum RenderPasses {
 
                 for subMesh in mesh.submeshes {
                     renderEncoder.drawIndexedPrimitives(
-                        type: subMesh.metalKitSubmesh.primitiveType,
-                        indexCount: subMesh.metalKitSubmesh.indexCount,
-                        indexType: subMesh.metalKitSubmesh.indexType,
-                        indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                        indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset
+                        type: subMesh.primitiveType,
+                        indexCount: subMesh.indexCount,
+                        indexType: subMesh.indexType,
+                        indexBuffer: subMesh.indexBuffer,
+                        indexBufferOffset: subMesh.indexBufferOffset
                     )
                 }
             }
@@ -4320,11 +4338,11 @@ public enum RenderPasses {
                     renderEncoder.setTriangleFillMode(.lines)
                     for subMesh in mesh.submeshes {
                         renderEncoder.drawIndexedPrimitivesTracked(
-                            type: subMesh.metalKitSubmesh.primitiveType,
-                            indexCount: subMesh.metalKitSubmesh.indexCount,
-                            indexType: subMesh.metalKitSubmesh.indexType,
-                            indexBuffer: subMesh.metalKitSubmesh.indexBuffer.buffer,
-                            indexBufferOffset: subMesh.metalKitSubmesh.indexBuffer.offset,
+                            type: subMesh.primitiveType,
+                            indexCount: subMesh.indexCount,
+                            indexType: subMesh.indexType,
+                            indexBuffer: subMesh.indexBuffer,
+                            indexBufferOffset: subMesh.indexBufferOffset,
                             category: .other
                         )
                     }

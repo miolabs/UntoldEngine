@@ -12,6 +12,7 @@ import ArgumentParser
 import Foundation
 import simd
 import UntoldEngine
+import UntoldEngineMeshCook
 
 struct ExportCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
@@ -44,9 +45,12 @@ struct ExportCommand: ParsableCommand {
         If the source .blend scene contains more than one independent model
         (more than one object with no parent among the exported objects), the
         exporter writes a <name>.untoldpack manifest next to --output instead
-        of a single .untold file, plus one self-contained .untold per model
-        under its own subfolder. --optimize bakes textures for every model
-        in the pack.
+        of a single .untold file, plus one .untold per model under its own
+        subfolder; copies of a model share one file, and the models share one
+        Textures folder. --optimize bakes those textures for the whole pack.
+        Each model of a pack that is detailed enough also gets its LOD chain
+        (simplified copies the engine switches to with distance, see
+        `untoldengine bake-lods`); --no-lods leaves them out.
 
         Example:
           untoldengine export --input model.usdz --output model.untold --convert-orientation --optimize
@@ -98,6 +102,9 @@ struct ExportCommand: ParsableCommand {
 
     @Flag(name: .long, help: "Compress geometry and bake/patch textures after export (implies --compress-geometry)")
     var optimize = false
+
+    @Flag(name: .customLong("no-lods"), help: "Do not build the LOD chains of a pack's models (see `untoldengine bake-lods`)")
+    var noLODs = false
 
     @Option(name: .customLong("color-grade-lut"), help: "Path to an externally-authored standard .cube 3D LUT to stage and apply as a post-tonemap creative grade. Nothing is rendered from Blender -- the .cube is copied as-is and loaded directly by the engine")
     var colorGradeLUT: String?
@@ -272,10 +279,26 @@ struct ExportCommand: ParsableCommand {
                 printInfo("  \(model.displayName ?? model.path) -> \(model.path)")
             }
             if optimize {
+                // Several placements can share one .untold, so each file is handled once.
+                var modelURLs: [URL] = []
                 for model in pack.models {
-                    let modelURL = packURL.deletingLastPathComponent().appendingPathComponent(model.path)
-                    try optimizeTextures(outputURL: modelURL)
+                    let modelURL = packURL.deletingLastPathComponent().appendingPathComponent(model.path).standardizedFileURL
+                    if !modelURLs.contains(modelURL) { modelURLs.append(modelURL) }
                 }
+                let sharedTextures = (assetsURL ?? packURL.deletingLastPathComponent()).appendingPathComponent("Textures")
+                if validateDirectory(sharedTextures) {
+                    try optimizeSharedTextures(texturesDir: sharedTextures, packURL: packURL, modelURLs: modelURLs)
+                } else {
+                    // An exporter that predates the shared Textures/ folder gives each model its own.
+                    for modelURL in modelURLs {
+                        try optimizeTextures(outputURL: modelURL)
+                    }
+                }
+            }
+
+            // Last, so that the levels copy the materials the models end up with.
+            if !noLODs {
+                bakeLODChains(packURL: packURL)
             }
         } else {
             // Mirror image of the above: an old pack manifest from a previous
@@ -301,6 +324,17 @@ struct ExportCommand: ParsableCommand {
             if optimize {
                 try optimizeTextures(outputURL: outputURL, assetsURL: assetsURL)
             }
+        }
+    }
+
+    /// Builds the LOD chain of every model of the pack, as `untoldengine bake-lods` does.
+    /// The pack is complete without them, so a failure is reported and the export stands.
+    private func bakeLODChains(packURL: URL) {
+        do {
+            let report = try BakeLODsCommand.bakePack(at: packURL, options: UntoldMeshLODOptions())
+            BakeLODsCommand.printReport(report, packURL: packURL)
+        } catch {
+            printWarning("The LOD chains of \(packURL.lastPathComponent) were not built: \(error)")
         }
     }
 
@@ -513,6 +547,26 @@ struct ExportCommand: ParsableCommand {
 
         printInfo("Patching texture references: \(outputURL.path)")
         try runPython(python3URL, [texbakeScriptURL.path, "--patch-refs", outputURL.path])
+
+        printSuccess("Optimized textures: \(texturesDir.path)")
+    }
+
+    /// A pack's Textures/ folder, shared by its models: baked once, with the pack's
+    /// model files read for slot hints, then each model's references patched.
+    private func optimizeSharedTextures(texturesDir: URL, packURL: URL, modelURLs: [URL]) throws {
+        let python3URL = try resolvePython3()
+        let texbakeScriptURL = try resolveTexbakeScript()
+
+        printInfo("Baking textures: \(texturesDir.path)")
+        // The pack's manifest, from which texbake takes the models it lists: naming each
+        // file would overflow the command line on a large pack, and naming their folder
+        // would bring in whatever else an assets folder holds.
+        try runPython(python3URL, [texbakeScriptURL.path, "--dir", texturesDir.path, "--untold", packURL.path])
+
+        for modelURL in modelURLs {
+            printInfo("Patching texture references: \(modelURL.path)")
+            try runPython(python3URL, [texbakeScriptURL.path, "--patch-refs", modelURL.path])
+        }
 
         printSuccess("Optimized textures: \(texturesDir.path)")
     }

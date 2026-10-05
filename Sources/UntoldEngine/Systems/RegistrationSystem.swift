@@ -12,6 +12,7 @@
 import CShaderTypes
 import Foundation
 import MetalKit
+import os
 
 @inline(__always)
 private func enforceRegistrationMainActor() {
@@ -252,6 +253,8 @@ private func registerComponentCleanupHandlers() {
     }
 }
 
+/// Creates an entity that already has its transform (local and world) and scene graph
+/// components. Registering them again replaces them with new ones at their defaults.
 public func createEntity() -> EntityID {
     enforceRegistrationMainActor()
     globalEntityCounter += 1
@@ -597,8 +600,14 @@ private func ensureUntoldNodeComponents(entityId: EntityID) {
     }
 }
 
-func makeMeshes(from node: RuntimeAssetNode) -> [Mesh] {
+/// `withMaterials: false` builds the geometry alone, for meshes that take their
+/// materials from elsewhere (the levels of a LOD chain use the model's).
+func makeMeshes(from node: RuntimeAssetNode, withMaterials: Bool = true) -> [Mesh] {
     node.primitives.compactMap { primitive -> Mesh? in
+        var primitive = primitive
+        if !withMaterials {
+            primitive.material = nil
+        }
         guard var mesh = Mesh.makeMesh(from: primitive, device: renderInfo.device) else {
             return nil
         }
@@ -611,10 +620,10 @@ func makeMeshes(from node: RuntimeAssetNode) -> [Mesh] {
 /// Pre-build Metal meshes for all renderable nodes in a runtime asset.
 /// Returns a map of nodeID → [Mesh] built via makeMeshes() — pure MTLBuffer allocation,
 /// no ECS access. Safe to call outside withWorldMutationGate.
-func prebuildNodeMeshes(from nodes: [RuntimeAssetNode]) -> [UInt32: [Mesh]] {
+func prebuildNodeMeshes(from nodes: [RuntimeAssetNode], withMaterials: Bool = true) -> [UInt32: [Mesh]] {
     var result: [UInt32: [Mesh]] = [:]
     for node in nodes where !node.primitives.isEmpty {
-        let meshes = makeMeshes(from: node)
+        let meshes = makeMeshes(from: node, withMaterials: withMaterials)
         if !meshes.isEmpty {
             result[node.id] = meshes
         }
@@ -910,7 +919,9 @@ private func registerUntoldRuntimeAsset(
     filename: String,
     withExtension: String,
     assetName: String? = nil,
-    prebuiltMeshes: [UInt32: [Mesh]] = [:]
+    prebuiltMeshes: [UInt32: [Mesh]] = [:],
+    lodLevels: [PackLODLevelMeshes] = [],
+    lodPlacementScale: Float = 1
 ) -> Bool {
     guard !runtimeAsset.nodes.isEmpty else {
         handleError(.assetDataMissing, filename)
@@ -1079,13 +1090,22 @@ private func registerUntoldRuntimeAsset(
             continue
         }
 
-        _ = registerUntoldNodePayload(
+        let didRegisterPayload = registerUntoldNodePayload(
             entityId: targetEntityId,
             node: node,
             nodesByID: nodesByID,
             url: url,
             prebuiltMeshes: prebuiltMeshes[node.id]
         )
+        if didRegisterPayload, !lodLevels.isEmpty {
+            registerPackLODLevels(
+                entityId: targetEntityId,
+                node: node,
+                modelURL: url,
+                worldRadius: boundingRadius(of: runtimeAsset.worldBounds) * lodPlacementScale,
+                levels: lodLevels
+            )
+        }
     }
 
     // Register animation clips embedded in the asset (e.g. redplayer.untold walk/run cycles).
@@ -1371,6 +1391,63 @@ private func resolveAssetFilenameExtension(
     return ((filename as NSString).deletingPathExtension, embeddedExtension)
 }
 
+/// Resolves a resource URL, probing between two candidate extensions when the caller didn't
+/// say which one they meant -- mesh (`.untoldpack`/`.untold`), animation
+/// (`.untoldanim`/`.untold`), and Gaussian splats (`.untoldgs`/`.ply`) all share this.
+///
+/// When `ext` is non-empty -- an explicit `withExtension` or one embedded in
+/// `filename` via `resolveAssetFilenameExtension` -- resolves exactly that file,
+/// same as before this helper existed. When `ext` is empty (no extension given
+/// anywhere), tries each of `probeExtensions` in order and returns the first
+/// that exists, so `setEntityMeshAsync(entityId:, filename: "Bedroom")` works
+/// whether "Bedroom" exported as a single `.untold` or a multi-model
+/// `.untoldpack`, without the caller needing to know which ahead of time.
+///
+/// The exporter keeps a given base name single-owner -- re-exporting after a
+/// scene's model count changes removes the stale `.untold`/`.untoldpack` at
+/// that stem (see UsingUntoldEngineCLI.md) -- so more than one candidate
+/// existing here means something outside the normal export flow put both
+/// there; that's worth a log line since the choice would otherwise be silent.
+func resolveProbedAssetURL(
+    filename: String,
+    ext: String,
+    probeExtensions: [String],
+    subResource: String? = nil
+) -> URL? {
+    guard ext.isEmpty else {
+        return LoadingSystem.shared.resourceURL(forResource: filename, withExtension: ext, subResource: subResource)
+    }
+    let matches = probeExtensions.compactMap { candidate -> (String, URL)? in
+        LoadingSystem.shared.resourceURL(forResource: filename, withExtension: candidate, subResource: subResource)
+            .map { (candidate, $0) }
+    }
+    if matches.count > 1 {
+        Logger.logWarning(
+            message: "[RegistrationSystem] '\(filename)' resolves to both ." +
+                matches.map(\.0).joined(separator: " and .") +
+                "; using .\(matches[0].0). Pass withExtension explicitly to choose."
+        )
+    }
+    return matches.first?.1
+}
+
+/// Like `resolveProbedAssetURL`, but also returns the concrete extension that won -- for
+/// callers that must persist a filename/extension pair for a later, deferred load (e.g.
+/// `StreamingComponent.assetExtension`) rather than resolving a URL once and using it
+/// immediately. Persisting the resolved extension means the deferred load never has to probe
+/// again or risk re-resolving to a different file if one is added later.
+func resolveProbedAsset(
+    filename: String,
+    ext: String,
+    probeExtensions: [String],
+    subResource: String? = nil
+) -> (url: URL, extension: String)? {
+    guard let url = resolveProbedAssetURL(filename: filename, ext: ext, probeExtensions: probeExtensions, subResource: subResource) else {
+        return nil
+    }
+    return (url, ext.isEmpty ? url.pathExtension : ext)
+}
+
 /// Loads a standalone .cube color-grade LUT and applies it immediately, fully
 /// independent of any scene/manifest -- unlike the colorGradeLUT reference
 /// installed by loadSceneAuthored, this can point at any .cube file (hand
@@ -1521,10 +1598,10 @@ public func setEntityMesh(
     assetName: String? = nil
 ) {
     let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
-    guard let url = LoadingSystem.shared.resourceURL(
-        forResource: filename,
-        withExtension: withExtension,
-        subResource: nil
+    guard let url = resolveProbedAssetURL(
+        filename: filename,
+        ext: withExtension,
+        probeExtensions: ["untoldpack", "untold"]
     ) else {
         handleError(.filenameNotFound, filename)
         loadFallbackMesh(entityId: entityId, filename: filename)
@@ -1570,6 +1647,35 @@ public func setEntityMeshAsync(
     blockRenderLoop: Bool = true,
     completion: ((Bool) -> Void)? = nil
 ) {
+    loadEntityMeshAsync(
+        entityId: entityId,
+        filename: filename,
+        withExtension: withExtension,
+        assetName: assetName,
+        streamingPolicy: streamingPolicy,
+        blockRenderLoop: blockRenderLoop,
+        sharedBuilds: nil,
+        completion: completion
+    )
+}
+
+/// setEntityMeshAsync's implementation. `sharedBuilds` lets the models of one
+/// `.untoldpack` that point at the same `.untold` parse it and build its GPU meshes
+/// once (see UntoldBuildCache). It applies to whole files loaded at once, as the pack
+/// loader asks for them: with an `assetName` or a streaming policy other than
+/// `.immediate` the load is not shared. `lodChain` is the model's LOD chain, whose
+/// levels are built the same way and registered on the entities the model creates.
+func loadEntityMeshAsync(
+    entityId: EntityID,
+    filename: String,
+    withExtension: String?,
+    assetName: String?,
+    streamingPolicy: MeshStreamingPolicy,
+    blockRenderLoop: Bool,
+    sharedBuilds: UntoldBuildCache?,
+    lodChain: PackLODChain? = nil,
+    completion: ((Bool) -> Void)?
+) {
     let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
     let completionBox = completion.map { BoolCompletionBox(callback: $0) }
 
@@ -1580,7 +1686,11 @@ public func setEntityMeshAsync(
         await AssetLoadingState.shared.startLoading(entityId: entityId, filename: filename, blockRenderLoop: blockRenderLoop)
 
         // Get URL
-        guard let url = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
+        guard let url = resolveProbedAssetURL(
+            filename: filename,
+            ext: withExtension,
+            probeExtensions: ["untoldpack", "untold"]
+        ) else {
             handleError(.filenameNotFound, filename)
             withWorldMutationGate {
                 loadFallbackMesh(entityId: entityId, filename: filename)
@@ -1629,13 +1739,51 @@ public func setEntityMeshAsync(
         }
 
         if RuntimeAssetSource.infer(from: url).kind == .untold {
-            guard let runtimeAsset = loadUntoldRuntimeAsset(url: url) else {
+            // Placements of one pack that share this file reuse its parsed asset and its
+            // GPU meshes: each entity registers its own copy of the Mesh values, which
+            // share the buffers and textures.
+            //
+            // A shared build is the whole file, built at once. A load of one named node
+            // (`assetName`) or one that streams its meshes in later is neither, so it
+            // goes the way it always did, on its own, even when the caller passes
+            // `sharedBuilds`. The pack loader asks for whole files loaded at once, which
+            // is why every one of its placements shares. A caller that needs shared
+            // builds for named nodes or streamed meshes has to teach the cache about
+            // them first: this test is where that shows.
+            let usesSharedBuild = sharedBuilds != nil && assetName == nil && streamingPolicy == .immediate
+            var sharedBuild: UntoldBuild?
+            if usesSharedBuild, let sharedBuilds {
+                sharedBuild = await sharedBuilds.build(for: url) {
+                    guard let runtimeAsset = loadUntoldRuntimeAsset(url: url) else { return nil }
+                    return UntoldBuild(runtimeAsset: runtimeAsset, prebuiltMeshes: prebuildNodeMeshes(from: runtimeAsset.nodes))
+                }
+            }
+            guard let runtimeAsset = usesSharedBuild ? sharedBuild?.runtimeAsset : loadUntoldRuntimeAsset(url: url) else {
                 withWorldMutationGate {
                     loadFallbackMesh(entityId: entityId, filename: filename)
                 }
                 await AssetLoadingState.shared.finishLoading(entityId: entityId)
                 completionBox?.call(false)
                 return
+            }
+
+            // The levels of the model's LOD chain: geometry alone, since every level is
+            // drawn with the model's materials. A level that fails to load is left out
+            // and the others still switch at their own sizes.
+            var lodLevels: [PackLODLevelMeshes] = []
+            if usesSharedBuild, let sharedBuilds, let lodChain {
+                for level in lodChain.levels {
+                    let build = await sharedBuilds.build(for: level.url) {
+                        guard let levelAsset = loadUntoldRuntimeAsset(url: level.url) else { return nil }
+                        return UntoldBuild(
+                            runtimeAsset: levelAsset,
+                            prebuiltMeshes: prebuildNodeMeshes(from: levelAsset.nodes, withMaterials: false)
+                        )
+                    }
+                    if let build {
+                        lodLevels.append(PackLODLevelMeshes(url: level.url, screenSize: level.screenSize, meshesByNode: build.prebuiltMeshes))
+                    }
+                }
             }
 
             // OCC is only valid for whole-asset loads. Named-node loads always full-load.
@@ -1666,7 +1814,7 @@ public func setEntityMeshAsync(
             // Keeping this inside withWorldMutationGate was the root cause of 30-40ms gate
             // holds during HLOD and LOD tile registration, which blocked the main thread.
             // OCC path builds meshes separately (CPU→GPU upload), so no pre-build needed there.
-            let prebuiltMeshes: [UInt32: [Mesh]] = useOCC ? [:] : prebuildNodeMeshes(from: runtimeAsset.nodes)
+            let prebuiltMeshes: [UInt32: [Mesh]] = useOCC ? [:] : (sharedBuild?.prebuiltMeshes ?? prebuildNodeMeshes(from: runtimeAsset.nodes))
 
             let didLoad: Bool = withWorldMutationGate {
                 if hasComponent(entityId: entityId, componentType: LocalTransformComponent.self) == false {
@@ -1695,7 +1843,9 @@ public func setEntityMeshAsync(
                         filename: filename,
                         withExtension: withExtension,
                         assetName: assetName,
-                        prebuiltMeshes: prebuiltMeshes
+                        prebuiltMeshes: prebuiltMeshes,
+                        lodLevels: lodLevels,
+                        lodPlacementScale: lodChain?.placementScale ?? 1
                     )
                 }
 
@@ -2311,6 +2461,23 @@ public struct UntoldPackData: Decodable {
     public let formatVersion: Int
     public let sourceAsset: String?
     public let models: [UntoldPackModelEntry]
+    /// The LOD chain of each model that has one, by the model's `path`: its simplified
+    /// levels from the finest (see `UntoldMeshLODCooker` in the UntoldEngineMeshCook
+    /// module). Nil in a pack cooked without them.
+    public let lodChains: [String: [UntoldPackLODLevelEntry]]?
+}
+
+/// One simplified level of a pack model: a `.untold` with the model's entities and
+/// materials and fewer triangles, next to the model.
+public struct UntoldPackLODLevelEntry: Decodable, Sendable {
+    /// The level's file, relative to the manifest like the model's.
+    public let path: String
+    /// The level is detailed enough once the model's bounding sphere covers at most
+    /// this share of the viewport height (1 is the whole height).
+    public let screenSize: Float
+    public let triangles: Int?
+    /// The largest deviation from the model, in model units.
+    public let error: Float?
 }
 
 /// Reads and decodes a `.untoldpack` manifest from a local file URL.
@@ -2324,6 +2491,15 @@ public func loadUntoldPack(url: URL) -> UntoldPackData? {
         return nil
     }
     return pack
+}
+
+/// The largest of the scales `matrix` applies along its three axes.
+func largestAxisScale(of matrix: simd_float4x4) -> Float {
+    max(
+        simd_length(simd_make_float3(matrix.columns.0)),
+        simd_length(simd_make_float3(matrix.columns.1)),
+        simd_length(simd_make_float3(matrix.columns.2))
+    )
 }
 
 private func decomposeTRS(_ matrix: simd_float4x4) -> (position: simd_float3, rotation: simd_quatf, scale: simd_float3) {
@@ -2410,6 +2586,239 @@ public func createUntoldScene(fromPackAt packURL: URL, savingTo sceneURL: URL) -
     }
 }
 
+/// The LOD chain of a pack model, as one placement of it needs it.
+struct PackLODChain {
+    struct Level {
+        let url: URL
+        let screenSize: Float
+    }
+
+    /// The simplified levels, finest first.
+    let levels: [Level]
+    /// The largest scale the placement gives the model, the pack's root included.
+    let placementScale: Float
+}
+
+/// One level of a chain built into GPU meshes, by the node of the model they belong to.
+struct PackLODLevelMeshes {
+    let url: URL
+    let screenSize: Float
+    let meshesByNode: [UInt32: [Mesh]]
+}
+
+/// Half the diagonal of `bounds`: the radius of the sphere around a model.
+func boundingRadius(of bounds: RuntimeAABB) -> Float {
+    let radius = simd_length(bounds.max - bounds.min) * 0.5
+    return radius.isFinite ? radius : 0
+}
+
+/// The distance at which a sphere of `radius` covers `screenSize` of the viewport
+/// height (1 is the whole height) under a vertical field of view of `fovYDegrees`.
+func lodSwitchDistance(radius: Float, screenSize: Float, fovYDegrees: Float) -> Float {
+    let halfHeightPerUnitDistance = tan(degreesToRadians(degrees: fovYDegrees) * 0.5)
+    guard radius > 0, screenSize > 0, halfHeightPerUnitDistance > 0 else {
+        return .greatestFiniteMagnitude
+    }
+    return min(radius / (screenSize * halfHeightPerUnitDistance), .greatestFiniteMagnitude)
+}
+
+/// Gives the entity of a pack model's node the levels of the model's LOD chain, after
+/// its own meshes (level 0). The meshes of a level pair with the node's by position
+/// and take their materials, so a level is the same surface with fewer triangles.
+///
+/// Each level's screen size becomes a switch distance for this placement: the distance
+/// at which the model's bounding sphere (`worldRadius`) covers that share of the
+/// viewport under the engine's field of view. A small prop and a large tree with the
+/// same chain therefore switch at distances that suit each.
+private func registerPackLODLevels(
+    entityId: EntityID,
+    node: RuntimeAssetNode,
+    modelURL: URL,
+    worldRadius: Float,
+    levels: [PackLODLevelMeshes]
+) {
+    guard worldRadius > 0, let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
+        return
+    }
+    let modelMeshes = renderComponent.mesh
+
+    var usable: [(screenSize: Float, url: URL, meshes: [Mesh])] = []
+    for level in levels {
+        guard var meshes = level.meshesByNode[node.id],
+              meshes.count == modelMeshes.count,
+              zip(meshes, modelMeshes).allSatisfy({ $0.submeshes.count == $1.submeshes.count })
+        else { continue }
+        for meshIndex in meshes.indices {
+            for submeshIndex in meshes[meshIndex].submeshes.indices {
+                meshes[meshIndex].submeshes[submeshIndex].material = modelMeshes[meshIndex].submeshes[submeshIndex].material
+            }
+            meshes[meshIndex].localSpace = modelMeshes[meshIndex].localSpace
+            meshes[meshIndex].worldSpace = modelMeshes[meshIndex].worldSpace
+        }
+        usable.append((level.screenSize, level.url, meshes))
+    }
+    guard let first = usable.first else { return }
+
+    // A level's maxDistance is where the next one takes over; the last has no end.
+    var lodLevels: [LODLevel] = []
+    var previousDistance = lodSwitchDistance(radius: worldRadius, screenSize: first.screenSize, fovYDegrees: fov)
+    lodLevels.append(LODLevel(mesh: modelMeshes, maxDistance: previousDistance, url: modelURL, assetName: node.name))
+    for (index, level) in usable.enumerated() {
+        var maxDistance = Float.greatestFiniteMagnitude
+        if index + 1 < usable.count {
+            // Never closer than the level before, whatever the manifest says.
+            maxDistance = max(
+                lodSwitchDistance(radius: worldRadius, screenSize: usable[index + 1].screenSize, fovYDegrees: fov),
+                previousDistance
+            )
+            previousDistance = maxDistance
+        }
+        lodLevels.append(LODLevel(
+            mesh: level.meshes,
+            maxDistance: maxDistance,
+            screenPercentage: level.screenSize,
+            url: level.url,
+            assetName: node.name
+        ))
+    }
+
+    configureLODComponent(entityId: entityId, lodLevels: lodLevels, activeLODIndex: 0)
+    scene.get(component: LODComponent.self, for: entityId)?.levelsShareMaterials = true
+}
+
+/// A `.untold` parsed and built into GPU meshes, ready for any number of entities to
+/// register copies of.
+final class UntoldBuild: @unchecked Sendable {
+    let runtimeAsset: RuntimeAsset
+    let prebuiltMeshes: [UInt32: [Mesh]]
+
+    init(runtimeAsset: RuntimeAsset, prebuiltMeshes: [UInt32: [Mesh]]) {
+        self.runtimeAsset = runtimeAsset
+        self.prebuiltMeshes = prebuiltMeshes
+    }
+}
+
+/// The `.untold` builds of one pack load, keyed by file. A `.untoldpack` can place the
+/// same `.untold` hundreds of times (the exporter writes a repeated model once), and
+/// each placement used to read the file, decode it and allocate its own GPU buffers.
+/// `Mesh` is a value type whose buffers and textures are references, so every entity
+/// registers its own copy of the built meshes, sharing the GPU memory, while material
+/// edits and skins stay per entity.
+///
+/// Single-flight: the first caller for a file builds it; callers arriving meanwhile
+/// suspend until it is ready instead of building it again. A build that fails is tried
+/// a second time at once, so that a passing read error does not cost every placement
+/// of the file its model; a file that fails twice is remembered as failed, and its
+/// other placements fall back without reading it again.
+///
+/// The table of states lives inside an unfair lock, so it can only be read or changed
+/// while the lock is held, and that is for a few instructions at a time. The lock is
+/// never held while a file is built, so different files build at the same time, and
+/// never while a waiting caller is resumed.
+final class UntoldBuildCache: Sendable {
+    private typealias Waiter = CheckedContinuation<UntoldBuild?, Never>
+
+    /// Where the build of one file stands.
+    private enum State {
+        /// A caller is building it; these callers wait for the result.
+        case building(waiters: [Waiter])
+        /// Built, or failed twice (nil).
+        case finished(UntoldBuild?)
+    }
+
+    /// What a caller that asks for a file has to do.
+    private enum Claim {
+        case take(UntoldBuild?)
+        case wait
+        case build
+    }
+
+    /// What became of a caller that went to wait for a build.
+    private enum Arrival {
+        /// It is queued, and will be resumed with the result.
+        case queued
+        /// The build finished before it could queue.
+        case finished(UntoldBuild?)
+    }
+
+    /// The state of every file asked for so far, by its standardized path.
+    private let states = OSAllocatedUnfairLock<[String: State]>(initialState: [:])
+
+    func build(for url: URL, make: () -> UntoldBuild?) async -> UntoldBuild? {
+        let key = url.standardizedFileURL.path
+        switch claim(key) {
+        case let .take(build):
+            return build
+        case .wait:
+            return await withCheckedContinuation { continuation in
+                if case let .finished(build) = queue(continuation, for: key) {
+                    continuation.resume(returning: build)
+                }
+            }
+        case .build:
+            let result = make() ?? make()
+            // Resumed here, after `finish` has let go of the lock.
+            for waiter in finish(key, result) {
+                waiter.resume(returning: result)
+            }
+            return result
+        }
+    }
+
+    /// Whether the file is built, being built by another caller, or now this caller's to build.
+    private func claim(_ key: String) -> Claim {
+        states.withLock { states in
+            switch states[key] {
+            case let .finished(build):
+                return .take(build)
+            case .building:
+                return .wait
+            case nil:
+                states[key] = .building(waiters: [])
+                return .build
+            }
+        }
+    }
+
+    /// Queues a caller behind the build in progress, unless it finished since `claim`.
+    private func queue(_ waiter: Waiter, for key: String) -> Arrival {
+        states.withLock { states in
+            switch states[key] {
+            case let .building(waiters):
+                states[key] = .building(waiters: waiters + [waiter])
+                return .queued
+            case let .finished(build):
+                return .finished(build)
+            case nil:
+                // Not reached: a caller waits only for a build that was claimed, and a
+                // claimed build ends in `finished`.
+                return .finished(nil)
+            }
+        }
+    }
+
+    /// Records the result and hands back the callers waiting for it.
+    private func finish(_ key: String, _ result: UntoldBuild?) -> [Waiter] {
+        states.withLock { states in
+            defer { states[key] = .finished(result) }
+            if case let .building(waiters) = states[key] {
+                return waiters
+            }
+            return []
+        }
+    }
+
+    /// The number of distinct files built so far (for tests and diagnostics).
+    var buildCount: Int {
+        states.withLock { states in
+            states.values.reduce(0) { count, state in
+                if case .finished = state { return count + 1 }
+                return count
+            }
+        }
+    }
+}
+
 /// Drives loadEntityFromPack's model loads through a bounded concurrency window
 /// instead of firing every model's setEntityMeshAsync at once.
 ///
@@ -2425,17 +2834,29 @@ public func createUntoldScene(fromPackAt packURL: URL, savingTo sceneURL: URL) -
 private final class PackLoadDispatcher: @unchecked Sendable {
     private let lock = NSLock()
     private let models: [UntoldPackModelEntry]
+    private let lodChains: [String: [UntoldPackLODLevelEntry]]
     private let packDir: URL
     private let rootEntityId: EntityID
     private let completionBox: BoolCompletionBox?
     private var nextIndex = 0
     private var remaining: Int
     private var overallSuccess = true
+    /// One parse and one GPU build per distinct .untold for the duration of the pack
+    /// load; dropped with the dispatcher, after which the entities' copies keep the
+    /// shared buffers alive.
+    private let builds = UntoldBuildCache()
 
     private static let maxConcurrentLoads = 8
 
-    init(models: [UntoldPackModelEntry], packDir: URL, rootEntityId: EntityID, completionBox: BoolCompletionBox?) {
+    init(
+        models: [UntoldPackModelEntry],
+        lodChains: [String: [UntoldPackLODLevelEntry]],
+        packDir: URL,
+        rootEntityId: EntityID,
+        completionBox: BoolCompletionBox?
+    ) {
         self.models = models
+        self.lodChains = lodChains
         self.packDir = packDir
         self.rootEntityId = rootEntityId
         self.completionBox = completionBox
@@ -2466,15 +2887,31 @@ private final class PackLoadDispatcher: @unchecked Sendable {
         let withExtension = modelURL.pathExtension
         let (position, rotation, scale) = decomposeTRS(model.transform)
         let rootEntityId = rootEntityId
+        let lodLevels = (lodChains[model.path] ?? []).map {
+            PackLODChain.Level(url: packDir.appendingPathComponent($0.path), screenSize: $0.screenSize)
+        }
 
         withWorldMutationGate {
+            var lodChain: PackLODChain?
+            if !lodLevels.isEmpty {
+                // The size of the placement in the world decides where its levels switch.
+                let rootScale = scene.get(component: WorldTransformComponent.self, for: rootEntityId).map { largestAxisScale(of: $0.space) } ?? 1
+                lodChain = PackLODChain(levels: lodLevels, placementScale: simd_reduce_max(simd_abs(scale)) * rootScale)
+            }
             let childId = createEntity()
-            registerTransformComponent(entityId: childId)
-            registerSceneGraphComponent(entityId: childId)
             setEntityName(entityId: childId, name: displayName)
             setParent(childId: childId, parentId: rootEntityId)
 
-            setEntityMeshAsync(entityId: childId, filename: modelPath, withExtension: withExtension) { success in
+            loadEntityMeshAsync(
+                entityId: childId,
+                filename: modelPath,
+                withExtension: withExtension,
+                assetName: nil,
+                streamingPolicy: .immediate,
+                blockRenderLoop: true,
+                sharedBuilds: builds,
+                lodChain: lodChain
+            ) { success in
                 withWorldMutationGate {
                     translateTo(entityId: childId, position: position)
                     scaleTo(entityId: childId, scale: scale)
@@ -2549,7 +2986,13 @@ private func loadEntityFromPack(
     }
 
     let packDir = packURL.deletingLastPathComponent()
-    let dispatcher = PackLoadDispatcher(models: pack.models, packDir: packDir, rootEntityId: rootEntityId, completionBox: completionBox)
+    let dispatcher = PackLoadDispatcher(
+        models: pack.models,
+        lodChains: pack.lodChains ?? [:],
+        packDir: packDir,
+        rootEntityId: rootEntityId,
+        completionBox: completionBox
+    )
     dispatcher.start()
 }
 
@@ -2723,6 +3166,14 @@ private func manifestColorGradeLUT(
 /// The caller is responsible for creating `rootEntityId` via `createEntity()` before
 /// calling this function, and for managing its lifetime.  To replace a streamed scene,
 /// destroy the old root (cascades to all tile stubs), then call this with a new root.
+///
+/// The root keeps its place in the scene graph: its parent, and the entities already
+/// parented under it.  Its own position, rotation and scale are reset to identity when
+/// the stubs are registered, because the manifest's tile bounds are world-space values
+/// that do not follow the root; a warning is logged when that discards a transform, and
+/// when an ancestor still keeps the root away from identity.  To place a streamed scene,
+/// use `translateSceneTo`, `rotateSceneToYaw` and `scaleSceneTo`.
+///
 /// A manifest `colorLUT` is installed automatically because it is scene-wide.
 /// Scene-authored lights/cameras remain opt-in; call `loadSceneAuthored(url:)`
 /// explicitly when you want those entities in the current scene.
@@ -2870,7 +3321,9 @@ public func loadTiledScene(
 /// streaming system as the camera approaches each tile.
 ///
 /// The caller is responsible for creating `rootEntityId` via `createEntity()` before
-/// calling this function, and for managing its lifetime. A manifest `colorLUT`
+/// calling this function, and for managing its lifetime. The root keeps its parent and
+/// the entities already parented under it; its own transform is reset to identity, as
+/// described on `setEntityStreamScene(entityId:manifest:)`. A manifest `colorLUT`
 /// is installed automatically. Scene-authored lights/cameras remain opt-in
 /// through `loadSceneAuthored(url:)`.
 ///
@@ -3008,6 +3461,53 @@ public func loadTiledScene(
     }
 }
 
+/// Puts the root of a tiled scene back at the identity of its parent's space, and says
+/// so when that discards a transform or cannot make the world transform the identity.
+///
+/// The streaming and culling checks read the manifest's tile bounds as world-space values,
+/// so a tiled scene only streams correctly while the world transform of its root is the
+/// identity.  The root's own position, rotation and scale are reset through the transform
+/// API, which moves the entities already parented under it at once.  A transform that
+/// comes from an ancestor is not the root's to change and can only be reported.
+private func resetTiledSceneRootTransform(rootEntityId: EntityID) {
+    guard let local = scene.get(component: LocalTransformComponent.self, for: rootEntityId) else {
+        return
+    }
+
+    let isMoved = local.position != .zero
+    // The vector part of a quaternion is zero for the identity, whatever the sign of q.
+    let isRotated = simd_length_squared(local.rotation.imag) > 1.0e-12
+    let isScaled = local.scale != .one
+
+    // These warnings go to the general category: TileStreaming is off by default, and a
+    // caller whose placement is dropped or whose scene shows displaced has to see why.
+    if isMoved || isRotated || isScaled {
+        Logger.logWarning(
+            message: "[setEntityStreamScene] Root '\(getEntityName(entityId: rootEntityId))' had a transform of its own (position \(local.position), scale \(local.scale)\(isRotated ? ", rotated" : "")), which was reset to identity: tile bounds are world-space values and do not follow the root. Place a streamed scene with translateSceneTo / rotateSceneToYaw / scaleSceneTo."
+        )
+        if isMoved {
+            translateTo(entityId: rootEntityId, position: .zero)
+        }
+        if isRotated {
+            applyAxisRotations(entityId: rootEntityId, axis: .zero)
+        }
+        if isScaled {
+            scaleTo(entityId: rootEntityId, scale: .one)
+        }
+    }
+
+    guard let world = scene.get(component: WorldTransformComponent.self, for: rootEntityId),
+          transformsApproximatelyEqual(world.space, .identity) == false
+    else {
+        return
+    }
+
+    let parentName = getEntityParent(entityId: rootEntityId).map { getEntityName(entityId: $0) } ?? "none"
+    Logger.logWarning(
+        message: "[setEntityStreamScene] Root '\(getEntityName(entityId: rootEntityId))' is not at identity in world space because of its ancestors (parent '\(parentName)'). Tile bounds are world-space values and do not follow them: the scene is drawn displaced and tiles can be streamed or culled wrongly. Keep the ancestors of a tiled scene root at identity, or place the scene with translateSceneTo / rotateSceneToYaw / scaleSceneTo."
+    )
+}
+
 /// Canonical scene-loading runtime.
 ///
 /// Registers one TileComponent stub per manifest entry, parents all stubs under
@@ -3051,15 +3551,27 @@ private func registerTiledScene(
     GeometryStreamingSystem.shared.firstRangeTimestamps.removeAll()
 
     // ── 2. Set up root entity ──────────────────────────────────────────────
-    // The root receives a transform (identity) and a scenegraph node so tile
-    // stubs can be parented under it.  TiledSceneComponent marks it as a tiled
-    // scene root for inspection and future editor workflows.
+    // Tile stubs are parented under the root, so it needs a transform and a
+    // scenegraph node.  createEntity() gave it both, and registering them again
+    // would replace them: the root would drop out of its hierarchy on its own
+    // side only, with its parent still listing it and its children still
+    // pointing to it.  They are registered only for an entity that has none.
+    // TiledSceneComponent marks it as a tiled scene root for inspection and
+    // future editor workflows.
     //
     // Root transforms are NOT propagated to streaming/culling bounds in this
-    // release.  The manifest tile bounds are world-space values; keep the root
-    // at identity transform to avoid incorrect streaming/culling decisions.
-    registerTransformComponent(entityId: rootEntityId)
-    registerSceneGraphComponent(entityId: rootEntityId)
+    // release.  The manifest tile bounds are world-space values, so the root's
+    // own transform is put back to identity to avoid incorrect streaming/culling
+    // decisions.  Its parent and its children are the caller's and stay.
+    //
+    // Under the world mutation gate, like the stub batches below: the reset
+    // moves the entities under the root, and a scene being deserialized holds
+    // the gate until it has restored the root's saved transform and parent, so
+    // the root is always prepared after them.
+    withWorldMutationGate {
+        ensureUntoldNodeComponents(entityId: rootEntityId)
+        resetTiledSceneRootTransform(rootEntityId: rootEntityId)
+    }
     registerComponent(entityId: rootEntityId, componentType: TiledSceneComponent.self)
     if let sceneComp = scene.get(component: TiledSceneComponent.self, for: rootEntityId) {
         sceneComp.manifestLabel = label
@@ -3127,14 +3639,12 @@ private func registerTiledScene(
                 withWorldMutationGate {
                     let entityId = createEntity()
                     setEntityName(entityId: entityId, name: shared.tileId)
-                    registerTransformComponent(entityId: entityId)
                     if let local = scene.get(component: LocalTransformComponent.self, for: entityId) {
                         local.boundingBox = (
                             min: simd_float3(shared.bounds.min[0], shared.bounds.min[1], shared.bounds.min[2]),
                             max: simd_float3(shared.bounds.max[0], shared.bounds.max[1], shared.bounds.max[2])
                         )
                     }
-                    registerSceneGraphComponent(entityId: entityId)
                     registerComponent(entityId: entityId, componentType: TileComponent.self)
                     if let tileComp = scene.get(component: TileComponent.self, for: entityId) {
                         tileComp.tileURL = sharedURL
@@ -3206,14 +3716,12 @@ private func registerTiledScene(
                 // world space in the exported USDC).  The local bounding box is set to
                 // the tile's world-space AABB — valid because identity world transform
                 // means local space == world space.
-                registerTransformComponent(entityId: entityId)
                 if let local = scene.get(component: LocalTransformComponent.self, for: entityId) {
                     local.boundingBox = (
                         min: simd_float3(tile.bounds.min[0], tile.bounds.min[1], tile.bounds.min[2]),
                         max: simd_float3(tile.bounds.max[0], tile.bounds.max[1], tile.bounds.max[2])
                     )
                 }
-                registerSceneGraphComponent(entityId: entityId)
                 registerComponent(entityId: entityId, componentType: TileComponent.self)
                 if let tileComp = scene.get(component: TileComponent.self, for: entityId) {
                     if let cb = tile.cellBounds, cb.min.count >= 3, cb.max.count >= 3 {
@@ -3386,7 +3894,11 @@ public func setEntityAnimations(entityId: EntityID, filename: String, withExtens
         return
     }
 
-    let resourceURL = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension)
+    let resourceURL = resolveProbedAssetURL(
+        filename: filename,
+        ext: withExtension,
+        probeExtensions: ["untoldanim", "untold"]
+    )
     guard let url = resourceURL else {
         handleError(.filenameNotFound, filename)
         return
@@ -4070,26 +4582,6 @@ func computeGaussianSplatBoundingBox(_ splats: [GaussianSplat]) -> (min: simd_fl
     )
 }
 
-/// Reads a `.ply` or `.untoldgs` Gaussian splat asset from disk and builds its GPU buffers.
-/// Returns `nil` on any failure, calling `handleError` internally — callers just guard-return.
-private func buildGaussianLoadResult(filename: String, withExtension: String) -> GaussianLoadResult? {
-    guard let url = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil) else {
-        handleError(.filenameNotFound, filename)
-        return nil
-    }
-
-    if withExtension.lowercased() == "untoldgs" {
-        return buildGaussianLoadResultFromUntoldGS(url: url)
-    }
-
-    do {
-        return try buildGaussianLoadResultFromPLY(url: url, sourceDescription: filename)
-    } catch {
-        handleError(.assetDataMissing, "Failed to read Gaussian splats from \(filename): \(error.localizedDescription)")
-        return nil
-    }
-}
-
 func buildGaussianLoadResultFromPLY(url: URL, sourceDescription: String) throws -> GaussianLoadResult? {
     let asset = try PLYReader.readGaussianAsset(from: url)
     let encodedSplats = asset.splats.map(encodeGaussianSplatForTBDR)
@@ -4401,7 +4893,10 @@ func copyGaussianLoadResult(_ result: GaussianLoadResult, to gaussianComponent: 
 }
 
 public enum GaussianSource {
-    case single(filename: String, withExtension: String)
+    /// `withExtension` defaults to `""`, meaning "probe": resolve `.untoldgs` first, then
+    /// `.ply`, the same convention `setEntityMeshAsync` uses for `.untoldpack`/`.untold`.
+    /// Pass an explicit extension to force one or the other regardless of what else exists.
+    case single(filename: String, withExtension: String = "")
     /// No `boundingBoxHalfExtent` here: both `setEntityGaussian(source:)` and
     /// `setEntityGaussianTileStreaming(source:options:)` can read a real box baked into the
     /// `.untoldgs` header itself (see `UntoldGSFormat.readHeader`) — an explicit override, when
@@ -4422,14 +4917,17 @@ public typealias GaussianStreamingSource = GaussianSource
 
 public func setEntityGaussian(entityId: EntityID, filename: String, withExtension: String? = nil) {
     let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
-    guard let result = buildGaussianLoadResult(filename: filename, withExtension: withExtension) else {
+    guard let url = resolveProbedAssetURL(filename: filename, ext: withExtension, probeExtensions: ["untoldgs", "ply"]) else {
+        handleError(.filenameNotFound, filename)
         return
     }
-    let sourceURL = LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil)
+    guard let result = buildGaussianLoadResult(url: url) else {
+        return
+    }
 
     withWorldMutationGate {
         applyGaussianLoadResult(result, to: entityId)
-        scene.get(component: GaussianComponent.self, for: entityId)?.sourceURL = sourceURL
+        scene.get(component: GaussianComponent.self, for: entityId)?.sourceURL = url
     }
 }
 
@@ -4463,20 +4961,27 @@ public func setEntityGaussian(entityId: EntityID, source: GaussianSource) {
 /// `setEntityGaussianAsync` wraps this in a fire-and-forget `Task` for callers that just want
 /// `setEntityMeshAsync`'s plain completion-closure ergonomics.
 func performGaussianAsyncLoad(entityId: EntityID, filename: String, withExtension: String) async -> Bool {
+    // Resolved up front (cheap file-existence probing, not the heavy parse/decode below) so
+    // both the detached decode and the sourceURL assignment share one answer, and an empty
+    // withExtension probes .untoldgs then .ply instead of failing outright.
+    guard let url = resolveProbedAssetURL(filename: filename, ext: withExtension, probeExtensions: ["untoldgs", "ply"]) else {
+        handleError(.filenameNotFound, filename)
+        return false
+    }
+
     // buildGaussianLoadResult is a plain synchronous function — awaiting it directly would
     // just run it inline on whatever actor called us (e.g. still the main thread, if called
     // from a `Task { @MainActor in ... }`). Task.detached guarantees the parse/decode/encode
     // work actually happens off the caller's thread regardless of where it's awaited from.
     let result = await Task.detached(priority: .userInitiated) {
-        buildGaussianLoadResult(filename: filename, withExtension: withExtension)
+        buildGaussianLoadResult(url: url)
     }.value
 
     guard let result else { return false }
 
     withWorldMutationGate {
         applyGaussianLoadResult(result, to: entityId)
-        scene.get(component: GaussianComponent.self, for: entityId)?.sourceURL =
-            LoadingSystem.shared.resourceURL(forResource: filename, withExtension: withExtension, subResource: nil)
+        scene.get(component: GaussianComponent.self, for: entityId)?.sourceURL = url
     }
 
     return true
@@ -4487,12 +4992,16 @@ func performGaussianAsyncLoad(entityId: EntityID, filename: String, withExtensio
 /// the call site, and read the result via `completion`, exactly like `setEntityMeshAsync`.
 /// Gaussians have no cache/OCC layer analogous to `MeshResourceManager`, so unlike mesh
 /// streaming there is no separate streaming-only loader.
+///
+/// `withExtension` is optional, like `setEntityMeshAsync` — omitting it (or leaving it out
+/// of `filename`) probes `.untoldgs` first, then `.ply`.
 public func setEntityGaussianAsync(
     entityId: EntityID,
     filename: String,
-    withExtension: String,
+    withExtension: String? = nil,
     completion: ((Bool) -> Void)? = nil
 ) {
+    let (filename, withExtension) = resolveAssetFilenameExtension(filename, withExtension)
     let completionBox = completion.map { BoolCompletionBox(callback: $0) }
     Task {
         let success = await performGaussianAsyncLoad(entityId: entityId, filename: filename, withExtension: withExtension)
@@ -4534,10 +5043,18 @@ public func setEntityGaussianTileStreaming(
 ) {
     switch source {
     case let .single(filename, ext):
+        // Resolved to a concrete extension now, once, rather than carrying ext == ""
+        // (meaning "probe") into StreamingComponent.assetExtension -- the deferred load this
+        // registers for reads that field directly (GeometryStreamingSystem+GaussianStreaming.swift)
+        // without ever coming back through this probing logic.
+        guard let resolved = resolveProbedAsset(filename: filename, ext: ext, probeExtensions: ["untoldgs", "ply"]) else {
+            handleError(.filenameNotFound, filename)
+            return
+        }
         setEntityGaussianStreamable(
             entityId: entityId,
             filename: filename,
-            withExtension: ext,
+            withExtension: resolved.extension,
             streamingRadius: options.streamingRadius,
             unloadRadius: options.unloadRadius,
             boundingBoxHalfExtent: options.boundingBoxHalfExtent,
@@ -6138,8 +6655,6 @@ public func createStreamingEntity(
         let entityId = createEntity()
 
         // Register required components
-        registerTransformComponent(entityId: entityId)
-        registerSceneGraphComponent(entityId: entityId)
         registerComponent(entityId: entityId, componentType: StreamingComponent.self)
 
         guard let streaming = scene.get(component: StreamingComponent.self, for: entityId) else {

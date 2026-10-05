@@ -1,5 +1,15 @@
 //
 //  AppDelegate.swift
+//  UntoldEngine
+//
+// Copyright (C) Untold Engine Studios
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//
+//  AppDelegate.swift
 //
 
 #if os(macOS)
@@ -11,7 +21,7 @@
     @MainActor
     final class AppDelegate: NSObject, NSApplicationDelegate {
         private enum Constants {
-            static let appVersion = "0.21.0"
+            static let appVersion = "0.22.0"
             static let defaultWindowSize = NSSize(width: 1920, height: 1080)
             static let minimumWindowSize = NSSize(width: 640, height: 480)
         }
