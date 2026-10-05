@@ -138,6 +138,37 @@ TEXTURE_CHANNEL_G = 1
 TEXTURE_CHANNEL_B = 2
 TEXTURE_CHANNEL_A = 3
 UNTOLD_EXPORT_TEMP_OBJECT_PROP = "_untold_export_temp_object"
+# The name of the material a mesh with no material of its own is given. It is one name
+# for all of them, and not one made from the object's name: the material is part of what
+# tells two models apart (see model_content_signature), so a name taken from the object
+# made every copy of a prop with no material a model of its own.
+DEFAULT_MATERIAL_NAME = "default_material"
+# Material alpha modes, the low two bits of a material record's flags (the engine's
+# MaterialAlphaMode).
+MATERIAL_ALPHA_MODE_OPAQUE = 0
+MATERIAL_ALPHA_MODE_MASK = 1
+MATERIAL_ALPHA_MODE_BLEND = 2
+# The opacity a fully transmissive, clear surface (Principled Transmission Weight 1 with
+# a white base colour) keeps when exported: the engine has no transmission, so glass
+# becomes a blended surface this opaque, enough to keep its reflections visible. Tinted
+# or frosted glass comes out more opaque, by what its colour and its roughness take from
+# what is seen through it, and a metal opaque (see principled_transmittance).
+TRANSMISSION_OPACITY = 0.1
+# The engine's own parallax depth (the default of its heightScale), for a material with
+# no height and for a height whose depth is linked and so has no single value.
+DEFAULT_HEIGHT_SCALE = 0.05
+# The deepest relief the engine's parallax occlusion mapping can show, as a share of the
+# texture's width (the engine's heightScale). Blender leaves a Displacement Scale and a
+# Bump Distance at 1, a metre, and what it draws from them under its default "Bump Only"
+# displacement is the shading of a bump, not a hollow a metre deep. Carried over as a
+# parallax depth, such a value smears the texture across the surface, so a height with
+# a scale above this is left out of the export.
+MAX_PARALLAX_HEIGHT_SCALE = 0.2
+# Samples per channel of the lookup tables that carry RGB Curves and ColorRamp nodes.
+CURVE_LUT_SIZE = 256
+# Rec. 709 luminance, which Blender uses to turn a colour into a value (a Color output
+# linked to a Fac or Alpha input).
+LUMINANCE_WEIGHTS = (0.2126, 0.7152, 0.0722)
 # Records the name of the source object a temporary export object stands in for:
 # each single-material fragment produced by split_blender_objects_by_material(), and
 # each mesh made from a curve, surface or text object by convert_curve_objects_to_meshes().
@@ -557,7 +588,7 @@ class MaterialRecord:
     emissive_texture_index: int = INVALID_INDEX
     occlusion_texture_index: int = INVALID_INDEX
     height_texture_index: int = INVALID_INDEX
-    height_scale: float = 0.05
+    height_scale: float = DEFAULT_HEIGHT_SCALE
     height_midlevel: float = 0.5
     height_remap_min: float = 0.0
     height_remap_max: float = 1.0
@@ -846,9 +877,32 @@ class ExportedTexture:
     source_image_name: Optional[str] = None
     channel: int = TEXTURE_CHANNEL_R
     texture_format: int = TEXTURE_FORMAT_UNKNOWN
-    # Set when the texture reaches its socket through an Invert node at full strength
-    # (e.g. a glossiness map feeding Roughness): staging writes the inverted image.
-    invert: bool = False
+    # Per-pixel colour nodes between the image and the socket it feeds (Invert, Gamma,
+    # Bright/Contrast, Hue/Saturation/Value, RGB Curves, ColorRamp), in the order they
+    # apply; staging writes the adjusted image (see adjust_staged_image).
+    adjustments: tuple["ImageAdjustment", ...] = ()
+    # The image is sRGB-encoded (its Blender colour space is not data): the adjustments
+    # run on linear values, as Blender's shader nodes do.
+    srgb_source: bool = False
+
+
+@dataclass(frozen=True)
+class ImageAdjustment:
+    """One per-pixel colour operation of a shader node, applied to linear RGB values
+    exactly as Blender's node does it.
+
+    kind: "invert" (no params), "gamma" (gamma), "bright_contrast" (bright, contrast),
+    "hue_saturation" (hue, saturation, value), "curves" (three lookup tables of
+    CURVE_LUT_SIZE samples over [0, 1], for R, G and B) or "ramp" (three tables for
+    R, G and B, indexed by the luminance of the input).
+    fac: how much of the result is mixed over the input, for the nodes that have one.
+    """
+    kind: str
+    params: tuple[float, ...] = ()
+    fac: float = 1.0
+
+    def key(self) -> str:
+        return hashlib.sha1(repr((self.kind, self.params, self.fac)).encode("utf-8")).hexdigest()[:8]
 
 
 @dataclass(frozen=True)
@@ -884,14 +938,14 @@ class ExportedMaterial:
     # depth fraction — these are not the same unit and there is no exact conversion without
     # knowing the mesh's texel density. This value is carried through as a reasonable
     # starting point, not a precise conversion; expect to retune heightScale after import.
-    height_scale: float = 0.05
+    height_scale: float = DEFAULT_HEIGHT_SCALE
     # Always the neutral default (0.5 = no additional shift) for Displacement-sourced height —
     # Blender's Midlevel is NOT copied here. The engine's POM is unidirectional (cannot bulge
     # outward past the true polygon surface the way Blender's signed displacement-around-
     # Midlevel can), so heightMidlevel is just an additive shift, not a true zero-reference;
     # copying Blender's Midlevel into it would not reproduce "neutral gray = no visible depth".
-    # Blender's Midlevel is used to derive height_remap_max instead — see extract_material's
-    # Displacement-node detection block.
+    # Blender's Midlevel is used to derive height_remap_max instead — see
+    # _displacement_remap_max.
     height_midlevel: float = 0.5
     # Derived from Blender's Displacement Midlevel when present (clamped to (0, 1]): raw values
     # at/above this clip to "no depth", values below get contrast-stretched into the full depth
@@ -900,6 +954,12 @@ class ExportedMaterial:
     height_remap_max: float = 1.0
     roughness_texture_channel: int = TEXTURE_CHANNEL_R
     metallic_texture_channel: int = TEXTURE_CHANNEL_R
+    # MATERIAL_ALPHA_MODE_*: blended when the surface is not fully opaque in Blender.
+    alpha_mode: int = MATERIAL_ALPHA_MODE_OPAQUE
+    # A texture feeding the Principled Alpha input that is not the base colour
+    # texture's own alpha. The engine reads alpha from the base colour texture only,
+    # so staging writes it into that texture's alpha channel (see compose_alpha_texture).
+    alpha_texture: Optional[ExportedTexture] = None
 
 
 @dataclass(frozen=True)
@@ -1809,6 +1869,16 @@ def blender_required() -> None:
         raise RuntimeError("This exporter must run inside Blender so it can use bpy for USD import and mesh extraction.")
 
 
+def single_file_output_path(output_path: Path) -> Path:
+    """The single `.untold` an output path stands for. A scene with several models is
+    written as a `.untoldpack` of the same name, and a caller may name that pack as the
+    output: taken as it is, the pack would count as a stale single-file export and be
+    removed right after it is written."""
+    if output_path.suffix.lower() == ".untoldpack":
+        return output_path.with_suffix(".untold")
+    return output_path
+
+
 def normalize_blender_path(path: str) -> Path:
     raw_path = path
     if bpy is not None and path.startswith("//"):
@@ -2190,7 +2260,7 @@ def _layer_collection_tree(layer_collection: object) -> Iterable[tuple[object, b
             stack.append((child, render_disabled))
 
 
-def filter_scene_objects_for_export(objects: list[object], *, include_hidden: bool = False) -> list[object]:
+def filter_scene_objects_for_export(objects: list[object], *, include_hidden: bool = False, quiet: bool = False) -> list[object]:
     """Drop the objects of a whole-scene export that Blender itself does not show.
 
     Objects that only live in collections excluded from the view layer (the checkbox
@@ -2206,7 +2276,10 @@ def filter_scene_objects_for_export(objects: list[object], *, include_hidden: bo
     if bpy is None:
         return list(objects)
     view_layer = bpy.context.view_layer
-    view_layer_object_ids = {obj.as_pointer() for obj in view_layer.objects}
+    # Objects removed since the view layer last updated (an export's temporary
+    # objects) are still listed, as None, until it does.
+    objects = [obj for obj in objects if obj is not None]
+    view_layer_object_ids = {obj.as_pointer() for obj in view_layer.objects if obj is not None}
     collection_render_disabled: dict[int, bool] = {}
     for layer_collection, render_disabled in _layer_collection_tree(view_layer.layer_collection):
         pointer = layer_collection.collection.as_pointer()
@@ -2232,6 +2305,8 @@ def filter_scene_objects_for_export(objects: list[object], *, include_hidden: bo
             hidden_names.append(obj.name)
         else:
             kept.append(obj)
+    if quiet:
+        return kept
     if excluded_names:
         print(f"  Skipped {len(excluded_names)} object(s) in collections excluded from the view layer", flush=True)
     if hidden_names:
@@ -2562,6 +2637,14 @@ def resolve_texture_from_socket(input_socket: object, asset_path: Path) -> Optio
     return _resolve_texture_from_socket(input_socket, asset_path, visited_nodes=set(), channel=TEXTURE_CHANNEL_R)
 
 
+def _image_is_srgb(image: object) -> bool:
+    """True when Blender decodes the image from sRGB before shader nodes see it."""
+    settings = getattr(image, "colorspace_settings", None)
+    if settings is None or getattr(settings, "is_data", False):
+        return False
+    return "srgb" in str(getattr(settings, "name", "")).lower()
+
+
 def _exported_texture_from_image(image: object, asset_path: Path, channel: int = TEXTURE_CHANNEL_R) -> ExportedTexture:
     """Build the pre-staging ExportedTexture for a Blender image datablock.
 
@@ -2594,6 +2677,7 @@ def _exported_texture_from_image(image: object, asset_path: Path, channel: int =
             source_path=None,
             source_image_name=source_image_name,
             channel=channel,
+            srgb_source=_image_is_srgb(image),
         )
 
     raw_path = bpy.path.abspath(filepath, library=getattr(image, "library", None)) if bpy is not None else filepath
@@ -2613,6 +2697,7 @@ def _exported_texture_from_image(image: object, asset_path: Path, channel: int =
         source_path=texture_path,
         source_image_name=source_image_name,
         channel=channel,
+        srgb_source=_image_is_srgb(image),
     )
 
 
@@ -2632,13 +2717,21 @@ def _resolve_texture_from_socket(input_socket: object, asset_path: Path, visited
         texture_channel = texture_channel_from_socket_name(getattr(source_socket, "name", ""), channel)
         return _exported_texture_from_image(source_node.image, asset_path, channel=texture_channel)
 
-    if source_node.bl_idname == "ShaderNodeInvert":
-        # At full strength the inversion is written into the staged image (see
-        # stage_texture_for_output); at any other strength its math is dropped.
-        resolved = _resolve_texture_from_socket(source_node.inputs.get("Color"), asset_path, visited_nodes, channel)
-        if resolved is not None and _invert_node_is_full(source_node):
-            return replace(resolved, invert=not resolved.invert)
-        return resolved
+    adjustment_input = _ADJUSTMENT_NODE_INPUTS.get(source_node.bl_idname)
+    if adjustment_input is not None:
+        # Written into the staged image (see stage_texture_for_output). A node whose
+        # settings are themselves linked cannot be: the texture goes through as is and
+        # material fidelity analysis reports the node, as before; a ColorRamp then
+        # gives no texture, since its output is not the texture's.
+        resolved = _resolve_texture_from_socket(source_node.inputs.get(adjustment_input), asset_path, visited_nodes, channel)
+        if resolved is None:
+            return None
+        adjustment = image_adjustment_for_node(source_node, getattr(source_socket, "name", ""))
+        if adjustment is NOT_REPRESENTABLE:
+            return None if source_node.bl_idname == "ShaderNodeValToRGB" else resolved
+        if adjustment is None:
+            return resolved
+        return replace(resolved, adjustments=resolved.adjustments + (adjustment,))
 
     if source_node.bl_idname in {"ShaderNodeSeparateColor", "ShaderNodeSeparateRGB"}:
         texture_channel = texture_channel_from_socket_name(getattr(source_socket, "name", ""), channel)
@@ -2651,11 +2744,6 @@ def _resolve_texture_from_socket(input_socket: object, asset_path: Path, visited
         "ShaderNodeNormalMap":      ["Color"],
         "ShaderNodeRGBToBW":        ["Color"],
         "NodeReroute":              ["Input"],
-        # Color-correction nodes — the texture passes through their Color input.
-        "ShaderNodeGamma":          ["Color"],
-        "ShaderNodeBrightContrast": ["Color"],
-        "ShaderNodeHueSaturation":  ["Color"],
-        "ShaderNodeCurveRGB":       ["Color"],
         "ShaderNodeCurveFloat":     ["Value"],
         # Mix nodes — try both color inputs; returns whichever one traces to a texture.
         "ShaderNodeMixRGB":         ["Color1", "Color2"],
@@ -2673,9 +2761,113 @@ def _resolve_texture_from_socket(input_socket: object, asset_path: Path, visited
     return None
 
 
-def _invert_node_is_full(node: object) -> bool:
-    """True for an Invert node at full strength (Fac unlinked and 1)."""
-    return _socket_is_identity(node, "Fac", 1.0)
+# The colour nodes written into a staged image, and the input the texture comes in by.
+_ADJUSTMENT_NODE_INPUTS = {
+    "ShaderNodeInvert": "Color",
+    "ShaderNodeGamma": "Color",
+    "ShaderNodeBrightContrast": "Color",
+    "ShaderNodeHueSaturation": "Color",
+    "ShaderNodeRGBCurve": "Color",
+    "ShaderNodeCurveRGB": "Color",
+    "ShaderNodeValToRGB": "Fac",
+}
+
+# image_adjustment_for_node's answer for a node an image adjustment cannot reproduce.
+NOT_REPRESENTABLE = object()
+
+
+def _unlinked_value(node: object, socket_name: str, default):
+    """A setting's value, None when the socket is linked (its value varies per pixel)."""
+    socket = node.inputs.get(socket_name) if getattr(node, "inputs", None) is not None else None
+    if socket is None:
+        return default
+    if getattr(socket, "is_linked", False):
+        return None
+    value = getattr(socket, "default_value", default)
+    return tuple(float(component) for component in value) if hasattr(value, "__len__") else float(value)
+
+
+def _curve_mapping_tables(node: object) -> Optional[tuple[float, ...]]:
+    """R, G and B lookup tables of an RGB Curves node: the combined (C) curve first,
+    then each channel's own curve, as Cycles bakes them."""
+    mapping = getattr(node, "mapping", None)
+    curves = list(getattr(mapping, "curves", []))
+    if mapping is None or len(curves) < 4:
+        return None
+    initialize = getattr(mapping, "initialize", None)
+    if callable(initialize):
+        initialize()
+    positions = [index / (CURVE_LUT_SIZE - 1) for index in range(CURVE_LUT_SIZE)]
+    combined = [mapping.evaluate(curves[3], position) for position in positions]
+    tables: list[float] = []
+    for channel in range(3):
+        tables.extend(float(mapping.evaluate(curves[channel], value)) for value in combined)
+    return tuple(tables)
+
+
+def _color_ramp_tables(node: object) -> Optional[tuple[float, ...]]:
+    ramp = getattr(node, "color_ramp", None)
+    if ramp is None:
+        return None
+    samples = [ramp.evaluate(index / (CURVE_LUT_SIZE - 1)) for index in range(CURVE_LUT_SIZE)]
+    return tuple(float(sample[channel]) for channel in range(3) for sample in samples)
+
+
+def _is_identity_table(tables: tuple[float, ...]) -> bool:
+    size = len(tables) // 3
+    return all(
+        abs(tables[channel * size + index] - index / (size - 1)) <= 1.0e-4
+        for channel in range(3)
+        for index in range(size)
+    )
+
+
+def image_adjustment_for_node(node: object, output_name: str = "Color"):
+    """The image adjustment a colour node applies to the texture passing through it.
+
+    Returns an ImageAdjustment, None for a node set up to change nothing, or
+    NOT_REPRESENTABLE when a setting is linked (it varies per pixel) or, for a
+    ColorRamp, when its Alpha output is the one used.
+    """
+    node_id = node.bl_idname
+    if node_id == "ShaderNodeInvert":
+        fac = _unlinked_value(node, "Fac", 1.0)
+        if fac is None:
+            return NOT_REPRESENTABLE
+        return ImageAdjustment("invert", fac=fac) if fac != 0.0 else None
+    if node_id == "ShaderNodeGamma":
+        gamma = _unlinked_value(node, "Gamma", 1.0)
+        if gamma is None:
+            return NOT_REPRESENTABLE
+        return ImageAdjustment("gamma", (gamma,)) if gamma != 1.0 else None
+    if node_id == "ShaderNodeBrightContrast":
+        bright = _unlinked_value(node, "Bright", 0.0)
+        contrast = _unlinked_value(node, "Contrast", 0.0)
+        if bright is None or contrast is None:
+            return NOT_REPRESENTABLE
+        return ImageAdjustment("bright_contrast", (bright, contrast)) if (bright, contrast) != (0.0, 0.0) else None
+    if node_id == "ShaderNodeHueSaturation":
+        values = [_unlinked_value(node, name, default) for name, default in (("Hue", 0.5), ("Saturation", 1.0), ("Value", 1.0), ("Fac", 1.0))]
+        if any(value is None for value in values):
+            return NOT_REPRESENTABLE
+        hue, saturation, value, fac = values
+        if fac == 0.0 or (abs(hue - 0.5) < 1.0e-6 and saturation == 1.0 and value == 1.0):
+            return None
+        return ImageAdjustment("hue_saturation", (hue, saturation, value), fac=fac)
+    if node_id in {"ShaderNodeRGBCurve", "ShaderNodeCurveRGB"}:
+        fac = _unlinked_value(node, "Fac", 1.0)
+        tables = _curve_mapping_tables(node)
+        if fac is None or tables is None:
+            return NOT_REPRESENTABLE
+        if fac == 0.0 or _is_identity_table(tables):
+            return None
+        return ImageAdjustment("curves", tables, fac=fac)
+    if node_id == "ShaderNodeValToRGB":
+        tables = _color_ramp_tables(node)
+        if output_name != "Color" or tables is None:
+            return NOT_REPRESENTABLE
+        return ImageAdjustment("ramp", tables)
+    return NOT_REPRESENTABLE
 
 
 def _linked_source(input_socket: object) -> tuple[Optional[object], Optional[object]]:
@@ -2793,9 +2985,26 @@ def material_uv_transform(material: Optional[object]) -> Optional[UVTransform]:
     return first_by_key[winner]
 
 
-def _first_material(mesh_object: object) -> Optional[object]:
-    material_slots = getattr(getattr(mesh_object, "data", None), "materials", [])
-    return material_slots[0] if material_slots and material_slots[0] is not None else None
+def mesh_object_material(mesh_object: object) -> Optional[object]:
+    """The material the mesh's faces use. Each exported mesh has one (multi-material
+    objects are split first), but it need not sit in the first slot: an object can use
+    only its second material, which used to export as the first one. Object-linked
+    slots are honoured through material_slots."""
+    data = getattr(mesh_object, "data", None)
+    polygons = getattr(data, "polygons", None)
+    try:
+        index = int(polygons[0].material_index) if polygons is not None and len(polygons) > 0 else 0
+    except (TypeError, IndexError, AttributeError):
+        index = 0
+    slots = getattr(mesh_object, "material_slots", None)
+    if slots is not None and index < len(slots):
+        material = getattr(slots[index], "material", None)
+        if material is not None:
+            return material
+    materials = getattr(data, "materials", [])
+    if materials and index < len(materials) and materials[index] is not None:
+        return materials[index]
+    return materials[0] if materials and materials[0] is not None else None
 
 
 def _emission_surface_node(material: object) -> Optional[object]:
@@ -2837,9 +3046,9 @@ _GRAPH_FAITHFUL_NODE_IDS = {
     "NodeGroupInput",
     "NodeGroupOutput",
     # extract_material reads these directly (Displacement -> height texture/Scale/Midlevel,
-    # or Bump -> height texture/Distance as a fallback) — see the height/displacement
-    # detection block. Their own Height/Scale/Midlevel/Distance inputs are still walked and
-    # classified individually below; only the node type itself is exempted here.
+    # or Bump -> height texture/Distance as a fallback) — see material_height. Their own
+    # Height/Scale/Midlevel/Distance inputs are still walked and classified individually
+    # below; only the node type itself is exempted here.
     "ShaderNodeDisplacement",
     "ShaderNodeBump",
 }
@@ -2858,8 +3067,8 @@ _GRAPH_TRACED_THROUGH_NODE_IDS = {
 }
 
 _GRAPH_UNBAKEABLE_NODE_IDS = {
-    "ShaderNodeFresnel": "view-dependent",
-    "ShaderNodeLayerWeight": "view-dependent",
+    "ShaderNodeFresnel": "view-dependent; exported as seen straight on",
+    "ShaderNodeLayerWeight": "view-dependent; exported as seen straight on",
     "ShaderNodeCameraData": "view-dependent",
     "ShaderNodeLightPath": "depends on the active render ray",
 }
@@ -2963,8 +3172,13 @@ def _classify_graph_node(node: object, from_socket_name: str) -> Optional[Materi
         and _is_uv_coordinate_source(*_linked_source(node.inputs.get("Vector")))
     ):
         return None
-    if node_id == "ShaderNodeInvert" and _invert_node_is_full(node):
+    if node_id in _ADJUSTMENT_NODE_INPUTS and image_adjustment_for_node(node, from_socket_name) is not NOT_REPRESENTABLE:
         return None
+    if node_id in {"ShaderNodeBsdfTransparent", "ShaderNodeMixShader"}:
+        return MaterialGraphFinding(
+            node_name, node_id, MATERIAL_GRAPH_BAKEABLE,
+            "approximated: the surface is blended at the opacity the shaders mix to",
+        )
     if node_id in _GRAPH_TRACED_THROUGH_NODE_IDS or node_id == "ShaderNodeMapping":
         return MaterialGraphFinding(node_name, node_id, MATERIAL_GRAPH_BAKEABLE, "node math is dropped by the exporter")
     return MaterialGraphFinding(node_name, node_id, MATERIAL_GRAPH_BAKEABLE, "not evaluated by the exporter")
@@ -3092,6 +3306,41 @@ def analyze_material(material: object) -> MaterialGraphAnalysis:
     if emission_node is not None:
         emission_name = getattr(emission_node, "name", "") or emission_node.bl_idname
         findings = [finding for finding in findings if finding.node_name != emission_name]
+
+    principled = _principled_bsdf_node(node_tree)
+    if principled is not None:
+        transmission, unfollowed = principled_transmission(principled)
+        if transmission or unfollowed:
+            opacity = transmission_opacity(principled_transmittance(principled, (transmission, unfollowed))[0])
+            if opacity >= 0.995:
+                reason = "nothing is seen through its transmission (a black base colour, a metal, or a fully rough surface), so it is exported as an opaque surface"
+            else:
+                reason = f"transmission is approximated as a blended surface at {opacity:.0%} opacity"
+            if unfollowed:
+                reason = (
+                    "Transmission is driven by a texture or node math the exporter cannot follow; "
+                    f"its slider value {transmission:.2f} is used, so {reason}"
+                )
+            findings.append(
+                MaterialGraphFinding(
+                    getattr(principled, "name", "") or principled.bl_idname,
+                    principled.bl_idname,
+                    MATERIAL_GRAPH_BAKEABLE,
+                    reason,
+                )
+            )
+
+    # Where the images are does not matter here, only which heights the export leaves out.
+    _, heights_left_out = material_height(material, Path())
+    for height, why in heights_left_out:
+        findings.append(
+            MaterialGraphFinding(
+                getattr(height.node, "name", "") or height.node.bl_idname,
+                height.node.bl_idname,
+                MATERIAL_GRAPH_BAKEABLE,
+                f"{why}; the relief it gives is not exported",
+            )
+        )
 
     distinct_uv_transforms = {_uv_transform_key(transform) for transform in _material_image_uv_transforms(material)}
     if len(distinct_uv_transforms) > 1:
@@ -3946,8 +4195,19 @@ def write_blender_hdr_image_to_path(image_name: str, destination_path: Path) -> 
         img_settings.file_format, img_settings.exr_codec, img_settings.color_depth = saved_image_settings
 
 
+def adjustments_suffix(adjustments: tuple[ImageAdjustment, ...]) -> str:
+    """Tells an adjusted image apart from its source in staging keys and file names:
+    "_inverted" for a lone Invert (readable, and what earlier exports wrote), else a
+    short fingerprint of the adjustments."""
+    if not adjustments:
+        return ""
+    if adjustments == (ImageAdjustment("invert"),):
+        return "_inverted"
+    return "_adj" + hashlib.sha1("|".join(adjustment.key() for adjustment in adjustments).encode("utf-8")).hexdigest()[:8]
+
+
 def texture_staging_key(texture: ExportedTexture) -> str:
-    inverted = "|inverted" if texture.invert else ""
+    inverted = adjustments_suffix(texture.adjustments)
     if texture.source_path is not None:
         return f"path:{texture.source_path.expanduser().resolve()}{inverted}"
     if texture.source_image_name:
@@ -3955,27 +4215,115 @@ def texture_staging_key(texture: ExportedTexture) -> str:
     return f"uri:{texture.uri}{inverted}"
 
 
-def invert_staged_image(path: Path) -> None:
-    """Invert the color channels of a staged image in place, leaving alpha alone
-    (Blender's Invert node inverts color only)."""
+def srgb_to_linear(values: "np.ndarray") -> "np.ndarray":
+    return np.where(values <= 0.04045, values / 12.92, ((values + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(values: "np.ndarray") -> "np.ndarray":
+    values = np.clip(values, 0.0, 1.0)
+    return np.where(values <= 0.0031308, values * 12.92, 1.055 * np.power(values, 1.0 / 2.4) - 0.055)
+
+
+def _rgb_to_hsv(rgb: "np.ndarray") -> "np.ndarray":
+    maximum = rgb.max(axis=1)
+    minimum = rgb.min(axis=1)
+    delta = maximum - minimum
+    value = maximum
+    saturation = np.where(maximum > 0.0, delta / np.where(maximum > 0.0, maximum, 1.0), 0.0)
+    safe_delta = np.where(delta > 0.0, delta, 1.0)
+    r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    hue = np.where(
+        maximum == r,
+        (g - b) / safe_delta,
+        np.where(maximum == g, 2.0 + (b - r) / safe_delta, 4.0 + (r - g) / safe_delta),
+    )
+    hue = np.where(delta > 0.0, (hue / 6.0) % 1.0, 0.0)
+    return np.stack([hue, saturation, value], axis=1)
+
+
+def _hsv_to_rgb(hsv: "np.ndarray") -> "np.ndarray":
+    hue, saturation, value = hsv[:, 0], hsv[:, 1], hsv[:, 2]
+    sector = (hue % 1.0) * 6.0
+    index = np.floor(sector).astype(np.int32) % 6
+    fraction = sector - np.floor(sector)
+    p = value * (1.0 - saturation)
+    q = value * (1.0 - saturation * fraction)
+    t = value * (1.0 - saturation * (1.0 - fraction))
+    choices_r = np.stack([value, q, p, p, t, value], axis=1)
+    choices_g = np.stack([t, value, value, q, p, p], axis=1)
+    choices_b = np.stack([p, p, t, value, value, q], axis=1)
+    rows = np.arange(len(hue))
+    return np.stack([choices_r[rows, index], choices_g[rows, index], choices_b[rows, index]], axis=1)
+
+
+def _lookup(table: "np.ndarray", values: "np.ndarray") -> "np.ndarray":
+    """Linear interpolation into a table sampled evenly over [0, 1]."""
+    return np.interp(np.clip(values, 0.0, 1.0), np.linspace(0.0, 1.0, len(table)), table)
+
+
+def apply_image_adjustments(rgb: "np.ndarray", adjustments: Iterable[ImageAdjustment]) -> "np.ndarray":
+    """Run linear RGB values (an N x 3 array) through shader-node adjustments, using the
+    same formulas as Cycles' nodes (svm_gamma, svm_brightness, svm_hsv, svm_invert,
+    curves and ramp lookups)."""
+    result = np.asarray(rgb, dtype=np.float64)
+    for adjustment in adjustments:
+        before = result
+        params = adjustment.params
+        if adjustment.kind == "invert":
+            result = 1.0 - result
+        elif adjustment.kind == "gamma":
+            result = np.where(result > 0.0, np.power(np.maximum(result, 0.0), params[0]), result)
+        elif adjustment.kind == "bright_contrast":
+            bright, contrast = params
+            result = np.maximum((1.0 + contrast) * result + (bright - contrast * 0.5), 0.0)
+        elif adjustment.kind == "hue_saturation":
+            hue, saturation, value = params
+            hsv = _rgb_to_hsv(result)
+            hsv[:, 0] = (hsv[:, 0] + hue + 0.5) % 1.0
+            hsv[:, 1] = np.clip(hsv[:, 1] * saturation, 0.0, 1.0)
+            hsv[:, 2] = hsv[:, 2] * value
+            result = _hsv_to_rgb(hsv)
+        elif adjustment.kind == "curves":
+            tables = np.asarray(params, dtype=np.float64).reshape(3, -1)
+            result = np.stack([_lookup(tables[channel], result[:, channel]) for channel in range(3)], axis=1)
+        elif adjustment.kind == "ramp":
+            tables = np.asarray(params, dtype=np.float64).reshape(3, -1)
+            luminance = result @ np.asarray(LUMINANCE_WEIGHTS)
+            result = np.stack([_lookup(tables[channel], luminance) for channel in range(3)], axis=1)
+        else:
+            raise ValueError(f"Unknown image adjustment: {adjustment.kind}")
+        if adjustment.fac != 1.0:
+            result = before + (result - before) * adjustment.fac
+        if adjustment.kind == "hue_saturation":
+            result = np.maximum(result, 0.0)
+    return result
+
+
+def adjust_staged_image(path: Path, adjustments: tuple[ImageAdjustment, ...], *, srgb: bool) -> None:
+    """Apply shader-node adjustments to the colour channels of a staged image in place,
+    leaving alpha alone. An sRGB image is decoded to linear first and encoded back, so
+    the nodes see the values Blender's shader sees."""
     blender_required()
+    if not _HAS_NUMPY:
+        print(f"  Warning: '{path.name}' needs numpy to apply its colour nodes; staged without them.", flush=True)
+        return
     image = bpy.data.images.load(str(path), check_existing=False)
     try:
         image.colorspace_settings.name = "Non-Color"
         channels = int(image.channels)
-        color_channels = 3 if channels >= 3 else 1
-        if _HAS_NUMPY:
-            pixels = np.empty(len(image.pixels), dtype=np.float32)
-            image.pixels.foreach_get(pixels)
-            pixels = pixels.reshape(-1, channels)
-            pixels[:, :color_channels] = 1.0 - pixels[:, :color_channels]
-            image.pixels.foreach_set(pixels.ravel())
+        pixels = np.empty(len(image.pixels), dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        pixels = pixels.reshape(-1, channels)
+        color = pixels[:, :3] if channels >= 3 else np.repeat(pixels[:, :1], 3, axis=1)
+        if srgb:
+            color = srgb_to_linear(color)
+        color = apply_image_adjustments(color, adjustments)
+        color = linear_to_srgb(color) if srgb else np.clip(color, 0.0, 1.0)
+        if channels >= 3:
+            pixels[:, :3] = color
         else:
-            pixels = list(image.pixels)
-            for start in range(0, len(pixels), channels):
-                for offset in range(color_channels):
-                    pixels[start + offset] = 1.0 - pixels[start + offset]
-            image.pixels[:] = pixels
+            pixels[:, 0] = color @ np.asarray(LUMINANCE_WEIGHTS)
+        image.pixels.foreach_set(pixels.ravel())
         image.filepath_raw = str(path)
         image.file_format = "PNG"
         image.save()
@@ -4020,8 +4368,7 @@ def unique_texture_destination_name(
 ) -> str:
     source_name = texture.source_path.name if texture.source_path is not None else texture.name
     base = Path(source_name).stem or "texture"
-    if texture.invert:
-        base = f"{base}_inverted"
+    base = f"{base}{adjustments_suffix(texture.adjustments)}"
     suffix = suffix_override if suffix_override is not None else Path(source_name).suffix
     candidate = f"{base}{suffix}"
     if candidate not in context.used_names:
@@ -4078,10 +4425,12 @@ def stage_texture_for_output(
         print(f"  Warning: {message}", flush=True)
         context.skipped_textures.append(message)
 
-    # Early rejection: file-backed textures with unsupported suffixes (EXR, HDR, …)
-    # are not part of the engine pipeline.  Skip with a warning so the export
-    # continues without crashing.
-    if source_path is not None:
+    # The engine loads no EXR/HDR/Cineon/DPX textures. With Blender at hand the image
+    # is converted to PNG like any other 16-bit source (see write_blender_image_to_path:
+    # data maps such as an EXR normal or metallic map keep their values, colour values
+    # above 1 are clipped); without it the file could only be copied as it is, so the
+    # texture is skipped with a warning and the export carries on.
+    if source_path is not None and bpy is None:
         resolved = source_path.expanduser().resolve()
         if resolved.suffix.lower() in _UNSUPPORTED_TEXTURE_SUFFIXES:
             skip(
@@ -4099,8 +4448,8 @@ def stage_texture_for_output(
             source_path=existing_destination,
         )
 
-    # An image fails to write whether or not the texture is then inverted.
-    source_key = texture_staging_key(replace(texture, invert=False))
+    # An image fails to write whether or not colour nodes are then applied to it.
+    source_key = texture_staging_key(replace(texture, adjustments=()))
     write_failures = context.write_failures
     known_failure = write_failures.left_out.get(source_key)
     if known_failure is not None:
@@ -4168,11 +4517,11 @@ def stage_texture_for_output(
         skip(str(exc))
         return None
 
-    if texture.invert:
+    if texture.adjustments:
         if bpy is not None:
-            invert_staged_image(destination_path)
+            adjust_staged_image(destination_path, texture.adjustments, srgb=texture.srgb_source)
         else:
-            print(f"  Warning: texture '{texture.name}' feeds an Invert node, which needs Blender to apply; staged as is.", flush=True)
+            print(f"  Warning: texture '{texture.name}' feeds colour nodes, which need Blender to apply; staged as is.", flush=True)
 
     context.staged_by_key[staging_key] = destination_path
 
@@ -4366,6 +4715,128 @@ def texture_usage(slot: str, material_name: str, object_name: Optional[str] = No
     return f"{usage} on object '{object_name}'" if object_name else usage
 
 
+def _load_image_pixels(path: Path) -> tuple["np.ndarray", int, int]:
+    """A staged image's pixels as stored (no colour transform): rows of RGBA, plus its size."""
+    image = bpy.data.images.load(str(path), check_existing=False)
+    try:
+        image.colorspace_settings.name = "Non-Color"
+        width, height = int(image.size[0]), int(image.size[1])
+        channels = int(image.channels)
+        pixels = np.empty(len(image.pixels), dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        pixels = pixels.reshape(-1, channels)
+    finally:
+        bpy.data.images.remove(image)
+    if channels >= 4:
+        rgba = pixels[:, :4].copy()
+    elif channels == 3:
+        rgba = np.concatenate([pixels, np.ones((len(pixels), 1), dtype=np.float32)], axis=1)
+    else:
+        rgba = np.concatenate([np.repeat(pixels[:, :1], 3, axis=1), pixels[:, 1:2] if channels == 2 else np.ones((len(pixels), 1), dtype=np.float32)], axis=1)
+    return rgba, width, height
+
+
+def _resample_nearest(values: "np.ndarray", width: int, height: int, new_width: int, new_height: int) -> "np.ndarray":
+    if (width, height) == (new_width, new_height):
+        return values
+    columns = np.minimum((np.arange(new_width) * width) // new_width, width - 1)
+    rows = np.minimum((np.arange(new_height) * height) // new_height, height - 1)
+    grid = values.reshape(height, width, -1)
+    return grid[rows][:, columns].reshape(new_width * new_height, -1)
+
+
+def compose_alpha_texture(
+    base_color_texture: Optional[ExportedTexture],
+    alpha_texture: ExportedTexture,
+    output_path: Path,
+    context: TextureStagingContext,
+    *,
+    used_as: Optional[str] = None,
+) -> Optional[ExportedTexture]:
+    """Write the Principled Alpha texture into the alpha channel of the (staged) base
+    colour texture, or of a white texture when the base colour is a constant, since
+    the engine reads a material's alpha from its base colour texture only.
+
+    The alpha image is staged on its own first (so its colour nodes are applied) in a
+    temporary folder, read as a value (its alpha channel when the Alpha output feeds
+    the socket, else the luminance of its colour, as Blender converts a colour linked
+    to a value) and resampled to the base colour texture's size.
+    """
+    if bpy is None or not _HAS_NUMPY:
+        print(f"  Warning: the {used_as or 'alpha texture'} needs Blender and numpy to be written; the material stays without it.", flush=True)
+        return base_color_texture
+    base_key = texture_staging_key(base_color_texture) if base_color_texture is not None else "white"
+    key = f"alpha:{base_key}|{texture_staging_key(alpha_texture)}|{alpha_texture.channel}"
+    existing = context.staged_by_key.get(key)
+    if existing is not None:
+        return ExportedTexture(
+            name=existing.name,
+            uri=relative_asset_uri(existing, output_path.parent),
+            width=base_color_texture.width if base_color_texture is not None else alpha_texture.width,
+            height=base_color_texture.height if base_color_texture is not None else alpha_texture.height,
+            mip_count=1,
+            source_path=existing,
+            srgb_source=True,
+        )
+
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch_context = TextureStagingContext(
+            context.skipped_textures, context.write_failures, assets_dir=Path(scratch)
+        )
+        staged_alpha = stage_texture_for_output(alpha_texture, Path(scratch) / "alpha.untold", scratch_context, used_as=used_as)
+        if staged_alpha is None or staged_alpha.source_path is None:
+            return base_color_texture
+        alpha_rgba, alpha_width, alpha_height = _load_image_pixels(staged_alpha.source_path)
+
+    if alpha_texture.channel == TEXTURE_CHANNEL_A:
+        alpha_values = alpha_rgba[:, 3:4]
+    elif alpha_texture.channel in (TEXTURE_CHANNEL_G, TEXTURE_CHANNEL_B):
+        alpha_values = alpha_rgba[:, alpha_texture.channel:alpha_texture.channel + 1]
+    else:
+        # The staged image holds encoded values; Blender converts the linear colour.
+        color = srgb_to_linear(alpha_rgba[:, :3]) if alpha_texture.srgb_source else alpha_rgba[:, :3]
+        alpha_values = (color @ np.asarray(LUMINANCE_WEIGHTS, dtype=np.float32)).reshape(-1, 1)
+
+    if base_color_texture is not None and base_color_texture.source_path is not None:
+        rgba, width, height = _load_image_pixels(base_color_texture.source_path)
+        stem = Path(base_color_texture.name).stem or "base_color"
+    else:
+        width, height = alpha_width, alpha_height
+        rgba = np.ones((width * height, 4), dtype=np.float32)
+        stem = f"{Path(alpha_texture.name).stem or 'alpha'}_white"
+    rgba[:, 3:4] = np.clip(_resample_nearest(alpha_values, alpha_width, alpha_height, width, height), 0.0, 1.0)
+
+    texture_dir = (context.assets_dir or output_path.parent) / "Textures"
+    texture_dir.mkdir(parents=True, exist_ok=True)
+    fingerprint = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    destination_name = unique_texture_destination_name(
+        ExportedTexture(name=f"{stem}_alpha_{fingerprint}.png", uri="", width=width, height=height, mip_count=1),
+        context,
+        ".png",
+    )
+    destination_path = texture_dir / destination_name
+    image = bpy.data.images.new(destination_path.stem, width, height, alpha=True)
+    try:
+        image.colorspace_settings.name = "Non-Color"
+        image.alpha_mode = "STRAIGHT"
+        image.pixels.foreach_set(rgba.ravel())
+        image.filepath_raw = str(destination_path)
+        image.file_format = "PNG"
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+    context.staged_by_key[key] = destination_path
+    return ExportedTexture(
+        name=destination_name,
+        uri=relative_asset_uri(destination_path, output_path.parent),
+        width=width,
+        height=height,
+        mip_count=1,
+        source_path=destination_path,
+        srgb_source=True,
+    )
+
+
 def stage_material_for_output(
     material: ExportedMaterial,
     output_path: Path,
@@ -4384,9 +4855,19 @@ def stage_material_for_output(
             used_as=texture_usage(slot, material.name, object_name),
         )
 
+    base_color_texture = stage(material.base_color_texture, "base color")
+    if material.alpha_texture is not None:
+        base_color_texture = compose_alpha_texture(
+            base_color_texture,
+            material.alpha_texture,
+            output_path,
+            context,
+            used_as=texture_usage("alpha", material.name, object_name),
+        )
     return replace(
         material,
-        base_color_texture=stage(material.base_color_texture, "base color"),
+        alpha_texture=None,
+        base_color_texture=base_color_texture,
         normal_texture=stage(material.normal_texture, "normal", preserve_precision=True),
         metallic_texture=stage(material.metallic_texture, "metallic"),
         roughness_texture=stage(material.roughness_texture, "roughness"),
@@ -4421,8 +4902,13 @@ def stage_nodes_for_output(
     skipped_textures: Optional[list[str]] = None,
     write_failures: Optional[TextureWriteFailures] = None,
     assets_dir: Optional[Path] = None,
+    context: Optional[TextureStagingContext] = None,
 ) -> list[ExportedNode]:
     """Stage every node's textures next to output_path, or in assets_dir when given.
+
+    context: staging shared with other files of the same export (the models of a
+    pack), so a texture they have in common is staged once; it then also decides where
+    Textures/ goes, in place of skipped_textures, write_failures and assets_dir.
 
     skipped_textures: a list that receives one line per texture that had to be left
     out, so the caller can report them together once the export is done.
@@ -4430,7 +4916,8 @@ def stage_nodes_for_output(
     write_failures: what the export already knows about textures Blender cannot write.
     An export that stages several models or tiles hands the same one to each of them.
     """
-    context = TextureStagingContext(skipped_textures, write_failures, assets_dir)
+    if context is None:
+        context = TextureStagingContext(skipped_textures, write_failures, assets_dir)
     staged_nodes: list[ExportedNode] = []
     total = len(exported_nodes)
     for i, exported_node in enumerate(exported_nodes, 1):
@@ -4489,6 +4976,161 @@ def _detect_occlusion_texture(material: object, asset_path: Path) -> Optional[Ex
     return None
 
 
+def _as_color(value) -> tuple[float, float, float]:
+    if isinstance(value, tuple):
+        return (float(value[0]), float(value[1]), float(value[2])) if len(value) >= 3 else (float(value[0]),) * 3
+    return (float(value),) * 3
+
+
+def _as_scalar(value) -> float:
+    """A value as Blender converts it for a float socket: a colour becomes its luminance."""
+    if isinstance(value, tuple):
+        color = _as_color(value)
+        return sum(component * weight for component, weight in zip(color, LUMINANCE_WEIGHTS))
+    return float(value)
+
+
+def _socket_default(socket: object):
+    value = getattr(socket, "default_value", None)
+    if value is None:
+        return None
+    return tuple(float(component) for component in value) if hasattr(value, "__len__") else float(value)
+
+
+def _enabled_inputs(node: object) -> list:
+    return [socket for socket in getattr(node, "inputs", []) if getattr(socket, "enabled", True)]
+
+
+def _mix_colors(blend_type: str, fac: float, a: tuple, b: tuple) -> Optional[tuple]:
+    if blend_type == "MIX":
+        return tuple(x + (y - x) * fac for x, y in zip(a, b))
+    if blend_type == "MULTIPLY":
+        return tuple(x * (1.0 - fac + fac * y) for x, y in zip(a, b))
+    if blend_type == "ADD":
+        return tuple(x + fac * y for x, y in zip(a, b))
+    if blend_type == "SUBTRACT":
+        return tuple(x - fac * y for x, y in zip(a, b))
+    if blend_type == "SCREEN":
+        return tuple(1.0 - (1.0 - fac + fac * (1.0 - y)) * (1.0 - x) for x, y in zip(a, b))
+    return None
+
+
+_MATH_OPERATIONS = {
+    "ADD": lambda a, b: a + b,
+    "SUBTRACT": lambda a, b: a - b,
+    "MULTIPLY": lambda a, b: a * b,
+    "DIVIDE": lambda a, b: a / b if b != 0.0 else 0.0,
+    "POWER": lambda a, b: a ** b if a > 0.0 or float(b).is_integer() else 0.0,
+    "MINIMUM": min,
+    "MAXIMUM": max,
+    "GREATER_THAN": lambda a, b: 1.0 if a > b else 0.0,
+    "LESS_THAN": lambda a, b: 1.0 if a < b else 0.0,
+    "ABSOLUTE": lambda a, b: abs(a),
+}
+
+
+def evaluate_socket_facing(socket: object, _groups: tuple = (), _depth: int = 0):
+    """The value a shader node chain gives an input socket for a surface seen straight
+    on: a float or an RGB(A) tuple, or None when the chain holds something that is not
+    a constant there (an image or procedural texture, an unknown node).
+
+    View-dependent nodes take their straight-on value (Layer Weight Facing 0, Fresnel
+    the normal-incidence reflectance), so a material built on them exports what it
+    shows facing the camera; the engine's own Fresnel then brightens its edges. A Mix
+    whose factor is 0 or 1 never looks at the side it ignores.
+    """
+    if socket is None or _depth > 64:
+        return None
+    if not getattr(socket, "is_linked", False):
+        return _socket_default(socket)
+    link = socket.links[0]
+    return _evaluate_node_output(link.from_node, getattr(getattr(link, "from_socket", None), "name", ""), _groups, _depth + 1)
+
+
+def _evaluate_node_output(node: object, output_name: str, groups: tuple, depth: int):
+    node_id = node.bl_idname
+    inputs = _enabled_inputs(node)
+
+    def value_of(socket):
+        return evaluate_socket_facing(socket, groups, depth)
+
+    if node_id == "NodeReroute":
+        return value_of(node.inputs.get("Input") if hasattr(node.inputs, "get") else inputs[0])
+    if node_id in {"ShaderNodeValue", "ShaderNodeRGB"}:
+        outputs = list(getattr(node, "outputs", []))
+        return _socket_default(outputs[0]) if outputs else None
+    if node_id == "ShaderNodeLayerWeight":
+        if output_name == "Facing":
+            return 0.0
+        blend = _unlinked_value(node, "Blend", 0.5)
+        if blend is None:
+            return None
+        eta = 1.0 / max(1.0 - min(max(blend, 0.0), 0.99999), 1.0e-5)
+        return ((eta - 1.0) / (eta + 1.0)) ** 2
+    if node_id == "ShaderNodeFresnel":
+        ior = _unlinked_value(node, "IOR", 1.45)
+        return None if ior is None else ((ior - 1.0) / (ior + 1.0)) ** 2
+    if node_id in {"ShaderNodeMix", "ShaderNodeMixRGB"}:
+        if len(inputs) < 3:
+            return None
+        fac = value_of(inputs[0])
+        if fac is None:
+            return None
+        fac = _as_scalar(fac)
+        if node_id == "ShaderNodeMix" and getattr(node, "data_type", "RGBA") != "RGBA":
+            if getattr(node, "data_type", "") != "FLOAT":
+                return None
+            fac = min(max(fac, 0.0), 1.0) if getattr(node, "clamp_factor", True) else fac
+            a = value_of(inputs[1]) if fac < 1.0 else 0.0
+            b = value_of(inputs[2]) if fac > 0.0 else 0.0
+            if a is None or b is None:
+                return None
+            return _as_scalar(a) + (_as_scalar(b) - _as_scalar(a)) * fac
+        fac = min(max(fac, 0.0), 1.0) if getattr(node, "clamp_factor", True) else fac
+        blend_type = getattr(node, "blend_type", "MIX")
+        a = value_of(inputs[1]) if not (blend_type == "MIX" and fac >= 1.0) else (0.0, 0.0, 0.0)
+        b = value_of(inputs[2]) if fac > 0.0 else (0.0, 0.0, 0.0)
+        if a is None or b is None:
+            return None
+        mixed = _mix_colors(blend_type, fac, _as_color(a), _as_color(b))
+        if mixed is None:
+            return None
+        if getattr(node, "clamp_result", False) or getattr(node, "use_clamp", False):
+            mixed = tuple(min(max(component, 0.0), 1.0) for component in mixed)
+        return mixed
+    if node_id == "ShaderNodeMath":
+        operation = _MATH_OPERATIONS.get(getattr(node, "operation", ""))
+        if operation is None or not inputs:
+            return None
+        a = value_of(inputs[0])
+        b = value_of(inputs[1]) if len(inputs) > 1 else 0.0
+        if a is None or b is None:
+            return None
+        result = operation(_as_scalar(a), _as_scalar(b))
+        return min(max(result, 0.0), 1.0) if getattr(node, "use_clamp", False) else result
+    if node_id in _ADJUSTMENT_NODE_INPUTS:
+        source = value_of(node.inputs.get(_ADJUSTMENT_NODE_INPUTS[node_id]))
+        adjustment = image_adjustment_for_node(node, output_name)
+        if source is None or adjustment is NOT_REPRESENTABLE or not _HAS_NUMPY:
+            return None
+        color = _as_color(source)
+        if adjustment is None:
+            return color
+        adjusted = apply_image_adjustments(np.asarray([color], dtype=np.float64), (adjustment,))[0]
+        return tuple(float(component) for component in adjusted)
+    if node_id == "ShaderNodeGroup":
+        tree = getattr(node, "node_tree", None)
+        group_output = _group_output_node(tree) if tree is not None else None
+        if group_output is None:
+            return None
+        inner = group_output.inputs.get(output_name) if hasattr(group_output.inputs, "get") else None
+        return evaluate_socket_facing(inner, groups + (node,), depth) if inner is not None else None
+    if node_id == "NodeGroupInput" and groups:
+        outer = groups[-1].inputs.get(output_name) if hasattr(groups[-1].inputs, "get") else None
+        return evaluate_socket_facing(outer, groups[:-1], depth) if outer is not None else None
+    return None
+
+
 def _scalar_socket_factor(input_socket: object, texture: Optional[ExportedTexture], default: float) -> float:
     """Factor exported for a scalar Principled socket (Metallic, Roughness).
 
@@ -4506,15 +5148,294 @@ def _scalar_socket_factor(input_socket: object, texture: Optional[ExportedTextur
         return default
     if texture is not None:
         return 1.0
+    if getattr(input_socket, "is_linked", False):
+        # No texture behind it: the chain's value seen straight on, if it has one.
+        value = evaluate_socket_facing(input_socket)
+        if value is not None:
+            return min(max(_as_scalar(value), 0.0), 1.0)
     return float(input_socket.default_value)
 
 
+def principled_transmission(node: object) -> tuple[float, bool]:
+    """A Principled BSDF's transmission in [0, 1], and whether it could not be followed.
+
+    The socket is "Transmission Weight" from Blender 4.0 and "Transmission" before;
+    the old name is looked up only when the new one is absent, so a linked "Transmission
+    Weight" is not mistaken for a missing one (which read as no transmission at all).
+    A linked socket gets the value its node chain has seen straight on (see
+    evaluate_socket_facing). When a texture is in the way the slider value stands in,
+    as for the other scalar inputs (see _scalar_socket_factor), and the second value is
+    True so material fidelity analysis reports it.
+    """
+    inputs = getattr(node, "inputs", None)
+    socket = None
+    if inputs is not None:
+        socket = inputs.get("Transmission Weight")
+        if socket is None:
+            socket = inputs.get("Transmission")
+    if socket is None:
+        return 0.0, False
+    unfollowed = False
+    if getattr(socket, "is_linked", False):
+        value = evaluate_socket_facing(socket)
+        if value is not None:
+            return min(max(_as_scalar(value), 0.0), 1.0), False
+        unfollowed = True
+    value = getattr(socket, "default_value", 0.0)
+    try:
+        transmission = float(value)
+    except (TypeError, ValueError):
+        transmission = 0.0
+    return min(max(transmission, 0.0), 1.0), unfollowed
+
+
+def principled_transmittance(node: object, followed: Optional[tuple[float, bool]] = None) -> tuple[float, bool]:
+    """How much of what is behind it a Principled BSDF lets one see, in [0, 1], and
+    whether its transmission could not be followed (see principled_transmission, whose
+    answer for the node a caller that already has it passes as `followed`).
+
+    Transmission says how much of the surface is glass. Three things then take from
+    what is seen through it:
+
+    - The base colour tints the light that crosses it: clear glass (a white base
+      colour) lets all of it through and black glass none, which is why black glass
+      looks like a black mirror and not like a window. The tint counts by its brightness.
+    - Blender lays the metal over the glass, so the metallic share of a surface lets
+      nothing through whatever its transmission says.
+    - A rough surface scatters what crosses it: frosted glass glows with the light
+      behind it and shows nothing of what is there.
+
+    A base colour, a metallic value or a roughness the exporter cannot follow to a
+    constant (a texture) counts as clear, as no metal and as polished.
+    """
+    transmission, unfollowed = followed if followed is not None else principled_transmission(node)
+    if transmission <= 0.0:
+        return 0.0, unfollowed
+    inputs = getattr(node, "inputs", None)
+
+    def constant(name: str, default: float) -> float:
+        socket = inputs.get(name) if inputs is not None else None
+        value = evaluate_socket_facing(socket) if socket is not None else None
+        return default if value is None else min(max(_as_scalar(value), 0.0), 1.0)
+
+    tint = constant("Base Color", 1.0)
+    metallic = constant("Metallic", 0.0)
+    roughness = constant("Roughness", 0.0)
+    return transmission * (1.0 - metallic) * tint * (1.0 - roughness), unfollowed
+
+
+def transmission_opacity(transmittance: float) -> float:
+    """The opacity of the blended surface that stands in for a transmissive one."""
+    return 1.0 - transmittance * (1.0 - TRANSMISSION_OPACITY)
+
+
+def _shader_opacity(node: Optional[object]) -> Optional[float]:
+    """How much of the surface a shader covers: 1 for a BSDF, 0 for Transparent BSDF,
+    less for a transmissive Principled BSDF (see principled_transmittance), mixed by a
+    Mix Shader's factor. A Mix Shader driven by Geometry > Backfacing takes the
+    front-face side. None for anything else (a linked factor, Add Shader, ...)."""
+    if node is None:
+        return None
+    node_id = node.bl_idname
+    if node_id == "ShaderNodeBsdfTransparent":
+        return 0.0
+    if node_id == "ShaderNodeBsdfPrincipled":
+        transmittance, _ = principled_transmittance(node)
+        return transmission_opacity(transmittance)
+    if node_id in {"ShaderNodeBsdfDiffuse", "ShaderNodeBsdfGlossy", "ShaderNodeEmission"}:
+        return 1.0
+    if node_id == "ShaderNodeMixShader":
+        inputs = list(getattr(node, "inputs", []))
+        if len(inputs) < 3:
+            return None
+        fac_socket = inputs[0]
+        if getattr(fac_socket, "is_linked", False):
+            source, source_socket = _linked_source(fac_socket)
+            if source is None or source.bl_idname != "ShaderNodeNewGeometry" or getattr(source_socket, "name", "") != "Backfacing":
+                return None
+            fac = 0.0
+        else:
+            fac = float(getattr(fac_socket, "default_value", 0.5))
+        first = _shader_opacity(_linked_source(inputs[1])[0])
+        second = _shader_opacity(_linked_source(inputs[2])[0])
+        if first is None or second is None:
+            return None
+        return (1.0 - fac) * first + fac * second
+    return None
+
+
+def surface_opacity(material: object) -> float:
+    """The opacity the material's surface shader gives (see _shader_opacity); 1 when
+    the shader tree is not one it can read."""
+    node_tree = getattr(material, "node_tree", None)
+    output = _material_output_node(node_tree) if node_tree is not None else None
+    if output is None:
+        return 1.0
+    opacity = _shader_opacity(_linked_source(output.inputs.get("Surface"))[0])
+    return 1.0 if opacity is None else min(max(opacity, 0.0), 1.0)
+
+
+def _same_image(first: ExportedTexture, second: ExportedTexture) -> bool:
+    return replace(first, channel=TEXTURE_CHANNEL_R, adjustments=()) == replace(second, channel=TEXTURE_CHANNEL_R, adjustments=())
+
+
+def _material_alpha(
+    material: object,
+    alpha_input: Optional[object],
+    alpha: float,
+    base_color_texture: Optional[ExportedTexture],
+    asset_path: Path,
+) -> tuple[float, int, Optional[ExportedTexture]]:
+    """The base colour factor's alpha, the alpha mode and the texture to write into the
+    base colour texture's alpha channel (None when there is none, or when the Alpha
+    input already reads the base colour image's own alpha).
+
+    The engine multiplies the base colour texture's alpha by the factor's alpha, and
+    blends only materials flagged MATERIAL_ALPHA_MODE_BLEND: before this every
+    material was flagged opaque, so Alpha and glass rendered solid.
+    """
+    opacity = surface_opacity(material)
+    alpha_texture = None
+    uses_base_alpha = False
+    if alpha_input is not None and getattr(alpha_input, "is_linked", False):
+        alpha_texture = resolve_texture_from_socket(alpha_input, asset_path)
+        if (
+            alpha_texture is not None
+            and base_color_texture is not None
+            and alpha_texture.channel == TEXTURE_CHANNEL_A
+            and not alpha_texture.adjustments
+            and _same_image(alpha_texture, base_color_texture)
+        ):
+            uses_base_alpha = True
+            alpha_texture = None
+    factor_alpha = alpha * opacity
+    blended = alpha_texture is not None or uses_base_alpha or factor_alpha < 1.0 - 1.0e-4
+    return factor_alpha, MATERIAL_ALPHA_MODE_BLEND if blended else MATERIAL_ALPHA_MODE_OPAQUE, alpha_texture
+
+
+@dataclass(frozen=True)
+class MaterialHeight:
+    """A height a material's relief is read from: the image behind the Height input of a
+    Displacement or a Bump node, and how deep that node says the relief is."""
+
+    node: object
+    texture: ExportedTexture
+    # The node's Scale (Displacement) or Distance (Bump); DEFAULT_HEIGHT_SCALE when that
+    # input is linked. Blender's value is a distance in the scene and the engine's
+    # heightScale a share of the texture's width: it is carried over as a starting
+    # point, not converted (see ExportedMaterial.height_scale).
+    scale: float
+    # Texture values at or above this count as no depth (see _displacement_remap_max).
+    remap_max: float = 1.0
+
+    @property
+    def too_deep(self) -> bool:
+        """The shading of a bump, not a depth (see MAX_PARALLAX_HEIGHT_SCALE)."""
+        return self.scale > MAX_PARALLAX_HEIGHT_SCALE
+
+
+def _displacement_remap_max(displacement_node: object) -> float:
+    """What a Displacement node's Midlevel becomes in the engine.
+
+    The engine's POM is unidirectional (ray-marches INTO the surface from an apparent
+    flat top; it cannot bulge outward past the true polygon surface the way Blender's
+    signed displacement-around-Midlevel can). Copying Blender's Midlevel straight into
+    heightMidlevel does NOT reproduce "neutral gray = no visible depth" — heightMidlevel
+    is just an additive shift, not a zero-reference (see
+    HeightMapParallaxOcclusionMapping.md). Instead, it is used as the remap ceiling: raw
+    values at/above Midlevel clip to "no depth" (the closest unidirectional approximation
+    of "flush or bulging outward"), and values below it get contrast-stretched into the
+    full depth range. heightMidlevel itself stays at its neutral default so it remains
+    available as a separate, manual runtime tuning shift. Clamped to (0, 1] since raw
+    texture samples are always in that range — an out-of-range authored Midlevel (e.g. an
+    artist overshooting a slider) would otherwise make the remap divide by a value that
+    never matches any real sample. A linked Midlevel has no single value: 1, no remap.
+    """
+    midlevel_input = displacement_node.inputs.get("Midlevel")
+    if midlevel_input is None or midlevel_input.is_linked:
+        return 1.0
+    return min(max(float(midlevel_input.default_value), 0.01), 1.0)
+
+
+def _node_height(node: object, depth_input_name: str, asset_path: Path, remap_max: float = 1.0) -> Optional[MaterialHeight]:
+    """The height a Displacement node (its depth is its Scale) or a Bump node (its
+    Distance) gives, None when no image is behind its Height input."""
+    height_input = node.inputs.get("Height")
+    texture = resolve_texture_from_socket(height_input, asset_path) if height_input is not None else None
+    if texture is None:
+        return None
+    depth_input = node.inputs.get(depth_input_name)
+    scale = DEFAULT_HEIGHT_SCALE
+    if depth_input is not None and not depth_input.is_linked:
+        scale = float(depth_input.default_value)
+    return MaterialHeight(node, texture, scale, remap_max)
+
+
+def _material_height_candidates(node_tree: object, principled: Optional[object], asset_path: Path) -> Iterable[MaterialHeight]:
+    """The heights a material holds, in the order the export tries them: the one of the
+    Displacement on the Material Output, then the one of the Bump on the Normal input
+    of its Principled BSDF, if it has one."""
+    output = _material_output_node(node_tree)
+    displacement_input = output.inputs.get("Displacement") if output is not None else None
+    if displacement_input is not None and displacement_input.is_linked:
+        node = displacement_input.links[0].from_node
+        if node.bl_idname == "ShaderNodeDisplacement":
+            height = _node_height(node, "Scale", asset_path, _displacement_remap_max(node))
+            if height is not None:
+                yield height
+    normal_input = principled.inputs.get("Normal") if principled is not None else None
+    if normal_input is not None and normal_input.is_linked:
+        node = normal_input.links[0].from_node
+        if node.bl_idname == "ShaderNodeBump":
+            # A Bump node has nothing like a Midlevel: no remap.
+            height = _node_height(node, "Distance", asset_path)
+            if height is not None:
+                yield height
+
+
+def material_height(material: object, asset_path: Path) -> tuple[Optional[MaterialHeight], list[tuple[MaterialHeight, str]]]:
+    """The height a material is exported with, and the heights read on the way to it
+    that are left out, each with why.
+
+    The Material Output's Displacement input comes first (the standard ArchViz/Poliigon
+    authoring pattern: an Image Texture feeding a Displacement node's Height socket),
+    then a Bump node feeding the Principled BSDF's Normal input directly (common in
+    materials authored without a separate Displacement setup). A node counts only with
+    an image behind its Height input, and the Bump node is read only when the
+    Displacement gives no height. See docs/proposals/HeightMapParallaxOcclusionMapping.md
+    for the domain rationale.
+
+    Two things leave a height out:
+
+    - Its depth: above MAX_PARALLAX_HEIGHT_SCALE it is the shading of a bump.
+    - Its surface: only a material with a Principled BSDF is exported with a height
+      (extract_material returns before it asks for one of any other). A Displacement
+      on a Diffuse, a Glass or an Emission surface is left out whatever its depth, and
+      says that and not its depth: a smaller Scale would not bring its relief back.
+
+    extract_material exports the first and analyze_material reports the second, so the
+    material fidelity report cannot say something else than the export does.
+    """
+    node_tree = getattr(material, "node_tree", None)
+    left_out: list[tuple[MaterialHeight, str]] = []
+    if node_tree is None:
+        return None, left_out
+    principled = _principled_bsdf_node(node_tree)
+    for height in _material_height_candidates(node_tree, principled, asset_path):
+        if principled is None:
+            left_out.append((height, "a height is exported only with a Principled BSDF surface"))
+        elif height.too_deep:
+            left_out.append((height, f"its height of {height.scale:g} is the shading of a bump, too deep to be a parallax depth"))
+        else:
+            return height, left_out
+    return None, left_out
+
+
 def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
-    material_slots = getattr(mesh_object.data, "materials", [])
-    material = material_slots[0] if material_slots and material_slots[0] is not None else None
+    material = mesh_object_material(mesh_object)
     if material is None:
         return ExportedMaterial(
-            name=f"{mesh_object.name}_material",
+            name=DEFAULT_MATERIAL_NAME,
             base_color_factor=(1.0, 1.0, 1.0, 1.0),
             emissive_factor=(0.0, 0.0, 0.0),
             normal_scale=1.0,
@@ -4603,6 +5524,11 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
     # default_value when NO texture is connected (i.e. solid color material).
     if base_color_input is None or base_color_input.is_linked:
         base_color = (1.0, 1.0, 1.0, 1.0)
+        if base_color_input is not None and resolve_texture_from_socket(base_color_input, asset_path) is None:
+            # Node math with no texture behind it: its colour seen straight on.
+            value = evaluate_socket_facing(base_color_input)
+            if value is not None:
+                base_color = (*(min(max(component, 0.0), 1.0) for component in _as_color(value)), 1.0)
     else:
         base_color = vector4(base_color_input.default_value)
     # Blender 4.0+ splits Emission into "Emission Color" (defaults to white)
@@ -4624,6 +5550,10 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
         emissive = (0.0, 0.0, 0.0)
     elif emissive_input.is_linked:
         emissive = (emission_strength, emission_strength, emission_strength)
+        if resolve_texture_from_socket(emissive_input, asset_path) is None:
+            value = evaluate_socket_facing(emissive_input)
+            if value is not None:
+                emissive = tuple(max(component, 0.0) * emission_strength for component in _as_color(value))
     else:
         emissive_default = emissive_input.default_value
         emissive = (
@@ -4631,9 +5561,11 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
             float(emissive_default[1]) * emission_strength,
             float(emissive_default[2]) * emission_strength,
         )
-    alpha = float(alpha_input.default_value) if alpha_input is not None else 1.0
+    # A linked Alpha's slider is stale, like Base Color's above.
+    alpha = float(alpha_input.default_value) if alpha_input is not None and not alpha_input.is_linked else 1.0
 
     base_color_texture = resolve_texture_from_socket(base_color_input, asset_path) if base_color_input is not None else None
+    alpha, alpha_mode, alpha_texture = _material_alpha(material, alpha_input, alpha, base_color_texture, asset_path)
     normal_texture = resolve_texture_from_socket(normal_input, asset_path) if normal_input is not None else None
     emissive_texture = resolve_texture_from_socket(emissive_input, asset_path) if emissive_input is not None else None
     metallic_texture = resolve_texture_from_socket(metallic_input, asset_path) if metallic_input is not None else None
@@ -4647,61 +5579,7 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
             strength_input = source.inputs.get("Strength")
             normal_scale = float(strength_input.default_value) if strength_input is not None else 1.0
 
-    # Height/displacement detection: prefer the Material Output's Displacement input (the
-    # standard ArchViz/Poliigon authoring pattern — an Image Texture feeding a Displacement
-    # node's Height socket), falling back to a Bump node feeding the Principled BSDF's Normal
-    # input directly (common in materials authored without a separate Displacement setup).
-    # See docs/proposals/HeightMapParallaxOcclusionMapping.md for the domain rationale.
-    height_texture: Optional[ExportedTexture] = None
-    height_scale = 0.05
-    height_midlevel = 0.5
-    height_remap_min = 0.0
-    height_remap_max = 1.0
-
-    material_output = _material_output_node(material.node_tree) if getattr(material, "node_tree", None) is not None else None
-    displacement_input = material_output.inputs.get("Displacement") if material_output is not None else None
-    if displacement_input is not None and displacement_input.is_linked:
-        displacement_source = displacement_input.links[0].from_node
-        if displacement_source.bl_idname == "ShaderNodeDisplacement":
-            height_input = displacement_source.inputs.get("Height")
-            height_texture = resolve_texture_from_socket(height_input, asset_path) if height_input is not None else None
-            if height_texture is not None:
-                # Blender's Displacement Scale is a world-space distance, not the engine's
-                # UV-normalized heightScale — carried through as a starting point only (see
-                # ExportedMaterial.height_scale docstring), not a precise unit conversion.
-                scale_input = displacement_source.inputs.get("Scale")
-                midlevel_input = displacement_source.inputs.get("Midlevel")
-                if scale_input is not None and not scale_input.is_linked:
-                    height_scale = float(scale_input.default_value)
-                if midlevel_input is not None and not midlevel_input.is_linked:
-                    # The engine's POM is unidirectional (ray-marches INTO the surface from an
-                    # apparent flat top; it cannot bulge outward past the true polygon surface
-                    # the way Blender's signed displacement-around-Midlevel can). Copying
-                    # Blender's Midlevel straight into heightMidlevel does NOT reproduce
-                    # "neutral gray = no visible depth" — heightMidlevel is just an additive
-                    # shift, not a zero-reference (see HeightMapParallaxOcclusionMapping.md).
-                    # Instead, use it as the remap ceiling: raw values at/above Midlevel clip to
-                    # "no depth" (the closest unidirectional approximation of "flush or bulging
-                    # outward"), and values below it get contrast-stretched into the full depth
-                    # range. heightMidlevel itself stays at its neutral default so it remains
-                    # available as a separate, manual runtime tuning shift. Clamped to (0, 1]
-                    # since raw texture samples are always in that range — an out-of-range
-                    # authored Midlevel (e.g. an artist overshooting a slider) would otherwise
-                    # make the remap divide by a value that never matches any real sample.
-                    blender_midlevel = float(midlevel_input.default_value)
-                    height_remap_max = min(max(blender_midlevel, 0.01), 1.0)
-
-    if height_texture is None and normal_input is not None and normal_input.is_linked:
-        normal_source = normal_input.links[0].from_node
-        if normal_source.bl_idname == "ShaderNodeBump":
-            height_input = normal_source.inputs.get("Height")
-            height_texture = resolve_texture_from_socket(height_input, asset_path) if height_input is not None else None
-            if height_texture is not None:
-                distance_input = normal_source.inputs.get("Distance")
-                if distance_input is not None and not distance_input.is_linked:
-                    height_scale = float(distance_input.default_value)
-                # Bump has no Midlevel-equivalent input; height_midlevel/height_remap_max stay
-                # at their neutral defaults.
+    height, _ = material_height(material, asset_path)
 
     occlusion_texture = _detect_occlusion_texture(material, asset_path)
 
@@ -4720,13 +5598,13 @@ def extract_material(mesh_object: object, asset_path: Path) -> ExportedMaterial:
         roughness_texture=roughness_texture,
         emissive_texture=emissive_texture,
         occlusion_texture=occlusion_texture,
-        height_texture=height_texture,
-        height_scale=height_scale,
-        height_midlevel=height_midlevel,
-        height_remap_min=height_remap_min,
-        height_remap_max=height_remap_max,
+        height_texture=height.texture if height is not None else None,
+        height_scale=height.scale if height is not None else DEFAULT_HEIGHT_SCALE,
+        height_remap_max=height.remap_max if height is not None else 1.0,
         roughness_texture_channel=roughness_texture.channel if roughness_texture is not None else TEXTURE_CHANNEL_R,
         metallic_texture_channel=metallic_texture.channel if metallic_texture is not None else TEXTURE_CHANNEL_R,
+        alpha_mode=alpha_mode,
+        alpha_texture=alpha_texture,
     )
 
 
@@ -4878,7 +5756,7 @@ def _extract_mesh_numpy(mesh_object: object, mesh_data: object, asset_path: Path
         uv0_flat = np.empty(n_loops * 2, dtype=np.float32)
         mesh_data.uv_layers[0].data.foreach_get("uv", uv0_flat)
         loop_uv0 = uv0_flat.reshape(-1, 2)
-        uv_transform = material_uv_transform(_first_material(mesh_object))
+        uv_transform = material_uv_transform(mesh_object_material(mesh_object))
         if uv_transform is not None:
             loop_uv0 = loop_uv0 * np.array(uv_transform.scale, dtype=np.float32) + np.array(
                 uv_transform.offset, dtype=np.float32
@@ -5123,7 +6001,7 @@ def extract_mesh_object(
         uv1_layer = mesh_data.uv_layers[1].data if len(mesh_data.uv_layers) > 1 else None
         if has_uvs:
             mesh_data.calc_tangents(uvmap=mesh_data.uv_layers[0].name)
-        uv_transform = material_uv_transform(_first_material(mesh_object)) if has_uvs else None
+        uv_transform = material_uv_transform(mesh_object_material(mesh_object)) if has_uvs else None
 
         color_layer = mesh_data.color_attributes.active_color
         vertex_writer = BinaryWriter()
@@ -5288,6 +6166,25 @@ def extract_meshes(
     ]
 
 
+def mesh_share_key(obj: object) -> Optional[tuple]:
+    """Identifies mesh objects whose exported mesh is the same: linked duplicates (one
+    mesh datablock, Alt+D in Blender) with the same materials and nothing that changes
+    the mesh per object. Their geometry is then split and extracted once and reused.
+
+    None for anything that can differ per object: modifiers (a Mirror or Array can
+    depend on the object), skinning or shape keys (see _is_rigged_object).
+    """
+    if getattr(obj, "type", None) != "MESH" or getattr(obj, "data", None) is None:
+        return None
+    if getattr(obj, "modifiers", None) or _is_rigged_object(obj):
+        return None
+    materials = tuple(
+        slot.material.as_pointer() if getattr(slot, "material", None) is not None else 0
+        for slot in getattr(obj, "material_slots", [])
+    )
+    return (obj.data.as_pointer(), materials)
+
+
 def _is_rigged_object(obj: object) -> bool:
     """Whether a mesh object carries skinning or morph targets: an Armature modifier,
     or shape keys."""
@@ -5366,6 +6263,10 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
     # scene, which invalidates the depsgraph.
     evaluated_meshes: dict[int, object] = {}
     depsgraph = None
+    # Copies of one mesh (see mesh_share_key) are cut once: the first one's fragment
+    # meshes are linked into the others' fragment objects.
+    fragments_by_share_key: dict[tuple, list[tuple[int, object]]] = {}
+    keys_to_cut: set[tuple] = set()
     for obj in objects:
         if getattr(obj, "type", None) != "MESH" or obj.data is None:
             continue
@@ -5373,6 +6274,11 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
             continue
         if _is_rigged_object(obj):
             continue
+        share_key = mesh_share_key(obj)
+        if share_key is not None:
+            if share_key in keys_to_cut:
+                continue
+            keys_to_cut.add(share_key)
         if depsgraph is None:
             depsgraph = bpy.context.evaluated_depsgraph_get()
         evaluated_meshes[obj.as_pointer()] = bpy.data.meshes.new_from_object(
@@ -5384,6 +6290,12 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
     for obj in objects:
         if getattr(obj, "type", None) != "MESH" or obj.data is None:
             result.append(obj)
+            continue
+        share_key = mesh_share_key(obj)
+        shared_fragments = fragments_by_share_key.get(share_key) if share_key is not None else None
+        if shared_fragments is not None:
+            for mat_idx, fragment_mesh in shared_fragments:
+                result.append(_material_fragment_object(obj, mat_idx, fragment_mesh))
             continue
         evaluated_mesh = evaluated_meshes.pop(obj.as_pointer(), None)
         mesh = evaluated_mesh if evaluated_mesh is not None else obj.data
@@ -5398,6 +6310,7 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
         if _is_rigged_object(obj):
             result.extend(_separate_rigged_object_by_material(obj))
             continue
+        fragments: list[tuple[int, object]] = []
         for mat_idx in sorted(used_indices):
             bm = _bmesh.new()
             try:
@@ -5421,28 +6334,36 @@ def split_blender_objects_by_material(objects: list[object]) -> list[object]:
                     new_mesh.materials.append(mat)
                     for p in new_mesh.polygons:
                         p.material_index = 0
-                new_obj = bpy.data.objects.new(f"{obj.name}_mat{mat_idx}", new_mesh)
-                # Preserve the source object's parent link (if any) so nodes that
-                # already sit under a real Blender hierarchy still group correctly;
-                # UNTOLD_MATERIAL_SPLIT_SOURCE_PROP below is what reunites fragments
-                # of a *parentless* multi-material object, which parent-chain
-                # walking alone can't do since these fragments aren't parented to
-                # each other.
-                new_obj.parent = obj.parent
-                if obj.parent is not None:
-                    new_obj.matrix_parent_inverse = obj.matrix_parent_inverse.copy()
-                new_obj.matrix_world = obj.matrix_world.copy()
-                new_obj[UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
-                # A stand-in being split (a converted curve) passes on the object it
-                # already stands in for.
-                new_obj[UNTOLD_MATERIAL_SPLIT_SOURCE_PROP] = obj.get(UNTOLD_MATERIAL_SPLIT_SOURCE_PROP) or obj.name
-                bpy.context.scene.collection.objects.link(new_obj)
-                result.append(new_obj)
+                fragments.append((mat_idx, new_mesh))
+                result.append(_material_fragment_object(obj, mat_idx, new_mesh))
             finally:
                 bm.free()
+        if share_key is not None:
+            fragments_by_share_key[share_key] = fragments
         if evaluated_mesh is not None:
             bpy.data.meshes.remove(evaluated_mesh)
     return result
+
+
+def _material_fragment_object(obj: object, mat_idx: int, mesh: object) -> object:
+    """A temporary object for one material's fragment of obj, placed like obj."""
+    import bpy
+    new_obj = bpy.data.objects.new(f"{obj.name}_mat{mat_idx}", mesh)
+    # Preserve the source object's parent link (if any) so nodes that already sit
+    # under a real Blender hierarchy still group correctly;
+    # UNTOLD_MATERIAL_SPLIT_SOURCE_PROP below is what reunites fragments of a
+    # *parentless* multi-material object, which parent-chain walking alone can't do
+    # since these fragments aren't parented to each other.
+    new_obj.parent = obj.parent
+    if obj.parent is not None:
+        new_obj.matrix_parent_inverse = obj.matrix_parent_inverse.copy()
+    new_obj.matrix_world = obj.matrix_world.copy()
+    new_obj[UNTOLD_EXPORT_TEMP_OBJECT_PROP] = True
+    # A stand-in being split (a converted curve) passes on the object it already
+    # stands in for.
+    new_obj[UNTOLD_MATERIAL_SPLIT_SOURCE_PROP] = obj.get(UNTOLD_MATERIAL_SPLIT_SOURCE_PROP) or obj.name
+    bpy.context.scene.collection.objects.link(new_obj)
+    return new_obj
 
 
 def cleanup_temporary_export_objects(objects: Iterable[object]) -> None:
@@ -5516,14 +6437,39 @@ def extract_scene_payload_from_current_scene(
     mesh_name: Optional[str],
     convert_orientation: bool = False,
     source_orientation: str = "blender-native",
+    include_hidden: bool = False,
 ) -> tuple[list[ExportedLight], list[ExportedCamera]]:
+    """The scene's lights and cameras, by the same rule as its meshes (see
+    filter_scene_objects_for_export): never from collections excluded from the view
+    layer, and hidden ones only with include_hidden."""
     blender_required()
     include_scene_payload = mesh_name is None
     return extract_scene_payload_from_objects(
-        list(bpy.data.objects),
+        filter_scene_objects_for_export(list(bpy.context.scene.objects), include_hidden=include_hidden, quiet=True),
         convert_orientation=convert_orientation,
         source_orientation=source_orientation,
         include_scene_payload=include_scene_payload,
+    )
+
+
+def placed_mesh_copy(mesh: ExportedMesh, obj: object, conversion_matrix: Optional[object]) -> ExportedMesh:
+    """An extracted mesh for another object that copies its mesh (see mesh_share_key):
+    the same vertices, indices and material, with the object's own name, parent and
+    transform. Its world bounds are the local bounds' corners through the object's
+    world transform (a box around the exact bounds, which only empty nodes' bounds use
+    before normalize_export_nodes recomputes them from the vertices)."""
+    local_rows = matrix_rows_from_blender(obj.matrix_local)
+    world_rows = matrix_rows_from_blender(obj.matrix_world)
+    if conversion_matrix is not None:
+        local_rows = transform_matrix_rows(local_rows, conversion_matrix)
+        world_rows = transform_matrix_rows(world_rows, conversion_matrix)
+    corners = [transform_point_rows(world_rows, corner) for corner in aabb_corners(mesh.local_bounds)]
+    return replace(
+        mesh,
+        entity_name=obj.get("mesh_original_name") or obj.name,
+        parent_entity_name=getattr(getattr(obj, "parent", None), "name", None),
+        local_transform_rows=local_rows,
+        world_bounds=aabb_from_points(corners),
     )
 
 
@@ -5548,27 +6494,45 @@ def extract_nodes_from_objects(
     total = len(mesh_objects)
     print(f"  Processing {total} mesh(es) ...", flush=True)
     exported_meshes_by_name: dict[str, ExportedMesh] = {}
+    # Copies of one mesh (see mesh_share_key) are extracted once; each copy takes the
+    # result with its own placement. An extraction that failed fails for every copy.
+    extracted_by_share_key: dict[tuple, object] = {}
+    reused = 0
     skipped = 0
     for i, obj in enumerate(mesh_objects, 1):
         percent = (100.0 * i) / max(total, 1)
         print(f"  [{i}/{total} | {percent:6.2f}%] {obj.name}", flush=True)
+        share_key = mesh_share_key(obj)
         try:
-            exported_meshes_by_name[obj.name] = extract_mesh_object(
-                obj,
-                asset_path,
-                convert_orientation=convert_orientation,
-                source_orientation=source_orientation,
-                _cached_conversion_matrix=conversion_matrix,
-                _depsgraph=depsgraph,
-                _validate=validate,
-            )
+            earlier = extracted_by_share_key.get(share_key) if share_key is not None else None
+            if isinstance(earlier, ExportedMesh):
+                exported_meshes_by_name[obj.name] = placed_mesh_copy(earlier, obj, conversion_matrix)
+                reused += 1
+            elif isinstance(earlier, RuntimeError):
+                raise earlier
+            else:
+                exported_meshes_by_name[obj.name] = extract_mesh_object(
+                    obj,
+                    asset_path,
+                    convert_orientation=convert_orientation,
+                    source_orientation=source_orientation,
+                    _cached_conversion_matrix=conversion_matrix,
+                    _depsgraph=depsgraph,
+                    _validate=validate,
+                )
+                if share_key is not None:
+                    extracted_by_share_key[share_key] = exported_meshes_by_name[obj.name]
         except RuntimeError as exc:
+            if share_key is not None:
+                extracted_by_share_key.setdefault(share_key, exc)
             print(f"    Skipped: {exc}", flush=True)
             skipped += 1
         if progress_callback is not None:
             progress_callback("Extract meshes", i, total, obj.name)
     if skipped:
         print(f"  Skipped {skipped} mesh(es) with errors", flush=True)
+    if reused:
+        print(f"  Reused the geometry of {reused} mesh(es) that copy another one", flush=True)
 
     for report_line in material_fidelity_report_lines(mesh_objects):
         print(f"  {report_line}", flush=True)
@@ -5836,6 +6800,7 @@ def build_untold_file(
             material.height_remap_max,
             material.roughness_texture_channel,
             material.metallic_texture_channel,
+            material.alpha_mode,
         )
         existing = material_indices.get(key)
         if existing is not None:
@@ -5846,7 +6811,7 @@ def build_untold_file(
         materials.append(
             MaterialRecord(
                 name_offset=string_table.add(material.name),
-                flags=0,
+                flags=material.alpha_mode,
                 base_color_factor=material.base_color_factor,
                 emissive_factor=material.emissive_factor,
                 normal_scale=material.normal_scale,
@@ -6809,6 +7774,7 @@ def write_single_untold_from_nodes(
     Blender add-on's "Export Untold Asset" operator behave identically when a
     scene's model topology changes between runs at the same --output stem.
     """
+    output_path = single_file_output_path(output_path)
     exported_nodes = normalize_export_nodes(exported_nodes)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -6886,6 +7852,46 @@ def write_single_untold_from_nodes(
     }
 
 
+def model_content_signature(nodes: list[ExportedNode], digests: dict[int, tuple[bytes, str]]) -> Optional[str]:
+    """A fingerprint of what a pack model's .untold would hold, independent of where the
+    model stands (its root transform goes in the manifest) and of its objects' names:
+    geometry, materials (a mesh with none has the same one as any other, see
+    DEFAULT_MATERIAL_NAME) and hierarchy.
+    Two models with the same fingerprint are the same model placed twice, and are
+    written once. None for a model that is not compared: skinned or with morph targets.
+
+    digests caches the hash of each geometry buffer by object identity, since copies
+    of a mesh share their buffers (see placed_mesh_copy).
+    """
+    def digest(data: bytes) -> str:
+        # Keyed by identity, holding the buffer so its identity cannot be reused.
+        cached = digests.get(id(data))
+        if cached is None or cached[0] is not data:
+            cached = (data, hashlib.sha1(data).hexdigest())
+            digests[id(data)] = cached
+        return cached[1]
+
+    position = {node.entity_name: index for index, node in enumerate(nodes)}
+    parts = []
+    for node in nodes:
+        if node.skeleton is not None:
+            return None
+        mesh = node.mesh
+        if mesh is not None and (mesh.skin_binding is not None or mesh.morph_targets):
+            return None
+        is_root = node.parent_entity_name is None or node.parent_entity_name not in position
+        rows = identity_matrix_rows() if is_root else node.local_transform_rows
+        mesh_part = None
+        if mesh is not None:
+            mesh_part = (digest(mesh.vertices), digest(mesh.indices), mesh.index_type, repr(mesh.material))
+        parts.append((
+            None if is_root else position[node.parent_entity_name],
+            tuple(tuple(round(float(value), 6) for value in row) for row in rows),
+            mesh_part,
+        ))
+    return hashlib.sha1(repr(parts).encode("utf-8")).hexdigest()
+
+
 def write_untold_pack_from_groups(
     model_groups: dict[str, list[ExportedNode]],
     *,
@@ -6905,7 +7911,13 @@ def write_untold_pack_from_groups(
     The per-model folders go in assets_dir when one is given (see --assets-dir),
     else beside the manifest; the manifest's model paths are relative to its own
     folder either way.
+
+    A model that is a copy of one already written (see model_content_signature) is not
+    written again: its manifest entry points at the first one's .untold with its own
+    transform. Textures go in one Textures/ folder beside the model folders, shared by
+    every model, instead of a copy in each.
     """
+    output_path = single_file_output_path(output_path)
     pack_path = output_path.with_suffix(".untoldpack")
     models_root = assets_dir or output_path.parent
     # Captured before write_untoldpack_manifest() overwrites pack_path below, so
@@ -6923,7 +7935,13 @@ def write_untold_pack_from_groups(
     total_bytes = 0
     skipped_textures: list[str] = []
     write_failures = TextureWriteFailures()
+    # One staging for the whole pack: Textures/ beside the model folders, each texture
+    # written once and referenced from every model that uses it (../Textures/...).
+    texture_context = TextureStagingContext(skipped_textures, write_failures, assets_dir=models_root)
     used_model_dir_names: set[str] = set()
+    written_by_signature: dict[str, Path] = {}
+    geometry_digests: dict[int, tuple[bytes, str]] = {}
+    shared_model_count = 0
     for root_name, raw_group_nodes in model_groups.items():
         # The root's own placement is captured here, from the un-baked node, and
         # carried in the manifest instead of being baked into the geometry
@@ -6932,18 +7950,36 @@ def write_untold_pack_from_groups(
         original_root_transform = next(
             node.local_transform_rows for node in raw_group_nodes if node.parent_entity_name is None
         )
+        signature = model_content_signature(raw_group_nodes, geometry_digests)
+        written = written_by_signature.get(signature) if signature is not None else None
+        if written is not None:
+            manifest_models.append(
+                {
+                    "displayName": root_name,
+                    "path": relative_asset_uri(written, pack_path.parent),
+                    "transform": original_root_transform,
+                }
+            )
+            shared_model_count += 1
+            if progress_callback is not None:
+                progress_callback("Share models", 0, 1, f"{root_name} -> {written.name}")
+            continue
+
         group_nodes = normalize_export_nodes(zero_root_transform(raw_group_nodes))
 
         model_dir_name = unique_pack_model_dir_name(root_name, used_model_dir_names)
         model_output_path = models_root / model_dir_name / f"{model_dir_name}.untold"
         model_output_path.parent.mkdir(parents=True, exist_ok=True)
+        # A Textures/ folder of the model's own from an earlier export is no longer used.
+        own_textures = model_output_path.parent / "Textures"
+        if own_textures.is_dir():
+            shutil.rmtree(own_textures)
 
         staged_group_nodes = stage_nodes_for_output(
             group_nodes,
             model_output_path,
             progress_callback=progress_callback,
-            skipped_textures=skipped_textures,
-            write_failures=write_failures,
+            context=texture_context,
         )
         model_bytes = build_untold_file(
             staged_group_nodes,
@@ -6975,6 +8011,8 @@ def write_untold_pack_from_groups(
             }
         )
         new_model_dirs.append(model_output_path.parent.resolve())
+        if signature is not None:
+            written_by_signature[signature] = model_output_path
 
     write_untoldpack_manifest(pack_path, source_asset_name, manifest_models)
 
@@ -7002,6 +8040,8 @@ def write_untold_pack_from_groups(
         "models": manifest_models,
         "model_paths": model_paths,
         "model_count": len(manifest_models),
+        "written_model_count": len(model_paths),
+        "shared_model_count": shared_model_count,
         "mesh_count": total_meshes,
         "vertex_count": total_vertices,
         "index_count": total_indices,
@@ -7110,7 +8150,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         argv = argv[1:]
     parser = argparse.ArgumentParser(description="Cook USD scene or animation data into UntoldEngine's .untold format.")
     parser.add_argument("--input", required=True, help="Path to a source USD/USDZ asset or a .blend file.")
-    parser.add_argument("--output", required=True, help="Path to the output .untold file (or .untoldanim with --animation).")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help=(
+            "Path to the output .untold file (or .untoldanim with --animation). A scene with several "
+            "models is written as a .untoldpack of the same name; that name may be given as well."
+        ),
+    )
     parser.add_argument("--file-type", default="tile", choices=sorted(FILE_TYPES.keys()), help="Untold file type to emit.")
     parser.add_argument("--mesh-name", default=None, help="Optional mesh object name when the USD asset imports multiple meshes.")
     parser.add_argument(
@@ -7174,7 +8221,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     EXPORT_SHAPE_KEYS = bool(getattr(args, "export_shapekeys", False))
     input_path = normalize_blender_path(args.input)
-    output_path = normalize_blender_path(args.output)
+    output_path = single_file_output_path(normalize_blender_path(args.output))
     assets_dir = normalize_blender_path(args.assets_dir) if args.assets_dir else None
 
     if input_path.suffix.lower() not in {".usd", ".usda", ".usdc", ".usdz", ".blend"}:
@@ -7222,6 +8269,7 @@ def main(argv: list[str]) -> int:
             mesh_name=args.mesh_name,
             convert_orientation=args.convert_orientation,
             source_orientation=args.source_orientation,
+            include_hidden=args.include_hidden,
         )
         clean_generated_sidecar_dirs(output_path, assets_dir)
 
@@ -7301,6 +8349,12 @@ def main(argv: list[str]) -> int:
             )
             progress.advance("Build file", result["pack_path"].name)
             print(f"Wrote {result['pack_path']} ({result['model_count']} model(s))")
+            if result["shared_model_count"]:
+                print(
+                    f"{result['written_model_count']} model file(s) written; {result['shared_model_count']} "
+                    "placement(s) reuse a model already written",
+                    flush=True,
+                )
             print(f"Nodes: {len(exported_nodes)}, Meshes: {result['mesh_count']}")
             if staged_hdr_assets:
                 print(f"HDR environments: {len(staged_hdr_assets)}")

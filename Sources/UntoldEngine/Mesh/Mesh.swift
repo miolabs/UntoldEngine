@@ -40,6 +40,10 @@ public enum CoordinateSystemConversion: Sendable {
 
 public struct Mesh {
     public let metalKitMesh: MTKMesh
+    /// The Metal buffers of `metalKitMesh.vertexBuffers`, in the same order, read once
+    /// when the mesh is made. The passes bind them for every draw, and MetalKit builds a
+    /// new array, whose elements answer through Objective-C, each time it is asked.
+    let vertexBuffers: [MTLBuffer]
     public var submeshes: [SubMesh] = []
     public var localSpace: simd_float4x4 = .identity
     public var worldSpace: simd_float4x4 = .identity
@@ -91,6 +95,7 @@ public struct Mesh {
             return nil
         }
         metalKitMesh = localMetalKitMesh
+        vertexBuffers = localMetalKitMesh.vertexBuffers.map(\.buffer)
 
         submeshes = modelIOMesh.submeshes?.enumerated().compactMap { index, element in
             guard let mdlSubmesh = element as? MDLSubmesh else { return nil }
@@ -484,12 +489,26 @@ public struct SubMesh {
     public let metalKitSubmesh: MTKSubmesh
     public var material: Material?
 
+    // What a draw of the submesh hands to Metal, read from `metalKitSubmesh` once when
+    // the submesh is made: asking MetalKit for them costs half a dozen Objective-C calls
+    // per draw.
+    let primitiveType: MTLPrimitiveType
+    let indexCount: Int
+    let indexType: MTLIndexType
+    let indexBuffer: MTLBuffer
+    let indexBufferOffset: Int
+
     init(metalKitSubmesh: MTKSubmesh) {
         self.metalKitSubmesh = metalKitSubmesh
+        primitiveType = metalKitSubmesh.primitiveType
+        indexCount = metalKitSubmesh.indexCount
+        indexType = metalKitSubmesh.indexType
+        indexBuffer = metalKitSubmesh.indexBuffer.buffer
+        indexBufferOffset = metalKitSubmesh.indexBuffer.offset
     }
 
     init(modelIOSubmesh: MDLSubmesh, metalKitSubmesh: MTKSubmesh, textureLoader: TextureLoader) {
-        self.metalKitSubmesh = metalKitSubmesh
+        self.init(metalKitSubmesh: metalKitSubmesh)
 
         // Fallback to an empty material if none is provided
         if let mdlMaterial = modelIOSubmesh.material {
@@ -784,6 +803,9 @@ public struct Material {
     public var metallicValue: Float = 0.0
     public var roughnessChannel: UntoldTextureChannel = .r
     public var metallicChannel: UntoldTextureChannel = .r
+    /// How much of the normal map the surface takes: 1 as authored, 0 none. A native
+    /// asset's material carries its normal strength here (Blender's Normal Map "Strength").
+    public var normalScale: Float = 1.0
 
     // Disney material properties
     public var specular: Float = 0.0
@@ -877,6 +899,16 @@ public struct Material {
                 )
             }
 
+            // Many models share an image (a pack's shared Textures/ folder): it is decoded
+            // once while any material still holds it, also when several of those models
+            // load at the same time.
+            let cacheKey = LoadedTextureCache.key(url: url, isSRGB: isSRGB)
+            return LoadedTextureCache.shared.texture(for: cacheKey) {
+                decodeRuntimeTexture(label, url: url, isSRGB: isSRGB)
+            }
+        }
+
+        func decodeRuntimeTexture(_ label: String, url: URL, isSRGB: Bool) -> MTLTexture? {
             let options: [MTKTextureLoader.Option: Any] = [
                 .textureUsage: NSNumber(value: MTLTextureUsage([.shaderRead, .pixelFormatView]).rawValue),
                 .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
@@ -884,34 +916,14 @@ public struct Material {
                 .generateMipmaps: NSNumber(value: true),
             ]
 
-            // Grayscale PNGs produce an r8Unorm Metal texture.  The shader samples it as
-            // RGBA where G=B=0, making the mesh appear solid red.  Detect and expand to
-            // RGBA via Core Graphics before handing off to MTKTextureLoader.
-            if let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
-               let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil),
-               cgImage.colorSpace?.model == .monochrome
-            {
-                let w = cgImage.width, h = cgImage.height
-                let colorSpace = isSRGB
-                    ? (CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB())
-                    : CGColorSpaceCreateDeviceRGB()
-                if let ctx = CGContext(
-                    data: nil, width: w, height: h,
-                    bitsPerComponent: 8, bytesPerRow: w * 4,
-                    space: colorSpace,
-                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue).rawValue
-                ) {
-                    ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
-                    if let rgbaImage = ctx.makeImage(),
-                       let texture = try? textureLoader.newTexture(cgImage: rgbaImage, options: options)
-                    {
-                        Logger.log(
-                            message: "[UntoldTexture] Expanded grayscale \(label.lowercased()) to RGBA '\(runtimeMaterial.name ?? "<unnamed material>")' \(texture.width)x\(texture.height)",
-                            category: LogCategory.textureLoading.rawValue
-                        )
-                        return texture
-                    }
-                }
+            // A grayscale image loads as a texture of one channel, which a shader reading a
+            // color from it shows as solid red: load it with that channel in red, green and blue.
+            if let texture = loadGrayscaleTextureAsRGBA(url: url, isSRGB: isSRGB, loader: textureLoader, options: options) {
+                Logger.log(
+                    message: "[UntoldTexture] Expanded grayscale \(label.lowercased()) to RGBA '\(runtimeMaterial.name ?? "<unnamed material>")' \(texture.width)x\(texture.height)",
+                    category: LogCategory.textureLoading.rawValue
+                )
+                return texture
             }
 
             do {
@@ -995,6 +1007,7 @@ public struct Material {
         metallicValue = runtimeMaterial.metallicFactor
         roughnessChannel = runtimeMaterial.roughnessTextureChannel
         metallicChannel = runtimeMaterial.metallicTextureChannel
+        normalScale = runtimeMaterial.normalScale
         alphaCutoff = runtimeMaterial.alphaCutoff
         heightScale = runtimeMaterial.heightScale
         heightMidlevel = runtimeMaterial.heightMidlevel
@@ -1064,6 +1077,11 @@ public struct Material {
             mapType: "Emissive map"
         )
         emissive = createTextureDescriptor(device: renderInfo.device, texture: emissiveTex, wrapMode: .repeat)
+        // The surface gives off its emissive color times its emissive texture. A source
+        // material with the texture alone means the texture as painted, so its color is white.
+        if emissiveTex != nil {
+            emissiveValue = simd_float3(repeating: 1.0)
+        }
 
         let heightTex = textureLoader.loadTexture(
             from: mdlMaterial.property(with: .displacement),
@@ -1720,6 +1738,74 @@ final class TextureLoader {
     }
 }
 
+/// Loads a grayscale image as a texture that carries its one channel in red, green and
+/// blue, so that a shader reading a color from it sees gray and not red. Returns nil when
+/// the image is not grayscale: the caller then loads it as it is.
+///
+/// MTKTextureLoader takes the `.SRGB` option from a file and ignores it for a CGImage: the
+/// texture comes back as plain rgba8Unorm, and a color texture would be read as linear
+/// values, more than twice as bright in the middle tones. A color image is therefore
+/// handed back as an sRGB view of that texture.
+func loadGrayscaleTextureAsRGBA(
+    url: URL,
+    isSRGB: Bool,
+    loader: MTKTextureLoader,
+    options: [MTKTextureLoader.Option: Any]
+) -> MTLTexture? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil),
+          cgImage.colorSpace?.model == .monochrome
+    else { return nil }
+
+    let width = cgImage.width
+    let height = cgImage.height
+    let colorSpace = isSRGB
+        ? (CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB())
+        : CGColorSpaceCreateDeviceRGB()
+    guard let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: colorSpace,
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue).rawValue
+    ) else { return nil }
+
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    guard let rgbaImage = context.makeImage(),
+          let texture = try? loader.newTexture(cgImage: rgbaImage, options: options)
+    else { return nil }
+
+    return isSRGB ? sRGBView(of: texture) : texture
+}
+
+/// The texture read as sRGB values: a view of it in the sRGB twin of its format, or the
+/// texture itself when it has none or is one already.
+private func sRGBView(of texture: MTLTexture) -> MTLTexture {
+    let sRGBFormat: MTLPixelFormat
+    switch texture.pixelFormat {
+    case .rgba8Unorm: sRGBFormat = .rgba8Unorm_srgb
+    case .bgra8Unorm: sRGBFormat = .bgra8Unorm_srgb
+    default: return texture
+    }
+    guard let view = texture.makeTextureView(pixelFormat: sRGBFormat) else { return texture }
+    view.label = texture.label
+
+    // The smaller levels were averaged from the stored values. Build them again through
+    // the view, which averages the light those values stand for, as for any color texture.
+    if view.mipmapLevelCount > 1,
+       let commandBuffer = renderInfo.commandQueue?.makeCommandBuffer(),
+       let blitEncoder = commandBuffer.makeBlitCommandEncoder()
+    {
+        blitEncoder.generateMipmaps(for: view)
+        blitEncoder.endEncoding()
+        commandBuffer.commit()
+    }
+    return view
+}
+
 func createTextureDescriptor(device: MTLDevice,
                              texture: MTLTexture?,
                              wrapMode: WrapMode) -> TextureDescriptor
@@ -1765,4 +1851,59 @@ private func cachedSamplerState(device: MTLDevice, wrapMode: WrapMode) -> MTLSam
     }
 
     return sampler
+}
+
+/// Image textures (PNG, JPEG, ...) loaded for runtime materials, by file and colour
+/// space, held only while some material still uses them (weak values). Models that
+/// share an image, such as the models of a `.untoldpack` with its shared Textures/
+/// folder, decode and upload it once instead of once per model. `.utex` textures
+/// have their own cache (NativeTextureLoader.sharedCache).
+///
+/// Sharing is safe because loaded textures are never written after loading: material
+/// edits and texture streaming replace a material's texture rather than change it.
+///
+/// Single-flight, as `NativeTextureLoader` is: materials are built on several threads
+/// at once (a pack loads eight models at a time), and a thread that asks for an image
+/// another one is decoding waits for it and takes its texture. The callers build their
+/// materials synchronously, so they wait on a condition, and the lock is never held
+/// while an image is decoded.
+final class LoadedTextureCache: @unchecked Sendable {
+    static let shared = LoadedTextureCache()
+
+    /// Guards `textures` and `loading`, and wakes the threads waiting for a load.
+    private let condition = NSCondition()
+    private let textures = NSMapTable<NSString, AnyObject>(keyOptions: .strongMemory, valueOptions: .weakMemory)
+    /// The keys one thread is loading right now.
+    private var loading: Set<String> = []
+
+    static func key(url: URL, isSRGB: Bool) -> String {
+        "\(url.standardizedFileURL.path)|srgb=\(isSRGB)"
+    }
+
+    /// The texture cached for `key`, or the one `load` returns, which is then cached.
+    /// `load` runs on the calling thread, and for one caller at a time per key. A load
+    /// that fails is not remembered: the next caller tries again.
+    func texture(for key: String, load: () -> MTLTexture?) -> MTLTexture? {
+        condition.lock()
+        while loading.contains(key) {
+            condition.wait()
+        }
+        if let cached = textures.object(forKey: key as NSString) as? MTLTexture {
+            condition.unlock()
+            return cached
+        }
+        loading.insert(key)
+        condition.unlock()
+
+        let texture = load()
+
+        condition.lock()
+        if let texture {
+            textures.setObject(texture as AnyObject, forKey: key as NSString)
+        }
+        loading.remove(key)
+        condition.broadcast()
+        condition.unlock()
+        return texture
+    }
 }

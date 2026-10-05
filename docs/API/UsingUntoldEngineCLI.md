@@ -153,21 +153,32 @@ macOS location and is not available on `PATH`.
 If the source `.blend` scene contains more than one independent model (more
 than one object with no parent among the exported objects), the exporter
 writes a `<name>.untoldpack` manifest next to `--output` instead of a single
-`.untold` file, plus one self-contained `.untold` per model under its own
-subfolder:
+`.untold` file, plus one `.untold` per model under its own subfolder and one
+`Textures/` folder the models share:
 
 ```bash
 untoldengine export \
   --input warehouse.blend \
   --output warehouse.untold \
   --convert-orientation --optimize
-# → warehouse.untoldpack, Shelf/Shelf.untold, Forklift/Forklift.untold, ...
+# → warehouse.untoldpack, Shelf/Shelf.untold, Forklift/Forklift.untold, ..., Textures/
 ```
 
-`--optimize` bakes textures for every model in the pack. Load the result with
-`setEntityMeshAsync(entityId:filename:withExtension:)` using `"untoldpack"` —
-the engine loads a pack the same way it loads a single `.untold`, placing
-each model as a child entity. See [Using the Registration
+A model placed more than once (a shelf copied fifty times, a tree planted all
+over a site) is written once: every placement in the manifest points at the
+same `.untold`, with its own transform. Copies are found by content: the same
+geometry, materials and hierarchy, wherever they stand and whatever their
+names; meshes with no material all get the same default one, so their copies
+count as well. Skinned models and models with morph targets are always written
+on their own. Objects that share one mesh datablock in Blender (linked
+duplicates) and have no modifiers are also split and extracted once, which is
+most of the export time on scenes full of copies.
+
+`--optimize` bakes the shared textures once for the whole pack. Load the result with
+`setEntityMeshAsync(entityId:filename:)`, leaving `withExtension` out —
+the engine probes for `.untoldpack` then `.untold` automatically, so the same
+call works whether the scene exported as one file or a pack, placing each
+pack model as a child entity. See [Using the Registration
 System](UsingRegistrationSystem.md).
 
 Re-exporting the same `--output` path after the scene's model count changes
@@ -175,6 +186,59 @@ Re-exporting the same `--output` path after the scene's model count changes
 `.untold`/`.untoldpack` output, and any model subfolders a shrunk pack no
 longer references, so a caller never picks up a leftover file from an older
 export by accident.
+
+**A pack carries no scene-level data.** Scene-authored lights, cameras, and
+a `--color-grade-lut` are extracted from the `.blend` scene but have nowhere
+to go in a `.untoldpack` — there's no scene-wide slot in the manifest, only
+one self-contained `.untold` per model. The exporter prints a console note
+when this happens (and the Blender add-on's status bar shows the same
+warning). `loadSceneAuthored` (see [Using the Registration
+System](UsingRegistrationSystem.md)) only ever resolves a single `.untold`
+file, so it has nothing to do for a pack — recreate those lights/cameras by
+hand in the scene you build from the pack's models, or keep the source
+`.blend` to a single root model if you need them carried automatically.
+
+The export also builds a LOD chain for every model of the pack that is detailed
+enough to need one, so a large scene stays drawable from a distance without
+hand-made LODs. See [LOD chains for packs](#lod-chains-for-packs); pass
+`--no-lods` to leave them out.
+
+### LOD chains for packs
+
+`untoldengine bake-lods` writes simplified copies of a model next to it
+(`<name>_LOD1.untold`, `<name>_LOD2.untold`, ...) and, for a pack, records them
+in the manifest. The engine loads the levels with the pack and switches each
+placement between them by its size on screen (see [Automatic LOD chains for
+packs](UsingLODSystem.md#automatic-lod-chains-for-packs)).
+
+`untoldengine export` runs this step for the packs it writes. Use the command
+on its own for a pack cooked earlier, or to cook with other settings; it works
+from the cooked files, so neither the source asset nor Blender is needed, and
+running it again replaces the levels of the run before:
+
+```bash
+untoldengine bake-lods --input GameData/Models/site.untoldpack
+
+# Four levels instead of three, and chains for smaller models too
+untoldengine bake-lods --input site.untoldpack --ratios 0.5,0.25,0.1,0.02 --min-triangles 500
+
+# The levels of one model, without a pack
+untoldengine bake-lods --input Models/tree/tree.untold
+```
+
+| Flag | Description |
+|---|---|
+| `--input <path>` | The `.untoldpack` manifest, or one `.untold` model |
+| `--ratios <list>` | Share of the triangles each level aims for, finest first (default `0.5,0.15,0.03`) |
+| `--min-triangles <n>` | Models with fewer triangles get no chain (default `2000`) |
+| `--pixels-per-triangle <n>` | Screen pixels a triangle of a level covers when the level takes over, on a viewport 1080 pixels high (default `4`); higher values switch to the simpler levels sooner |
+
+A model placed many times is simplified once. A level the simplifier cannot
+reduce by a worthwhile amount is left out, and skinned, morphing and
+animation-only models keep their full meshes. Vegetation and similar models
+made of thousands of small separate pieces are thinned evenly, with the
+remaining pieces enlarged so that a canopy keeps its density. The simplifier is
+[meshoptimizer](https://github.com/zeux/meshoptimizer).
 
 ### Animation-only exports → `.untoldanim`
 
@@ -190,7 +254,9 @@ untoldengine export \
 
 `.untoldanim` is a plain `.untold` container under the hood, named distinctly
 so it's never mistaken for a mesh — `setEntityMeshAsync` rejects it; load it
-with `setEntityAnimations(entityId:filename:withExtension:name:)` instead.
+with `setEntityAnimations(entityId:filename:name:)` instead, again leaving
+`withExtension` out — it probes `.untoldanim` then `.untold`, covering assets
+exported before `.untoldanim` existed.
 
 ### Gaussian splats → `.untoldgs`
 
@@ -220,6 +286,7 @@ re-export from the source tool as v2/v3, or convert through `.ply` instead.
 | `--compress-geometry` | LZ4-compress vertex/index chunks |
 | `--assets-dir <path>` | Folder for the textures and per-model folders the result references (default: the `--output` folder) |
 | `--include-hidden` | Also export objects hidden in the viewport or disabled in renders |
+| `--no-lods` | Do not build the [LOD chains](#lod-chains-for-packs) of a pack's models |
 | `--validate` | Write a companion validation JSON file |
 | `--color-grade-lut <path>` | Stage an externally-authored `.cube` 3D LUT and apply it as a post-tonemap creative grade (no Blender render, no conversion) — see [Using Color Management](UsingColorManagement.md) |
 
@@ -331,6 +398,43 @@ payload: an alignment registers one capture to one mesh, so pass `--clear-alignm
 new capture's `--align-*` values then (the other tunables go back to their option defaults
 on every re-link). `--list` prints it after the exposure (`align (x, y, z) m, yaw d°,
 scale s`).
+
+---
+
+## Baking an ML Deformer Training Set
+
+`untoldengine bake-mldeformer` plays animation clips (plus smooth random
+augmentations) through the volumetric XPBD muscle simulation of a rigged
+`.untold` asset and records pose features and the skin deltas the muscles
+produce, every few frames, into a dataset you train a model on:
+
+```bash
+untoldengine bake-mldeformer --untold Models/hero/hero.untold \
+  --clip Animations/hero_flex/hero_flex.untoldanim \
+  --muscles hero.muscles.json --output bake/hero --passes 8
+```
+
+This writes `bake/hero.json`, `bake/hero.features.f32`, and
+`bake/hero.deltas.f16`. Train the network with `scripts/train_mldeformer.py`,
+which writes the `.untoldml` sidecar the runtime loads from next to the
+asset — see [`muscleDeformation.md`](../Architecture/muscleDeformation.md).
+
+| Flag | Description | Default |
+|---|---|---|
+| `--untold <path>` | The rigged `.untold` asset | — |
+| `--clip <path>` | Animation clip (`.untoldanim`); repeatable | — |
+| `--muscles <path>` | Muscle rig JSON (same format `untoldexplorer.py --muscles` consumes) | asset's muscle table |
+| `--output <path>` | Output base path, without extension | — |
+| `--passes <n>` | Augmentation passes per clip | `6` |
+| `--every <n>` | Record a sample every N simulated frames | `4` |
+| `--settle <n>` | Settle frames before the first sample of a play | `24` |
+| `--max-angle-degrees <f>` | Largest augmentation rotation per joint | `25` |
+| `--frame-rate <f>` | Simulation frame rate | `90` |
+| `--seed <u64>` | Random seed | `1` |
+
+If `--muscles` is omitted, the asset's own muscle table is used; the command
+fails with a clear error if neither is present. At least one `--clip` is
+required.
 
 ---
 

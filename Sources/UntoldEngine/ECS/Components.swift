@@ -912,6 +912,12 @@ public class LODComponent: Component {
     /// Mesh asset identifier for batching (material hash + LOD)
     public var activeMeshAssetID: String = ""
 
+    /// True when every level is the same surface at a different detail, mesh for mesh
+    /// (an automatic LOD chain): the materials then belong to the entity, not to a
+    /// level, and a switch carries them over, so a material edited or streamed while
+    /// one level is drawn stays when another takes its place.
+    public var levelsShareMaterials: Bool = false
+
     public required init() {}
 
     /// Check if the desired LOD level has a resident mesh
@@ -1150,7 +1156,8 @@ public enum TileVisualState {
 /// entire tiled scene as a single logical object.
 ///
 /// - Note: Root-entity transforms are not propagated to streaming/culling
-///   bounds in this release.  Keep the root at identity transform.
+///   bounds in this release.  `setEntityStreamScene` resets the root's own
+///   transform to identity; keep it, and the root's ancestors, there.
 public class TiledSceneComponent: Component {
     /// Human-readable label derived from the manifest filename.
     public var manifestLabel: String = ""
