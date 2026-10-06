@@ -15,10 +15,10 @@ The overall roadmap (see *Context* below) is:
 | Milestone | Deliverable |
 |---|---|
 | **M1 (this doc)** | Indexed pose representation, allocation-free clip sampling, inertialized transitions, root motion |
-| M2 | Two-bone foot IK using the existing ray-picking systems |
+| M2 | Two-bone foot IK using the existing ray-picking systems (first pose modifier, section 5) |
 | M3 | Motion matching: feature database, nearest-neighbour search, trajectory queries from `SteeringSystem` |
 | M4 | Demo: AI character locomoting over real terrain on visionOS with no animation state machine |
-| Later | Learned Motion Matching (network compression of the database); physics-based controllers |
+| Later | Learned Motion Matching (network compression of the database); physics-based animation (spring bones, ragdoll readback — see `docs/proposals/PhysicsBasedAnimationResearch.md`), physics-based controllers |
 
 M1 is valuable on its own even if nothing after it ships: every consumer of
 `changeAnimation` gets smooth transitions, and locomotion clips stop sliding.
@@ -177,7 +177,60 @@ This runs inside `AnimationSystem.update`, which executes before
 `PhysicsSystem` in the frame (`UntoldEngine.swift` update order), so physics
 and steering see the post-root-motion transform in the same frame.
 
-### 4. Joint buffer frames-in-flight fix
+### 4. Pose modifier stack
+
+A single hook between root motion and hierarchy compose: an ordered list of
+**pose modifiers** per entity that read and adjust the local-space
+`PoseBuffer` after the controller has produced it. This is the slot where
+everything that *post-processes* an animated pose lives — it is deliberately
+the same architectural seam as Godot 4's `SkeletonModifier3D` stack, which is
+the cleanest shipped model of "animation owns the bone transforms; everything
+else is a pose source blended in at a defined point".
+
+```swift
+protocol PoseModifier {
+    /// Blend weight applied by the system (see below), not by the modifier.
+    var influence: Float { get }
+    mutating func apply(to pose: inout PoseBuffer,
+                        context: PoseModifierContext,   // entity, skeleton,
+                        deltaTime: Float)               // model-space access
+}
+```
+
+Rules of the stack:
+
+- **Order is explicit** (array order on `AnimationComponent`). The expected
+  ordering when multiple modifiers exist: physics readback → IK → look-at →
+  secondary motion (spring bones last, so they react to everything).
+- **The system applies `influence`**, blending each modifier's output against
+  its input pose (nlerp rotations, lerp translations). Modifiers never blend
+  themselves — centralizing the blend is what makes ramping a modifier in and
+  out (hit reactions, IK fade during swing phase) uniform and free.
+  A modifier may additionally expose *per-joint* weights (physics readback
+  needs this: hit bone 1.0, falloff up the chain); per-joint weights multiply
+  the scalar `influence`.
+- **Local space in, local space out.** Modifiers that need model-space joint
+  matrices (foot IK, a future ragdoll mapper) get them from
+  `PoseModifierContext`, which computes the model-space snapshot lazily and
+  invalidates it when a prior modifier writes the pose. The contiguous
+  model-space matrices + parent-index array in the context are exactly the
+  interchange format a physics skeleton mapper consumes — that requirement is
+  designed in here so the physics phase later plugs in without touching this
+  layer.
+- **Not public in M1/M2.** Same publication policy as the controller
+  protocol: foot IK (M2) is the first *internal* modifier and exercises the
+  seam; the protocol goes `public` in a small `[Feature]` PR when the first
+  external consumer (physics-based animation, or a game's custom look-at)
+  needs it. Until then the stack is engine-internal machinery.
+
+Known future modifiers, to keep the design honest: foot IK (M2), spring/jiggle
+bone chains, ragdoll/physics pose readback with per-bone blend weights, and
+aim/look-at. The physics research doc
+(`docs/proposals/PhysicsBasedAnimationResearch.md`, section 5) depends on
+exactly this hook plus the model-space snapshot; nothing else in that plan
+touches M1–M3 machinery.
+
+### 5. Joint buffer frames-in-flight fix
 
 Independent `[Patch]` PR: `Skin.jointTransformsBuffer` becomes a ring of
 `totalPerMeshUniformBuffers()` buffers indexed by the frame-in-flight counter,
@@ -206,7 +259,9 @@ layering is:
 │ Pose machinery (engine-owned, this doc)                │
 │   PoseBuffer · compiled clips · sampler ·              │
 │   inertialization · root motion application ·          │
-│   hierarchy compose · skinning upload                  │
+│   pose modifier stack (IK · physics readback ·         │
+│   secondary motion) · hierarchy compose ·              │
+│   skinning upload                                      │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -219,12 +274,12 @@ Consequences for M1:
 
 - The machinery is built **in-engine** (as decided), but `AnimationSystem`'s
   update is structured as *evaluate controller → inertialize → apply root
-  motion → compose → skin* from the start, with the existing clip player as
-  the built-in controller. No public protocol yet. (Since M1 the layer, reach
-  IK and foot IK stages sit between root motion and compose, and a
-  **physics pose** — a model-space pose a physics plugin hands in through
-  `setPhysicsPose`, blended per joint — is the last stage before compose;
-  see `docs/API/UsingPhysicsPose.md`.)
+  motion → run pose modifiers → compose → skin* from the start, with the
+  existing clip player as the built-in controller. No public protocol yet.
+  (Since M1 the layer, reach IK and foot IK stages sit between root motion
+  and compose, and a **physics pose** — a model-space pose a physics plugin
+  hands in through `setPhysicsPose`, blended per joint — is the last stage
+  before compose; see `docs/API/UsingPhysicsPose.md`.)
 - The controller interface (`PoseBuffer` + an `AnimationPoseController`
   protocol + registration) is **published only when M3 exists** — motion
   matching is the first real external consumer, and freezing a public API
