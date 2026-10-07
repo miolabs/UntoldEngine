@@ -134,6 +134,9 @@ public enum RenderPasses {
     /// Try-out only: whether a glass draw writes its depth in the headset. UNTOLD_GLASS_XR_DEPTH=0
     /// never, =1 always; unset: when the pane mostly shows itself (Material.paneShowsItself).
     private static let glassXRDepthMode = ProcessInfo.processInfo.environment["UNTOLD_GLASS_XR_DEPTH"]
+    /// Try-out only: the depth bias of glass draws (see the transparency pass).
+    private static let glassDepthBias = Float(ProcessInfo.processInfo.environment["UNTOLD_GLASS_DEPTH_BIAS"] ?? "") ?? 4
+    private static let glassDepthSlope = Float(ProcessInfo.processInfo.environment["UNTOLD_GLASS_DEPTH_SLOPE"] ?? "") ?? 2
     private static func glassWritesDepthInXR(_ material: Material) -> Bool {
         switch glassXRDepthMode {
         case "0": return false
@@ -4122,6 +4125,17 @@ public enum RenderPasses {
                     // in no order, and the far side of a pane must not come out over its near
                     // side. The other materials are drawn in one go, as before.
                     let isGlass = material.transmitsLight
+                    // Try-out only: a pane modelled into its frame shares a plane with the frame
+                    // and fights it for depth along its edges, at every move of the head. Glass is
+                    // pushed a hair away from the viewer (UNTOLD_GLASS_DEPTH_BIAS units of depth
+                    // resolution and UNTOLD_GLASS_DEPTH_SLOPE per unit of slope, 0 = off), so the
+                    // frame wins wherever the two coincide and the pane's edge sits in its frame.
+                    if isGlass, glassDepthBias != 0 || glassDepthSlope != 0 {
+                        let away: Float = renderInfo.reverseZEnabled ? -1 : 1
+                        renderEncoder.setDepthBias(away * glassDepthBias, slopeScale: away * glassDepthSlope, clamp: 0)
+                    } else {
+                        renderEncoder.setDepthBias(0, slopeScale: 0, clamp: 0)
+                    }
                     // Try-out only: in the headset the compositor reprojects every pixel by the
                     // depth it finds, so a pane that writes no depth carries the depth of what
                     // is behind it and its tint and reflections jitter against it. Glass writes
