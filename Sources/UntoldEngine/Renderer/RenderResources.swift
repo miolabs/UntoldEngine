@@ -97,8 +97,11 @@ func eyePosition(fromViewMatrix viewMatrix: simd_float4x4) -> simd_float3 {
 /// Already folded through SceneRootTransform like every other shading camera position.
 @inline(__always)
 func shadingCameraPosition(_ cameraComponent: CameraComponent) -> simd_float3 {
-    SceneRootTransform.shared.effectiveCameraPosition(renderInfo.xrEyeCameraPosition ?? cameraComponent.localPosition)
+    SceneRootTransform.shared.effectiveCameraPosition((perEyeShadingInXR ? renderInfo.xrEyeCameraPosition : nil) ?? cameraComponent.localPosition)
 }
+
+/// Try-out only: UNTOLD_XR_PER_EYE=0 shades both eyes from the head centre again, to compare.
+let perEyeShadingInXR = ProcessInfo.processInfo.environment["UNTOLD_XR_PER_EYE"] != "0"
 
 @inline(__always)
 public func sceneDepthClearValue() -> Double {
