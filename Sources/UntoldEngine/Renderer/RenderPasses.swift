@@ -131,8 +131,16 @@ public enum RenderPasses {
     }
 
     @inline(__always)
-    /// Try-out only: glass writes its depth in the headset unless UNTOLD_GLASS_XR_DEPTH=0.
-    private static let glassWritesDepthInXR = ProcessInfo.processInfo.environment["UNTOLD_GLASS_XR_DEPTH"] != "0"
+    /// Try-out only: whether a glass draw writes its depth in the headset. UNTOLD_GLASS_XR_DEPTH=0
+    /// never, =1 always; unset: when the pane mostly shows itself (Material.paneShowsItself).
+    private static let glassXRDepthMode = ProcessInfo.processInfo.environment["UNTOLD_GLASS_XR_DEPTH"]
+    private static func glassWritesDepthInXR(_ material: Material) -> Bool {
+        switch glassXRDepthMode {
+        case "0": return false
+        case "1": return true
+        default: return material.paneShowsItself
+        }
+    }
 
     private static func getOrCreateTransparencyXRDepthWriteState(device: MTLDevice) -> MTLDepthStencilState? {
         runtimeState.lock.lock()
@@ -4120,8 +4128,8 @@ public enum RenderPasses {
                     // its depth there (UNTOLD_GLASS_XR_DEPTH=0 keeps the old way, to compare);
                     // the other blended materials keep the pass's state. Passthrough already
                     // writes depth for every transparent draw.
-                    if renderInfo.isXRStereoMode, renderInfo.immersionStyle != .mixed, glassWritesDepthInXR {
-                        if isGlass, let writeState = getOrCreateTransparencyXRDepthWriteState(device: renderInfo.device) {
+                    if renderInfo.isXRStereoMode, renderInfo.immersionStyle != .mixed {
+                        if isGlass, glassWritesDepthInXR(material), let writeState = getOrCreateTransparencyXRDepthWriteState(device: renderInfo.device) {
                             renderEncoder.setDepthStencilState(writeState)
                         } else {
                             renderEncoder.setDepthStencilState(transparencyPipeline.depthState)

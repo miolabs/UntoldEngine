@@ -114,7 +114,9 @@ fragment TransparencyOutput fragmentTransparencyShader(
         : normalize(uniforms.normalMatrix * in.normal);
     // A face of glass is lit on the side the viewer sees: the far face of a pane
     // reflects from inside it what its near face reflects from outside.
-    if (faces != transparencyPassEveryFace && turnedAway) {
+    // The shading normal of a pane faces the viewer whichever go draws the face: the
+    // face's side and the smooth normal can disagree at an edge.
+    if (faces != transparencyPassEveryFace && dot(normal, viewVector) < 0.0) {
         normal = -normal;
     }
 
