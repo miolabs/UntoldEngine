@@ -504,7 +504,9 @@ func executeHZBOcclusionCulling(
     outputVisibleCountBuffer: MTLBuffer,
     hzbPyramidOverride: MTLTexture? = nil
 ) -> Bool {
-    if hzbPyramidOverride == nil && renderInfo.hzbIsValid == false {
+    // Try-out only: UNTOLD_HZB_OCCLUSION=0 leaves the occlusion test out, so that the
+    // frustum alone decides; the pyramid is the previous frame's view.
+    if hzbPyramidOverride == nil && (renderInfo.hzbIsValid == false || hzbOcclusionForMeshesEnabled == false) {
         return false
     }
 
@@ -1224,3 +1226,6 @@ func isAABBInFrustum(_ frustum: Frustum, min aabbMin: simd_float3, max aabbMax: 
 func isAABBInFrustum(center: simd_float3, halfExtent: simd_float3, frustum: Frustum) -> Bool {
     isAABBInFrustum(frustum, min: center - halfExtent, max: center + halfExtent)
 }
+
+/// Try-out only: the mesh occlusion test against the depth pyramid, off with UNTOLD_HZB_OCCLUSION=0.
+let hzbOcclusionForMeshesEnabled = ProcessInfo.processInfo.environment["UNTOLD_HZB_OCCLUSION"] != "0"
