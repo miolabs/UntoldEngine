@@ -320,7 +320,7 @@ public enum RenderPasses {
 
         init(cameraComponent: CameraComponent) {
             viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-            cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+            cameraPosition = shadingCameraPosition(cameraComponent)
         }
 
         /// The entity's LOD component while LOD fades are on; nil otherwise, and for an
@@ -1231,7 +1231,7 @@ public enum RenderPasses {
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
         skyUniforms.invViewMatrix = viewMatrix.inverse
         skyUniforms.invProjectionMatrix = renderInfo.perspectiveSpace.inverse
-        skyUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        skyUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
 
         let sunParameters = getDirectionalLightParameters()
         skyUniforms.sunDirection = sunParameters.direction
@@ -1438,7 +1438,7 @@ public enum RenderPasses {
 
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
         // What every draw of the pass shares, read once.
-        let cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let cameraPosition = shadingCameraPosition(cameraComponent)
         let projectionMatrix = renderInfo.perspectiveSpace
 
         // The casters whose vertices are not their own (no skeleton, no deformation) are
@@ -1589,7 +1589,7 @@ public enum RenderPasses {
         batchUniforms.viewMatrix = viewMatrix
         batchUniforms.modelViewMatrix = viewMatrix
         batchUniforms.normalMatrix = matrix_identity_float3x3
-        batchUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        batchUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
         batchUniforms.projectionMatrix = renderInfo.perspectiveSpace
 
         for cascadeIdx in 0 ..< csmCascadeCount {
@@ -1714,7 +1714,7 @@ public enum RenderPasses {
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
         // What every draw of the pass shares, read once.
         let sceneSnapshot = RenderSceneSnapshot()
-        let cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let cameraPosition = shadingCameraPosition(cameraComponent)
         let projectionMatrix = renderInfo.perspectiveSpace
         for caster in spotShadowCasters(in: sceneSnapshot) {
             let transformComponent = caster.components.world
@@ -1754,7 +1754,7 @@ public enum RenderPasses {
             batchUniforms.viewMatrix = viewMatrix
             batchUniforms.modelViewMatrix = viewMatrix
             batchUniforms.normalMatrix = matrix_identity_float3x3
-            batchUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+            batchUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
             batchUniforms.projectionMatrix = renderInfo.perspectiveSpace
 
             for batchGroup in spotShadowCasterBatchGroups() {
@@ -1814,7 +1814,7 @@ public enum RenderPasses {
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
         // What every draw of the pass shares, read once.
         let sceneSnapshot = RenderSceneSnapshot()
-        let cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let cameraPosition = shadingCameraPosition(cameraComponent)
         let projectionMatrix = renderInfo.perspectiveSpace
         let casters = pointShadowCasters(in: sceneSnapshot)
         let batchGroups = BatchingSystem.shared.isEnabled() ? pointShadowCasterBatchGroups() : []
@@ -1888,7 +1888,7 @@ public enum RenderPasses {
                 batchUniforms.viewMatrix = viewMatrix
                 batchUniforms.modelViewMatrix = viewMatrix
                 batchUniforms.normalMatrix = matrix_identity_float3x3
-                batchUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+                batchUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
                 batchUniforms.projectionMatrix = renderInfo.perspectiveSpace
 
                 for batchGroup in batchGroups {
@@ -2287,7 +2287,7 @@ public enum RenderPasses {
         batchUniforms.viewMatrix = viewMatrix
         batchUniforms.modelViewMatrix = modelViewMatrix
         batchUniforms.normalMatrix = normalMatrix
-        batchUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        batchUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
         batchUniforms.projectionMatrix = renderInfo.perspectiveSpace
 
         // Render only batch groups that contain at least one visible entity.
@@ -2645,7 +2645,7 @@ public enum RenderPasses {
                 batchUniforms.viewMatrix = viewMatrix
                 batchUniforms.modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
                 batchUniforms.normalMatrix = matrix3x3_upper_left(modelMatrix).inverse.transpose
-                batchUniforms.cameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+                batchUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
                 batchUniforms.projectionMatrix = renderInfo.perspectiveSpace
 
                 for batchGroup in visibleBatchGroups {
@@ -2806,7 +2806,7 @@ public enum RenderPasses {
         lightQuadEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         lightQuadEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
 
-        var effectiveCamPos = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        var effectiveCamPos = shadingCameraPosition(cameraComponent)
         lightQuadEncoder.setFragmentBytes(&effectiveCamPos, length: MemoryLayout<simd_float3>.stride, index: Int(lightPassCameraPositionIndex.rawValue))
 
         var csmUniforms = shadowSystem.makeUniforms()
@@ -3467,7 +3467,7 @@ public enum RenderPasses {
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
 
-        var effectiveCamPos = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        var effectiveCamPos = shadingCameraPosition(cameraComponent)
         renderEncoder.setFragmentBytes(&effectiveCamPos, length: MemoryLayout<simd_float3>.stride, index: Int(lightPassCameraPositionIndex.rawValue))
 
         // CSM uniforms: pack all cascade matrices + split distances into one struct.
@@ -3826,7 +3826,7 @@ public enum RenderPasses {
             index: Int(transparencyPassLightOrthoViewMatrixIndex.rawValue)
         )
 
-        var effectiveCamPos = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        var effectiveCamPos = shadingCameraPosition(cameraComponent)
         renderEncoder.setFragmentBytes(
             &effectiveCamPos,
             length: MemoryLayout<simd_float3>.stride,
@@ -3913,7 +3913,7 @@ public enum RenderPasses {
             index: Int(transparencyPassIBLRotationAngleIndex.rawValue)
         )
 
-        let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
 
         // What every draw of the pass shares, read once.
         let sceneSnapshot = RenderSceneSnapshot()
@@ -4180,7 +4180,7 @@ public enum RenderPasses {
         guard !shellEntityIds.isEmpty else { return }
 
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
 
         let descriptor = MTLRenderPassDescriptor()
         descriptor.renderTargetWidth = depthTexture.width
@@ -4273,7 +4273,7 @@ public enum RenderPasses {
             return
         }
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
         wireframeRenderStateLock.lock()
         let wireframeSettings = wireframeRenderState
         wireframeRenderStateLock.unlock()
@@ -4462,7 +4462,7 @@ public enum RenderPasses {
             return
         }
         let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let effectiveCameraPosition = SceneRootTransform.shared.effectiveCameraPosition(cameraComponent.localPosition)
+        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
 
         let sceneSnapshot = RenderSceneSnapshot()
         let batchingEnabled = BatchingSystem.shared.isEnabled()
