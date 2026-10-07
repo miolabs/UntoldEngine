@@ -131,6 +131,9 @@ public enum RenderPasses {
     }
 
     @inline(__always)
+    /// Try-out only: glass writes its depth in the headset unless UNTOLD_GLASS_XR_DEPTH=0.
+    private static let glassWritesDepthInXR = ProcessInfo.processInfo.environment["UNTOLD_GLASS_XR_DEPTH"] != "0"
+
     private static func getOrCreateTransparencyXRDepthWriteState(device: MTLDevice) -> MTLDepthStencilState? {
         runtimeState.lock.lock()
         if let cached = runtimeState.transparencyXRDepthWriteState {
@@ -4111,6 +4114,19 @@ public enum RenderPasses {
                     // in no order, and the far side of a pane must not come out over its near
                     // side. The other materials are drawn in one go, as before.
                     let isGlass = material.transmitsLight
+                    // Try-out only: in the headset the compositor reprojects every pixel by the
+                    // depth it finds, so a pane that writes no depth carries the depth of what
+                    // is behind it and its tint and reflections jitter against it. Glass writes
+                    // its depth there (UNTOLD_GLASS_XR_DEPTH=0 keeps the old way, to compare);
+                    // the other blended materials keep the pass's state. Passthrough already
+                    // writes depth for every transparent draw.
+                    if renderInfo.isXRStereoMode, renderInfo.immersionStyle != .mixed, glassWritesDepthInXR {
+                        if isGlass, let writeState = getOrCreateTransparencyXRDepthWriteState(device: renderInfo.device) {
+                            renderEncoder.setDepthStencilState(writeState)
+                        } else {
+                            renderEncoder.setDepthStencilState(transparencyPipeline.depthState)
+                        }
+                    }
                     let firstGo = isGlass ? transparencyPassFarFaces : transparencyPassEveryFace
                     for go in 0 ..< (isGlass ? 2 : 1) {
                         var faces = Int32((go == 0 ? firstGo : transparencyPassNearFaces).rawValue)
