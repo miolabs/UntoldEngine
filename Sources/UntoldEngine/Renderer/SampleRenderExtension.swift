@@ -74,7 +74,7 @@ public final class SampleRenderExtension: RenderExtension, @unchecked Sendable {
                 clearColor.w
             )
 
-            guard let encoder = context.commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            guard let encoder = context.commandBuffer.makeRenderCommandEncoder(descriptor: descriptor, passLabel: "Sample Render Extension Scratch Clear") else {
                 return
             }
             encoder.label = "Sample Render Extension Scratch Clear"

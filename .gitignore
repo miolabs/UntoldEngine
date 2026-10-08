@@ -97,3 +97,7 @@ scripts/tests/__pycache__/
 
 # Local SwiftPM scratch directories other than .build (e.g. .build-strict for the strict-concurrency build).
 .build*/
+
+# PerfBench run output (scripts/perf/run_bench.sh)
+perf/results/*
+!perf/results/.gitkeep

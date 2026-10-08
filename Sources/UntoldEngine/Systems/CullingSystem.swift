@@ -379,7 +379,7 @@ public func buildHZBDepthPyramid(_ commandBuffer: MTLCommandBuffer, eyeIndex: In
             var mipLevel = UInt32(level)
             var sourceDimensions = simd_uint2(UInt32(sourceWidth), UInt32(sourceHeight))
             var reverseZFlag: UInt32 = renderInfo.reverseZEnabled ? 1 : 0
-            let computeEncoder = commandBuffer.makeComputeCommandEncoder()!
+            let computeEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "HZB Build Eye\(ei) Mip \(level)")!
             computeEncoder.label = "HZB Build Eye\(ei) Mip \(level)"
             computeEncoder.setComputePipelineState(pipelineState)
             computeEncoder.setBytes(&mipLevel, length: MemoryLayout<UInt32>.stride, index: Int(hzbBuildPassMipLevelIndex.rawValue))
@@ -447,7 +447,7 @@ public func buildHZBDepthPyramid(_ commandBuffer: MTLCommandBuffer, eyeIndex: In
         )
         var reverseZFlag: UInt32 = renderInfo.reverseZEnabled ? 1 : 0
 
-        let computeEncoder: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder()!
+        let computeEncoder: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "HZB Build Mip \(level)")!
         computeEncoder.label = "HZB Build Mip \(level)"
         computeEncoder.setComputePipelineState(pipelineState)
         computeEncoder.setBytes(&mipLevel, length: MemoryLayout<UInt32>.stride, index: Int(hzbBuildPassMipLevelIndex.rawValue))
@@ -523,7 +523,7 @@ func executeHZBOcclusionCulling(
     // and projection drift before declaring an object fully occluded.
     var occlusionBias: Float = 0.02
 
-    let computeEncoder: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder()!
+    let computeEncoder: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "HZB Occlusion Culling pass")!
     computeEncoder.label = "HZB Occlusion Culling pass"
     computeEncoder.setComputePipelineState(pipelineState)
     computeEncoder.setBuffer(outputVisibilityBuffer, offset: 0, index: Int(hzbCullPassEntityAABBIndex.rawValue))
@@ -714,7 +714,7 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         return
     }
 
-    let computeEncoder: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder()!
+    let computeEncoder: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Frustum Culling pass")!
 
     computeEncoder.label = "Frustum Culling pass"
 
@@ -1069,7 +1069,7 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     // Mark visible launch
     do {
-        let computeEncoderMarkVisible: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder()!
+        let computeEncoderMarkVisible: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Mark Visible Pass")!
 
         computeEncoderMarkVisible.label = "Mark Visible Pass"
 
@@ -1089,7 +1089,7 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     // scan local
     do {
-        let computeEncoderLocalScan: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder()!
+        let computeEncoderLocalScan: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Local Scan Pass")!
 
         computeEncoderLocalScan.label = "Local Scan Pass"
 
@@ -1111,7 +1111,7 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     // scan block
 
     do {
-        let computeEncoderBlockScan: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder()!
+        let computeEncoderBlockScan: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Block Scan Pass")!
 
         computeEncoderBlockScan.label = "Block Scan Pass"
 
@@ -1136,7 +1136,7 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     // Compact and stream
     do {
-        let computeEncoderCompact: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder()!
+        let computeEncoderCompact: MTLComputeCommandEncoder = commandBuffer.makeComputeCommandEncoder(passLabel: "Compact and Stream Pass")!
 
         computeEncoderCompact.label = "Compact and Stream Pass"
 

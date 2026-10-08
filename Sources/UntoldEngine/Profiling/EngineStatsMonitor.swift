@@ -9,6 +9,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
+import os
 import QuartzCore
 
 public enum EngineStatsLoggingProfile: Equatable {
@@ -18,6 +19,10 @@ public enum EngineStatsLoggingProfile: Equatable {
 
 public final class EngineStatsMonitor: @unchecked Sendable {
     public static let shared = EngineStatsMonitor()
+
+    /// Runtime switch for stats collection. Read on every frame-loop call site without taking the
+    /// monitor lock; defaults to on in debug builds and off in release builds, or to `UNTOLD_STATS=1`.
+    private let collecting: OSAllocatedUnfairLock<Bool>
 
     #if ENGINE_STATS_ENABLED
         private let lock = NSLock()
@@ -33,6 +38,27 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         private var _latestGPUFrameCadenceMs: Double = 0.0
         private var _lastGPUCompletionTime: Double = 0.0 // 0 = no completion seen yet
 
+        // Compositor deadline accounting (visionOS) — written from addCompletedHandler, read at completeFrame()
+        private var _latestDeadlineMarginMs: Double = 0.0
+        private var _latestPresentationMarginMs: Double = 0.0
+        private var _latestMissedDeadline: Bool = false
+        private var _missedDeadlineCount: Int = 0
+        private var _deadlineSampleCount: Int = 0
+        private var _missingAnchorCount: Int = 0
+
+        // Hitch accounting (frame-time histogram, over-budget counts, one-second window)
+        private var _frameBudgetMs: Double = 1000.0 / 60.0
+        private var _hitches = EngineHitchStats()
+        private var _windowStartSeconds: Double = 0.0
+        private var _windowStarted = false
+        private var _windowFrames: Int = 0
+        private var _windowFramesOverBudget: Int = 0
+        private var _windowWorstFrameMs: Double = 0.0
+        private var _lastThermalState: Int = -1
+
+        /// Optional JSON Lines recorder fed with every published snapshot.
+        private var recorder: EngineStatsRecorder?
+
         // 30-frame rolling average for smoothed CPU frame time
         private let kSmoothingWindow = 30
         private var _frameMsBuffer: [Double] = .init(repeating: 0.0, count: 30)
@@ -41,9 +67,28 @@ public final class EngineStatsMonitor: @unchecked Sendable {
     #endif
 
     private init() {
+        let environmentValue = ProcessInfo.processInfo.environment["UNTOLD_STATS"]
+        let initialState: Bool
+        if let environmentValue {
+            initialState = environmentValue == "1"
+        } else {
+            #if DEBUG
+                initialState = true
+            #else
+                initialState = false
+            #endif
+        }
+        collecting = OSAllocatedUnfairLock(initialState: initialState)
         #if ENGINE_STATS_ENABLED
             lastLogTime = CACurrentMediaTime()
         #endif
+    }
+
+    /// Whether the monitor collects and publishes stats. When false every per-frame call returns
+    /// at once and `snapshot()` keeps returning the last published frame.
+    public var isCollecting: Bool {
+        get { collecting.withLock { $0 } }
+        set { collecting.withLock { $0 = newValue } }
     }
 
     public var enableLogging: Bool {
@@ -63,6 +108,40 @@ public final class EngineStatsMonitor: @unchecked Sendable {
                 lock.unlock()
             #endif
         }
+    }
+
+    /// Frame budget for the hitch counts (`EngineHitchStats`). Defaults to 60 Hz; the visionOS
+    /// runtime sets it to the 90 Hz period. Changing it does not rewrite past counts.
+    public var frameBudgetMs: Double {
+        get {
+            #if ENGINE_STATS_ENABLED
+                lock.lock()
+                defer { lock.unlock() }
+                return _frameBudgetMs
+            #else
+                return 1000.0 / 60.0
+            #endif
+        }
+        set {
+            #if ENGINE_STATS_ENABLED
+                lock.lock()
+                _frameBudgetMs = max(0.1, newValue)
+                lock.unlock()
+            #endif
+        }
+    }
+
+    /// Attaches a recorder that receives every published snapshot, replacing any earlier one.
+    func attachRecorder(_ newRecorder: EngineStatsRecorder?) -> EngineStatsRecorder? {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            let previous = recorder
+            recorder = newRecorder
+            lock.unlock()
+            return previous
+        #else
+            return newRecorder
+        #endif
     }
 
     public var loggingProfile: EngineStatsLoggingProfile {
@@ -130,16 +209,19 @@ public final class EngineStatsMonitor: @unchecked Sendable {
 
     public func beginFrame(timestampSeconds: Double = CACurrentMediaTime()) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             currentSnapshot.frameIndex &+= 1
             currentSnapshot.timestampSeconds = timestampSeconds
             currentSnapshot.timing = .init()
+            currentSnapshot.compositor = .init()
             lock.unlock()
         #endif
     }
 
     public func update(_ updater: (inout EngineStatsSnapshot) -> Void) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             updater(&currentSnapshot)
             lock.unlock()
@@ -150,6 +232,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
     /// Safe to call from any thread.
     public func recordGPUCompletion(executionMs: Double) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             let now = CACurrentMediaTime()
             lock.lock()
             let cadenceMs = _lastGPUCompletionTime > 0
@@ -162,13 +245,53 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         #endif
     }
 
+    /// Called from MTLCommandBuffer.addCompletedHandler on visionOS with the GPU completion time
+    /// measured against the compositor's rendering deadline and presentation time for that frame.
+    /// Safe to call from any thread.
+    public func recordCompositorCompletion(deadlineMarginMs: Double, presentationMarginMs: Double) {
+        #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
+            lock.lock()
+            _latestDeadlineMarginMs = deadlineMarginMs
+            _latestPresentationMarginMs = presentationMarginMs
+            _latestMissedDeadline = deadlineMarginMs < 0.0
+            _deadlineSampleCount += 1
+            if deadlineMarginMs < 0.0 {
+                _missedDeadlineCount += 1
+            }
+            lock.unlock()
+        #else
+            _ = deadlineMarginMs
+            _ = presentationMarginMs
+        #endif
+    }
+
+    /// Called once per frame that is presented without a fresh device anchor (visionOS).
+    public func recordMissingAnchor() {
+        #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
+            lock.lock()
+            _missingAnchorCount += 1
+            lock.unlock()
+        #endif
+    }
+
     /// Publishes the current frame so API readers can safely consume it next frame.
     public func completeFrame() {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             lock.lock()
             // Pull in latest GPU timing from async handler
             currentSnapshot.timing.gpuExecutionMs = _latestGPUExecutionMs
             currentSnapshot.timing.gpuFrameCadenceMs = _latestGPUFrameCadenceMs
+
+            // Pull in the latest compositor deadline sample and the cumulative counters
+            currentSnapshot.compositor.deadlineMarginMs = _latestDeadlineMarginMs
+            currentSnapshot.compositor.presentationMarginMs = _latestPresentationMarginMs
+            currentSnapshot.compositor.missedDeadline = _latestMissedDeadline
+            currentSnapshot.compositor.missedDeadlineCount = _missedDeadlineCount
+            currentSnapshot.compositor.deadlineSampleCount = _deadlineSampleCount
+            currentSnapshot.compositor.missingAnchorCount = _missingAnchorCount
 
             // Update 30-frame rolling average for CPU frame time
             let frameMs = currentSnapshot.timing.frameTotalMs
@@ -183,8 +306,50 @@ public final class EngineStatsMonitor: @unchecked Sendable {
                 ? sum / Double(_frameMsFilled)
                 : frameMs
 
+            // Hitch accounting: cumulative histogram and over-budget count, plus a one-second window
+            _hitches.frameBudgetMs = _frameBudgetMs
+            _hitches.framesSampled += 1
+            let overBudget = frameMs > _frameBudgetMs
+            if overBudget {
+                _hitches.framesOverBudget += 1
+            }
+            _hitches.histogram[EngineHitchStats.bucketIndex(forFrameMs: frameMs)] += 1
+
+            let now = currentSnapshot.timestampSeconds
+            if !_windowStarted {
+                _windowStarted = true
+                _windowStartSeconds = now
+            }
+            if now - _windowStartSeconds >= 1.0 {
+                _hitches.framesLastSecond = _windowFrames
+                _hitches.framesOverBudgetLastSecond = _windowFramesOverBudget
+                _hitches.worstFrameMsLastSecond = _windowWorstFrameMs
+                _windowFrames = 0
+                _windowFramesOverBudget = 0
+                _windowWorstFrameMs = 0.0
+                _windowStartSeconds = now
+            }
+            _windowFrames += 1
+            if overBudget {
+                _windowFramesOverBudget += 1
+            }
+            _windowWorstFrameMs = max(_windowWorstFrameMs, frameMs)
+            currentSnapshot.hitches = _hitches
+
+            // Thermal transitions are rare and worth a mark on the Instruments timeline
+            let thermalState = currentSnapshot.memory.thermalState
+            let thermalChanged = _lastThermalState >= 0 && thermalState != _lastThermalState
+            _lastThermalState = thermalState
+
             publishedSnapshot = currentSnapshot
+            let recordedSnapshot = currentSnapshot
+            let activeRecorder = recorder
             lock.unlock()
+
+            if thermalChanged {
+                EngineProfiler.shared.emitEvent(.thermalStateChanged)
+            }
+            activeRecorder?.enqueue(recordedSnapshot)
         #endif
     }
 
@@ -206,6 +371,19 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             _latestGPUExecutionMs = 0.0
             _latestGPUFrameCadenceMs = 0.0
             _lastGPUCompletionTime = 0.0
+            _latestDeadlineMarginMs = 0.0
+            _latestPresentationMarginMs = 0.0
+            _latestMissedDeadline = false
+            _missedDeadlineCount = 0
+            _deadlineSampleCount = 0
+            _missingAnchorCount = 0
+            _hitches = EngineHitchStats(frameBudgetMs: _frameBudgetMs)
+            _windowStartSeconds = 0.0
+            _windowStarted = false
+            _windowFrames = 0
+            _windowFramesOverBudget = 0
+            _windowWorstFrameMs = 0.0
+            _lastThermalState = -1
             _frameMsBuffer = .init(repeating: 0.0, count: kSmoothingWindow)
             _frameMsBufferIndex = 0
             _frameMsFilled = 0
@@ -215,6 +393,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
 
     public func tick() {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             let now = CACurrentMediaTime()
             var shouldLog = false
             var snapshotToLog: EngineStatsSnapshot = .init()
@@ -259,6 +438,17 @@ public func getEngineStatsSnapshotInProgress() -> EngineStatsSnapshot {
 
 public func setEngineStatsLogging(enabled: Bool) {
     EngineStatsMonitor.shared.enableLogging = enabled
+}
+
+/// Turns stats collection on or off at runtime. Collection is on by default in debug builds and
+/// off in release builds (`UNTOLD_STATS=1` in the environment turns it on anywhere). Turning it on
+/// in a release build is how device measurements are taken.
+public func setEngineStatsCollection(enabled: Bool) {
+    EngineStatsMonitor.shared.isCollecting = enabled
+}
+
+public func isEngineStatsCollectionEnabled() -> Bool {
+    EngineStatsMonitor.shared.isCollecting
 }
 
 public func setEngineStatsLogging(
