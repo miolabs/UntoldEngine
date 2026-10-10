@@ -396,13 +396,17 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             var summary = TileRenderCostSummary()
             let loadedFullTiles = Set(GeometryStreamingSystem.shared.loadedTileEntitiesSnapshot())
 
+            let sceneSnapshot = RenderSceneSnapshot()
             for entityId in visibleEntityIds {
-                guard scene.exists(entityId),
-                      let render = scene.get(component: RenderComponent.self, for: entityId)
-                else { continue }
+                guard let entity = sceneSnapshot.entity(entityId) else { continue }
+                // Neither a tile's LOD mesh nor, with no full tile loaded, a child of one:
+                // nothing of this entity goes into the summary.
+                let tileLODTag = sceneSnapshot.tileLODTag(of: entity)
+                if tileLODTag == nil, loadedFullTiles.isEmpty { continue }
+                guard let render = sceneSnapshot.render(of: entity) else { continue }
 
                 let cost = tileRenderCost(for: render)
-                if let tag = scene.get(component: TileLODTagComponent.self, for: entityId) {
+                if let tag = tileLODTag {
                     if tag.levelIndex == 5 {
                         summary.hlodVisibleInstances += 1
                         summary.hlodDrawsEstimate += cost.draws
@@ -689,6 +693,8 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     }
 
     public func draw(in view: MTKView) {
+        // Not an XR eye: shading uses the camera's own position.
+        renderInfo.xrEyeCameraPosition = nil
         if pendingResize {
             initSizeableResources()
             pendingResize = false
@@ -831,6 +837,10 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         }
 
         cameraComponent.viewSpace = viewMatrix
+        // The eye's own position: the view matrix is the inverse of the eye's camera
+        // transform. CameraComponent.localPosition stays at the head centre (see
+        // setXRCameraWorldPosition), which streaming wants and shading does not.
+        renderInfo.xrEyeCameraPosition = eyePosition(fromViewMatrix: viewMatrix)
 
         // Save this eye's view-projection for next frame's per-eye HZB culling, and the raw
         // view and projection it was built from for the Gaussian chunk cull, which folds in

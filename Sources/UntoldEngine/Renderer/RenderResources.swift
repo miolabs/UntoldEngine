@@ -55,6 +55,10 @@ public struct RenderInfo {
     public var colorPipeline: ColorPipelineConfig = .standard(presentFormat: .bgra8Unorm_srgb)
     public var hzbMipCount: Int = 0
     public var hzbIsValid: Bool = false
+    /// The camera the HZB pyramid was built from: the view-projection of the frame whose
+    /// depth it holds and where that camera stood. The occlusion test of the next frame
+    /// projects with it (see `executeHZBOcclusionCulling`). Nil until a pyramid is built.
+    public var hzbFrame: HZBPyramidFrame?
     /// Whether the Gaussian pass encoded this frame, so `gaussianColorMap` holds this frame's
     /// coverage: false on the simulator and on a frame the pass skipped, when the anti-aliasing
     /// passes must not read the map.
@@ -78,6 +82,26 @@ public struct RenderInfo {
     public var xrEye0Projection: simd_float4x4 = matrix_identity_float4x4
     public var xrEye1View: simd_float4x4 = matrix_identity_float4x4
     public var xrEye1Projection: simd_float4x4 = matrix_identity_float4x4
+    /// The position of the eye `renderXR` is drawing, in the same space as
+    /// CameraComponent.localPosition; nil outside XR. Shading reads it through
+    /// shadingCameraPosition so each eye gets its own view vector (specular highlights,
+    /// Fresnel), while streaming, LOD and culling keep the head-centre camera position.
+    public var xrEyeCameraPosition: simd_float3?
+}
+
+/// Where an eye is, from its view matrix (the inverse of the eye's camera transform).
+@inline(__always)
+func eyePosition(fromViewMatrix viewMatrix: simd_float4x4) -> simd_float3 {
+    let eyeTransform = simd_inverse(viewMatrix)
+    return simd_float3(eyeTransform.columns.3.x, eyeTransform.columns.3.y, eyeTransform.columns.3.z)
+}
+
+/// The camera position shading uses: in XR, the eye being drawn, so highlights and
+/// Fresnel sit at the right depth for each eye; otherwise the camera's own position.
+/// Already folded through SceneRootTransform like every other shading camera position.
+@inline(__always)
+func shadingCameraPosition(_ cameraComponent: CameraComponent) -> simd_float3 {
+    SceneRootTransform.shared.effectiveCameraPosition(renderInfo.xrEyeCameraPosition ?? cameraComponent.localPosition)
 }
 
 @inline(__always)
@@ -295,5 +319,18 @@ public struct ScenePickingGeometryMetadata {
     public init(meshIndex: Int, submeshIndex: Int) {
         self.meshIndex = meshIndex
         self.submeshIndex = submeshIndex
+    }
+}
+
+/// The camera a depth pyramid was built from.
+public struct HZBPyramidFrame: Sendable {
+    /// The view-projection of the frame whose depth the pyramid holds, scene root included.
+    public var viewProjection: simd_float4x4
+    /// Where that frame's camera stood, in world space.
+    public var cameraPosition: simd_float3
+
+    public init(viewProjection: simd_float4x4, cameraPosition: simd_float3) {
+        self.viewProjection = viewProjection
+        self.cameraPosition = cameraPosition
     }
 }

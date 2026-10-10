@@ -1098,11 +1098,18 @@ private func registerUntoldRuntimeAsset(
             prebuiltMeshes: prebuiltMeshes[node.id]
         )
         if didRegisterPayload, !lodLevels.isEmpty {
+            // The parts of a model change level together, at the size of the whole
+            // model: each carries the model's radius in its own space. A model that is
+            // one node is measured by its own bounds.
+            let modelRadius = boundingRadius(of: runtimeAsset.worldBounds)
+            let nodeScale = largestAxisScale(of: node.worldTransform)
+            let isPartOfModel = targetEntityId != entityId && nodeScale > 0 && nodeScale.isFinite
             registerPackLODLevels(
                 entityId: targetEntityId,
                 node: node,
                 modelURL: url,
-                worldRadius: boundingRadius(of: runtimeAsset.worldBounds) * lodPlacementScale,
+                worldRadius: modelRadius * lodPlacementScale,
+                screenSizeRadius: isPartOfModel ? modelRadius / nodeScale : 0,
                 levels: lodLevels
             )
         }
@@ -1117,8 +1124,18 @@ private func registerUntoldRuntimeAsset(
             if let animComp = ensureAnimationComponent(entityId: animTarget, errorEntityId: entityId) {
                 let registeredNames = registerRuntimeAnimationClips(animClips, preferredName: animClips.first?.name ?? "", to: animComp)
                 appendAnimationSourceURLIfNeeded(url, to: animComp)
-                if animComp.currentAnimation == nil, let first = registeredNames.first {
-                    animComp.currentAnimation = animComp.animationClips[first]
+                if animComp.currentAnimation == nil, let first = registeredNames.first,
+                   let selectedClip = animComp.animationClips[first]
+                {
+                    if let skeleton = scene.get(component: SkeletonComponent.self, for: animTarget)?.skeleton {
+                        warnIfClipHasNoMatchingJoints(
+                            entityId: animTarget,
+                            name: first,
+                            clip: selectedClip,
+                            skeleton: skeleton
+                        )
+                    }
+                    animComp.currentAnimation = selectedClip
                 }
             }
         }
@@ -2626,15 +2643,22 @@ func lodSwitchDistance(radius: Float, screenSize: Float, fovYDegrees: Float) -> 
 /// its own meshes (level 0). The meshes of a level pair with the node's by position
 /// and take their materials, so a level is the same surface with fewer triangles.
 ///
-/// Each level's screen size becomes a switch distance for this placement: the distance
-/// at which the model's bounding sphere (`worldRadius`) covers that share of the
-/// viewport under the engine's field of view. A small prop and a large tree with the
-/// same chain therefore switch at distances that suit each.
+/// The levels are chosen by the size of the placement on screen, read as each frame is
+/// drawn (`LODComponent.selectsByScreenSize`), so a small prop and a large tree with
+/// the same chain switch at distances that suit each, and keep doing so when the
+/// placement is scaled or the field of view changes.
+/// `screenSizeRadius` is the radius that size is measured by, in the entity's own
+/// space (0 for the entity's bounding box).
+///
+/// Each level also gets the distance the same switch falls at as the pack loads: where
+/// the model's bounding sphere (`worldRadius`) covers the level's screen size under the
+/// engine's field of view. It serves a view without perspective.
 private func registerPackLODLevels(
     entityId: EntityID,
     node: RuntimeAssetNode,
     modelURL: URL,
     worldRadius: Float,
+    screenSizeRadius: Float,
     levels: [PackLODLevelMeshes]
 ) {
     guard worldRadius > 0, let renderComponent = scene.get(component: RenderComponent.self, for: entityId) else {
@@ -2643,6 +2667,9 @@ private func registerPackLODLevels(
     let modelMeshes = renderComponent.mesh
 
     var usable: [(screenSize: Float, url: URL, meshes: [Mesh])] = []
+    // A level never takes over at a larger size than the level before it, whatever the
+    // manifest says.
+    var previousScreenSize = Float.greatestFiniteMagnitude
     for level in levels {
         guard var meshes = level.meshesByNode[node.id],
               meshes.count == modelMeshes.count,
@@ -2655,23 +2682,23 @@ private func registerPackLODLevels(
             meshes[meshIndex].localSpace = modelMeshes[meshIndex].localSpace
             meshes[meshIndex].worldSpace = modelMeshes[meshIndex].worldSpace
         }
-        usable.append((level.screenSize, level.url, meshes))
+        previousScreenSize = min(level.screenSize, previousScreenSize)
+        usable.append((previousScreenSize, level.url, meshes))
     }
     guard let first = usable.first else { return }
 
     // A level's maxDistance is where the next one takes over; the last has no end.
     var lodLevels: [LODLevel] = []
-    var previousDistance = lodSwitchDistance(radius: worldRadius, screenSize: first.screenSize, fovYDegrees: fov)
-    lodLevels.append(LODLevel(mesh: modelMeshes, maxDistance: previousDistance, url: modelURL, assetName: node.name))
+    lodLevels.append(LODLevel(
+        mesh: modelMeshes,
+        maxDistance: lodSwitchDistance(radius: worldRadius, screenSize: first.screenSize, fovYDegrees: fov),
+        url: modelURL,
+        assetName: node.name
+    ))
     for (index, level) in usable.enumerated() {
         var maxDistance = Float.greatestFiniteMagnitude
         if index + 1 < usable.count {
-            // Never closer than the level before, whatever the manifest says.
-            maxDistance = max(
-                lodSwitchDistance(radius: worldRadius, screenSize: usable[index + 1].screenSize, fovYDegrees: fov),
-                previousDistance
-            )
-            previousDistance = maxDistance
+            maxDistance = lodSwitchDistance(radius: worldRadius, screenSize: usable[index + 1].screenSize, fovYDegrees: fov)
         }
         lodLevels.append(LODLevel(
             mesh: level.meshes,
@@ -2683,7 +2710,11 @@ private func registerPackLODLevels(
     }
 
     configureLODComponent(entityId: entityId, lodLevels: lodLevels, activeLODIndex: 0)
-    scene.get(component: LODComponent.self, for: entityId)?.levelsShareMaterials = true
+    if let lodComponent = scene.get(component: LODComponent.self, for: entityId) {
+        lodComponent.levelsShareMaterials = true
+        lodComponent.selectsByScreenSize = true
+        lodComponent.screenSizeRadius = screenSizeRadius
+    }
 }
 
 /// A `.untold` parsed and built into GPU meshes, ready for any number of entities to
@@ -3929,9 +3960,18 @@ public func setEntityAnimations(entityId: EntityID, filename: String, withExtens
                 appendAnimationSourceURLIfNeeded(url, to: animationComponent)
 
                 if animationComponent.currentAnimation == nil,
-                   let selectedName = registeredNames.first(where: { $0 == name }) ?? registeredNames.first
+                   let selectedName = registeredNames.first(where: { $0 == name }) ?? registeredNames.first,
+                   let selectedClip = animationComponent.animationClips[selectedName]
                 {
-                    animationComponent.currentAnimation = animationComponent.animationClips[selectedName]
+                    if let skeleton = scene.get(component: SkeletonComponent.self, for: targetEntityId)?.skeleton {
+                        warnIfClipHasNoMatchingJoints(
+                            entityId: targetEntityId,
+                            name: selectedName,
+                            clip: selectedClip,
+                            skeleton: skeleton
+                        )
+                    }
+                    animationComponent.currentAnimation = selectedClip
                 }
             }
         }
