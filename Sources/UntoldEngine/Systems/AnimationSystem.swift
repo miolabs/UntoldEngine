@@ -366,6 +366,33 @@ public func isAnimationComponentPaused(entityId: EntityID) -> Bool {
     }
 }
 
+/// Reports `.animationClipNoMatchingJoints` if none of `clip`'s channels
+/// target a joint path present in `skeleton` — e.g. a namespace prefix
+/// (`"skel:LeftArm"` vs `"LeftArm"`) or hierarchy mismatch between the
+/// exported clip and the skeleton it's bound to. Every joint would otherwise
+/// silently sample its rest pose: the clip still registers and plays
+/// (`currentTime` advances) with no visible motion and no error. This is a
+/// diagnostic only — it does not block registration or playback, so
+/// intentional no-op/placeholder clips still work.
+///
+/// Checked directly against `clip.jointAnimation`'s keys rather than through
+/// `AnimationComponent.compiledClip(for:skeleton:)`: that cache is keyed by
+/// clip identity and considers a cache hit valid whenever `jointCount`
+/// matches, so compiling here against a skeleton that is later swapped out
+/// for another of the same joint count (same clip, different rig) would
+/// pollute the cache with a stale compilation.
+func warnIfClipHasNoMatchingJoints(
+    entityId: EntityID,
+    name: String,
+    clip: AnimationClip,
+    skeleton: Skeleton
+) {
+    guard clip.jointAnimation.isEmpty == false else { return }
+    let jointPaths = Set(skeleton.jointPaths)
+    guard clip.jointAnimation.keys.contains(where: { jointPaths.contains($0) }) == false else { return }
+    handleError(.animationClipNoMatchingJoints, name, entityId)
+}
+
 /// Default halflife for inertialized clip switches, shared by every public
 /// entry point (`changeAnimation`, the node builder, USC `.playAnimation`).
 public let defaultAnimationTransitionHalflife: Float = 0.1
@@ -405,6 +432,14 @@ public func changeAnimation(entityId: EntityID, name: String, transitionHalflife
             to: animationClip,
             halflife: transitionHalflife
         )
+        if let skeleton = scene.get(component: SkeletonComponent.self, for: targetEntityId)?.skeleton {
+            warnIfClipHasNoMatchingJoints(
+                entityId: targetEntityId,
+                name: name,
+                clip: animationClip,
+                skeleton: skeleton
+            )
+        }
         animationComponent.currentAnimation = animationClip
         animationComponent.currentTime = 0
         animationComponent.pause = withPause
@@ -1026,4 +1061,84 @@ public func removeAnimationClip(entityId: EntityID, animationClip: String) {
     for (_, animationComponent) in animationComponents {
         animationComponent.removeAnimationClip(animationClip: animationClip)
     }
+}
+
+/// Restarts a named clip from time zero, even when it is already selected.
+/// Call on the engine update thread. Applies to every animated descendant.
+/// No-op (reports `.noAnimationClip`) if `entityId` and its animated descendants have no clip
+/// registered under `name`.
+///
+/// `repeats`, when non-nil, overwrites the clip's own looping configuration
+/// for every future playback, not just this restart — `AnimationClip`
+/// instances are shared by reference from `animationComponent.animationClips`,
+/// so this is a persistent change to the asset, not a one-shot playback flag.
+/// Pass `nil` (the default) to restart without touching the clip's current
+/// looping behavior.
+public func restartAnimation(entityId: EntityID, name: String, repeats: Bool? = nil, withPause: Bool = false) {
+    let components = animationComponentsContainingClip(entityId: entityId, name: name)
+    guard !components.isEmpty else {
+        handleError(.noAnimationClip, name, entityId)
+        return
+    }
+    for (targetEntityId, component, clip) in components {
+        // Restarting playback does not change compiled channels. Invalidate only
+        // this clip when its looping setting changes; preserve warmed caches.
+        if let repeats, clip.jointAnimation.values.contains(where: { $0.repeatAnimation != repeats }) {
+            for path in clip.jointAnimation.keys {
+                clip.jointAnimation[path]?.repeatAnimation = repeats
+            }
+            component.compiledClips.removeValue(forKey: ObjectIdentifier(clip))
+        }
+        if let skeleton = scene.get(component: SkeletonComponent.self, for: targetEntityId)?.skeleton {
+            warnIfClipHasNoMatchingJoints(
+                entityId: targetEntityId,
+                name: name,
+                clip: clip,
+                skeleton: skeleton
+            )
+        }
+        component.transition.cancel()
+        component.currentAnimation = clip
+        component.currentTime = 0
+        component.pause = withPause
+        component.rootMotion.resetHistory()
+    }
+}
+
+/// Playback time of the first animated part of a root or split character.
+/// Returns nil if no part has a selected clip. Read on the engine update thread.
+public func getAnimationPlaybackTime(entityId: EntityID) -> Float? {
+    animationComponentsForEntityOrDescendants(entityId: entityId)
+        .first(where: { $0.1.currentAnimation != nil })?.1.currentTime
+}
+
+/// Samples a named joint at a clip time without changing the displayed pose.
+/// Returns world space. Call on the engine update thread after mesh loading.
+/// Returns nil if `name` has no registered clip, `jointName` is not found in the skeleton, or the
+/// target entity is missing its skeleton/world-transform components.
+public func sampleAnimationJointPosition(entityId: EntityID, name: String, jointName: String, time: Float) -> SIMD3<Float>? {
+    for (target, component, clip) in animationComponentsContainingClip(entityId: entityId, name: name) {
+        guard let skeleton = scene.get(component: SkeletonComponent.self, for: target)?.skeleton,
+              let joint = skeleton.jointPaths.firstIndex(where: {
+                  $0.split(separator: "/").last?.split(separator: ":").last.map(String.init) == jointName
+              }), let world = scene.get(component: WorldTransformComponent.self, for: target) else { continue }
+        let compiled = component.compiledClip(for: clip, skeleton: skeleton)
+        var sampler = ClipSampler()
+        var pose = PoseBuffer()
+        sampler.sample(compiled, time: time, duration: clip.duration, speed: clip.speed, into: &pose)
+        var models = [simd_float4x4](repeating: matrix_identity_float4x4, count: pose.jointCount)
+        for index in 0 ..< pose.jointCount {
+            let local = simd_float4x4(translation: pose.translations[index])
+                * simd_float4x4(pose.rotations[index])
+                * simd_float4x4(scale: compiled.restScales[index])
+            if let parent = skeleton.parentIndices[index] {
+                models[index] = models[parent] * local
+            } else {
+                models[index] = local
+            }
+        }
+        let point = world.space * models[joint] * SIMD4<Float>(0, 0, 0, 1)
+        return SIMD3<Float>(point.x, point.y, point.z)
+    }
+    return nil
 }
