@@ -3565,6 +3565,11 @@ public enum RenderPasses {
         var ssaoEnabled = SSAOParams.shared.enabled
         renderEncoder.setFragmentBytes(&ssaoEnabled, length: MemoryLayout<Bool>.stride, index: Int(prePassSSAOEnabledIndex.rawValue))
 
+        // The splat layer is read only on a frame the Gaussian pass drew it (see
+        // gaussianExecution): on any other it holds an earlier frame, or nothing at all.
+        var gaussianLayerPresent = renderInfo.gaussianCoverageWritten && textureResources.gaussianColorMap != nil
+        renderEncoder.setFragmentBytes(&gaussianLayerPresent, length: MemoryLayout<Bool>.stride, index: Int(prePassGaussianLayerIndex.rawValue))
+
         // set the draw command
 
         renderEncoder.drawIndexedPrimitivesTracked(
@@ -4818,6 +4823,17 @@ public enum RenderPasses {
             _ = commandBuffer
             return
         #else
+            // A frame without a splat entity has nothing to draw. The pass is skipped whole —
+            // the depth snapshot, the tile initialise, the empty draw, the resolve — and its
+            // layer is left as it is: the composite, the look and the anti-aliasing passes read
+            // it only when `gaussianCoverageWritten` says this frame drew it. The order is the
+            // preprocess's (an empty one when the scene has no splat entity), stale only while
+            // the asset-loading gate skips the preprocess, when the draw below handles it.
+            let workingSet = GaussianSharedWorkingSet.shared
+            let gaussianFrameSlot = min(renderInfo.currentInFlightFrameSlot, maxInFlightCommandBuffers - 1)
+            let entities = workingSet.entityOrder(slot: gaussianFrameSlot)
+            guard !entities.isEmpty else { return }
+
             EngineProfiler.shared.beginScope(.gaussianDraw)
             defer { EngineProfiler.shared.endScope(.gaussianDraw) }
 
@@ -4940,12 +4956,8 @@ public enum RenderPasses {
             // vertex stage indexes, written per uniform ring index so the two eyes of a stereo
             // frame keep their own matrices; an entity that has gone gets zero matrices, which
             // makes its stale records fail the vertex stage's w test and draw nothing.
-            let workingSet = GaussianSharedWorkingSet.shared
-            let gaussianFrameSlot = min(renderInfo.currentInFlightFrameSlot, maxInFlightCommandBuffers - 1)
             let uniformIndex = min(currentUniformBufferIndex(), totalPerMeshUniformBuffers() - 1)
-            let entities = workingSet.entityOrder(slot: gaussianFrameSlot)
-            if !entities.isEmpty,
-               let sortedKeys = workingSet.keys(slot: gaussianFrameSlot),
+            if let sortedKeys = workingSet.keys(slot: gaussianFrameSlot),
                let sharedRecords = workingSet.records(slot: gaussianFrameSlot),
                let sharedVisibleSet = workingSet.visibleSet(slot: gaussianFrameSlot),
                let entityConstants = workingSet.entityConstants(uniformIndex: uniformIndex)

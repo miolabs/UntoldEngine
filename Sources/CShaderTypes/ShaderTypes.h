@@ -364,7 +364,8 @@ typedef struct{
 typedef enum{
     prePassGizmoBufferIndex,
     prePassPassthroughBufferIndex,
-    prePassSSAOEnabledIndex
+    prePassSSAOEnabledIndex,
+    prePassGaussianLayerIndex      // bool: the Gaussian pass drew its layer this frame
 }PrePassBufferIndices;
 
 typedef enum{
