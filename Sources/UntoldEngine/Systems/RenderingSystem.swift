@@ -127,8 +127,7 @@ func UpdateRenderingSystem(in view: MTKView) {
         let visibleEntityIdsAtSubmission = visibleEntityIds
         commandBuffer.addCompletedHandler { cb in
             #if ENGINE_STATS_ENABLED
-                let gpuExecutionMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
-                EngineStatsMonitor.shared.recordGPUCompletion(executionMs: gpuExecutionMs)
+                EngineStatsMonitor.shared.recordGPUCompletion(gpuStartTime: cb.gpuStartTime, gpuEndTime: cb.gpuEndTime)
             #endif
             // Signal that this command buffer slot is now available
             commandBufferSemaphore.signal()
@@ -199,8 +198,7 @@ func UpdateXRRenderingSystem(commandBuffer: MTLCommandBuffer, passDescriptor: MT
     commandBuffer.addCompletedHandler { cb in
         #if ENGINE_STATS_ENABLED
             if renderInfo.immersionStyle == .ar {
-                let gpuExecutionMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
-                EngineStatsMonitor.shared.recordGPUCompletion(executionMs: gpuExecutionMs)
+                EngineStatsMonitor.shared.recordGPUCompletion(gpuStartTime: cb.gpuStartTime, gpuEndTime: cb.gpuEndTime)
             }
         #endif
         needsFinalizeDestroys = true
