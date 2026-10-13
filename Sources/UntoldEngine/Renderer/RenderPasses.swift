@@ -3438,6 +3438,9 @@ public enum RenderPasses {
         renderEncoder.updateFence(renderInfo.fence, after: .fragment)
     } // end _legacyLightExecution_DEAD
 
+    /// Whether the first skipped pre-composite frame has been logged.
+    private nonisolated(unsafe) static var loggedPreCompositeBypass = false
+
     public static let preCompositeExecution: RenderPassExecution = { commandBuffer in
         guard let preCompositePipeline = PipelineManager.shared.renderPipelinesByType[.preComposite] else {
             handleError(.pipelineStateNulled, "preCompositePipeline is nil")
@@ -3487,6 +3490,42 @@ public enum RenderPasses {
         // Load Gaussian texture so it isn't cleared
         renderInfo.gaussianRenderPassDescriptor?.colorAttachments[0].loadAction = .load
 
+        // In XR passthrough nothing lies behind the scene, so with no splat, ambient-occlusion
+        // or gizmo layer to join and the lit view wanted, the composite is the lit scene itself
+        // and this full-screen pass would copy one texture into another (two frames' worth of
+        // bandwidth per eye at the headset's resolution). The look pass reads the lit scene
+        // directly instead. A registered render extension may draw into the composite, which
+        // keeps the pass.
+        let gameFrame = gameMode
+        let finalColorTexture: MTLTexture? = gameFrame
+            ? (bypassPostProcessing
+                ? (renderInfo.deferredRenderPassDescriptor?.colorAttachments[0].texture
+                    ?? renderInfo.postProcessRenderPassDescriptor?.colorAttachments[0].texture)
+                : renderInfo.postProcessRenderPassDescriptor?.colorAttachments[0].texture)
+            : renderInfo.deferredRenderPassDescriptor?.colorAttachments[0].texture
+        // The splat layer holds something only on a frame the Gaussian pass drew for splat
+        // entities: the pass draws the working set's entities, none when its order is empty.
+        let gaussianFrameSlot = min(renderInfo.currentInFlightFrameSlot, maxInFlightCommandBuffers - 1)
+        let splatLayerPresent = renderInfo.gaussianCoverageWritten
+            && textureResources.gaussianColorMap != nil
+            && !GaussianSharedWorkingSet.shared.entityOrder(slot: gaussianFrameSlot).isEmpty
+        let copyOnly = renderInfo.preCompositeBypassEnabled
+            && gameFrame
+            && renderInfo.immersionStyle == .mixed
+            && !SSAOParams.shared.enabled
+            && !splatLayerPresent
+            && renderDebugViewMode == .lit
+            && !RenderExtensionRegistry.shared.hasRegisteredExtensions
+        if copyOnly, let finalColorTexture {
+            renderInfo.preCompositeBypassSource = finalColorTexture
+            if !RenderPasses.loggedPreCompositeBypass {
+                RenderPasses.loggedPreCompositeBypass = true
+                print("✓ Pre-composite pass skipped: a passthrough frame with no layer to join; the look pass reads the lit scene")
+            }
+            return
+        }
+        renderInfo.preCompositeBypassSource = nil
+
         // set your encoder here
         guard
             let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
@@ -3527,11 +3566,6 @@ public enum RenderPasses {
                 index: Int(prePassDepthTextureIndex.rawValue)
             )
         } else {
-            let postProcessColorTexture = renderInfo.postProcessRenderPassDescriptor?.colorAttachments[0].texture
-            let finalColorTexture = bypassPostProcessing
-                ? (renderInfo.deferredRenderPassDescriptor?.colorAttachments[0].texture ?? postProcessColorTexture)
-                : postProcessColorTexture
-
             renderEncoder.setFragmentTexture(
                 finalColorTexture,
                 index: Int(prePassFinalTextureIndex.rawValue)

@@ -1386,7 +1386,8 @@ public let lookRenderPass: RenderPasses.RenderPassExecution = { commandBuffer in
     }
 
     if lookPassShouldRenderLitOutput(for: viewMode) {
-        guard let sourceTexture = textureResources.sceneCompositeTexture else {
+        // The composite, or the lit scene itself on a frame the pre-composite pass was skipped.
+        guard let sourceTexture = renderInfo.preCompositeBypassSource ?? textureResources.sceneCompositeTexture else {
             handleError(.renderPassCreationFailed, "Look Pass: source texture is nil")
             return
         }

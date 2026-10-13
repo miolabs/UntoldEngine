@@ -63,6 +63,14 @@ public struct RenderInfo {
     /// coverage: false on the simulator and on a frame the pass skipped, when the anti-aliasing
     /// passes must not read the map.
     public var gaussianCoverageWritten: Bool = false
+    /// The texture the look pass reads instead of `sceneCompositeTexture` on a frame the
+    /// pre-composite pass was skipped (see `RenderPasses.preCompositeExecution`): in XR
+    /// passthrough the composite is the lit scene itself whenever no layer joins it, so the
+    /// pass would copy a full-screen texture into another. Nil on a frame the pass ran.
+    public var preCompositeBypassSource: MTLTexture?
+    /// Whether the pre-composite pass may be skipped on a frame it would only copy. On by
+    /// default; `setRendering(.preCompositeBypass(.disabled))` runs the pass on every frame.
+    public var preCompositeBypassEnabled: Bool = true
     public var hzbDebugMipLevel: Int = 0
     public var gBufferDebugStorageEnabled: Bool = false
     public var opaqueSampleCount: Int = 1

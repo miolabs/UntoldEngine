@@ -86,6 +86,11 @@ public enum RenderingProperty: Sendable {
     /// frustum keeps. In scene units; the default is 0.5. See
     /// `getOcclusionCullingMaxCameraStep()` to read the current value.
     case occlusionCullingMaxCameraStep(Float)
+    /// Whether the pre-composite pass is skipped on a frame it would only copy the lit scene
+    /// (XR passthrough with no environment, splat, ambient-occlusion or gizmo layer to join;
+    /// the lit debug view; no render extension). Enabled by default; disabling it runs the
+    /// pass on every frame, as a diagnostic.
+    case preCompositeBypass(RenderingToggle)
 }
 
 public enum RenderingToggle: Sendable {
@@ -148,6 +153,10 @@ public func setRendering(_ property: RenderingProperty) {
         SmallObjectCulling.minimumPixels = pixels.isFinite ? max(pixels, 0) : 0
     case let .occlusionCullingMaxCameraStep(step):
         HZBOcclusionCulling.maxCameraStep = step.isFinite ? max(step, 0) : 0
+    case .preCompositeBypass(.enabled):
+        renderInfo.preCompositeBypassEnabled = true
+    case .preCompositeBypass(.disabled):
+        renderInfo.preCompositeBypassEnabled = false
     }
 }
 
