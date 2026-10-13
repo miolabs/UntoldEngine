@@ -343,6 +343,14 @@ public enum RenderPasses {
         ]
     }
 
+    /// Whether a draw with these material parameters can never discard a fragment — an opaque
+    /// material, neither masked nor blended, with no dither fade running — and so goes through
+    /// the model pipeline compiled without discards.
+    @inline(__always)
+    private static func modelDrawNeverDiscards(_ parameters: MaterialParametersUniform) -> Bool {
+        parameters.alphaMode == 0 && parameters.lodDither.y <= 0.5
+    }
+
     @inline(__always)
     private static func applyLODDither(
         draw: LODDitherDraw,
@@ -2303,6 +2311,17 @@ public enum RenderPasses {
             return
         }
 
+        // The model pipeline compiled without discards, for the draws that never need them (an
+        // opaque material, no fade running): the GPU resolves their visibility before shading.
+        // Nil runs every draw through the general pipeline.
+        let plainModelPipeline: RenderPipeline? = renderInfo.opaqueHiddenSurfaceRemovalEnabled
+            ? PipelineManager.shared.renderPipelinesByType[.modelOpaque].flatMap { $0.success && $0.pipelineState != nil ? $0 : nil }
+            : nil
+        renderInfo.opaqueDrawsPlain = 0
+        renderInfo.opaqueDrawsDiscarding = 0
+        // Which of the two the encoder holds; the general one is bound first below.
+        var plainBound = false
+
         // G-buffer slots (0-4): cleared at start, normally discarded at end.
         // Lit output (5): cleared at start, stored for downstream passes.
         // The simulator always stores the G-buffer: its light pass samples it as
@@ -2452,6 +2471,13 @@ public enum RenderPasses {
                         applyTileRepresentationDither(fade: tileRepresentationFade, materialParameters: &materialParameters)
                         applyMeshFadeDither(fade: meshFade, materialParameters: &materialParameters)
 
+                        let plain = plainModelPipeline != nil && modelDrawNeverDiscards(materialParameters)
+                        if plain != plainBound {
+                            renderEncoder.setRenderPipelineState((plain ? plainModelPipeline! : modelPipeline).pipelineState!)
+                            plainBound = plain
+                        }
+                        if plain { renderInfo.opaqueDrawsPlain += 1 } else { renderInfo.opaqueDrawsDiscarding += 1 }
+
                         renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
                         renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))
                         renderEncoder.setFragmentSamplerState(material.normal.sampler, index: Int(modelPassNormalSamplerIndex.rawValue))
@@ -2549,6 +2575,13 @@ public enum RenderPasses {
                     applyMaterialTextureState(material: material, materialParameters: &materialParameters)
                     applyLODDebugColorOverride(batchGroup: batchGroup, materialParameters: &materialParameters)
                     applyStreamingTierDebugColorOverride(batchMaterial: material, materialParameters: &materialParameters)
+
+                    let plain = plainModelPipeline != nil && modelDrawNeverDiscards(materialParameters)
+                    if plain != plainBound {
+                        renderEncoder.setRenderPipelineState((plain ? plainModelPipeline! : modelPipeline).pipelineState!)
+                        plainBound = plain
+                    }
+                    if plain { renderInfo.opaqueDrawsPlain += 1 } else { renderInfo.opaqueDrawsDiscarding += 1 }
 
                     renderEncoder.setFragmentBytes(&materialParameters, length: MemoryLayout<MaterialParametersUniform>.stride, index: Int(modelPassFragmentMaterialParameterIndex.rawValue))
                     renderEncoder.setFragmentTexture(material.normal.texture, index: Int(modelPassNormalTextureIndex.rawValue))

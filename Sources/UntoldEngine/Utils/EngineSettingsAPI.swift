@@ -86,6 +86,11 @@ public enum RenderingProperty: Sendable {
     /// frustum keeps. In scene units; the default is 0.5. See
     /// `getOcclusionCullingMaxCameraStep()` to read the current value.
     case occlusionCullingMaxCameraStep(Float)
+    /// Whether opaque draws that never discard a fragment (an opaque material, no fade
+    /// running) use the model pipeline compiled without discards, which lets the GPU resolve
+    /// visibility before shading: a fragment another surface covers is never shaded. Enabled
+    /// by default; disabling it draws everything through the general pipeline, as a diagnostic.
+    case opaqueHiddenSurfaceRemoval(RenderingToggle)
 }
 
 public enum RenderingToggle: Sendable {
@@ -148,6 +153,10 @@ public func setRendering(_ property: RenderingProperty) {
         SmallObjectCulling.minimumPixels = pixels.isFinite ? max(pixels, 0) : 0
     case let .occlusionCullingMaxCameraStep(step):
         HZBOcclusionCulling.maxCameraStep = step.isFinite ? max(step, 0) : 0
+    case .opaqueHiddenSurfaceRemoval(.enabled):
+        renderInfo.opaqueHiddenSurfaceRemovalEnabled = true
+    case .opaqueHiddenSurfaceRemoval(.disabled):
+        renderInfo.opaqueHiddenSurfaceRemovalEnabled = false
     }
 }
 

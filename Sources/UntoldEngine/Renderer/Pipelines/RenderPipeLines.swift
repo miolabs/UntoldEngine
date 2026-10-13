@@ -7,6 +7,7 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+import CShaderTypes
 import MetalKit
 
 public struct RenderPipeline {
@@ -367,7 +368,20 @@ private var wf: WorkingColorFormats {
 /// pipeline. Attachments 0-4 are the G-buffer targets written by geometry draws.
 /// Attachment 5 is the lit output (deferredColorMap) that only the light sub-pass
 /// writes — geometry must not touch it, so writeMask is disabled for slot 5.
+/// The general model pipeline: its fragment function keeps the discards an alpha-masked or
+/// blended material or a dither fade needs.
 public func InitModelPipeline() -> RenderPipeline? {
+    makeModelPipeline(mayDiscard: true, name: "Model Pipeline")
+}
+
+/// The model pipeline for the opaque draws that never discard, compiled without the
+/// discards: the GPU then resolves visibility before it shades, and a fragment another
+/// surface covers costs nothing. The pass picks it per draw (`combinedModelLightExecution`).
+public func InitModelOpaquePipeline() -> RenderPipeline? {
+    makeModelPipeline(mayDiscard: false, name: "Model Pipeline (opaque)")
+}
+
+private func makeModelPipeline(mayDiscard: Bool, name: String) -> RenderPipeline? {
     guard let library = renderInfo.library else {
         handleError(.metalLibraryNotFound)
         return nil
@@ -376,13 +390,19 @@ public func InitModelPipeline() -> RenderPipeline? {
         handleError(.shaderCreationFailed, "vertexModelShader")
         return nil
     }
-    guard let fragmentFunction = library.makeFunction(name: "fragmentModelShader") else {
-        handleError(.shaderCreationFailed, "fragmentModelShader")
+    let constants = MTLFunctionConstantValues()
+    var mayDiscardValue = mayDiscard
+    constants.setConstantValue(&mayDiscardValue, type: .bool, index: Int(modelFunctionConstantMayDiscard.rawValue))
+    let fragmentFunction: MTLFunction
+    do {
+        fragmentFunction = try library.makeFunction(name: "fragmentModelShader", constantValues: constants)
+    } catch {
+        handleError(.shaderCreationFailed, "fragmentModelShader (\(name)): \(error.localizedDescription)")
         return nil
     }
 
     let desc = MTLRenderPipelineDescriptor()
-    desc.label = "Model Pipeline"
+    desc.label = name
     desc.vertexFunction = vertexFunction
     desc.fragmentFunction = fragmentFunction
     desc.vertexDescriptor = createModelVertexDescriptor()
@@ -414,11 +434,11 @@ public func InitModelPipeline() -> RenderPipeline? {
             pipelineState: pipelineState,
             depthState: depthState,
             success: true,
-            name: "Model Pipeline",
+            name: name,
             rasterSampleCount: desc.rasterSampleCount
         )
     } catch {
-        handleError(.pipelineStateCreationFailed, "Model Pipeline")
+        handleError(.pipelineStateCreationFailed, name)
         return nil
     }
 }
@@ -1145,6 +1165,7 @@ public func DefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)
         (.sky, InitSkyPipeline),
         (.shadow, InitShadowPipeline),
         (.model, InitModelPipeline),
+        (.modelOpaque, InitModelOpaquePipeline),
         (.light, InitLightPipeline),
         (.geometry, InitGeometryPipeline),
         (.highlight, InitHighlightPipeline),

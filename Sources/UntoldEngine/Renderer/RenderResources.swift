@@ -66,6 +66,15 @@ public struct RenderInfo {
     public var hzbDebugMipLevel: Int = 0
     public var gBufferDebugStorageEnabled: Bool = false
     public var opaqueSampleCount: Int = 1
+    /// Whether opaque draws that never discard go through the model pipeline compiled without
+    /// discards, so the GPU resolves visibility before shading them. On by default;
+    /// `setRendering(.opaqueHiddenSurfaceRemoval(.disabled))` draws everything through the
+    /// general pipeline, as a diagnostic.
+    public var opaqueHiddenSurfaceRemovalEnabled: Bool = true
+    /// The last combined pass's draws by pipeline: plain (no discards) and general. Per pass,
+    /// so per eye in XR.
+    public var opaqueDrawsPlain: Int = 0
+    public var opaqueDrawsDiscarding: Int = 0
 
     // XR stereo-aware HZB culling
     // When true, depth and HZB pyramids are maintained per eye and occlusion
