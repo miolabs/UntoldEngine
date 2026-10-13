@@ -255,6 +255,7 @@ public func CreateTilePipeline(
     tileShader: String,
     tileShaderLibrary: RenderShaderLibraryReference = .engine,
     colorFormats: [MTLPixelFormat],
+    rasterSampleCount: Int = 1,
     name: String
 ) -> RenderPipeline? {
     #if targetEnvironment(simulator)
@@ -281,6 +282,7 @@ public func CreateTilePipeline(
             pipelineDescriptor.label = name
             pipelineDescriptor.tileFunction = tileFunction
             pipelineDescriptor.threadgroupSizeMatchesTileSize = true
+            pipelineDescriptor.rasterSampleCount = max(1, rasterSampleCount)
 
             for (index, format) in colorFormats.enumerated() {
                 pipelineDescriptor.colorAttachments[index].pixelFormat = format
@@ -296,7 +298,8 @@ public func CreateTilePipeline(
                 pipelineState: pipelineState,
                 depthState: nil,
                 success: true,
-                name: name
+                name: name,
+                rasterSampleCount: max(1, rasterSampleCount)
             )
 
         } catch {
@@ -503,6 +506,22 @@ public func InitLightPipeline() -> RenderPipeline? {
             return nil
         }
     #endif
+}
+
+/// The TBDR light pass as a tile stage (`lightTileShaderTBDR`): the same inputs and the same
+/// attachments as the light quad, dispatched over the tiles of the G-buffer encoder. Nil where
+/// tile shading is unavailable (the simulator; GPUs before Apple family 4), when the quad runs.
+public func InitLightTilePipeline() -> RenderPipeline? {
+    guard let device = renderInfo.device, device.supportsFamily(.apple4) else { return nil }
+    return CreateTilePipeline(
+        tileShader: "lightTileShaderTBDR",
+        colorFormats: [
+            wf.gBufferAlbedo, wf.gBufferNormal, wf.gBufferPosition,
+            wf.gBufferMaterial, wf.gBufferEmissive, wf.sceneColor,
+        ],
+        rasterSampleCount: max(1, renderInfo.opaqueSampleCount),
+        name: "Light Tile Pipeline (TBDR)"
+    )
 }
 
 // MARK: Geometry pipeline
@@ -1146,6 +1165,7 @@ public func DefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)
         (.shadow, InitShadowPipeline),
         (.model, InitModelPipeline),
         (.light, InitLightPipeline),
+        (.lightTile, InitLightTilePipeline),
         (.geometry, InitGeometryPipeline),
         (.highlight, InitHighlightPipeline),
         (.lightVisual, InitLightVisualPipeline),

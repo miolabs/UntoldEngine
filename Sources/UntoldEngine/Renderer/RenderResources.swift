@@ -66,6 +66,18 @@ public struct RenderInfo {
     public var hzbDebugMipLevel: Int = 0
     public var gBufferDebugStorageEnabled: Bool = false
     public var opaqueSampleCount: Int = 1
+    /// Whether the TBDR light pass runs as a tile stage, lighting each pixel once per colour it
+    /// holds, rather than as a quad that lights every sample. On by default where tile shading
+    /// exists; `setRendering(.tileLightStage(.disabled))` runs the quad, as a diagnostic.
+    public var tileLightStageEnabled: Bool = true
+    /// The samples per pixel the multisampled anti-aliasing modes ask for (2, 4 or 8; the
+    /// device may grant fewer). 4 by default; `setRendering(.multisampleCount(2))` halves the
+    /// G-buffer's samples, which under the tile light stage is what lets the lighting run once
+    /// per pixel on GPUs whose tile memory does not hold four samples of the G-buffer.
+    public var preferredMultisampleCount: Int = 4
+    /// Whether the last combined G-buffer pass lit through the tile stage (false after a frame
+    /// that ran the quad: the setting off, no tile pipeline, the simulator).
+    public var tileLightStageUsed: Bool = false
 
     // XR stereo-aware HZB culling
     // When true, depth and HZB pyramids are maintained per eye and occlusion

@@ -86,6 +86,13 @@ public enum RenderingProperty: Sendable {
     /// frustum keeps. In scene units; the default is 0.5. See
     /// `getOcclusionCullingMaxCameraStep()` to read the current value.
     case occlusionCullingMaxCameraStep(Float)
+    /// Whether the deferred light pass runs as a tile stage that lights each pixel once per
+    /// colour it holds, instead of a quad that lights every multisample. Enabled by default
+    /// where tile shading exists; disabling it runs the quad, as a diagnostic.
+    case tileLightStage(RenderingToggle)
+    /// The samples per pixel of the multisampled anti-aliasing modes: 2, 4 (the default) or 8,
+    /// or fewer when the device has no such count. Takes effect on the next frame.
+    case multisampleCount(Int)
 }
 
 public enum RenderingToggle: Sendable {
@@ -148,6 +155,12 @@ public func setRendering(_ property: RenderingProperty) {
         SmallObjectCulling.minimumPixels = pixels.isFinite ? max(pixels, 0) : 0
     case let .occlusionCullingMaxCameraStep(step):
         HZBOcclusionCulling.maxCameraStep = step.isFinite ? max(step, 0) : 0
+    case .tileLightStage(.enabled):
+        renderInfo.tileLightStageEnabled = true
+    case .tileLightStage(.disabled):
+        renderInfo.tileLightStageEnabled = false
+    case let .multisampleCount(count):
+        renderInfo.preferredMultisampleCount = [2, 4, 8].contains(count) ? count : 4
     }
 }
 

@@ -26,6 +26,8 @@ public extension RenderPipelineType {
     static let shadow: RenderPipelineType = "shadow"
     static let model: RenderPipelineType = "model"
     static let light: RenderPipelineType = "light"
+    /// The TBDR light pass as a tile stage: lights each pixel once per colour it holds.
+    static let lightTile: RenderPipelineType = "lightTile"
     static let geometry: RenderPipelineType = "geometry"
     static let highlight: RenderPipelineType = "highlight"
     static let lightVisual: RenderPipelineType = "lightVisual"

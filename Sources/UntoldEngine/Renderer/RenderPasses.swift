@@ -543,6 +543,64 @@ public enum RenderPasses {
         blitEncoder.endEncoding()
     }
 
+    // MARK: - Tile light stage
+
+    /// Pipeline states Metal refused a pass for (their imageblock did not fit the GPU's tile
+    /// memory at the pass's sample count); the quad lights those from then on.
+    private nonisolated(unsafe) static var refusedTileLightStates: [ObjectIdentifier] = []
+    private nonisolated(unsafe) static var loggedTileLightStage: ObjectIdentifier?
+
+    /// The smallest tile Metal lays a pass with an imageblock out in, in pixels (16×16; the
+    /// pass's tile is whatever larger size Metal picks). An imageblock that does not fit the
+    /// GPU's tile memory even at this size cannot be asked for: Metal refuses the encoder, and
+    /// under API validation it asserts instead.
+    private static let smallestTilePixels = 16 * 16
+
+    /// The tile light stage's pipeline for a combined pass, when it runs, with the descriptor
+    /// told the imageblock's bytes per sample; the tile size is left to Metal, which picks one
+    /// the imageblock fits (the encoder reports it). Nil runs the quad: the stage is off, has
+    /// no pipeline (the simulator, a GPU without tile shading), its imageblock at the pass's
+    /// sample count exceeds the tile memory, or Metal refused it before.
+    static func tileLightStage(for descriptor: MTLRenderPassDescriptor) -> MTLRenderPipelineState? {
+        descriptor.tileWidth = 0
+        descriptor.tileHeight = 0
+        descriptor.imageblockSampleLength = 0
+        #if targetEnvironment(simulator)
+            return nil
+        #else
+            guard renderInfo.tileLightStageEnabled,
+                  let pipeline = PipelineManager.shared.renderPipelinesByType[.lightTile],
+                  pipeline.success,
+                  let state = pipeline.pipelineState,
+                  !refusedTileLightStates.contains(ObjectIdentifier(state))
+            else {
+                return nil
+            }
+            // Metal lays the imageblock out in 16-byte strides per sample.
+            let bytesPerSample = (state.imageblockSampleLength + 15) / 16 * 16
+            let tileMemoryNeeded = bytesPerSample * max(1, renderInfo.opaqueSampleCount) * smallestTilePixels
+            guard tileMemoryNeeded <= renderInfo.device.maxThreadgroupMemoryLength else {
+                refuseTileLightStage(state, reason: "the stage's imageblock needs \(tileMemoryNeeded) bytes in a 16×16 tile, the GPU's tile memory holds \(renderInfo.device.maxThreadgroupMemoryLength)")
+                return nil
+            }
+            descriptor.imageblockSampleLength = state.imageblockSampleLength
+            return state
+        #endif
+    }
+
+    /// Records that a pass with this pipeline's imageblock cannot run, once.
+    static func refuseTileLightStage(_ state: MTLRenderPipelineState, reason: String = "Metal refused the pass with the stage's imageblock") {
+        refusedTileLightStates.append(ObjectIdentifier(state))
+        Logger.logWarning(message: "Tile light stage: \(reason) (\(state.imageblockSampleLength) bytes per sample, \(renderInfo.opaqueSampleCount) sample(s)); lighting with the quad")
+    }
+
+    /// Logs the tile size Metal chose, once per pipeline state.
+    static func logTileLightStage(_ state: MTLRenderPipelineState, encoder: MTLRenderCommandEncoder) {
+        guard loggedTileLightStage != ObjectIdentifier(state) else { return }
+        loggedTileLightStage = ObjectIdentifier(state)
+        print("✓ Tile light stage: \(encoder.tileWidth)×\(encoder.tileHeight) tiles, \(state.imageblockSampleLength) bytes per sample, \(renderInfo.opaqueSampleCount) sample(s)")
+    }
+
     // MARK: - Shadow entity cache
 
     /// Guards one-time subscription setup for the shadow entity cache.
@@ -2322,9 +2380,26 @@ public enum RenderPasses {
         encoderDescriptor.depthAttachment.storeAction = renderInfo.opaqueSampleCount > 1 ? .multisampleResolve : .store
         encoderDescriptor.depthAttachment.clearDepth = sceneDepthClearValue()
 
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor) else {
+        // The light pass as a tile stage, when it runs: its pipeline, with the descriptor told
+        // the imageblock's size before the encoder exists. A pass Metal refuses with it (the
+        // imageblock does not fit the GPU's tile memory at this sample count) runs the quad,
+        // this frame and after.
+        var tileLightState = tileLightStage(for: encoderDescriptor)
+        var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        if encoder == nil, let refused = tileLightState {
+            refuseTileLightStage(refused)
+            tileLightState = nil
+            encoderDescriptor.imageblockSampleLength = 0
+            encoder = commandBuffer.makeRenderCommandEncoder(descriptor: encoderDescriptor)
+        }
+        guard let renderEncoder = encoder else {
+            renderInfo.tileLightStageUsed = false
             handleError(.renderPassCreationFailed, "Combined G-buffer + Light Pass")
             return
+        }
+        renderInfo.tileLightStageUsed = tileLightState != nil
+        if let tileLightState {
+            logTileLightStage(tileLightState, encoder: renderEncoder)
         }
 
         // Both paths end this encoder explicitly (the simulator path ends it
@@ -2619,88 +2694,81 @@ public enum RenderPasses {
             let lightQuadEncoder: MTLRenderCommandEncoder = renderEncoder
         #endif
 
-        lightQuadEncoder.setRenderPipelineState(lightPipeline.pipelineState!)
-        if let depthState = lightPipeline.depthState {
-            lightQuadEncoder.setDepthStencilState(depthState)
+        // The tile stage lights each pixel once per colour it holds; the quad lights every
+        // sample. Same encoder and the same inputs either way; only the binding differs.
+        let lights = LightStageBinder(encoder: lightQuadEncoder, tile: tileLightState != nil)
+        if let tileLightState {
+            lightQuadEncoder.setRenderPipelineState(tileLightState)
+        } else {
+            lightQuadEncoder.setRenderPipelineState(lightPipeline.pipelineState!)
+            if let depthState = lightPipeline.depthState {
+                lightQuadEncoder.setDepthStencilState(depthState)
+            }
+            lightQuadEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
+            lightQuadEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
         }
 
-        lightQuadEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
-        lightQuadEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
-
         var effectiveCamPos = shadingCameraPosition(cameraComponent)
-        lightQuadEncoder.setFragmentBytes(&effectiveCamPos, length: MemoryLayout<simd_float3>.stride, index: Int(lightPassCameraPositionIndex.rawValue))
+        lights.setBytes(&effectiveCamPos, length: MemoryLayout<simd_float3>.stride, index: Int(lightPassCameraPositionIndex.rawValue))
 
         var csmUniforms = shadowSystem.makeUniforms()
         csmUniforms.cameraViewMatrix = viewMatrix
         csmUniforms.lightSpaceMatrices.0 = SceneRootTransform.shared.effectiveLightMatrix(csmUniforms.lightSpaceMatrices.0)
         csmUniforms.lightSpaceMatrices.1 = SceneRootTransform.shared.effectiveLightMatrix(csmUniforms.lightSpaceMatrices.1)
         csmUniforms.lightSpaceMatrices.2 = SceneRootTransform.shared.effectiveLightMatrix(csmUniforms.lightSpaceMatrices.2)
-        lightQuadEncoder.setFragmentBytes(&csmUniforms, length: MemoryLayout<CSMUniforms>.stride, index: Int(lightPassLightOrthoViewMatrixIndex.rawValue))
+        lights.setBytes(&csmUniforms, length: MemoryLayout<CSMUniforms>.stride, index: Int(lightPassLightOrthoViewMatrixIndex.rawValue))
 
-        lightQuadEncoder.setFragmentTexture(textureResources.csmShadowMap, index: Int(lightPassShadowTextureIndex.rawValue))
-        lightQuadEncoder.setFragmentTexture(textureResources.pointShadowCubeMap, index: Int(lightPassPointShadowTextureIndex.rawValue))
+        lights.setTexture(textureResources.csmShadowMap, index: Int(lightPassShadowTextureIndex.rawValue))
+        lights.setTexture(textureResources.pointShadowCubeMap, index: Int(lightPassPointShadowTextureIndex.rawValue))
         var pointShadowUniforms = pointShadowState.makeUniforms()
-        lightQuadEncoder.setFragmentBytes(&pointShadowUniforms, length: MemoryLayout<PointShadowUniforms>.stride, index: Int(lightPassPointShadowUniformIndex.rawValue))
-        lightQuadEncoder.setFragmentTexture(textureResources.spotShadowMap, index: Int(lightPassSpotShadowTextureIndex.rawValue))
+        lights.setBytes(&pointShadowUniforms, length: MemoryLayout<PointShadowUniforms>.stride, index: Int(lightPassPointShadowUniformIndex.rawValue))
+        lights.setTexture(textureResources.spotShadowMap, index: Int(lightPassSpotShadowTextureIndex.rawValue))
         var spotShadowUniforms = spotShadowState.makeUniforms()
-        lightQuadEncoder.setFragmentBytes(&spotShadowUniforms, length: MemoryLayout<SpotShadowUniforms>.stride, index: Int(lightPassSpotShadowUniformIndex.rawValue))
+        lights.setBytes(&spotShadowUniforms, length: MemoryLayout<SpotShadowUniforms>.stride, index: Int(lightPassSpotShadowUniformIndex.rawValue))
         let environmentLighting = resolveCurrentEnvironmentLighting()
-        lightQuadEncoder.setFragmentTexture(environmentLighting.irradianceMap, index: Int(lightPassIBLIrradianceTextureIndex.rawValue))
-        lightQuadEncoder.setFragmentTexture(environmentLighting.specularMap, index: Int(lightPassIBLSpecularTextureIndex.rawValue))
-        lightQuadEncoder.setFragmentTexture(environmentLighting.brdfMap, index: Int(lightPassIBLBRDFMapTextureIndex.rawValue))
-        lightQuadEncoder.setFragmentTexture(textureResources.areaTextureLTCMag, index: Int(lightPassAreaLTCMagTextureIndex.rawValue))
-        lightQuadEncoder.setFragmentTexture(textureResources.areaTextureLTCMat, index: Int(lightPassAreaLTCMatTextureIndex.rawValue))
+        lights.setTexture(environmentLighting.irradianceMap, index: Int(lightPassIBLIrradianceTextureIndex.rawValue))
+        lights.setTexture(environmentLighting.specularMap, index: Int(lightPassIBLSpecularTextureIndex.rawValue))
+        lights.setTexture(environmentLighting.brdfMap, index: Int(lightPassIBLBRDFMapTextureIndex.rawValue))
+        lights.setTexture(textureResources.areaTextureLTCMag, index: Int(lightPassAreaLTCMagTextureIndex.rawValue))
+        lights.setTexture(textureResources.areaTextureLTCMat, index: Int(lightPassAreaLTCMatTextureIndex.rawValue))
 
         var lightParams = getDirectionalLightParameters()
-        lightQuadEncoder.setFragmentBytes(&lightParams, length: MemoryLayout<LightParameters>.stride, index: Int(lightPassLightParamsIndex.rawValue))
+        lights.setBytes(&lightParams, length: MemoryLayout<LightParameters>.stride, index: Int(lightPassLightParamsIndex.rawValue))
 
         let headerSize = 16
-        _ = uploadAndBindLights(
-            buffer: bufferResources.pointLightBuffer,
-            lights: getPointLights(),
-            maxCount: 1024,
-            headerSize: headerSize,
-            encoder: lightQuadEncoder,
-            bufferIndex: Int(lightPassPointLightsIndex.rawValue),
-            labelForErrors: "Point Lights"
-        )
-        _ = uploadAndBindLights(
-            buffer: bufferResources.spotLightBuffer,
-            lights: getSpotLights(),
-            maxCount: 1024,
-            headerSize: headerSize,
-            encoder: lightQuadEncoder,
-            bufferIndex: Int(lightPassSpotLightsIndex.rawValue),
-            labelForErrors: "Spot Lights"
-        )
-        _ = uploadAndBindLights(
-            buffer: bufferResources.areaLightBuffer,
-            lights: getAreaLights(),
-            maxCount: 1024,
-            headerSize: headerSize,
-            encoder: lightQuadEncoder,
-            bufferIndex: Int(lightPassAreaLightsIndex.rawValue),
-            labelForErrors: "Area Lights"
-        )
+        if let pointLights = uploadLights(buffer: bufferResources.pointLightBuffer, lights: getPointLights(), maxCount: 1024, headerSize: headerSize, labelForErrors: "Point Lights") {
+            lights.setBuffer(pointLights, offset: 0, index: Int(lightPassPointLightsIndex.rawValue))
+        }
+        if let spotLights = uploadLights(buffer: bufferResources.spotLightBuffer, lights: getSpotLights(), maxCount: 1024, headerSize: headerSize, labelForErrors: "Spot Lights") {
+            lights.setBuffer(spotLights, offset: 0, index: Int(lightPassSpotLightsIndex.rawValue))
+        }
+        if let areaLights = uploadLights(buffer: bufferResources.areaLightBuffer, lights: getAreaLights(), maxCount: 1024, headerSize: headerSize, labelForErrors: "Area Lights") {
+            lights.setBuffer(areaLights, offset: 0, index: Int(lightPassAreaLightsIndex.rawValue))
+        }
 
         var brdfParameters = IBLParamsUniform()
         brdfParameters.applyIBL = environmentLighting.applyIBL
         brdfParameters.ambientIntensity = environmentLighting.ambientIntensity
-        lightQuadEncoder.setFragmentBytes(&brdfParameters, length: MemoryLayout<IBLParamsUniform>.stride, index: Int(lightPassIBLParamIndex.rawValue))
+        lights.setBytes(&brdfParameters, length: MemoryLayout<IBLParamsUniform>.stride, index: Int(lightPassIBLParamIndex.rawValue))
 
         var lightPassRotationAngle = envRotationAngle
-        lightQuadEncoder.setFragmentBytes(&lightPassRotationAngle, length: MemoryLayout<Float>.stride, index: Int(lightPassIBLRotationAngleIndex.rawValue))
+        lights.setBytes(&lightPassRotationAngle, length: MemoryLayout<Float>.stride, index: Int(lightPassIBLRotationAngleIndex.rawValue))
 
         var isGameMode = gameMode
-        lightQuadEncoder.setFragmentBytes(&isGameMode, length: MemoryLayout<Bool>.size, index: Int(lightPassGameModeIndex.rawValue))
+        lights.setBytes(&isGameMode, length: MemoryLayout<Bool>.size, index: Int(lightPassGameModeIndex.rawValue))
 
-        lightQuadEncoder.drawIndexedPrimitivesTracked(
-            type: .triangle,
-            indexCount: 6,
-            indexType: .uint16,
-            indexBuffer: bufferResources.quadIndexBuffer!,
-            indexBufferOffset: 0
-        )
+        if tileLightState != nil {
+            // One thread per pixel of the tile Metal chose for this pass.
+            lightQuadEncoder.dispatchThreadsPerTile(MTLSize(width: lightQuadEncoder.tileWidth, height: lightQuadEncoder.tileHeight, depth: 1))
+        } else {
+            lightQuadEncoder.drawIndexedPrimitivesTracked(
+                type: .triangle,
+                indexCount: 6,
+                indexType: .uint16,
+                indexBuffer: bufferResources.quadIndexBuffer!,
+                indexBufferOffset: 0
+            )
+        }
 
         lightQuadEncoder.updateFence(renderInfo.fence, after: .fragment)
         // Ends the shared TBDR encoder on device, the standalone light encoder
@@ -5093,19 +5161,19 @@ extension float4x4 {
     }
 }
 
+/// Writes the lights into the buffer (a uint4 count header, then the records, capped to
+/// `maxCount`) and returns it, or nil without a buffer.
 @inline(__always)
-private func uploadAndBindLights<T>(
+private func uploadLights<T>(
     buffer: MTLBuffer?,
     lights: [T],
     maxCount: Int,
     headerSize: Int = 16, // uint4 header
-    encoder: MTLRenderCommandEncoder,
-    bufferIndex: Int,
     labelForErrors: String
-) -> Bool {
+) -> MTLBuffer? {
     guard let buf = buffer else {
         print("Missing buffer for \(labelForErrors)")
-        return false
+        return nil
     }
 
     // Cap to buffer capacity
@@ -5121,10 +5189,54 @@ private func uploadAndBindLights<T>(
     lights.withUnsafeBytes { raw in
         dst.copyMemory(from: raw.baseAddress!, byteCount: nBytes)
     }
+    return buf
+}
 
-    // Bind
+private func uploadAndBindLights(
+    buffer: MTLBuffer?,
+    lights: [some Any],
+    maxCount: Int,
+    headerSize: Int = 16, // uint4 header
+    encoder: MTLRenderCommandEncoder,
+    bufferIndex: Int,
+    labelForErrors: String
+) -> Bool {
+    guard let buf = uploadLights(buffer: buffer, lights: lights, maxCount: maxCount, headerSize: headerSize, labelForErrors: labelForErrors) else {
+        return false
+    }
     encoder.setFragmentBuffer(buf, offset: 0, index: bufferIndex)
     return true
+}
+
+/// Binds the light pass's inputs to the stage that lights: the quad's fragment function or
+/// the tile kernel. Both take the same indices.
+struct LightStageBinder {
+    let encoder: MTLRenderCommandEncoder
+    let tile: Bool
+
+    func setBytes(_ bytes: UnsafeRawPointer, length: Int, index: Int) {
+        if tile {
+            encoder.setTileBytes(bytes, length: length, index: index)
+        } else {
+            encoder.setFragmentBytes(bytes, length: length, index: index)
+        }
+    }
+
+    func setTexture(_ texture: MTLTexture?, index: Int) {
+        if tile {
+            encoder.setTileTexture(texture, index: index)
+        } else {
+            encoder.setFragmentTexture(texture, index: index)
+        }
+    }
+
+    func setBuffer(_ buffer: MTLBuffer?, offset: Int, index: Int) {
+        if tile {
+            encoder.setTileBuffer(buffer, offset: offset, index: index)
+        } else {
+            encoder.setFragmentBuffer(buffer, offset: offset, index: index)
+        }
+    }
 }
 
 /// Returns true when the entity's AABB is farther than maxDistance from the camera.
