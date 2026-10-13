@@ -1484,9 +1484,14 @@ public let outputTransformRenderPass: RenderPasses.RenderPassExecution = { comma
     case .smaaDifference:
         sourceTexture = textureResources.smaaBlendTexture
     default:
-        sourceTexture = antiAliasingMode.usesPostLookPass
-            ? textureResources.antiAliasingTexture
-            : textureResources.lookTexture
+        if antiAliasingMode.isTemporal {
+            // The temporal resolve writes its result once, as the eye's new history.
+            sourceTexture = TemporalAntiAliasing.shared.resolvedTexture ?? textureResources.lookTexture
+        } else {
+            sourceTexture = antiAliasingMode.usesPostLookPass
+                ? textureResources.antiAliasingTexture
+                : textureResources.lookTexture
+        }
     }
     guard let sourceTexture else {
         handleError(.renderPassCreationFailed, "Output Transform Pass: source texture is nil")

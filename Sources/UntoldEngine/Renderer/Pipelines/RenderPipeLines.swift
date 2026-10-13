@@ -963,14 +963,14 @@ public func InitFXAAPipeline() -> RenderPipeline? {
     )
 }
 
-/// The temporal resolve: the look output and the eye's history into the anti-aliasing
-/// texture and the eye's next history, two colour targets of the look format.
+/// The temporal resolve: the look output and the eye's history into the eye's next history,
+/// one colour target of the look format, which the output transform then presents.
 public func InitTAAPipeline() -> RenderPipeline? {
     CreatePipeline(
         vertexShader: "vertexTAAShader",
         fragmentShader: "fragmentTAAShader",
         vertexDescriptor: createPostProcessVertexDescriptor(),
-        colorFormats: [renderInfo.colorPipeline.working.lookOutput, renderInfo.colorPipeline.working.lookOutput],
+        colorFormats: [renderInfo.colorPipeline.working.lookOutput],
         depthFormat: .invalid,
         depthEnabled: false,
         name: "TAA Pipeline"
