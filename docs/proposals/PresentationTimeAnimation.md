@@ -1,6 +1,6 @@
 # Posing the Frame for Its Presentation Time — Why a Moving Object Judders on Vision Pro, and the Fix
 
-Status: proposal with a prototype on this branch (engine side done and tested; the viewer app's change drafted in its working tree, uncommitted; the headset check still to do). Written 2026-10-14 from a headset session of the same day with the viewer app (`UntoldArcade-viewer`), the dartboard on its eased "tour" path.
+Status: proposal with a prototype on this branch (engine side done and tested; the viewer app's change saved as `viewer-frame-time.patch` beside this document; the headset check still to do). Written 2026-10-14 from a headset session of the same day with the viewer app (`UntoldArcade-viewer`), the dartboard on its eased "tour" path.
 
 ## TL;DR
 
@@ -71,11 +71,11 @@ public struct FrameTime: Sendable, Equatable {
 
 `renderNewFrame()` converts `timing.presentationTime` once, right after `predictTiming()`, and passes it to `updateXR(presentationTime:)`; the anchor query at submission converts `drawable.frameTiming.presentationTime` the same way. The two should be the same instant. `notePresentationRevision` counts the frames where the drawable's differs from the prediction by more than half a millisecond (`presentationTimeRevisions`, printed at most once a second): on such a frame the object was posed for a slightly different instant than the head, by exactly that difference. The count is the headset check that the prediction is stable (section 8).
 
-### 3.4 The viewer's change (drafted in the viewer's working tree, not committed there)
+### 3.4 The viewer's change (`viewer-frame-time.patch`, beside this document)
 
 `Viewer/App/EngineSession.swift`: `xr.setupCallbacks(frameUpdate: { [weak self] frame in self?.update(frame: frame) }, handleInput: ...)`, `update(frame:)`, and the tour's time from the frame: `tourTime = (frame.presentationTime - object.placed).truncatingRemainder(dividingBy: Catalog.Tour.period)`. `object.placed` is already in the same clock base (`systemUptime`). For the headset check, the session sums `frame.skippedFrames` over all frames and reads `xr.presentationTimeRevisions`; both go into `EngineDiagnostics` (`skippedFrames`, `presentationRevisions`), the run summary (`MeasurementRun.swift`: ", N skipped refreshes, N presentation revisions") and the controls' engine line ("frames N (M skipped)"). The RealityKit path keeps `SceneEvents.Update`, which gives no presentation time; RealityKit poses its own frames for the compositor.
 
-The viewer's project points at the `xr_foveation` worktree (`project.yml`, `packages.UntoldEngine.path`), which does not have this branch; building it needs that worktree on this branch (or the path changed and `xcodegen generate` run). The draft was compiled against this branch through a throwaway XcodeGen project outside the viewer's tree.
+The viewer's project points at the `xr_foveation` worktree (`project.yml`, `packages.UntoldEngine.path`), which does not have this branch, and the viewer must keep building against the try branch until this branch is merged into it. So the draft lives as a patch: `patch -p1 < viewer-frame-time.patch` from the `UntoldViewer` directory applies it (three files; it was taken against the viewer's tree of 2026-10-14). It was compiled against this branch through a throwaway XcodeGen project outside the viewer's tree.
 
 ## 4. Where the game update runs: before the wait, posed for the predicted presentation
 
