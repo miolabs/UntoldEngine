@@ -1,6 +1,6 @@
 # Posing the Frame for Its Presentation Time — Why a Moving Object Judders on Vision Pro, and the Fix
 
-Status: proposal with a prototype on this branch (engine side done and tested; the viewer app's one-line change and the headset check still to do). Written 2026-10-14 from a headset session of the same day with the viewer app (`UntoldArcade-viewer`), the dartboard on its eased "tour" path.
+Status: proposal with a prototype on this branch (engine side done and tested; the viewer app's change drafted in its working tree, uncommitted; the headset check still to do). Written 2026-10-14 from a headset session of the same day with the viewer app (`UntoldArcade-viewer`), the dartboard on its eased "tour" path.
 
 ## TL;DR
 
@@ -71,9 +71,11 @@ public struct FrameTime: Sendable, Equatable {
 
 `renderNewFrame()` converts `timing.presentationTime` once, right after `predictTiming()`, and passes it to `updateXR(presentationTime:)`; the anchor query at submission converts `drawable.frameTiming.presentationTime` the same way. The two should be the same instant. `notePresentationRevision` counts the frames where the drawable's differs from the prediction by more than half a millisecond (`presentationTimeRevisions`, printed at most once a second): on such a frame the object was posed for a slightly different instant than the head, by exactly that difference. The count is the headset check that the prediction is stable (section 8).
 
-### 3.4 The viewer's change (not made here; the viewer is read-only for this branch)
+### 3.4 The viewer's change (drafted in the viewer's working tree, not committed there)
 
-`EngineSession.swift`: `xr.setupCallbacks(frameUpdate: { [weak self] frame in self?.update(frame) }, handleInput: ...)` and, in `update`, `tourTime = (frame.presentationTime - object.placed).truncatingRemainder(dividingBy: Catalog.Tour.period)`. `object.placed` is already in the same clock base (`systemUptime`); recording it from `currentFrameTime.presentationTime` at placement makes the first frame exact too. The RealityKit path keeps `SceneEvents.Update`, which gives no presentation time; RealityKit poses its own frames for the compositor.
+`Viewer/App/EngineSession.swift`: `xr.setupCallbacks(frameUpdate: { [weak self] frame in self?.update(frame: frame) }, handleInput: ...)`, `update(frame:)`, and the tour's time from the frame: `tourTime = (frame.presentationTime - object.placed).truncatingRemainder(dividingBy: Catalog.Tour.period)`. `object.placed` is already in the same clock base (`systemUptime`). For the headset check, the session sums `frame.skippedFrames` over all frames and reads `xr.presentationTimeRevisions`; both go into `EngineDiagnostics` (`skippedFrames`, `presentationRevisions`), the run summary (`MeasurementRun.swift`: ", N skipped refreshes, N presentation revisions") and the controls' engine line ("frames N (M skipped)"). The RealityKit path keeps `SceneEvents.Update`, which gives no presentation time; RealityKit poses its own frames for the compositor.
+
+The viewer's project points at the `xr_foveation` worktree (`project.yml`, `packages.UntoldEngine.path`), which does not have this branch; building it needs that worktree on this branch (or the path changed and `xcodegen generate` run). The draft was compiled against this branch through a throwaway XcodeGen project outside the viewer's tree.
 
 ## 4. Where the game update runs: before the wait, posed for the predicted presentation
 
@@ -120,7 +122,7 @@ The compositor part cannot run in `swift test`; section 8 is its check.
 
 1. The start-up line `XR clock: the compositor epoch's time differs from the media time by N ms`: N should be the microseconds between two reads. A large constant N means the epoch assumption is wrong and the loop must go back to converting through "now" on both clocks.
 2. `presentationTimeRevisions` (and its log line) over a minute of the tour: near zero means the predicted and final presentation times agree and the object is posed for the head's instant; a steady count means the prediction is revised by the compositor and the game should be posed for the drawable's time instead (option B's place), or the revision applied as a per-frame correction.
-3. `EngineTimingStats.skippedFrames` summed over a minute against the fps shortfall (6 in 100, 5 in 90): they should match.
+3. The viewer's run summary: "N skipped refreshes" over the run against the fps shortfall (6 in 100, 5 in 90): they should match. "N presentation revisions" is check 2.
 4. The tour, with the viewer's change of section 3.4: the small per-frame steps should be gone; the occasional larger jump remains for every skipped refresh and should now be one clean double step with no drift after it.
 
 ## 9. Size, and the risk to the three draft pull requests
@@ -137,7 +139,7 @@ Behaviour changes to note in review: `timeSinceLastUpdate` is the presentation d
 
 ## 10. Follow-ups
 
-- The viewer's change (section 3.4) and the headset check (section 8).
+- The headset check (section 8), with the viewer's change of section 3.4.
 - A `TransformTrackComponent` with a system that samples it at `currentFrameTime.presentationTime` every frame, so a track plays with no game code; `TransformTrack` is the value type it would hold.
 - `updateCameraPath(frame:)` sampling from an absolute time.
 - A presented-time feedback for the `MTKView` estimate (section 6).
