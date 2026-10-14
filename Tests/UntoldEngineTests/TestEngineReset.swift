@@ -24,6 +24,7 @@
     entityNameMap.removeAll()
     reverseEntityNameMap.removeAll()
     globalEntityCounter = 0
+    currentFrameTime = .zero
     needsFinalizeDestroys = false
     hasPendingDestroys = false
     EngineExtensionRegistry.shared.removeAll()
