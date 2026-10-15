@@ -109,9 +109,6 @@
         private var secondGPUSumMs = 0.0
         private var secondPacedWaitSumMs = 0.0
         private var secondPacedWaits = 0
-        /// How much earlier than the cadence the paced query is made, in seconds: the query
-        /// blocks until the compositor hands out the frame, which aligns it to the refreshes.
-        private static let pacedQueryLead: TimeInterval = 0.003
         /// The automatic mode's current choice: waiting for the optimal input time, or not.
         private var automaticWaits = true
         /// The half-rate pacing: its policy, whether this frame is paced, the last second's
@@ -122,8 +119,17 @@
         private var pacingActiveNow = false
         private var secondMaxGPUMs = 0.0
         private var lastRenderedPresentation: LayerRenderer.Clock.Instant?
-        /// When the compositor handed the loop its last frame: the pacing's anchor.
+        /// When the compositor handed the loop its last frame, and the pacing's own grid: the
+        /// instant it started from, on which the paced queries fall every cadence.
         private var lastFrameHandedAt: LayerRenderer.Clock.Instant?
+        private var pacingOrigin: LayerRenderer.Clock.Instant?
+        /// The last frame's predicted presentation, and the last second's spacing between
+        /// consecutive ones: its sum, shortest and longest, the evenness of the frames shown.
+        private var lastPredictedPresentation: LayerRenderer.Clock.Instant?
+        private var secondSpacingSumMs = 0.0
+        private var secondSpacingMinMs = Double.infinity
+        private var secondSpacingMaxMs = 0.0
+        private var secondSpacings = 0
         /// The last second's loop: how long the query for a frame blocked, how long the loop
         /// took from one handed frame to the next query, how far after the query the compositor
         /// predicted the presentation, and how far before it the rendering deadline sat.
@@ -159,15 +165,17 @@
         }
 
         /// The half-rate pacing, before the next compositor frame is taken. With the pacing
-        /// active, by the setting or by the policy when the frames run late, the loop waits
-        /// until `cadenceRefreshes` refreshes after the compositor handed it the last frame,
-        /// less a few milliseconds, then asks for the next: the query blocks until the
-        /// compositor hands it out, which aligns the frames to the refreshes without the loop
-        /// guessing their grid (a wait aimed at a presentation instant landed just after the
-        /// hand-out and cost a refresh every frame). Nothing waits for the GPU: the next
-        /// frame's work queues behind the previous one's, so the GPU stays busy and keeps its
-        /// clock. Every frame taken is submitted: a frame taken and let go is never released by
-        /// the compositor, and three of them abort the app.
+        /// active, by the setting or by the policy when the frames run late, the queries fall
+        /// on the pacing's own grid: the instant it started from, every `cadenceRefreshes`
+        /// refreshes, exactly. The compositor hands out a frame on demand and predicts its
+        /// presentation a fixed time after the query, so queries spaced an exact number of
+        /// refreshes apart are shown an exact number of refreshes apart. (A wait aimed at the
+        /// previous frame's presentation instant made every cadence three refreshes, the
+        /// compositor predicting three ahead; a wait of a cadence less a lead spaced the frames
+        /// unevenly.) A query up to a quarter refresh late still takes its slot. Nothing waits
+        /// for the GPU: the next frame's work queues behind the previous one's, so the GPU
+        /// stays busy and keeps its clock. Every frame taken is submitted: a frame taken and
+        /// let go is never released by the compositor, and three of them abort the app.
         private func paceForHalfRate() {
             let active: Bool
             let cadence: Int
@@ -180,11 +188,21 @@
             cadence = halfRate.cadenceRefreshes
             pacingActiveNow = active
             deadlineLock.unlock()
-            guard active, let handed = lastFrameHandedAt else { return }
+            guard active, let handed = lastFrameHandedAt else {
+                pacingOrigin = nil
+                return
+            }
             let period = currentFrameTime.period
             guard period > 0 else { return }
             let clock = LayerRenderer.Clock()
-            let target = handed.advanced(by: .seconds(Double(cadence) * period - Self.pacedQueryLead))
+            guard let origin = pacingOrigin else {
+                pacingOrigin = handed
+                return
+            }
+            let step = Double(cadence) * period
+            let elapsed = Self.seconds(origin.duration(to: clock.now))
+            let slots = max(1, ((elapsed - 0.25 * period) / step).rounded(.up))
+            let target = origin.advanced(by: .seconds(slots * step))
             let waitMs = max(0, Self.milliseconds(clock.now.duration(to: target)))
             if waitMs > 0 {
                 clock.wait(until: target, tolerance: .zero)
@@ -721,6 +739,16 @@
             let compositorPresentationTime = Self.mediaTime(of: timing.presentationTime)
             let predictedPresentationTime = compositorPresentationTime + presentationLeadSeconds()
             logClockBasesOnce()
+            if let last = lastPredictedPresentation {
+                let spacingMs = Self.milliseconds(last.duration(to: timing.presentationTime))
+                deadlineLock.lock()
+                secondSpacingSumMs += spacingMs
+                secondSpacingMinMs = min(secondSpacingMinMs, spacingMs)
+                secondSpacingMaxMs = max(secondSpacingMaxMs, spacingMs)
+                secondSpacings += 1
+                deadlineLock.unlock()
+            }
+            lastPredictedPresentation = timing.presentationTime
             deadlineLock.lock()
             secondQueryBlockSumMs += Self.milliseconds(queryStart.duration(to: handedAt))
             secondLoopSumMs += loopMs
@@ -1485,6 +1513,9 @@
                         let timed = Double(secondTimedFrames)
                         report = (report ?? "") + String(format: "; the query blocked %.1f ms, the loop took %.1f ms between frames, the presentation was predicted %.1f ms after the query, the deadline %.1f ms before it", secondQueryBlockSumMs / timed, secondLoopSumMs / timed, secondPredictedAheadSumMs / timed, secondDeadlineMarginSumMs / timed)
                     }
+                    if secondSpacings > 0 {
+                        report = (report ?? "") + String(format: "; presentations spaced %.1f ms (%.1f to %.1f)", secondSpacingSumMs / Double(secondSpacings), secondSpacingMinMs, secondSpacingMaxMs)
+                    }
                     // With the GPU pass timing on, the heaviest passes of the last resolved frame
                     // name what a second of frames well past the deadline spent its time on.
                     if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {
@@ -1542,6 +1573,10 @@
                 secondPredictedAheadSumMs = 0
                 secondDeadlineMarginSumMs = 0
                 secondTimedFrames = 0
+                secondSpacingSumMs = 0
+                secondSpacingMinMs = .infinity
+                secondSpacingMaxMs = 0
+                secondSpacings = 0
                 lastDeadlineLogTime = now
             }
             deadlineLock.unlock()
