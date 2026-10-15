@@ -28,7 +28,7 @@ public enum XRFramePacing: Sendable, Equatable {
 /// millisecond on average for two seconds running; leave when the rendered frames' GPU work
 /// has fitted 80% of the refresh for two seconds running.
 public struct XRHalfRatePolicy: Equatable, Sendable {
-    /// Whether every other refresh is being skipped.
+    /// Whether the frames are being paced to every other refresh.
     public private(set) var active = false
     /// Whether the last second's rendered frames mostly landed a refresh late: the pose then
     /// aims one refresh later, where the display shows them.

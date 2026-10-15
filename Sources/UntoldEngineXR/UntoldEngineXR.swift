@@ -108,13 +108,15 @@
         private var secondSkippedWaitMaxMs = 0.0
         /// The automatic mode's current choice: waiting for the optimal input time, or not.
         private var automaticWaits = true
-        /// The half-rate pacing: its policy, the alternator that lets every other compositor
-        /// frame go while it is active, whether this frame is paced, and the last second's
-        /// longest GPU span.
+        /// The half-rate pacing: its policy, whether this frame is paced, the last second's
+        /// longest GPU span, and its anchors: the last rendered frame's command buffer, waited
+        /// for before the next frame is taken, and that frame's presentation instant, the
+        /// refresh grid the next frame is taken on.
         private var halfRate = XRHalfRatePolicy()
-        private var halfRateSkipNext = true
         private var pacingActiveNow = false
         private var secondMaxGPUMs = 0.0
+        private var lastRenderedCommandBuffer: MTLCommandBuffer?
+        private var lastRenderedPresentation: LayerRenderer.Clock.Instant?
         /// Whether the loop is rendering every other refresh at the moment.
         public var halfRatePacingActive: Bool { deadlineLock.withLock { pacingActiveNow } }
         /// Whether the last frame waited for the compositor's optimal input time: the setting,
@@ -141,9 +143,14 @@
             return waits
         }
 
-        /// Whether this compositor frame is let go for the half-rate pacing: every other one
-        /// while the pacing is active, by the setting or by the policy when the frames run late.
-        private func skipsFrameForPacing() -> Bool {
+        /// The half-rate pacing, before the next compositor frame is taken. With the pacing
+        /// active, by the setting or by the policy when the frames run late, the loop first
+        /// waits for the last rendered frame's GPU work to finish and then for the next refresh
+        /// after that, counted from that frame's presentation instant. Every frame taken is
+        /// submitted (a frame taken and let go is never released by the compositor, and three
+        /// of them abort the app), nothing queues on the GPU, and the frames land on every
+        /// other refresh while one refresh is not enough for a frame's work.
+        private func paceForHalfRate() {
             let active: Bool
             deadlineLock.lock()
             switch xrFramePacing {
@@ -153,12 +160,14 @@
             }
             pacingActiveNow = active
             deadlineLock.unlock()
-            guard active else {
-                halfRateSkipNext = true
-                return false
-            }
-            halfRateSkipNext.toggle()
-            return halfRateSkipNext
+            guard active, let anchor = lastRenderedPresentation else { return }
+            lastRenderedCommandBuffer?.waitUntilCompleted()
+            let period = currentFrameTime.period
+            guard period > 0 else { return }
+            let clock = LayerRenderer.Clock()
+            let behind = Self.seconds(anchor.duration(to: clock.now))
+            let refreshes = behind > 0 ? (behind / period).rounded(.up) : 0
+            clock.wait(until: anchor.advanced(by: .seconds(refreshes * period)), tolerance: .zero)
         }
 
         /// How far past the compositor's predicted presentation the frame is posed for: one
@@ -666,16 +675,12 @@
             guard let layerRenderer else { return }
             guard isRunning() else { return }
 
-            guard let frame = layerRenderer.queryNextFrame() else { return }
+            // The half-rate pacing waits here, before a frame is taken, so that the frames
+            // rendered land on every other refresh, evenly, when one refresh is not enough for
+            // a frame's GPU work; the display shows the previous frame again meanwhile.
+            paceForHalfRate()
 
-            // The half-rate pacing: every other compositor frame is let go, so the frames
-            // rendered are shown two refreshes apart, evenly, when one refresh is not enough
-            // for a frame's GPU work; the display shows the previous frame again meanwhile.
-            if skipsFrameForPacing() {
-                frame.startUpdate()
-                frame.endUpdate()
-                return
-            }
+            guard let frame = layerRenderer.queryNextFrame() else { return }
 
             // 2. Call predictTiming to get the predicted render deadlines for code
             guard let timing = frame.predictTiming() else { return }
@@ -882,6 +887,7 @@
             #else
                 renderer.finalizeXRStatsAndMonitors(frameStartTime: 0.0)
             #endif
+            lastRenderedPresentation = timing.presentationTime
         }
 
         /// Whether the scene is drawn into a drawable. The built-in display always; another
@@ -1253,6 +1259,9 @@
                 let submitStart = CACurrentMediaTime()
             #endif
             commandBuffer.commit()
+            if primary {
+                lastRenderedCommandBuffer = commandBuffer
+            }
             #if ENGINE_STATS_ENABLED
                 let submitMs = (CACurrentMediaTime() - submitStart) * 1000.0
                 let renderTotalMs = (CACurrentMediaTime() - renderTotalStart) * 1000.0
