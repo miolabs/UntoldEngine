@@ -108,6 +108,15 @@
         private var secondSkippedWaitMaxMs = 0.0
         /// The automatic mode's current choice: waiting for the optimal input time, or not.
         private var automaticWaits = true
+        /// The half-rate pacing: its policy, the alternator that lets every other compositor
+        /// frame go while it is active, whether this frame is paced, and the last second's
+        /// longest GPU span.
+        private var halfRate = XRHalfRatePolicy()
+        private var halfRateSkipNext = true
+        private var pacingActiveNow = false
+        private var secondMaxGPUMs = 0.0
+        /// Whether the loop is rendering every other refresh at the moment.
+        public var halfRatePacingActive: Bool { deadlineLock.withLock { pacingActiveNow } }
         /// Whether the last frame waited for the compositor's optimal input time: the setting,
         /// or in the automatic mode what the measured deadline allowed.
         public var optimalInputWaitActive: Bool { deadlineLock.withLock { lastFrameWaited } }
@@ -130,6 +139,33 @@
             lastFrameWaited = waits
             deadlineLock.unlock()
             return waits
+        }
+
+        /// Whether this compositor frame is let go for the half-rate pacing: every other one
+        /// while the pacing is active, by the setting or by the policy when the frames run late.
+        private func skipsFrameForPacing() -> Bool {
+            let active: Bool
+            deadlineLock.lock()
+            switch xrFramePacing {
+            case .fullRate: active = false
+            case .halfRate: active = true
+            case .halfRateWhenLate: active = halfRate.active
+            }
+            pacingActiveNow = active
+            deadlineLock.unlock()
+            guard active else {
+                halfRateSkipNext = true
+                return false
+            }
+            halfRateSkipNext.toggle()
+            return halfRateSkipNext
+        }
+
+        /// How far past the compositor's predicted presentation the frame is posed for: one
+        /// refresh while the half-rate pacing's rendered frames land a refresh late, where the
+        /// display then shows them; nothing otherwise.
+        private func presentationLeadSeconds() -> TimeInterval {
+            deadlineLock.withLock { pacingActiveNow && halfRate.framesLandLate ? currentFrameTime.period : 0 }
         }
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
@@ -632,6 +668,15 @@
 
             guard let frame = layerRenderer.queryNextFrame() else { return }
 
+            // The half-rate pacing: every other compositor frame is let go, so the frames
+            // rendered are shown two refreshes apart, evenly, when one refresh is not enough
+            // for a frame's GPU work; the display shows the previous frame again meanwhile.
+            if skipsFrameForPacing() {
+                frame.startUpdate()
+                frame.endUpdate()
+                return
+            }
+
             // 2. Call predictTiming to get the predicted render deadlines for code
             guard let timing = frame.predictTiming() else { return }
 
@@ -639,7 +684,8 @@
             // base: the game poses the frame for it in the update phase, and the head is posed
             // for the same instant at submission (the drawable's frameTiming, normally this
             // very value; notePresentationRevision counts the frames where it is not).
-            let predictedPresentationTime = Self.mediaTime(of: timing.presentationTime)
+            let compositorPresentationTime = Self.mediaTime(of: timing.presentationTime)
+            let predictedPresentationTime = compositorPresentationTime + presentationLeadSeconds()
             logClockBasesOnce()
 
             // 3. Call startUpdate() to mark the start of the update phase
@@ -777,7 +823,7 @@
                 let presentationTimeCA: TimeInterval = Self.mediaTime(of: presentationInstant)
                 if !presentationChecked {
                     presentationChecked = true
-                    notePresentationRevision(predicted: predictedPresentationTime, final: presentationTimeCA)
+                    notePresentationRevision(predicted: compositorPresentationTime, final: presentationTimeCA)
                 }
                 var deviceAnchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: presentationTimeCA)
 
@@ -1197,7 +1243,7 @@
                     EngineStatsMonitor.shared.recordGPUCompletion(gpuStartTime: cb.gpuStartTime, gpuEndTime: cb.gpuEndTime)
                 #endif
                 if countsDeadline {
-                    self?.noteGPUCompletion(at: cb.gpuEndTime, deadline: deadline)
+                    self?.noteGPUCompletion(at: cb.gpuEndTime, start: cb.gpuStartTime, deadline: deadline)
                 }
                 commandBufferSemaphore.signal()
             }
@@ -1363,13 +1409,14 @@
         /// Counts a frame whose GPU work finished after the compositor's rendering deadline, keeps
         /// the longest overrun, and prints once a second how many of that second's frames were
         /// late and by how much. Runs on the GPU's completion thread.
-        private func noteGPUCompletion(at gpuEnd: CFTimeInterval, deadline: TimeInterval) {
+        private func noteGPUCompletion(at gpuEnd: CFTimeInterval, start gpuStart: CFTimeInterval, deadline: TimeInterval) {
             let overrunMs = (gpuEnd - deadline) * 1000.0
             let now = CACurrentMediaTime()
             var report: String?
             deadlineLock.lock()
             secondFrames += 1
             secondLeastSlackMs = min(secondLeastSlackMs, -overrunMs)
+            secondMaxGPUMs = max(secondMaxGPUMs, (gpuEnd - gpuStart) * 1000.0)
             if overrunMs > 0 {
                 deadlineMissCount += 1
                 secondLate += 1
@@ -1388,7 +1435,7 @@
                     case .automatic: mode = "automatic"
                     }
                     let meanOverrunMs = secondOverrunSumMs / Double(secondLate)
-                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited")
+                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? "; half rate" : "")
                     // With the GPU pass timing on, the heaviest passes of the last resolved frame
                     // name what a second of frames well past the deadline spent its time on.
                     if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {
@@ -1405,11 +1452,31 @@
                 if xrOptimalInputWaitMode == .automatic, secondFrames > 0 {
                     if automaticWaits, secondLate * 20 >= secondFrames {
                         automaticWaits = false
-                        report = (report ?? "") + String(format: "\nXR frame timing: %d of %d frames late: encoding without the wait for the optimal input time", secondLate, secondFrames)
+                        let line = String(format: "XR frame timing: %d of %d frames late: encoding without the wait for the optimal input time", secondLate, secondFrames)
+                        report = report.map { $0 + "\n" + line } ?? line
                     } else if !automaticWaits, secondLeastSlackMs.isFinite, secondLeastSlackMs > secondSkippedWaitMaxMs + 1.5 {
                         automaticWaits = true
-                        report = (report ?? "") + String(format: "\nXR frame timing: the least slack of %.2f ms covers the skipped wait of %.2f ms: waiting for the optimal input time again", secondLeastSlackMs, secondSkippedWaitMaxMs)
+                        let line = String(format: "XR frame timing: the least slack of %.2f ms covers the skipped wait of %.2f ms: waiting for the optimal input time again", secondLeastSlackMs, secondSkippedWaitMaxMs)
+                        report = report.map { $0 + "\n" + line } ?? line
                     }
+                }
+                // The half-rate pacing, by its policy when the setting leaves it to the frames.
+                if xrFramePacing == .halfRateWhenLate {
+                    let waitStillToSkip = xrOptimalInputWaitMode == .automatic && automaticWaits
+                    let meanLateMs = secondLate > 0 ? secondOverrunSumMs / Double(secondLate) : 0
+                    let periodMs = currentFrameTime.period * 1000.0
+                    switch halfRate.secondEnded(frames: secondFrames, late: secondLate, meanOverrunMs: meanLateMs, maxGPUDurationMs: secondMaxGPUMs, periodMs: periodMs, waitStillToSkip: waitStillToSkip) {
+                    case .entered:
+                        let line = String(format: "XR frame timing: %d of %d frames late with no wait left to skip: rendering every other refresh", secondLate, secondFrames)
+                        report = report.map { $0 + "\n" + line } ?? line
+                    case .left:
+                        let line = String(format: "XR frame timing: the frame's GPU work of %.2f ms fits the refresh of %.2f ms: rendering every refresh again", secondMaxGPUMs, periodMs)
+                        report = report.map { $0 + "\n" + line } ?? line
+                    case .none:
+                        break
+                    }
+                } else {
+                    halfRate.reset()
                 }
                 secondFrames = 0
                 secondLate = 0
@@ -1417,6 +1484,7 @@
                 secondOverrunSumMs = 0
                 secondLeastSlackMs = .infinity
                 secondSkippedWaitMaxMs = 0
+                secondMaxGPUMs = 0
                 lastDeadlineLogTime = now
             }
             deadlineLock.unlock()
