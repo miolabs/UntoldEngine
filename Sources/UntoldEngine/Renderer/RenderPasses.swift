@@ -1415,7 +1415,7 @@ public enum RenderPasses {
         let projectionMatrix = renderInfo.perspectiveSpace
 
         // Render each cascade into its own depth array slice.
-        for cascadeIdx in 0 ..< csmCascadeCount {
+        for cascadeIdx in 0 ..< shadowSystem.cascadeCount {
             guard cascadeIdx < renderInfo.csmRenderPassDescriptors.count else { break }
             let descriptor = renderInfo.csmRenderPassDescriptors[cascadeIdx]
             descriptor.depthAttachment.loadAction = .clear
@@ -1528,7 +1528,7 @@ public enum RenderPasses {
         batchUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
         batchUniforms.projectionMatrix = renderInfo.perspectiveSpace
 
-        for cascadeIdx in 0 ..< csmCascadeCount {
+        for cascadeIdx in 0 ..< shadowSystem.cascadeCount {
             guard cascadeIdx < renderInfo.csmRenderPassDescriptors.count else { break }
 
             // Batched geometry adds into the existing cascade depth slice (already written by shadowExecution).
