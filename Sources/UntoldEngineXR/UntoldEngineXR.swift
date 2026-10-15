@@ -109,6 +109,9 @@
         private var secondGPUSumMs = 0.0
         private var secondPacedWaitSumMs = 0.0
         private var secondPacedWaits = 0
+        /// How much earlier than the cadence the paced query is made, in seconds: the query
+        /// blocks until the compositor hands out the frame, which aligns it to the refreshes.
+        private static let pacedQueryLead: TimeInterval = 0.003
         /// The automatic mode's current choice: waiting for the optimal input time, or not.
         private var automaticWaits = true
         /// The half-rate pacing: its policy, whether this frame is paced, the last second's
@@ -119,7 +122,16 @@
         private var pacingActiveNow = false
         private var secondMaxGPUMs = 0.0
         private var lastRenderedPresentation: LayerRenderer.Clock.Instant?
-        private var lastPacedQuery: LayerRenderer.Clock.Instant?
+        /// When the compositor handed the loop its last frame: the pacing's anchor.
+        private var lastFrameHandedAt: LayerRenderer.Clock.Instant?
+        /// The last second's loop: how long the query for a frame blocked, how long the loop
+        /// took from one handed frame to the next query, how far after the query the compositor
+        /// predicted the presentation, and how far before it the rendering deadline sat.
+        private var secondQueryBlockSumMs = 0.0
+        private var secondLoopSumMs = 0.0
+        private var secondPredictedAheadSumMs = 0.0
+        private var secondDeadlineMarginSumMs = 0.0
+        private var secondTimedFrames = 0
         /// Whether the loop is rendering every other refresh at the moment.
         public var halfRatePacingActive: Bool { deadlineLock.withLock { pacingActiveNow } }
         /// Whether the last frame waited for the compositor's optimal input time: the setting,
@@ -147,14 +159,15 @@
         }
 
         /// The half-rate pacing, before the next compositor frame is taken. With the pacing
-        /// active, by the setting or by the policy when the frames run late, the frames are
-        /// taken on the refresh grid (the last rendered frame's presentation instant and its
-        /// multiples of the period) every `cadenceRefreshes` refreshes: two, or as many as the
-        /// frame's GPU work with its encode needs. Nothing waits for the GPU: the next frame's
-        /// work queues behind the previous one's, so the GPU stays busy and keeps its clock
-        /// (idling it between frames made every frame a third longer). Every frame taken is
-        /// submitted: a frame taken and let go is never released by the compositor, and three
-        /// of them abort the app.
+        /// active, by the setting or by the policy when the frames run late, the loop waits
+        /// until `cadenceRefreshes` refreshes after the compositor handed it the last frame,
+        /// less a few milliseconds, then asks for the next: the query blocks until the
+        /// compositor hands it out, which aligns the frames to the refreshes without the loop
+        /// guessing their grid (a wait aimed at a presentation instant landed just after the
+        /// hand-out and cost a refresh every frame). Nothing waits for the GPU: the next
+        /// frame's work queues behind the previous one's, so the GPU stays busy and keeps its
+        /// clock. Every frame taken is submitted: a frame taken and let go is never released by
+        /// the compositor, and three of them abort the app.
         private func paceForHalfRate() {
             let active: Bool
             let cadence: Int
@@ -167,29 +180,15 @@
             cadence = halfRate.cadenceRefreshes
             pacingActiveNow = active
             deadlineLock.unlock()
-            guard active, let grid = lastRenderedPresentation else {
-                lastPacedQuery = nil
-                return
-            }
+            guard active, let handed = lastFrameHandedAt else { return }
             let period = currentFrameTime.period
             guard period > 0 else { return }
             let clock = LayerRenderer.Clock()
-            // The earliest the next frame may be taken: a cadence after the last paced one, and
-            // not before now; snapped up to the refresh grid.
-            var earliest = clock.now
-            if let last = lastPacedQuery {
-                let due = last.advanced(by: .seconds(Double(cadence) * period))
-                if due > earliest { earliest = due }
-            }
-            // Snapped up to the grid with a quarter of a refresh of tolerance: the learned period
-            // is a hair short of the compositor's, and without it "two refreshes" computed as
-            // 2.0001 and rounded up to three, every time.
-            let behind = Self.seconds(grid.duration(to: earliest))
-            let refreshes = behind > 0 ? max(0, (behind / period - 0.25).rounded(.up)) : 0
-            let target = grid.advanced(by: .seconds(refreshes * period))
+            let target = handed.advanced(by: .seconds(Double(cadence) * period - Self.pacedQueryLead))
             let waitMs = max(0, Self.milliseconds(clock.now.duration(to: target)))
-            clock.wait(until: target, tolerance: .zero)
-            lastPacedQuery = target
+            if waitMs > 0 {
+                clock.wait(until: target, tolerance: .zero)
+            }
             deadlineLock.lock()
             secondPacedWaitSumMs += waitMs
             secondPacedWaits += 1
@@ -706,7 +705,11 @@
             // a frame's GPU work; the display shows the previous frame again meanwhile.
             paceForHalfRate()
 
+            let queryStart = LayerRenderer.Clock().now
             guard let frame = layerRenderer.queryNextFrame() else { return }
+            let handedAt = LayerRenderer.Clock().now
+            let loopMs = lastFrameHandedAt.map { Self.milliseconds($0.duration(to: queryStart)) } ?? 0
+            lastFrameHandedAt = handedAt
 
             // 2. Call predictTiming to get the predicted render deadlines for code
             guard let timing = frame.predictTiming() else { return }
@@ -718,6 +721,13 @@
             let compositorPresentationTime = Self.mediaTime(of: timing.presentationTime)
             let predictedPresentationTime = compositorPresentationTime + presentationLeadSeconds()
             logClockBasesOnce()
+            deadlineLock.lock()
+            secondQueryBlockSumMs += Self.milliseconds(queryStart.duration(to: handedAt))
+            secondLoopSumMs += loopMs
+            secondPredictedAheadSumMs += Self.milliseconds(handedAt.duration(to: timing.presentationTime))
+            secondDeadlineMarginSumMs += Self.milliseconds(timing.renderingDeadline.duration(to: timing.presentationTime))
+            secondTimedFrames += 1
+            deadlineLock.unlock()
 
             // 3. Call startUpdate() to mark the start of the update phase
             frame.startUpdate()
@@ -1471,6 +1481,10 @@
                     let meanOverrunMs = secondOverrunSumMs / Double(secondLate)
                     report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes, landing +%d", halfRate.cadenceRefreshes, halfRate.landingRefreshes) : "")
                     report = (report ?? "") + String(format: "; GPU %.1f ms a frame, longest %.1f%@", secondGPUSumMs / Double(secondFrames), secondMaxGPUMs, secondPacedWaits > 0 ? String(format: ", paced wait %.1f ms", secondPacedWaitSumMs / Double(secondPacedWaits)) : "")
+                    if secondTimedFrames > 0 {
+                        let timed = Double(secondTimedFrames)
+                        report = (report ?? "") + String(format: "; the query blocked %.1f ms, the loop took %.1f ms between frames, the presentation was predicted %.1f ms after the query, the deadline %.1f ms before it", secondQueryBlockSumMs / timed, secondLoopSumMs / timed, secondPredictedAheadSumMs / timed, secondDeadlineMarginSumMs / timed)
+                    }
                     // With the GPU pass timing on, the heaviest passes of the last resolved frame
                     // name what a second of frames well past the deadline spent its time on.
                     if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {
@@ -1523,6 +1537,11 @@
                 secondGPUSumMs = 0
                 secondPacedWaitSumMs = 0
                 secondPacedWaits = 0
+                secondQueryBlockSumMs = 0
+                secondLoopSumMs = 0
+                secondPredictedAheadSumMs = 0
+                secondDeadlineMarginSumMs = 0
+                secondTimedFrames = 0
                 lastDeadlineLogTime = now
             }
             deadlineLock.unlock()
