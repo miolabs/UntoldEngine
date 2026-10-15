@@ -1134,7 +1134,7 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var enableEngineMetricsValue: Bool = false
     private var bypassPostProcessingValue: Bool = false
     private var xrFoveatedRenderingEnabledValue: Bool = true
-    private var xrOptimalInputWaitEnabledValue: Bool = true
+    private var xrOptimalInputWaitModeValue: XRInputWaitMode = .automatic
     private var antiAliasingModeValue: AntiAliasingMode = .fxaa
     private var renderDebugViewModeValue: RenderDebugViewMode = .lit
     private var pomQualitySettingsValue: POMQualitySettings = .platformDefault
@@ -1654,16 +1654,16 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         }
     }
 
-    var xrOptimalInputWaitEnabled: Bool {
+    var xrOptimalInputWaitMode: XRInputWaitMode {
         get {
             lock.lock()
-            let value = xrOptimalInputWaitEnabledValue
+            let value = xrOptimalInputWaitModeValue
             lock.unlock()
             return value
         }
         set {
             lock.lock()
-            xrOptimalInputWaitEnabledValue = newValue
+            xrOptimalInputWaitModeValue = newValue
             lock.unlock()
         }
     }
@@ -2174,13 +2174,12 @@ public var xrFoveatedRenderingEnabled: Bool {
     set { RuntimeGlobalsStore.shared.xrFoveatedRenderingEnabled = newValue }
 }
 
-/// Whether the XR loop waits for the compositor's optimal input time before it queries the
-/// head pose and encodes the frame, the default. Off, it encodes as soon as the update is
-/// done: the GPU starts about the wait's length earlier, and the head pose is predicted from
-/// earlier. See `RenderingProperty.optimalInputWait`.
-public var xrOptimalInputWaitEnabled: Bool {
-    get { RuntimeGlobalsStore.shared.xrOptimalInputWaitEnabled }
-    set { RuntimeGlobalsStore.shared.xrOptimalInputWaitEnabled = newValue }
+/// When the XR loop waits for the compositor's optimal input time before it queries the head
+/// pose and encodes the frame: always, never, or by the measured deadline (the default). See
+/// `RenderingProperty.optimalInputWait`.
+public var xrOptimalInputWaitMode: XRInputWaitMode {
+    get { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode }
+    set { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode = newValue }
 }
 
 /// Selects the active anti-aliasing pass inserted after the look pass.

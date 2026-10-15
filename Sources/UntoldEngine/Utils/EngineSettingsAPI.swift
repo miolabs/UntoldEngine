@@ -101,12 +101,13 @@ public enum RenderingProperty: Sendable {
     /// `getFoveatedRenderingEnabled()` to read the current value.
     case foveatedRendering(RenderingToggle)
     /// Whether the XR loop waits for the compositor's optimal input time before it queries the
-    /// head pose and encodes the frame. Enabled by default: the head pose is as fresh as the
-    /// frame allows. Disabled, a diagnostic, the frame is encoded as soon as the update is
-    /// done, so the GPU starts about the wait's length earlier (a frame that finished after
-    /// the rendering deadline may then make it) and the head pose is predicted from earlier,
-    /// which the compositor's reprojection must cover. See `getOptimalInputWaitEnabled()`.
-    case optimalInputWait(RenderingToggle)
+    /// head pose and encodes the frame. Waiting gives the freshest head pose; not waiting
+    /// starts the GPU about the wait's length earlier, so a frame whose GPU work would end
+    /// after the rendering deadline may make it, with the head pose predicted from earlier for
+    /// the compositor's reprojection to cover. `.automatic`, the default, waits while the
+    /// frames meet the deadline, stops when a second had late frames, and resumes once the
+    /// measured slack would cover the wait again. See `getOptimalInputWaitMode()`.
+    case optimalInputWait(XRInputWaitMode)
     /// Whether the pre-composite pass is skipped on a frame it would only copy the lit scene
     /// (XR passthrough with no environment, splat, ambient-occlusion or gizmo layer to join;
     /// the lit debug view; no render extension). Enabled by default; disabling it runs the
@@ -173,6 +174,17 @@ public enum RenderingToggle: Sendable {
     case disabled
 }
 
+/// When the XR loop waits for the compositor's optimal input time before encoding the frame.
+/// See `RenderingProperty.optimalInputWait`.
+public enum XRInputWaitMode: Sendable, Equatable {
+    /// Every frame: the freshest head pose, the latest GPU start.
+    case always
+    /// Never: the frame is encoded as soon as the update is done.
+    case never
+    /// By the measured deadline: waiting while the frames make it, not while they do not.
+    case automatic
+}
+
 public enum RenderExtensionProperty: Sendable {
     case register(any RenderExtension)
     case unregister(String)
@@ -234,10 +246,8 @@ public func setRendering(_ property: RenderingProperty) {
         xrFoveatedRenderingEnabled = true
     case .foveatedRendering(.disabled):
         xrFoveatedRenderingEnabled = false
-    case .optimalInputWait(.enabled):
-        xrOptimalInputWaitEnabled = true
-    case .optimalInputWait(.disabled):
-        xrOptimalInputWaitEnabled = false
+    case let .optimalInputWait(mode):
+        xrOptimalInputWaitMode = mode
     case .preCompositeBypass(.enabled):
         renderInfo.preCompositeBypassEnabled = true
     case .preCompositeBypass(.disabled):
@@ -276,10 +286,10 @@ public func getFoveatedRenderingEnabled() -> Bool {
     xrFoveatedRenderingEnabled
 }
 
-/// Whether the XR loop waits for the compositor's optimal input time before it encodes the
+/// When the XR loop waits for the compositor's optimal input time before it encodes the
 /// frame. See `RenderingProperty.optimalInputWait`.
-public func getOptimalInputWaitEnabled() -> Bool {
-    xrOptimalInputWaitEnabled
+public func getOptimalInputWaitMode() -> XRInputWaitMode {
+    xrOptimalInputWaitMode
 }
 
 public enum RenderResourceQuery {
