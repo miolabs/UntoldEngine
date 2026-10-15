@@ -98,11 +98,39 @@
         private var deadlineMissCount = 0
         private var worstOverrunMs = 0.0
         private var lastDeadlineLogTime: CFTimeInterval = 0
-        /// The last second's frames: how many, how many late, their worst and summed overruns.
+        /// The last second's frames: how many, how many late, their worst and summed overruns,
+        /// the least slack any had before the deadline, and the longest wait skipped.
         private var secondFrames = 0
         private var secondLate = 0
         private var secondWorstMs = 0.0
         private var secondOverrunSumMs = 0.0
+        private var secondLeastSlackMs = Double.infinity
+        private var secondSkippedWaitMaxMs = 0.0
+        /// The automatic mode's current choice: waiting for the optimal input time, or not.
+        private var automaticWaits = true
+        /// Whether the last frame waited for the compositor's optimal input time: the setting,
+        /// or in the automatic mode what the measured deadline allowed.
+        public var optimalInputWaitActive: Bool { deadlineLock.withLock { lastFrameWaited } }
+        private var lastFrameWaited = true
+
+        /// Whether this frame waits for the optimal input time, by the setting and, in the
+        /// automatic mode, by what the last seconds' deadlines allowed. `skippedWaitMs` is how
+        /// long the wait would be, kept for the automatic mode to know what resuming costs.
+        private func waitsForOptimalInput(skippedWaitMs: Double) -> Bool {
+            let waits: Bool
+            deadlineLock.lock()
+            switch xrOptimalInputWaitMode {
+            case .always: waits = true
+            case .never: waits = false
+            case .automatic: waits = automaticWaits
+            }
+            if !waits {
+                secondSkippedWaitMaxMs = max(secondSkippedWaitMaxMs, skippedWaitMs)
+            }
+            lastFrameWaited = waits
+            deadlineLock.unlock()
+            return waits
+        }
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
         /// The layer's depth format and the drawable's depth range (far, near), once a drawable
@@ -666,9 +694,11 @@
                 let xrWaitStart = CACurrentMediaTime()
             #endif
             // The wait for the compositor's optimal input time: the head pose is queried as late
-            // as the frame allows. Off (a diagnostic), the frame is encoded now, so the GPU
-            // starts about the wait's length earlier and the head is predicted from earlier.
-            if xrOptimalInputWaitEnabled {
+            // as the frame allows. Without it the frame is encoded now, so the GPU starts about
+            // the wait's length earlier and the head is predicted from earlier; the automatic
+            // mode waits while the frames meet the deadline and not while they do not.
+            let waitLengthMs = max(0, Self.milliseconds(LayerRenderer.Clock().now.duration(to: timing.optimalInputTime)))
+            if waitsForOptimalInput(skippedWaitMs: waitLengthMs) {
                 LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
             }
             #if ENGINE_STATS_ENABLED
@@ -1339,6 +1369,7 @@
             var report: String?
             deadlineLock.lock()
             secondFrames += 1
+            secondLeastSlackMs = min(secondLeastSlackMs, -overrunMs)
             if overrunMs > 0 {
                 deadlineMissCount += 1
                 secondLate += 1
@@ -1352,10 +1383,24 @@
                 if secondLate > 0 {
                     report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far)", secondLate, secondFrames, secondWorstMs, secondOverrunSumMs / Double(secondLate), deadlineMissCount)
                 }
+                // The automatic mode: stop waiting once a second had late frames (one in
+                // twenty or more); wait again once a second's least slack would have covered
+                // the longest wait skipped, with a margin.
+                if xrOptimalInputWaitMode == .automatic, secondFrames > 0 {
+                    if automaticWaits, secondLate * 20 >= secondFrames {
+                        automaticWaits = false
+                        report = (report ?? "") + String(format: "\nXR frame timing: %d of %d frames late: encoding without the wait for the optimal input time", secondLate, secondFrames)
+                    } else if !automaticWaits, secondLeastSlackMs.isFinite, secondLeastSlackMs > secondSkippedWaitMaxMs + 1.5 {
+                        automaticWaits = true
+                        report = (report ?? "") + String(format: "\nXR frame timing: the least slack of %.2f ms covers the skipped wait of %.2f ms: waiting for the optimal input time again", secondLeastSlackMs, secondSkippedWaitMaxMs)
+                    }
+                }
                 secondFrames = 0
                 secondLate = 0
                 secondWorstMs = 0
                 secondOverrunSumMs = 0
+                secondLeastSlackMs = .infinity
+                secondSkippedWaitMaxMs = 0
                 lastDeadlineLogTime = now
             }
             deadlineLock.unlock()
