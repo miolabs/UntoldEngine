@@ -339,6 +339,12 @@ struct ShadowSystem {
         return max(cameraNear, cascadeBlendStart(cascadeIdx: cascadeIdx - 1, splits: splits, blendFraction: blendFraction))
     }
 
+    /// A light-space matrix that lands every point outside the shadow map's [0, 1] range
+    /// (at 10, 10, 10 with w 1), where the shader samples no map and takes the point as lit.
+    static let nowhere = simd_float4x4(columns: (
+        simd_float4(0, 0, 0, 0), simd_float4(0, 0, 0, 0), simd_float4(0, 0, 0, 0), simd_float4(10, 10, 10, 1)
+    ))
+
     /// Fills the 3 fixed GPU slots from a per-cascade array, padding the slots past the
     /// `count` cascades in use with `fallback`, so the shader's cascadeCount field controls
     /// which slots are actually read.
@@ -356,7 +362,11 @@ struct ShadowSystem {
     func makeUniforms() -> CSMUniforms {
         var u = CSMUniforms()
         let count = cascadeCount
-        u.lightSpaceMatrices = Self.pack3(cascadeLightSpaceMatrices, count: count, fallback: matrix_identity_float4x4)
+        // A sun that casts no shadow (none active, or castsShadow off) draws no cascades, and
+        // the maps hold whatever was drawn last: its matrices put every point outside the
+        // maps, which the shader reads as lit, instead of the stale shadows.
+        let matrices = isActive ? cascadeLightSpaceMatrices : Array(repeating: Self.nowhere, count: cascadeLightSpaceMatrices.count)
+        u.lightSpaceMatrices = Self.pack3(matrices, count: count, fallback: matrix_identity_float4x4)
         u.cascadeSplits = Self.pack3(cascadeSplitDistances, count: count, fallback: 0)
         u.cascadeCount = Int32(count)
         u.cascadeWorldTexelSizes = Self.pack3(cascadeWorldTexelSizes, count: count, fallback: cascadeWorldTexelSizes[0])

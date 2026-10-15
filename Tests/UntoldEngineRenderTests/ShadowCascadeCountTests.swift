@@ -8,6 +8,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import Metal
 import simd
 @testable import UntoldEngine
 import XCTest
@@ -60,6 +61,51 @@ final class ShadowCascadeCountTests: BaseRenderSetup {
         XCTAssertEqual(getShadowCascades(), csmCascadeCount, "never more than the maps hold")
         setRendering(.shadowCascades(0))
         XCTAssertEqual(getShadowCascades(), 1, "never none: a sun casts")
+    }
+
+    private func readFloats(_ texture: MTLTexture) -> [Float] {
+        var halves = [UInt16](repeating: 0, count: texture.width * texture.height * 4)
+        halves.withUnsafeMutableBytes { bytes in
+            texture.getBytes(bytes.baseAddress!, bytesPerRow: texture.width * 8, from: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0)
+        }
+        return halves.map { Float(Float16(bitPattern: $0)) }
+    }
+
+    /// The lit frame's pixels that the sun's shadow darkens by a third or more: the floor
+    /// under and beside the box.
+    private func shadowedPixels(cascades: Int) throws -> Int {
+        let sun = try XCTUnwrap(LightingSystem.shared.activeDirectionalLight)
+        setRendering(.shadowCascades(cascades))
+        setLight(entityId: sun, .directional(.castsShadow(true)))
+        drawFrames()
+        let shadowed = try readFloats(XCTUnwrap(textureResources.deferredColorMap))
+        setLight(entityId: sun, .directional(.castsShadow(false)))
+        drawFrames()
+        let unshadowed = try readFloats(XCTUnwrap(textureResources.deferredColorMap))
+        setLight(entityId: sun, .directional(.castsShadow(true)))
+        var count = 0
+        for i in stride(from: 0, to: min(shadowed.count, unshadowed.count), by: 4) {
+            let lit = unshadowed[i] + unshadowed[i + 1] + unshadowed[i + 2]
+            let dark = shadowed[i] + shadowed[i + 1] + shadowed[i + 2]
+            if lit > 0.05, dark < 0.67 * lit { count += 1 }
+        }
+        return count
+    }
+
+    func testOneCascadeStillCastsAShadow() throws {
+        // A floor for the box to cast onto, and a sun that reaches across it.
+        let floor = createEntity()
+        setEntityMeshDirect(entityId: floor, meshes: BasicPrimitives.createCube(extent: 6.0), assetName: "Floor")
+        translateTo(entityId: floor, position: simd_float3(0, -3.0, 0))
+        let sun = try XCTUnwrap(LightingSystem.shared.activeDirectionalLight)
+        rotateTo(entityId: sun, pitch: -55, yaw: 30, roll: 0)
+        setVisibleEntities()
+
+        let withTwo = try shadowedPixels(cascades: 2)
+        let withOne = try shadowedPixels(cascades: 1)
+        XCTAssertGreaterThan(withTwo, 0, "two cascades shadow the floor under the box")
+        XCTAssertGreaterThan(withOne, 0, "one cascade shadows it too")
+        XCTAssertGreaterThan(withOne, withTwo / 2, "one cascade over the whole distance shadows about the same pixels")
     }
 
     func testTheHeadsetDefaultsToOneCascadeAndTheDesktopToAll() {
