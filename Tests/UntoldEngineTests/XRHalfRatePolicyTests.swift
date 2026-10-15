@@ -69,13 +69,20 @@ final class XRHalfRatePolicyTests: XCTestCase {
         // A mean of 14 ms, a fifth more and 3 ms of encode: 19.8 ms, two refreshes of 10 ms.
         XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 14.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 2)
+        // A mean of 14.5 ms: 20.4 ms, within the deadband past two refreshes, still two.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 14.5), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 2)
         // A mean of 16 ms: 22.2 ms, three.
         XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 16.0), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 3)
+        // Back to 14.5 ms, 20.4 ms, just under three refreshes but within the deadband of two: stays three.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 14.5), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 14.5), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 3)
         // Never more than four.
         XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 60.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 4)
-        // A shorter cadence is taken only after two seconds running that fit it.
+        // A shorter cadence is taken only after two seconds running that fit it clearly.
         XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 9.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 4)
         XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 9.0), .none)

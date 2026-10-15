@@ -62,6 +62,9 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
     /// The share above the mean GPU span the cadence allows for the longer frames.
     public static let spanMargin = 0.2
     public static let mostRefreshes = 4
+    /// How far past a cadence's boundary the typical frame must be for the cadence to change,
+    /// in milliseconds: a frame on the boundary would otherwise change it every few seconds.
+    public static let cadenceDeadbandMs = 1.0
 
     /// A second of frames ended: `frames` rendered, `late` of them past the deadline by
     /// `meanOverrunMs` on average, their GPU spans `meanGPUDurationMs` on average, the
@@ -90,18 +93,20 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
             landingRefreshes = meanOverrunMs > 1.0 ? min(Self.mostRefreshes - 1, Int((meanOverrunMs / periodMs).rounded(.up))) : 0
             // The cadence rises at once when the frame's work needs more refreshes, and falls
             // only after two seconds running that fit the shorter one: a cadence that changed
-            // every second would itself be a hop.
+            // every second would itself be a hop. Both ways with a deadband past the boundary.
             let typical = meanGPUDurationMs * (1 + Self.spanMargin) + Self.encodeAllowanceMs
-            let needed = min(Self.mostRefreshes, max(2, Int((typical / periodMs).rounded(.up))))
-            if needed >= cadenceRefreshes {
-                cadenceRefreshes = needed
+            let current = Double(cadenceRefreshes) * periodMs
+            if typical > current + Self.cadenceDeadbandMs {
+                cadenceRefreshes = min(Self.mostRefreshes, Int(((typical - Self.cadenceDeadbandMs) / periodMs).rounded(.up)))
                 shorterSeconds = 0
-            } else {
+            } else if cadenceRefreshes > 2, typical < current - periodMs - Self.cadenceDeadbandMs {
                 shorterSeconds += 1
                 if shorterSeconds >= 2 {
-                    cadenceRefreshes = needed
+                    cadenceRefreshes = max(2, Int(((typical + Self.cadenceDeadbandMs) / periodMs).rounded(.up)))
                     shorterSeconds = 0
                 }
+            } else {
+                shorterSeconds = 0
             }
         }
         if periodMs > 0, meanGPUDurationMs < Self.fitShare * periodMs {
