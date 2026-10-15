@@ -108,6 +108,12 @@ public enum RenderingProperty: Sendable {
     /// frames meet the deadline, stops when a second had late frames, and resumes once the
     /// measured slack would cover the wait again. See `getOptimalInputWaitMode()`.
     case optimalInputWait(XRInputWaitMode)
+    /// How the XR loop paces its frames against the display's refreshes: every refresh; every
+    /// other refresh while the frames run late (the default), so a frame whose GPU work does
+    /// not fit one refresh is shown two refreshes apart, evenly, and posed for that instant,
+    /// instead of landing a refresh late now and then, which hops; or every other refresh
+    /// always. The compositor reprojects the head between the frames. See `getFramePacing()`.
+    case framePacing(XRFramePacing)
     /// Whether the pre-composite pass is skipped on a frame it would only copy the lit scene
     /// (XR passthrough with no environment, splat, ambient-occlusion or gizmo layer to join;
     /// the lit debug view; no render extension). Enabled by default; disabling it runs the
@@ -248,6 +254,8 @@ public func setRendering(_ property: RenderingProperty) {
         xrFoveatedRenderingEnabled = false
     case let .optimalInputWait(mode):
         xrOptimalInputWaitMode = mode
+    case let .framePacing(pacing):
+        xrFramePacing = pacing
     case .preCompositeBypass(.enabled):
         renderInfo.preCompositeBypassEnabled = true
     case .preCompositeBypass(.disabled):
@@ -290,6 +298,12 @@ public func getFoveatedRenderingEnabled() -> Bool {
 /// frame. See `RenderingProperty.optimalInputWait`.
 public func getOptimalInputWaitMode() -> XRInputWaitMode {
     xrOptimalInputWaitMode
+}
+
+/// How the XR loop paces its frames against the display's refreshes. See
+/// `RenderingProperty.framePacing`.
+public func getFramePacing() -> XRFramePacing {
+    xrFramePacing
 }
 
 public enum RenderResourceQuery {

@@ -1135,6 +1135,7 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var bypassPostProcessingValue: Bool = false
     private var xrFoveatedRenderingEnabledValue: Bool = true
     private var xrOptimalInputWaitModeValue: XRInputWaitMode = .automatic
+    private var xrFramePacingValue: XRFramePacing = .halfRateWhenLate
     private var shadowSoftnessBeforeSystemValue: ShadowSoftnessSettings?
     private var antiAliasingModeValue: AntiAliasingMode = .fxaa
     private var renderDebugViewModeValue: RenderDebugViewMode = .lit
@@ -1669,6 +1670,20 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         }
     }
 
+    var xrFramePacing: XRFramePacing {
+        get {
+            lock.lock()
+            let value = xrFramePacingValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            xrFramePacingValue = newValue
+            lock.unlock()
+        }
+    }
+
     var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
         get {
             lock.lock()
@@ -2195,6 +2210,14 @@ public var xrFoveatedRenderingEnabled: Bool {
 public var xrOptimalInputWaitMode: XRInputWaitMode {
     get { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode }
     set { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode = newValue }
+}
+
+/// How the XR loop paces its frames against the display's refreshes: every one, every other
+/// one while the frames run late (the default), or every other one always. See
+/// `RenderingProperty.framePacing`.
+public var xrFramePacing: XRFramePacing {
+    get { RuntimeGlobalsStore.shared.xrFramePacing }
+    set { RuntimeGlobalsStore.shared.xrFramePacing = newValue }
 }
 
 /// The sun shadow's softness set while no shadow system existed, for the system the renderer
