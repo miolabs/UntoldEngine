@@ -1432,7 +1432,7 @@ public enum RenderPasses {
             renderEncoder.pushDebugGroup("Shadow Cascade \(cascadeIdx)")
             renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
             renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
             renderEncoder.setDepthBias(0.0015, slopeScale: 0.75, clamp: 0.02)
             renderEncoder.setViewport(
                 MTLViewport(originX: 0, originY: 0,
@@ -1545,7 +1545,7 @@ public enum RenderPasses {
             renderEncoder.pushDebugGroup("Batched Shadow Cascade \(cascadeIdx)")
             renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
             renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
             renderEncoder.setDepthBias(0.0015, slopeScale: 0.75, clamp: 0.02)
             renderEncoder.setViewport(
                 MTLViewport(originX: 0, originY: 0,
@@ -1634,7 +1634,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Spot Shadow")
         renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setDepthBias(0.0015, slopeScale: 0.75, clamp: 0.02)
         renderEncoder.setViewport(
             MTLViewport(originX: 0, originY: 0,
@@ -1774,7 +1774,7 @@ public enum RenderPasses {
             renderEncoder.pushDebugGroup("Point Shadow Face \(face)")
             renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
             renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
             renderEncoder.setDepthBias(0.002, slopeScale: 0.9, clamp: 0.03)
             renderEncoder.setViewport(
                 MTLViewport(originX: 0, originY: 0,
@@ -1931,7 +1931,7 @@ public enum RenderPasses {
         renderEncoder.setRenderPipelineState(modelPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
 
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         // What every draw of the pass shares, read once.
         let pass = OpaquePassState(cameraComponent: cameraComponent)
@@ -2200,7 +2200,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(modelPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         // Create identity uniform (batched vertices are already in world space)
         var batchUniforms = Uniforms()
@@ -2535,7 +2535,7 @@ public enum RenderPasses {
         // ── Sub-pass 1: Unbatched geometry ──────────────────────────────────────
         renderEncoder.setRenderPipelineState(modelPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         for entityId in visibleEntityIds {
             guard let entity = sceneSnapshot.entity(entityId) else { continue }
@@ -2954,7 +2954,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(ssaoPipeline.pipelineState!)
         // renderEncoder.setDepthStencilState(ssaoPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3063,7 +3063,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(ssaoBlurPipeline.pipelineState!)
         // renderEncoder.setDepthStencilState(ssaoBlurPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3186,7 +3186,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("SSAO Low-Res Pass")
 
         renderEncoder.setRenderPipelineState(ssaoPipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3290,7 +3290,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(pipeline.pipelineState!)
         // renderEncoder.setDepthStencilState(pipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3355,7 +3355,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("SSAO Simple Blur Pass")
 
         renderEncoder.setRenderPipelineState(ssaoBlurPipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3407,7 +3407,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("SSAO Upsample Pass")
 
         renderEncoder.setRenderPipelineState(upsamplePipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3501,7 +3501,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Light Pass")
 
         renderEncoder.setRenderPipelineState(lightPipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3765,7 +3765,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(preCompositePipeline.pipelineState!)
 
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3968,7 +3968,7 @@ public enum RenderPasses {
         } else {
             renderEncoder.setDepthStencilState(transparencyPipeline.depthState)
         }
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         var transpCSM = shadowSystem.makeUniforms()
         transpCSM.cameraViewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
@@ -4320,7 +4320,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Mesh Occluder Shell Pass")
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(pipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
         renderEncoder.setTriangleFillMode(.fill)
 
@@ -4463,7 +4463,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Wireframe Occlusion Depth Pass")
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(pipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
         renderEncoder.setTriangleFillMode(.fill)
 
@@ -4662,7 +4662,7 @@ public enum RenderPasses {
         } else {
             renderEncoder.setDepthStencilState(wireframePipeline.depthState)
         }
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
 
         var wireframeColor = wireframeSettings.color
@@ -5034,7 +5034,7 @@ public enum RenderPasses {
         if let depthState = spatialDebugPipeline.depthState {
             renderEncoder.setDepthStencilState(depthState)
         }
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
 
         var viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
@@ -5350,7 +5350,7 @@ public enum RenderPasses {
 
             renderEncoder.setRenderPipelineState(pipeline.pipelineState!)
 
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
             renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
             renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
