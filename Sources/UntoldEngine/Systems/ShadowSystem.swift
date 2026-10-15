@@ -407,6 +407,9 @@ struct ShadowSystem {
             return
         }
         guard directionalLight.castsShadow else { return }
+        // A sun at no intensity lights nothing, and the shading multiplies its shadow by that
+        // intensity: its cascades would be drawn, two depth maps a frame, for nothing.
+        guard (scene.get(component: LightComponent.self, for: lightEntity)?.intensity ?? 0) > 0 else { return }
 
         // Rotate into visual-world space to match the root-rotation-aware corners/caster bounds
         // below -- the light entity's own transform is scene-local, same as every other entity.

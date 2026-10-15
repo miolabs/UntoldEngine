@@ -165,7 +165,7 @@ public extension RenderPasses {
         ) {
             renderEncoder.setDepthStencilState(depthState)
         }
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
 
         var viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
