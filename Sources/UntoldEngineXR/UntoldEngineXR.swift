@@ -181,8 +181,11 @@
                 let due = last.advanced(by: .seconds(Double(cadence) * period))
                 if due > earliest { earliest = due }
             }
+            // Snapped up to the grid with a quarter of a refresh of tolerance: the learned period
+            // is a hair short of the compositor's, and without it "two refreshes" computed as
+            // 2.0001 and rounded up to three, every time.
             let behind = Self.seconds(grid.duration(to: earliest))
-            let refreshes = behind > 0 ? (behind / period).rounded(.up) : 0
+            let refreshes = behind > 0 ? max(0, (behind / period - 0.25).rounded(.up)) : 0
             let target = grid.advanced(by: .seconds(refreshes * period))
             let waitMs = max(0, Self.milliseconds(clock.now.duration(to: target)))
             clock.wait(until: target, tolerance: .zero)
