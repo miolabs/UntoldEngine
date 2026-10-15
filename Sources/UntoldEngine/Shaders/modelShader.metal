@@ -293,16 +293,20 @@ static inline float2 modelVelocity(float3 currentClip, float3 prevClip) {
 /// The emissive attachment's value with the indirect light and the sun's shadow folded in.
 static inline float4 emissiveWithIndirect(
     float3 emissive, float4 baseColor, float3 normal, float3 worldPosition, float roughness, float metallic,
-    float3 cameraPosition,
+    float3 viewVector,
     texture2d<float> iblIrradiance, texture2d<float> iblSpecular, texture2d<float> iblBRDF,
     depth2d_array<float> csmShadowArray,
     constant CSMUniforms &csmUniforms, constant LightParameters &lightParams,
     constant IBLParamsUniform &iblParam, constant float &iblRotationAngle
 ) {
-    float3 viewVector = normalize(cameraPosition - worldPosition);
     float3 indirect = computeIBLContribution(iblIrradiance, iblSpecular, iblBRDF, iblRotationAngle, iblParam,
                                              baseColor, normal, viewVector, roughness, metallic) * iblParam.ambientIntensity;
-    float shadow = computeCSMShadow(csmShadowArray, csmUniforms, worldPosition, normal, normalize(lightParams.direction));
+    // The sun's shadow only ever multiplies the sun's light, so a sun at no intensity needs
+    // no shadow taps: the branch is on a per-frame constant, uniform across the draw.
+    float shadow = 1.0;
+    if (lightParams.intensity != 0.0) {
+        shadow = computeCSMShadow(csmShadowArray, csmUniforms, worldPosition, normal, normalize(lightParams.direction));
+    }
     return float4(emissive + indirect, shadow);
 }
 
@@ -311,14 +315,13 @@ static inline float4 emissiveWithIndirect(
 /// alpha is the coverage the light pass would have written.
 static inline float4 litWithDirect(
     float4 emissiveAndShadow, float4 baseColor, float3 normal, float4 worldPosition, float roughness, float metallic,
-    float3 cameraPosition,
+    float3 viewVector,
     constant LightParameters &lightParams,
     constant PointLightBlock &plBlock, constant SpotLightBlock &slBlock, constant AreaLightBlock &alBlock,
     texture2d<float> ltcMagTexture, texture2d<float> ltcMatTexture,
     depthcube<float> pointShadowCube, depth2d<float> spotShadowMap,
     constant PointShadowUniforms &pointShadowUniforms, constant SpotShadowUniforms &spotShadowUniforms
 ) {
-    float3 viewVector = normalize(cameraPosition - worldPosition.xyz);
     float3 direct = computeDirectLighting(
         worldPosition, viewVector, normal, baseColor.rgb, roughness, metallic, emissiveAndShadow.a,
         lightParams, plBlock, slBlock, alBlock, ltcMagTexture, ltcMatTexture, pointShadowCube, spotShadowMap,
@@ -472,18 +475,23 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
     // pixel-to-pixel movement near the height field's silhouette-like transitions. `hasHeight`
     // is uniform across the whole draw call, so branching between the two sampling forms here
     // is safe for the implicit-derivative branch.
-    float4 sampledColor = hasHeight
-        ? baseColor.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
-        : baseColor.sample(baseColorSampler, st, bias(0.25f));
-
+    //
+    // Each map is sampled only when the material has it. The presence flags are per-draw
+    // constants, so each branch is uniform across the draw and the implicit-derivative sample
+    // inside it is as safe as the hasHeight one; a part without the map paid the sample on a
+    // nil texture before and threw the value away.
     // A textured material whose base color factor was never set (all zeros) shows its
     // texture untinted. Without a texture, zero is a color like any other: black.
     bool isBaseColorUnset = materialParameter.hasTexture.x == 1 && all(materialParameter.baseColor.rgb < 0.001);
     float3 tint = isBaseColorUnset ? float3(1.0) : materialParameter.baseColor.rgb;
 
-    float4 inBaseColor = (materialParameter.hasTexture.x == 1)
-        ? float4(sampledColor.rgb * tint, sampledColor.a * materialParameter.baseColor.a)
-    : float4(tint, materialParameter.baseColor.a);
+    float4 inBaseColor = float4(tint, materialParameter.baseColor.a);
+    if (materialParameter.hasTexture.x == 1) {
+        float4 sampledColor = hasHeight
+            ? baseColor.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
+            : baseColor.sample(baseColorSampler, st, bias(0.25f));
+        inBaseColor = float4(sampledColor.rgb * tint, sampledColor.a * materialParameter.baseColor.a);
+    }
 
 
     if (kModelMayDiscard) {
@@ -512,35 +520,38 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
 
     float passthroughAlpha = clamp(materialParameter.passthroughAlpha, 0.0, 1.0);
 
-    //normal map is in Tangent space
-    float4 normalSample = hasHeight
-        ? normalTexture.sample(normalSampler, sampleUV, gradient2d(stDx, stDy))
-        : normalTexture.sample(normalSampler, st, bias(0.25f));
+    // The shading normal: the vertex normal, or the normal map's, in tangent space, brought
+    // to world space.
+    float3 normalMap = normalize(normalVectorInWorldSpace);
+    if (hasNormal) {
+        float4 normalSample = hasHeight
+            ? normalTexture.sample(normalSampler, sampleUV, gradient2d(stDx, stDy))
+            : normalTexture.sample(normalSampler, st, bias(0.25f));
 
-    // Two on-disk encodings: a direct 3-component tangent-space normal (RGB, [0,1] ->
-    // [-1,1]), or astcenc's `-normal` packing (RGB=X, A=Y) used by texbake.py to get a
-    // better error metric for vector data — see NativeTexFlags.normalPackedXY. Z is
-    // reconstructed from the unit-length constraint for the packed case.
-    // [0,1] -> [-1,1] first, unit length after: normalizing the stored color instead
-    // shortens it before the remap and leaves every normal tilted (a flat texel, (0.5,
-    // 0.5, 1), came out 22 degrees off).
-    float3 normalMapStandard = normalSample.rgb * 2.0 - 1.0;
+        // Two on-disk encodings: a direct 3-component tangent-space normal (RGB, [0,1] ->
+        // [-1,1]), or astcenc's `-normal` packing (RGB=X, A=Y) used by texbake.py to get a
+        // better error metric for vector data — see NativeTexFlags.normalPackedXY. Z is
+        // reconstructed from the unit-length constraint for the packed case.
+        // [0,1] -> [-1,1] first, unit length after: normalizing the stored color instead
+        // shortens it before the remap and leaves every normal tilted (a flat texel, (0.5,
+        // 0.5, 1), came out 22 degrees off).
+        float3 normalMapStandard = normalSample.rgb * 2.0 - 1.0;
 
-    float2 packedXY = normalSample.ga * 2.0 - 1.0;
-    float3 normalMapPackedXY = float3(packedXY, sqrt(saturate(1.0 - dot(packedXY, packedXY))));
+        float2 packedXY = normalSample.ga * 2.0 - 1.0;
+        float3 normalMapPackedXY = float3(packedXY, sqrt(saturate(1.0 - dot(packedXY, packedXY))));
 
-    float3 normalMap = normalIsPackedXY ? normalMapPackedXY : normalMapStandard;
-    normalMap = applyNormalStrength(normalMap, materialParameter.normalScale);
+        float3 tangentNormal = normalIsPackedXY ? normalMapPackedXY : normalMapStandard;
+        tangentNormal = applyNormalStrength(tangentNormal, materialParameter.normalScale);
+        normalMap = normalize(TBN * tangentNormal);
+    }
 
-    //convert to normal map to world space???
-    normalMap=(hasNormal==false)?normalize(normalVectorInWorldSpace):normalize(TBN*normalMap);
-
-    float4 roughnessSample = hasHeight
-        ? roughnessTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
-        : roughnessTexture.sample(materialSampler, st, bias(0.25f));
-    float roughness=(materialParameter.hasTexture.y==1)
-        ? selectTextureChannel(roughnessSample, materialParameter.textureChannels.x) * materialParameter.roughness
-        : materialParameter.roughness;
+    float roughness = materialParameter.roughness;
+    if (materialParameter.hasTexture.y == 1) {
+        float4 roughnessSample = hasHeight
+            ? roughnessTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
+            : roughnessTexture.sample(materialSampler, st, bias(0.25f));
+        roughness = selectTextureChannel(roughnessSample, materialParameter.textureChannels.x) * materialParameter.roughness;
+    }
     roughness=clamp(roughness, 0.045, 1.0);
 
     // Specular anti-aliasing. Normal detail finer than a pixel (a dart's knurl,
@@ -559,31 +570,35 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
         roughness = sqrt(roughness * roughness + kernelRoughness2);
     }
 
-    float4 metallicSample = hasHeight
-        ? metallicTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
-        : metallicTexture.sample(materialSampler, st, bias(0.25f));
-    float metallic=(materialParameter.hasTexture.z==1)
-        ? selectTextureChannel(metallicSample, materialParameter.textureChannels.y) * materialParameter.metallic
-        : materialParameter.metallic;
+    float metallic = materialParameter.metallic;
+    if (materialParameter.hasTexture.z == 1) {
+        float4 metallicSample = hasHeight
+            ? metallicTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
+            : metallicTexture.sample(materialSampler, st, bias(0.25f));
+        metallic = selectTextureChannel(metallicSample, materialParameter.textureChannels.y) * materialParameter.metallic;
+    }
     metallic=clamp(metallic, 0.0, 1.0);
 
     // The light the surface gives off: the emissive color, times the emissive texture when
     // the material has one (the texture carries the color, the factor its strength). It
     // shares the base color's sampler: both wrap the same way over the same coordinates.
-    float4 emissiveSample = hasHeight
-        ? emissiveTexture.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
-        : emissiveTexture.sample(baseColorSampler, st, bias(0.25f));
-    float3 emissive = (materialParameter.hasEmissiveTexture == 1)
-        ? materialParameter.emmissive * emissiveSample.rgb
-        : materialParameter.emmissive;
+    float3 emissive = materialParameter.emmissive;
+    if (materialParameter.hasEmissiveTexture == 1) {
+        float4 emissiveSample = hasHeight
+            ? emissiveTexture.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
+            : emissiveTexture.sample(baseColorSampler, st, bias(0.25f));
+        emissive = materialParameter.emmissive * emissiveSample.rgb;
+    }
 
     float4 color=inBaseColor;
 
     float4 base = float4(color.rgb, passthroughAlpha);
     float4 emissiveOut = float4(emissive, 1.0);
+    // The view vector once, for the indirect and the direct light alike.
+    float3 viewVector = normalize(uniforms.cameraPosition - verticesInWorldSpace.xyz);
     if (kModelIndirectInGBuffer) {
         emissiveOut = emissiveWithIndirect(
-            emissive, base, normalMap, verticesInWorldSpace.xyz, roughness, metallic, uniforms.cameraPosition,
+            emissive, base, normalMap, verticesInWorldSpace.xyz, roughness, metallic, viewVector,
             iblIrradiance, iblSpecular, iblBRDF, csmShadowArray, csmUniforms, lightParams, iblParam, iblRotationAngle);
     }
     if (kModelGBufferOut) {
@@ -598,7 +613,7 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
     if (kModelLitInGBuffer) {
         gBufferOut.lit = litWithDirect(
             emissiveOut, base, normalMap, verticesInWorldSpace, roughness, metallic,
-            uniforms.cameraPosition, lightParams, plBlock, slBlock, alBlock, ltcMagTexture, ltcMatTexture,
+            viewVector, lightParams, plBlock, slBlock, alBlock, ltcMagTexture, ltcMatTexture,
             pointShadowCube, spotShadowMap, pointShadowUniforms, spotShadowUniforms);
         gBufferOut.velocity = modelVelocity(in.currentClip, in.prevClip);
     }
