@@ -37,6 +37,8 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
     public private(set) var cadenceRefreshes = 2
     private(set) var lateSeconds = 0
     private(set) var fitSeconds = 0
+    /// Seconds running in which a shorter cadence than the current one would have done.
+    private(set) var shorterSeconds = 0
 
     public init() {}
 
@@ -75,8 +77,20 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
             return .none
         }
         if periodMs > 0 {
-            let needed = Int(((maxGPUDurationMs + Self.encodeAllowanceMs) / periodMs).rounded(.up))
-            cadenceRefreshes = min(Self.mostRefreshes, max(2, needed))
+            // The cadence rises at once when the frame's work needs more refreshes, and falls
+            // only after two seconds running that fit the shorter one: a cadence that changed
+            // every second would itself be a hop.
+            let needed = min(Self.mostRefreshes, max(2, Int(((maxGPUDurationMs + Self.encodeAllowanceMs) / periodMs).rounded(.up))))
+            if needed >= cadenceRefreshes {
+                cadenceRefreshes = needed
+                shorterSeconds = 0
+            } else {
+                shorterSeconds += 1
+                if shorterSeconds >= 2 {
+                    cadenceRefreshes = needed
+                    shorterSeconds = 0
+                }
+            }
         }
         if periodMs > 0, maxGPUDurationMs < Self.fitShare * periodMs {
             fitSeconds += 1
@@ -86,6 +100,7 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
         if fitSeconds >= 2 {
             active = false
             fitSeconds = 0
+            shorterSeconds = 0
             cadenceRefreshes = 2
             return .left
         }

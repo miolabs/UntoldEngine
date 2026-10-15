@@ -106,6 +106,9 @@
         private var secondOverrunSumMs = 0.0
         private var secondLeastSlackMs = Double.infinity
         private var secondSkippedWaitMaxMs = 0.0
+        private var secondGPUSumMs = 0.0
+        private var secondPacedWaitSumMs = 0.0
+        private var secondPacedWaits = 0
         /// The automatic mode's current choice: waiting for the optimal input time, or not.
         private var automaticWaits = true
         /// The half-rate pacing: its policy, whether this frame is paced, the last second's
@@ -181,8 +184,13 @@
             let behind = Self.seconds(grid.duration(to: earliest))
             let refreshes = behind > 0 ? (behind / period).rounded(.up) : 0
             let target = grid.advanced(by: .seconds(refreshes * period))
+            let waitMs = max(0, Self.milliseconds(clock.now.duration(to: target)))
             clock.wait(until: target, tolerance: .zero)
             lastPacedQuery = target
+            deadlineLock.lock()
+            secondPacedWaitSumMs += waitMs
+            secondPacedWaits += 1
+            deadlineLock.unlock()
         }
 
         /// How far past the compositor's predicted presentation (one refresh after the frame is
@@ -1437,7 +1445,9 @@
             deadlineLock.lock()
             secondFrames += 1
             secondLeastSlackMs = min(secondLeastSlackMs, -overrunMs)
-            secondMaxGPUMs = max(secondMaxGPUMs, (gpuEnd - gpuStart) * 1000.0)
+            let gpuMs = (gpuEnd - gpuStart) * 1000.0
+            secondMaxGPUMs = max(secondMaxGPUMs, gpuMs)
+            secondGPUSumMs += gpuMs
             if overrunMs > 0 {
                 deadlineMissCount += 1
                 secondLate += 1
@@ -1457,6 +1467,7 @@
                     }
                     let meanOverrunMs = secondOverrunSumMs / Double(secondLate)
                     report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes", halfRate.cadenceRefreshes) : "")
+                    report = (report ?? "") + String(format: "; GPU %.1f ms a frame, longest %.1f%@", secondGPUSumMs / Double(secondFrames), secondMaxGPUMs, secondPacedWaits > 0 ? String(format: ", paced wait %.1f ms", secondPacedWaitSumMs / Double(secondPacedWaits)) : "")
                     // With the GPU pass timing on, the heaviest passes of the last resolved frame
                     // name what a second of frames well past the deadline spent its time on.
                     if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {
@@ -1506,6 +1517,9 @@
                 secondLeastSlackMs = .infinity
                 secondSkippedWaitMaxMs = 0
                 secondMaxGPUMs = 0
+                secondGPUSumMs = 0
+                secondPacedWaitSumMs = 0
+                secondPacedWaits = 0
                 lastDeadlineLogTime = now
             }
             deadlineLock.unlock()

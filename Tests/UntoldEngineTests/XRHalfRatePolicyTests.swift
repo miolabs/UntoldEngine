@@ -71,9 +71,17 @@ final class XRHalfRatePolicyTests: XCTestCase {
         // Never more than four.
         XCTAssertEqual(policy.secondEnded(frames: 20, late: 20, meanOverrunMs: 8.0, maxGPUDurationMs: 60.0, periodMs: period, waitStillToSkip: false), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 4)
-        // Never fewer than two while active.
+        // A shorter cadence is taken only after two seconds running that fit it.
+        XCTAssertEqual(policy.secondEnded(frames: 50, late: 50, meanOverrunMs: 8.0, maxGPUDurationMs: 9.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 4)
         XCTAssertEqual(policy.secondEnded(frames: 50, late: 50, meanOverrunMs: 8.0, maxGPUDurationMs: 9.0, periodMs: period, waitStillToSkip: false), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 2)
+        // A longer one at once, and a single fitting second between two needing it does not shorten it.
+        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 18.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 3)
+        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 12.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 18.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 3)
         XCTAssertTrue(policy.active)
     }
 
