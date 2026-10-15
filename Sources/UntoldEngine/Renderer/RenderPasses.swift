@@ -3852,6 +3852,80 @@ public enum RenderPasses {
             return
         }
 
+        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
+
+        // What every draw of the pass shares, read once.
+        let sceneSnapshot = RenderSceneSnapshot()
+        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
+        let projectionMatrix = renderInfo.perspectiveSpace
+        let batchingEnabled = BatchingSystem.shared.isEnabled()
+        let colorsByLOD = SpatialDebugVisualization.shared.colorRenderablesByLOD
+        let colorsByStreamingTier = SpatialDebugVisualization.shared.colorRenderablesByStreamingTier
+        var renderModes = SceneChannelRenderModeMemo()
+
+        // Build and sort transparent draw items back-to-front for correct alpha blending.
+        var transparentEntities: [(
+            entityId: EntityID,
+            render: RenderComponent,
+            world: WorldTransformComponent,
+            deformation: DeformationComponent?,
+            hasSkeleton: Bool,
+            distanceSq: Float
+        )] = []
+
+        for entityId in visibleEntityIds {
+            guard let entity = sceneSnapshot.entity(entityId) else { continue }
+            let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
+            if renderMode == .hidden || renderMode == .wireframe { continue }
+
+            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) {
+                continue
+            }
+
+            if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .gizmo, .light]) { continue }
+            // Blend submeshes go with the colour (there is no dither path here).
+            if meshSkipsColor(entity, in: sceneSnapshot) { continue }
+
+            guard let renderComponent = sceneSnapshot.render(of: entity) else {
+                continue
+            }
+            guard let worldTransformComponent = sceneSnapshot.worldTransform(of: entity) else {
+                continue
+            }
+
+            let hasTransparentSubmesh = renderComponent.mesh.contains { mesh in
+                mesh.submeshes.contains { submesh in
+                    submesh.material?.hasTransparency ?? false
+                }
+            }
+
+            if !hasTransparentSubmesh {
+                continue
+            }
+
+            let worldPosition = simd_float3(
+                worldTransformComponent.space.columns.3.x,
+                worldTransformComponent.space.columns.3.y,
+                worldTransformComponent.space.columns.3.z
+            )
+            let distanceSq = simd_length_squared(effectiveCameraPosition - worldPosition)
+            transparentEntities.append((
+                entityId: entityId,
+                render: renderComponent,
+                world: worldTransformComponent,
+                deformation: sceneSnapshot.deformation(of: entity),
+                hasSkeleton: entity.traits.contains(.skeleton),
+                distanceSq: distanceSq
+            ))
+        }
+
+        transparentEntities.sort { $0.distanceSq > $1.distanceSq }
+
+        // No transparent surface, no pass: the encoder would load and store the lit colour and
+        // the depth of the whole frame to draw nothing, as the wireframe and occluder passes
+        // also refuse.
+        guard !transparentEntities.isEmpty else { return }
+
         guard let encoderDescriptor = renderInfo.deferredRenderPassDescriptor else {
             handleError(.renderPassCreationFailed, "Deferred render pass descriptor not initialized")
             return
@@ -3993,75 +4067,6 @@ public enum RenderPasses {
             length: MemoryLayout<Float>.stride,
             index: Int(transparencyPassIBLRotationAngleIndex.rawValue)
         )
-
-        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
-
-        // What every draw of the pass shares, read once.
-        let sceneSnapshot = RenderSceneSnapshot()
-        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let projectionMatrix = renderInfo.perspectiveSpace
-        let batchingEnabled = BatchingSystem.shared.isEnabled()
-        let colorsByLOD = SpatialDebugVisualization.shared.colorRenderablesByLOD
-        let colorsByStreamingTier = SpatialDebugVisualization.shared.colorRenderablesByStreamingTier
-        var renderModes = SceneChannelRenderModeMemo()
-
-        // Build and sort transparent draw items back-to-front for correct alpha blending.
-        var transparentEntities: [(
-            entityId: EntityID,
-            render: RenderComponent,
-            world: WorldTransformComponent,
-            deformation: DeformationComponent?,
-            hasSkeleton: Bool,
-            distanceSq: Float
-        )] = []
-
-        for entityId in visibleEntityIds {
-            guard let entity = sceneSnapshot.entity(entityId) else { continue }
-            let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
-            if renderMode == .hidden || renderMode == .wireframe { continue }
-
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) {
-                continue
-            }
-
-            if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .gizmo, .light]) { continue }
-            // Blend submeshes go with the colour (there is no dither path here).
-            if meshSkipsColor(entity, in: sceneSnapshot) { continue }
-
-            guard let renderComponent = sceneSnapshot.render(of: entity) else {
-                continue
-            }
-            guard let worldTransformComponent = sceneSnapshot.worldTransform(of: entity) else {
-                continue
-            }
-
-            let hasTransparentSubmesh = renderComponent.mesh.contains { mesh in
-                mesh.submeshes.contains { submesh in
-                    submesh.material?.hasTransparency ?? false
-                }
-            }
-
-            if !hasTransparentSubmesh {
-                continue
-            }
-
-            let worldPosition = simd_float3(
-                worldTransformComponent.space.columns.3.x,
-                worldTransformComponent.space.columns.3.y,
-                worldTransformComponent.space.columns.3.z
-            )
-            let distanceSq = simd_length_squared(effectiveCameraPosition - worldPosition)
-            transparentEntities.append((
-                entityId: entityId,
-                render: renderComponent,
-                world: worldTransformComponent,
-                deformation: sceneSnapshot.deformation(of: entity),
-                hasSkeleton: entity.traits.contains(.skeleton),
-                distanceSq: distanceSq
-            ))
-        }
-
-        transparentEntities.sort { $0.distanceSq > $1.distanceSq }
 
         for entry in transparentEntities {
             let entityId = entry.entityId
