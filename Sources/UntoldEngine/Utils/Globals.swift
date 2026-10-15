@@ -305,6 +305,13 @@ public var timeSinceLastUpdate: Float! {
     set { RuntimeGlobalsStore.shared.timeSinceLastUpdate = newValue }
 }
 
+/// The frame being prepared: its predicted presentation time, the delta from the frame
+/// before and whether the display skipped a frame between them. `.zero` before the first.
+public internal(set) var currentFrameTime: FrameTime {
+    get { RuntimeGlobalsStore.shared.currentFrameTime }
+    set { RuntimeGlobalsStore.shared.currentFrameTime = newValue }
+}
+
 var firstUpdateCall: Bool {
     get { RuntimeGlobalsStore.shared.firstUpdateCall }
     set { RuntimeGlobalsStore.shared.firstUpdateCall = newValue }
@@ -1096,6 +1103,7 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var globalEntityCounterValue: UInt32 = 0
     private var timeSinceLastUpdatePreviousTimeValue: TimeInterval?
     private var timeSinceLastUpdateValue: Float?
+    private var currentFrameTimeValue: FrameTime = .zero
     private var firstUpdateCallValue: Bool = false
     private var frameCountValue: Int = 0
     private var timePassedSinceLastFrameValue: Float = 0.0
@@ -1126,6 +1134,9 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var enableEngineMetricsValue: Bool = false
     private var bypassPostProcessingValue: Bool = false
     private var xrFoveatedRenderingEnabledValue: Bool = true
+    private var xrOptimalInputWaitModeValue: XRInputWaitMode = .automatic
+    private var xrFramePacingValue: XRFramePacing = .halfRateWhenLate
+    private var shadowSoftnessBeforeSystemValue: ShadowSoftnessSettings?
     private var antiAliasingModeValue: AntiAliasingMode = .fxaa
     private var renderDebugViewModeValue: RenderDebugViewMode = .lit
     private var pomQualitySettingsValue: POMQualitySettings = .platformDefault
@@ -1191,6 +1202,20 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         set {
             lock.lock()
             timeSinceLastUpdateValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var currentFrameTime: FrameTime {
+        get {
+            lock.lock()
+            let value = currentFrameTimeValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            currentFrameTimeValue = newValue
             lock.unlock()
         }
     }
@@ -1627,6 +1652,48 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         set {
             lock.lock()
             xrFoveatedRenderingEnabledValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var xrOptimalInputWaitMode: XRInputWaitMode {
+        get {
+            lock.lock()
+            let value = xrOptimalInputWaitModeValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            xrOptimalInputWaitModeValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var xrFramePacing: XRFramePacing {
+        get {
+            lock.lock()
+            let value = xrFramePacingValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            xrFramePacingValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
+        get {
+            lock.lock()
+            let value = shadowSoftnessBeforeSystemValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            shadowSoftnessBeforeSystemValue = newValue
             lock.unlock()
         }
     }
@@ -2135,6 +2202,29 @@ public var bypassPostProcessing: Bool {
 public var xrFoveatedRenderingEnabled: Bool {
     get { RuntimeGlobalsStore.shared.xrFoveatedRenderingEnabled }
     set { RuntimeGlobalsStore.shared.xrFoveatedRenderingEnabled = newValue }
+}
+
+/// When the XR loop waits for the compositor's optimal input time before it queries the head
+/// pose and encodes the frame: always, never, or by the measured deadline (the default). See
+/// `RenderingProperty.optimalInputWait`.
+public var xrOptimalInputWaitMode: XRInputWaitMode {
+    get { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode }
+    set { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode = newValue }
+}
+
+/// How the XR loop paces its frames against the display's refreshes: every one, every other
+/// one while the frames run late (the default), or every other one always. See
+/// `RenderingProperty.framePacing`.
+public var xrFramePacing: XRFramePacing {
+    get { RuntimeGlobalsStore.shared.xrFramePacing }
+    set { RuntimeGlobalsStore.shared.xrFramePacing = newValue }
+}
+
+/// The sun shadow's softness set while no shadow system existed, for the system the renderer
+/// creates next. See `setShadowSoftness`.
+var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
+    get { RuntimeGlobalsStore.shared.shadowSoftnessBeforeSystem }
+    set { RuntimeGlobalsStore.shared.shadowSoftnessBeforeSystem = newValue }
 }
 
 /// Selects the active anti-aliasing pass inserted after the look pass.

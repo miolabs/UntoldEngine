@@ -63,7 +63,7 @@ let frame = layerRenderer.queryNextFrame()
 let timing = frame.predictTiming()
 ```
 
-`queryNextFrame()` dequeues the next compositor frame. `predictTiming()` returns `optimalInputTime` — the deadline by which you must finish reading input and preparing CPU-side data for the frame. These are not suggestions; missing them causes judder.
+`queryNextFrame()` dequeues the next compositor frame. `predictTiming()` returns `optimalInputTime` — the deadline by which you must finish reading input and preparing CPU-side data for the frame. These are not suggestions; missing them causes judder. It also returns `presentationTime`, the instant the frame will be shown; the engine converts it to the media-time base (through the compositor clock's epoch, which is the boot, like `CACurrentMediaTime()`) and poses the whole update for it.
 
 ### 2b. Update Phase
 
@@ -79,7 +79,7 @@ Everything between `startUpdate` and `endUpdate` is CPU-side frame preparation:
 
 - **Spatial input processing**: `updateSpatialInputState()` drains the queued `XRSpatialInputSnapshot` events and updates the `InputSystem`. If assets are loading or the scene isn't ready, input is cleared instead to avoid acting on stale state.
 
-- **Game update**: `renderer.updateXR()` calls the user's `gameUpdate` and `handleInput` callbacks. This is where game logic runs — entity movement, animation state machines, physics steps. It is skipped entirely while `AssetLoadingGate.shared.isLoadingAny` is true.
+- **Game update**: `renderer.updateXR(presentationTime:)` calls the user's `gameUpdate` (or `frameUpdate`) and `handleInput` callbacks. This is where game logic runs — entity movement, animation state machines, physics steps. The frame is posed for the instant the compositor predicts it will be shown, the same instant the head pose is queried for at submission: the engine's delta is the time between two presentations, and the game receives the instant itself as a `FrameTime`, so a moving object steps by the display's period from frame to frame instead of by the varying time between two updates, which is what reads as judder against the head-tracked world (see [Presentation-time animation](../proposals/PresentationTimeAnimation.md)). It is skipped entirely while `AssetLoadingGate.shared.isLoadingAny` is true.
 
 - **XR lighting probe processing**: When real-world lighting mode is active, accepted environment-light probe updates are prefiltered into runtime IBL textures. The renderer uses the latest valid probe plus `realWorldLightingContribution`; if no valid probe is available, it falls back to the configured static environment path.
 
@@ -111,7 +111,7 @@ drawable.deviceAnchor = anchor
 
 The device anchor is the head pose — a 4×4 transform from world space to the device. The compositor requires it to be attached to the drawable before presenting; without it, the system can't reproject the frame correctly for the user's eyes.
 
-The engine queries the anchor at **presentation time** (the future moment when the frame will appear on screen), not at "now". This is predictive — it compensates for the latency between encoding and display by predicting where the head will be.
+The engine queries the anchor at **presentation time** (the future moment when the frame will appear on screen), not at "now". This is predictive — it compensates for the latency between encoding and display by predicting where the head will be. The game's objects were posed for the same instant in the update phase, so head and objects agree; `presentationTimeRevisions` counts the frames whose drawable's presentation time differs from the prediction the update used.
 
 **Resilience strategy**: ARKit can occasionally return `nil` for the anchor (e.g., tracking hiccup, recovery). A three-level fallback prevents dropped frames:
 1. Query at predicted presentation time → use it if valid
@@ -267,6 +267,7 @@ Selection rays update from interaction events, not continuously as the user look
 | Frame timing | MTKView drives at display rate | CompositorServices dictates via `optimalInputTime` |
 | Eyes | 1 | 2 (per-eye loop over `drawable.views`) |
 | Compute passes | Once per frame | Once per frame (shared across both eyes) |
+| Default scene | A camera and a directional light, both active | A camera, the entity the head pose is written into, and no directional light unless the configuration asks for one (`UntoldRendererConfig.defaultSun`): the passthrough room is lit by its probe and the immersive environment by its own light, so a sun is the app's to add (`DirectionalLightNode`, or `createDirLight` and `setDirectionalLight(.active(_:))`), and it casts in one cascade by default (`setRendering(.shadowCascades(_:))`) |
 | View matrix | Camera entity transform | `(originFromDevice × deviceFromView)⁻¹` from ARKit anchor |
 | Projection | Camera component FOV | `drawable.computeProjection()` — asymmetric per-eye |
 | Present call | `commandBuffer.present(drawable)` | `drawable.encodePresent(commandBuffer:)` — encoded as GPU command |

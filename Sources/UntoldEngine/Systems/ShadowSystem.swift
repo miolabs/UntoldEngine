@@ -286,6 +286,17 @@ struct ShadowSystem {
     var cascadeBlendStarts: [Float] = Array(repeating: 0, count: csmCascadeCount)
     var softnessSettings: ShadowSoftnessSettings = .init()
     var isActive: Bool = false
+    /// The cascades the sun's shadow is drawn in and read from, one to `csmCascadeCount`:
+    /// what `setRendering(.shadowCascades(_:))` asked for, else the platform's default: one
+    /// on the headset, where the scene is a room or a tabletop and the second cascade's
+    /// draw of every caster and the cross-fade's double taps cost a frame's budget for a
+    /// distance it never shows; every cascade elsewhere. `maxShadowCastingDistance` sets how
+    /// far the cascades reach, so one cascade stays sharp on a small scene.
+    nonisolated(unsafe) static var cascadesWanted: Int?
+    var cascadeCount: Int {
+        let wanted = Self.cascadesWanted ?? (renderInfo.isXRStereoMode ? 1 : csmCascadeCount)
+        return min(max(wanted, 1), csmCascadeCount)
+    }
 
     /// Legacy accessor used by callers that only need to know "is there a shadow?"
     var dirLightSpaceMatrix: simd_float4x4? {
@@ -328,14 +339,20 @@ struct ShadowSystem {
         return max(cameraNear, cascadeBlendStart(cascadeIdx: cascadeIdx - 1, splits: splits, blendFraction: blendFraction))
     }
 
-    /// Fills the 3 fixed GPU slots from a per-cascade array, padding unused slots
-    /// (beyond csmCascadeCount) with `fallback` so the shader's cascadeCount field
-    /// controls which slots are actually read.
-    private static func pack3<T>(_ values: [T], fallback: T) -> (T, T, T) {
+    /// A light-space matrix that lands every point outside the shadow map's [0, 1] range
+    /// (at 10, 10, 10 with w 1), where the shader samples no map and takes the point as lit.
+    static let nowhere = simd_float4x4(columns: (
+        simd_float4(0, 0, 0, 0), simd_float4(0, 0, 0, 0), simd_float4(0, 0, 0, 0), simd_float4(10, 10, 10, 1)
+    ))
+
+    /// Fills the 3 fixed GPU slots from a per-cascade array, padding the slots past the
+    /// `count` cascades in use with `fallback`, so the shader's cascadeCount field controls
+    /// which slots are actually read.
+    private static func pack3<T>(_ values: [T], count: Int, fallback: T) -> (T, T, T) {
         (
             values[0],
-            csmCascadeCount > 1 ? values[1] : fallback,
-            csmCascadeCount > 2 ? values[2] : fallback
+            count > 1 && values.count > 1 ? values[1] : fallback,
+            count > 2 && values.count > 2 ? values[2] : fallback
         )
     }
 
@@ -344,12 +361,17 @@ struct ShadowSystem {
     /// left as identity/zero so the shader's cascadeCount field controls which are read.
     func makeUniforms() -> CSMUniforms {
         var u = CSMUniforms()
-        u.lightSpaceMatrices = Self.pack3(cascadeLightSpaceMatrices, fallback: matrix_identity_float4x4)
-        u.cascadeSplits = Self.pack3(cascadeSplitDistances, fallback: 0)
-        u.cascadeCount = Int32(csmCascadeCount)
-        u.cascadeWorldTexelSizes = Self.pack3(cascadeWorldTexelSizes, fallback: cascadeWorldTexelSizes[0])
-        u.cascadeDepthSpans = Self.pack3(cascadeDepthSpans, fallback: cascadeDepthSpans[0])
-        u.cascadeBlendStarts = Self.pack3(cascadeBlendStarts, fallback: cascadeBlendStarts[0])
+        let count = cascadeCount
+        // A sun that casts no shadow (none active, or castsShadow off) draws no cascades, and
+        // the maps hold whatever was drawn last: its matrices put every point outside the
+        // maps, which the shader reads as lit, instead of the stale shadows.
+        let matrices = isActive ? cascadeLightSpaceMatrices : Array(repeating: Self.nowhere, count: cascadeLightSpaceMatrices.count)
+        u.lightSpaceMatrices = Self.pack3(matrices, count: count, fallback: matrix_identity_float4x4)
+        u.cascadeSplits = Self.pack3(cascadeSplitDistances, count: count, fallback: 0)
+        u.cascadeCount = Int32(count)
+        u.cascadeWorldTexelSizes = Self.pack3(cascadeWorldTexelSizes, count: count, fallback: cascadeWorldTexelSizes[0])
+        u.cascadeDepthSpans = Self.pack3(cascadeDepthSpans, count: count, fallback: cascadeDepthSpans[0])
+        u.cascadeBlendStarts = Self.pack3(cascadeBlendStarts, count: count, fallback: cascadeBlendStarts[0])
         let softness = Self.sanitizedSoftnessSettings(softnessSettings)
         let xrScale = renderInfo.isXRStereoMode ? softness.xrRadiusScale : 1.0
         u.shadowSoftnessNear = softness.nearRadiusTexels * xrScale
@@ -364,7 +386,7 @@ struct ShadowSystem {
         softnessSettings = Self.sanitizedSoftnessSettings(settings)
     }
 
-    private static func sanitizedSoftnessSettings(_ settings: ShadowSoftnessSettings) -> ShadowSoftnessSettings {
+    static func sanitizedSoftnessSettings(_ settings: ShadowSoftnessSettings) -> ShadowSoftnessSettings {
         let nearRadius = simd_clamp(settings.nearRadiusTexels, 0.25, 8.0)
         let farRadius = simd_clamp(settings.farRadiusTexels, nearRadius, 12.0)
         let depthScale = simd_clamp(settings.depthScale, 0.0, 2.0)
@@ -407,6 +429,9 @@ struct ShadowSystem {
             return
         }
         guard directionalLight.castsShadow else { return }
+        // A sun at no intensity lights nothing, and the shading multiplies its shadow by that
+        // intensity: its cascades would be drawn, two depth maps a frame, for nothing.
+        guard (scene.get(component: LightComponent.self, for: lightEntity)?.intensity ?? 0) != 0 else { return }
 
         // Rotate into visual-world space to match the root-rotation-aware corners/caster bounds
         // below -- the light entity's own transform is scene-local, same as every other entity.
@@ -450,8 +475,9 @@ struct ShadowSystem {
 
         // Practical split scheme (blend of log and uniform, λ=0.5).
         let splits = computeCascadeSplits(cameraNear: near, cameraFar: cameraFar)
-        cascadeSplitDistances = splits
-        for i in 0 ..< csmCascadeCount {
+        // The arrays keep every slot; the ones past the cascades in use repeat the last split.
+        cascadeSplitDistances = splits + Array(repeating: splits.last ?? cameraFar, count: csmCascadeCount - splits.count)
+        for i in 0 ..< cascadeCount {
             cascadeBlendStarts[i] = Self.cascadeBlendStart(
                 cascadeIdx: i, splits: splits, blendFraction: csmCascadeBlendFraction
             )
@@ -466,7 +492,7 @@ struct ShadowSystem {
             lightSpaceBounds(for: $0, lightView: lightView)
         }
 
-        for i in 0 ..< csmCascadeCount {
+        for i in 0 ..< cascadeCount {
             let cascadeFar = splits[i]
             let cascadeNear = Self.cascadeNearDistance(
                 cascadeIdx: i,
@@ -568,8 +594,8 @@ struct ShadowSystem {
     private func computeCascadeSplits(cameraNear: Float, cameraFar: Float) -> [Float] {
         let lambda: Float = 0.5
         var splits: [Float] = []
-        for i in 1 ... csmCascadeCount {
-            let fi = Float(i) / Float(csmCascadeCount)
+        for i in 1 ... cascadeCount {
+            let fi = Float(i) / Float(cascadeCount)
             let logSplit = cameraNear * pow(cameraFar / cameraNear, fi)
             let uniformSplit = cameraNear + (cameraFar - cameraNear) * fi
             splits.append(lambda * logSplit + (1.0 - lambda) * uniformSplit)
@@ -705,12 +731,34 @@ struct ShadowSystem {
     }
 }
 
+/// Sets the sun shadow's softness. Before the shadow system exists (before the renderer is
+/// created, or between two sessions) the setting is kept and given to the system when the
+/// renderer creates it, so a setting made with no space open is neither lost nor a crash.
 public func setShadowSoftness(_ settings: ShadowSoftnessSettings) {
+    guard shadowSystem != nil else {
+        shadowSoftnessBeforeSystem = settings
+        return
+    }
     shadowSystem.setSoftness(settings)
 }
 
+/// The sun shadow's softness: the system's, or, before it exists, the setting kept for it,
+/// as the system will hold it.
 public func getShadowSoftness() -> ShadowSoftnessSettings {
-    shadowSystem.softnessSettings
+    if let system = shadowSystem {
+        return system.softnessSettings
+    }
+    if let kept = shadowSoftnessBeforeSystem {
+        return ShadowSystem.sanitizedSoftnessSettings(kept)
+    }
+    return ShadowSystem().softnessSettings
+}
+
+/// Gives a shadow system just created the softness set before it existed, if any.
+func applyShadowSoftnessSetBeforeSystem() {
+    guard let settings = shadowSoftnessBeforeSystem else { return }
+    shadowSoftnessBeforeSystem = nil
+    shadowSystem?.setSoftness(settings)
 }
 
 /// Current value set via `setRendering(.maxShadowCastingDistance(_:))`.

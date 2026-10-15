@@ -587,6 +587,15 @@ func initRenderPassDescriptors() {
         depthAttachment: (textureResources.depthMap, .dontCare, .store, sceneDepthClearValue())
     )
 
+    // The look pass: its colour alone (see RenderInfo.lookRenderPassDescriptor).
+    renderInfo.lookRenderPassDescriptor = createRenderPassDescriptor(
+        width: Int(renderInfo.viewPort.x),
+        height: Int(renderInfo.viewPort.y),
+        colorAttachments: [
+            (textureResources.lookTexture, .clear, .store, MTLClearColorMake(0.0, 0.0, 0.0, 0.0)),
+        ]
+    )
+
     // Gizmo Render Pass
     renderInfo.gizmoRenderPassDescriptor = createRenderPassDescriptor(
         width: Int(renderInfo.viewPort.x),
@@ -938,7 +947,7 @@ func initTextureResources() {
         pixelFormat: wf.sceneColor,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1021,7 +1030,7 @@ func initTextureResources() {
         pixelFormat: wf.environment,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1042,7 +1051,7 @@ func initTextureResources() {
         pixelFormat: wf.sceneComposite,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1052,7 +1061,7 @@ func initTextureResources() {
         pixelFormat: wf.lookOutput,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1062,7 +1071,7 @@ func initTextureResources() {
         pixelFormat: wf.lookOutput,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 

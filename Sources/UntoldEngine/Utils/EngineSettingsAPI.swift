@@ -71,6 +71,13 @@ public enum RenderingProperty: Sendable {
     /// existing texel budget on it instead, sharpening shadow edges without needing a larger
     /// shadow map. See `getMaxShadowCastingDistance()` to read the current value.
     case maxShadowCastingDistance(Float)
+    /// The cascades the sun's shadow is drawn in and read from, 1 or 2. Each cascade draws
+    /// every caster once more into its own 2048² depth map, and the band where two meet
+    /// samples both. The headset's default is one: a room or a tabletop never shows the
+    /// distance the second covers, and with `maxShadowCastingDistance` set to the scene's
+    /// size one cascade is sharp on it. Elsewhere the default is two. See
+    /// `getShadowCascades()`.
+    case shadowCascades(Int)
     /// Objects whose bounds are under this many pixels tall on screen are not drawn and
     /// cast no shadow. A scene with tens of thousands of small parts shows most of them
     /// at a pixel or less from any distance, and each would still cost a draw. The size
@@ -86,9 +93,11 @@ public enum RenderingProperty: Sendable {
     /// frustum keeps. In scene units; the default is 0.5. See
     /// `getOcclusionCullingMaxCameraStep()` to read the current value.
     case occlusionCullingMaxCameraStep(Float)
-    /// The fewest mesh entities in the culling set for which the occlusion test runs and the
-    /// depth pyramid it reads is built and its depth copied, every frame. 2 by default: one
-    /// entity hides nothing but itself. A scene with splats keeps the pyramid regardless.
+    /// The fewest objects in the culling set for which the occlusion test runs and the depth
+    /// pyramid it reads is built and its depth copied, every frame. An entity with its
+    /// children is one object: the parts of a model loaded from a file hide nothing but
+    /// themselves. 2 by default: one object hides nothing but itself. A scene with splats
+    /// keeps the pyramid regardless.
     case occlusionCullingMinimumEntities(Int)
     /// Whether the XR frame is drawn through the rasterization rate maps the visionOS
     /// compositor provides when the layer is configured with foveation enabled
@@ -100,6 +109,20 @@ public enum RenderingProperty: Sendable {
     /// compositor still unwarps, so the picture is distorted. See
     /// `getFoveatedRenderingEnabled()` to read the current value.
     case foveatedRendering(RenderingToggle)
+    /// Whether the XR loop waits for the compositor's optimal input time before it queries the
+    /// head pose and encodes the frame. Waiting gives the freshest head pose; not waiting
+    /// starts the GPU about the wait's length earlier, so a frame whose GPU work would end
+    /// after the rendering deadline may make it, with the head pose predicted from earlier for
+    /// the compositor's reprojection to cover. `.automatic`, the default, waits while the
+    /// frames meet the deadline, stops when a second had late frames, and resumes once the
+    /// measured slack would cover the wait again. See `getOptimalInputWaitMode()`.
+    case optimalInputWait(XRInputWaitMode)
+    /// How the XR loop paces its frames against the display's refreshes: every refresh; every
+    /// other refresh while the frames run late (the default), so a frame whose GPU work does
+    /// not fit one refresh is shown two refreshes apart, evenly, and posed for that instant,
+    /// instead of landing a refresh late now and then, which hops; or every other refresh
+    /// always. The compositor reprojects the head between the frames. See `getFramePacing()`.
+    case framePacing(XRFramePacing)
     /// Whether the pre-composite pass is skipped on a frame it would only copy the lit scene
     /// (XR passthrough with no environment, splat, ambient-occlusion or gizmo layer to join;
     /// the lit debug view; no render extension). Enabled by default; disabling it runs the
@@ -170,6 +193,17 @@ public enum RenderingToggle: Sendable {
     case disabled
 }
 
+/// When the XR loop waits for the compositor's optimal input time before encoding the frame.
+/// See `RenderingProperty.optimalInputWait`.
+public enum XRInputWaitMode: Sendable, Equatable {
+    /// Every frame: the freshest head pose, the latest GPU start.
+    case always
+    /// Never: the frame is encoded as soon as the update is done.
+    case never
+    /// By the measured deadline: waiting while the frames make it, not while they do not.
+    case automatic
+}
+
 public enum RenderExtensionProperty: Sendable {
     case register(any RenderExtension)
     case unregister(String)
@@ -221,6 +255,8 @@ public func setRendering(_ property: RenderingProperty) {
         applyRenderExtensionProperty(property)
     case let .maxShadowCastingDistance(distance):
         RenderPasses.maxShadowCastingDistance = max(distance, 0.001)
+    case let .shadowCascades(count):
+        ShadowSystem.cascadesWanted = count
     case let .smallObjectCulling(pixels):
         SmallObjectCulling.minimumPixels = pixels.isFinite ? max(pixels, 0) : 0
     case let .occlusionCullingMinimumEntities(entities):
@@ -231,6 +267,10 @@ public func setRendering(_ property: RenderingProperty) {
         xrFoveatedRenderingEnabled = true
     case .foveatedRendering(.disabled):
         xrFoveatedRenderingEnabled = false
+    case let .optimalInputWait(mode):
+        xrOptimalInputWaitMode = mode
+    case let .framePacing(pacing):
+        xrFramePacing = pacing
     case .preCompositeBypass(.enabled):
         renderInfo.preCompositeBypassEnabled = true
     case .preCompositeBypass(.disabled):
@@ -283,6 +323,23 @@ public func adoptXRRenderPathUnlessChosen() {
 /// provides them. See `RenderingProperty.foveatedRendering`.
 public func getFoveatedRenderingEnabled() -> Bool {
     xrFoveatedRenderingEnabled
+}
+
+/// When the XR loop waits for the compositor's optimal input time before it encodes the
+/// frame. See `RenderingProperty.optimalInputWait`.
+/// The cascades the sun's shadow is drawn in and read from.
+public func getShadowCascades() -> Int {
+    shadowSystem?.cascadeCount ?? min(max(ShadowSystem.cascadesWanted ?? csmCascadeCount, 1), csmCascadeCount)
+}
+
+public func getOptimalInputWaitMode() -> XRInputWaitMode {
+    xrOptimalInputWaitMode
+}
+
+/// How the XR loop paces its frames against the display's refreshes. See
+/// `RenderingProperty.framePacing`.
+public func getFramePacing() -> XRFramePacing {
+    xrFramePacing
 }
 
 public enum RenderResourceQuery {

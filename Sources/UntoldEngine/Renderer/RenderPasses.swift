@@ -1415,7 +1415,7 @@ public enum RenderPasses {
         let projectionMatrix = renderInfo.perspectiveSpace
 
         // Render each cascade into its own depth array slice.
-        for cascadeIdx in 0 ..< csmCascadeCount {
+        for cascadeIdx in 0 ..< shadowSystem.cascadeCount {
             guard cascadeIdx < renderInfo.csmRenderPassDescriptors.count else { break }
             let descriptor = renderInfo.csmRenderPassDescriptors[cascadeIdx]
             descriptor.depthAttachment.loadAction = .clear
@@ -1432,7 +1432,7 @@ public enum RenderPasses {
             renderEncoder.pushDebugGroup("Shadow Cascade \(cascadeIdx)")
             renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
             renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
             renderEncoder.setDepthBias(0.0015, slopeScale: 0.75, clamp: 0.02)
             renderEncoder.setViewport(
                 MTLViewport(originX: 0, originY: 0,
@@ -1528,7 +1528,7 @@ public enum RenderPasses {
         batchUniforms.cameraPosition = shadingCameraPosition(cameraComponent)
         batchUniforms.projectionMatrix = renderInfo.perspectiveSpace
 
-        for cascadeIdx in 0 ..< csmCascadeCount {
+        for cascadeIdx in 0 ..< shadowSystem.cascadeCount {
             guard cascadeIdx < renderInfo.csmRenderPassDescriptors.count else { break }
 
             // Batched geometry adds into the existing cascade depth slice (already written by shadowExecution).
@@ -1545,7 +1545,7 @@ public enum RenderPasses {
             renderEncoder.pushDebugGroup("Batched Shadow Cascade \(cascadeIdx)")
             renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
             renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
             renderEncoder.setDepthBias(0.0015, slopeScale: 0.75, clamp: 0.02)
             renderEncoder.setViewport(
                 MTLViewport(originX: 0, originY: 0,
@@ -1634,7 +1634,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Spot Shadow")
         renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setDepthBias(0.0015, slopeScale: 0.75, clamp: 0.02)
         renderEncoder.setViewport(
             MTLViewport(originX: 0, originY: 0,
@@ -1774,7 +1774,7 @@ public enum RenderPasses {
             renderEncoder.pushDebugGroup("Point Shadow Face \(face)")
             renderEncoder.setRenderPipelineState(shadowPipeline.pipelineState!)
             renderEncoder.setDepthStencilState(shadowPipeline.depthState!)
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
             renderEncoder.setDepthBias(0.002, slopeScale: 0.9, clamp: 0.03)
             renderEncoder.setViewport(
                 MTLViewport(originX: 0, originY: 0,
@@ -1931,7 +1931,7 @@ public enum RenderPasses {
         renderEncoder.setRenderPipelineState(modelPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
 
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         // What every draw of the pass shares, read once.
         let pass = OpaquePassState(cameraComponent: cameraComponent)
@@ -2200,7 +2200,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(modelPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         // Create identity uniform (batched vertices are already in world space)
         var batchUniforms = Uniforms()
@@ -2535,7 +2535,7 @@ public enum RenderPasses {
         // ── Sub-pass 1: Unbatched geometry ──────────────────────────────────────
         renderEncoder.setRenderPipelineState(modelPipeline.pipelineState!)
         renderEncoder.setDepthStencilState(modelPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         for entityId in visibleEntityIds {
             guard let entity = sceneSnapshot.entity(entityId) else { continue }
@@ -2954,7 +2954,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(ssaoPipeline.pipelineState!)
         // renderEncoder.setDepthStencilState(ssaoPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3063,7 +3063,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(ssaoBlurPipeline.pipelineState!)
         // renderEncoder.setDepthStencilState(ssaoBlurPipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3186,7 +3186,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("SSAO Low-Res Pass")
 
         renderEncoder.setRenderPipelineState(ssaoPipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3290,7 +3290,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(pipeline.pipelineState!)
         // renderEncoder.setDepthStencilState(pipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3355,7 +3355,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("SSAO Simple Blur Pass")
 
         renderEncoder.setRenderPipelineState(ssaoBlurPipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3407,7 +3407,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("SSAO Upsample Pass")
 
         renderEncoder.setRenderPipelineState(upsamplePipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3501,7 +3501,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Light Pass")
 
         renderEncoder.setRenderPipelineState(lightPipeline.pipelineState!)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3765,7 +3765,7 @@ public enum RenderPasses {
 
         renderEncoder.setRenderPipelineState(preCompositePipeline.pipelineState!)
 
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
@@ -3852,6 +3852,80 @@ public enum RenderPasses {
             return
         }
 
+        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
+
+        // What every draw of the pass shares, read once.
+        let sceneSnapshot = RenderSceneSnapshot()
+        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
+        let projectionMatrix = renderInfo.perspectiveSpace
+        let batchingEnabled = BatchingSystem.shared.isEnabled()
+        let colorsByLOD = SpatialDebugVisualization.shared.colorRenderablesByLOD
+        let colorsByStreamingTier = SpatialDebugVisualization.shared.colorRenderablesByStreamingTier
+        var renderModes = SceneChannelRenderModeMemo()
+
+        // Build and sort transparent draw items back-to-front for correct alpha blending.
+        var transparentEntities: [(
+            entityId: EntityID,
+            render: RenderComponent,
+            world: WorldTransformComponent,
+            deformation: DeformationComponent?,
+            hasSkeleton: Bool,
+            distanceSq: Float
+        )] = []
+
+        for entityId in visibleEntityIds {
+            guard let entity = sceneSnapshot.entity(entityId) else { continue }
+            let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
+            if renderMode == .hidden || renderMode == .wireframe { continue }
+
+            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) {
+                continue
+            }
+
+            if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .gizmo, .light]) { continue }
+            // Blend submeshes go with the colour (there is no dither path here).
+            if meshSkipsColor(entity, in: sceneSnapshot) { continue }
+
+            guard let renderComponent = sceneSnapshot.render(of: entity) else {
+                continue
+            }
+            guard let worldTransformComponent = sceneSnapshot.worldTransform(of: entity) else {
+                continue
+            }
+
+            let hasTransparentSubmesh = renderComponent.mesh.contains { mesh in
+                mesh.submeshes.contains { submesh in
+                    submesh.material?.hasTransparency ?? false
+                }
+            }
+
+            if !hasTransparentSubmesh {
+                continue
+            }
+
+            let worldPosition = simd_float3(
+                worldTransformComponent.space.columns.3.x,
+                worldTransformComponent.space.columns.3.y,
+                worldTransformComponent.space.columns.3.z
+            )
+            let distanceSq = simd_length_squared(effectiveCameraPosition - worldPosition)
+            transparentEntities.append((
+                entityId: entityId,
+                render: renderComponent,
+                world: worldTransformComponent,
+                deformation: sceneSnapshot.deformation(of: entity),
+                hasSkeleton: entity.traits.contains(.skeleton),
+                distanceSq: distanceSq
+            ))
+        }
+
+        transparentEntities.sort { $0.distanceSq > $1.distanceSq }
+
+        // No transparent surface, no pass: the encoder would load and store the lit colour and
+        // the depth of the whole frame to draw nothing, as the wireframe and occluder passes
+        // also refuse.
+        guard !transparentEntities.isEmpty else { return }
+
         guard let encoderDescriptor = renderInfo.deferredRenderPassDescriptor else {
             handleError(.renderPassCreationFailed, "Deferred render pass descriptor not initialized")
             return
@@ -3894,7 +3968,7 @@ public enum RenderPasses {
         } else {
             renderEncoder.setDepthStencilState(transparencyPipeline.depthState)
         }
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
         var transpCSM = shadowSystem.makeUniforms()
         transpCSM.cameraViewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
@@ -3993,75 +4067,6 @@ public enum RenderPasses {
             length: MemoryLayout<Float>.stride,
             index: Int(transparencyPassIBLRotationAngleIndex.rawValue)
         )
-
-        let effectiveCameraPosition = shadingCameraPosition(cameraComponent)
-
-        // What every draw of the pass shares, read once.
-        let sceneSnapshot = RenderSceneSnapshot()
-        let viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
-        let projectionMatrix = renderInfo.perspectiveSpace
-        let batchingEnabled = BatchingSystem.shared.isEnabled()
-        let colorsByLOD = SpatialDebugVisualization.shared.colorRenderablesByLOD
-        let colorsByStreamingTier = SpatialDebugVisualization.shared.colorRenderablesByStreamingTier
-        var renderModes = SceneChannelRenderModeMemo()
-
-        // Build and sort transparent draw items back-to-front for correct alpha blending.
-        var transparentEntities: [(
-            entityId: EntityID,
-            render: RenderComponent,
-            world: WorldTransformComponent,
-            deformation: DeformationComponent?,
-            hasSkeleton: Bool,
-            distanceSq: Float
-        )] = []
-
-        for entityId in visibleEntityIds {
-            guard let entity = sceneSnapshot.entity(entityId) else { continue }
-            let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
-            if renderMode == .hidden || renderMode == .wireframe { continue }
-
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entityId) {
-                continue
-            }
-
-            if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .gizmo, .light]) { continue }
-            // Blend submeshes go with the colour (there is no dither path here).
-            if meshSkipsColor(entity, in: sceneSnapshot) { continue }
-
-            guard let renderComponent = sceneSnapshot.render(of: entity) else {
-                continue
-            }
-            guard let worldTransformComponent = sceneSnapshot.worldTransform(of: entity) else {
-                continue
-            }
-
-            let hasTransparentSubmesh = renderComponent.mesh.contains { mesh in
-                mesh.submeshes.contains { submesh in
-                    submesh.material?.hasTransparency ?? false
-                }
-            }
-
-            if !hasTransparentSubmesh {
-                continue
-            }
-
-            let worldPosition = simd_float3(
-                worldTransformComponent.space.columns.3.x,
-                worldTransformComponent.space.columns.3.y,
-                worldTransformComponent.space.columns.3.z
-            )
-            let distanceSq = simd_length_squared(effectiveCameraPosition - worldPosition)
-            transparentEntities.append((
-                entityId: entityId,
-                render: renderComponent,
-                world: worldTransformComponent,
-                deformation: sceneSnapshot.deformation(of: entity),
-                hasSkeleton: entity.traits.contains(.skeleton),
-                distanceSq: distanceSq
-            ))
-        }
-
-        transparentEntities.sort { $0.distanceSq > $1.distanceSq }
 
         for entry in transparentEntities {
             let entityId = entry.entityId
@@ -4315,7 +4320,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Mesh Occluder Shell Pass")
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(pipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
         renderEncoder.setTriangleFillMode(.fill)
 
@@ -4458,7 +4463,7 @@ public enum RenderPasses {
         renderEncoder.pushDebugGroup("Wireframe Occlusion Depth Pass")
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setDepthStencilState(pipeline.depthState)
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
         renderEncoder.setTriangleFillMode(.fill)
 
@@ -4657,7 +4662,7 @@ public enum RenderPasses {
         } else {
             renderEncoder.setDepthStencilState(wireframePipeline.depthState)
         }
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
 
         var wireframeColor = wireframeSettings.color
@@ -5029,7 +5034,7 @@ public enum RenderPasses {
         if let depthState = spatialDebugPipeline.depthState {
             renderEncoder.setDepthStencilState(depthState)
         }
-        renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+        renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
         renderEncoder.setCullMode(.none)
 
         var viewMatrix = SceneRootTransform.shared.effectiveViewMatrix(cameraComponent.viewSpace)
@@ -5301,10 +5306,15 @@ public enum RenderPasses {
         #endif
     }
 
+    /// A full-screen pass of `pipeline` from `source` into `destination`. It draws into the
+    /// post-process descriptor, which carries the frame's depth loaded and stored, unless
+    /// `descriptor` names another: a pipeline built with no depth attachment (the look pass)
+    /// brings its own, colour alone.
     static func executePostProcess(
         _ pipeline: RenderPipeline,
         source: MTLTexture,
         destination: MTLTexture,
+        descriptor: MTLRenderPassDescriptor? = nil,
         customization: @escaping (_ encoder: MTLRenderCommandEncoder) -> Void
     ) -> (MTLCommandBuffer) -> Void {
         { commandBuffer in
@@ -5313,15 +5323,16 @@ public enum RenderPasses {
                 return
             }
 
-            renderInfo.postProcessRenderPassDescriptor.colorAttachments[0].texture = destination
-
-            renderInfo.postProcessRenderPassDescriptor.colorAttachments[0].loadAction = .clear
-            renderInfo.postProcessRenderPassDescriptor.colorAttachments[0].storeAction = .store
-            renderInfo.postProcessRenderPassDescriptor.depthAttachment.loadAction = .load
-
-            guard let renderPassDescriptor = renderInfo.postProcessRenderPassDescriptor else {
+            guard let renderPassDescriptor = descriptor ?? renderInfo.postProcessRenderPassDescriptor else {
                 handleError(.renderPassCreationFailed, "Post-process render pass descriptor not initialized")
                 return
+            }
+
+            renderPassDescriptor.colorAttachments[0].texture = destination
+            renderPassDescriptor.colorAttachments[0].loadAction = .clear
+            renderPassDescriptor.colorAttachments[0].storeAction = .store
+            if renderPassDescriptor.depthAttachment.texture != nil {
+                renderPassDescriptor.depthAttachment.loadAction = .load
             }
 
             // set your encoder here
@@ -5345,7 +5356,7 @@ public enum RenderPasses {
 
             renderEncoder.setRenderPipelineState(pipeline.pipelineState!)
 
-            renderEncoder.waitForFence(renderInfo.fence, before: .vertex)
+            renderEncoder.waitForFence(renderInfo.fence, before: .fragment)
 
             renderEncoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
             renderEncoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)

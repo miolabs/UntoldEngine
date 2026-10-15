@@ -1005,7 +1005,8 @@ public func InitLookPipeline() -> RenderPipeline? {
         fragmentShader: "fragmentLookShader",
         vertexDescriptor: createPostProcessVertexDescriptor(),
         colorFormats: [wf.lookOutput],
-        depthFormat: renderInfo.depthPixelFormat,
+        // The look pass draws into its own descriptor, colour alone: no depth to match.
+        depthFormat: .invalid,
         depthEnabled: false,
         name: "Look Pipeline"
     )

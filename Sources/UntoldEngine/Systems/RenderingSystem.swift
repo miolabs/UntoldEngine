@@ -1437,7 +1437,7 @@ private func lookPresentingPass(source: MTLTexture, destination: MTLTexture) -> 
         if let depthState = pipeline.depthState {
             encoder.setDepthStencilState(depthState)
         }
-        encoder.waitForFence(renderInfo.fence, before: .vertex)
+        encoder.waitForFence(renderInfo.fence, before: .fragment)
         encoder.setVertexBuffer(bufferResources.quadVerticesBuffer, offset: 0, index: 0)
         encoder.setVertexBuffer(bufferResources.quadTexCoordsBuffer, offset: 0, index: 1)
         encoder.setFragmentTexture(source, index: 0)
@@ -1500,6 +1500,7 @@ public let lookRenderPass: RenderPasses.RenderPassExecution = { commandBuffer in
             pipeline,
             source: sourceTexture,
             destination: destinationTexture,
+            descriptor: renderInfo.lookRenderPassDescriptor,
             customization: colorGradingCustomization
         )(commandBuffer)
         return

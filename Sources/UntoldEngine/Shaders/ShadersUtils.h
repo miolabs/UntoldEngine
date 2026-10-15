@@ -165,8 +165,11 @@ float4 specularImportanceMap(float2 texCoords, texture2d<float> environmentTextu
 
 float4 BRDFIntegrationMap(float roughness, float NoV);
 
+float2 brdfIntegration(float NoV, float roughness, texture2d<float> brdfMap);
+float3 environmentReflectance(float3 F0, float2 brdf);
 float3 environmentReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap);
 
+float3 singleBounceReflectance(float3 F0, float2 brdf);
 float3 singleBounceReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap);
 
 float3 blurredEnvironment(float3 direction, float roughness, texture2d<float> specularMap, float3 rotationAxis, float rotationAngle);
