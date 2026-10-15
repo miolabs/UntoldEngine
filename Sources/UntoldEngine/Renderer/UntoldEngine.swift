@@ -193,6 +193,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         initSizeableResources() // TODO: Find a better name function
 
         shadowSystem = ShadowSystem()
+        applyShadowSoftnessSetBeforeSystem()
         pointShadowState = PointShadowState()
         spotShadowState = SpotShadowState()
 

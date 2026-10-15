@@ -364,7 +364,7 @@ struct ShadowSystem {
         softnessSettings = Self.sanitizedSoftnessSettings(settings)
     }
 
-    private static func sanitizedSoftnessSettings(_ settings: ShadowSoftnessSettings) -> ShadowSoftnessSettings {
+    static func sanitizedSoftnessSettings(_ settings: ShadowSoftnessSettings) -> ShadowSoftnessSettings {
         let nearRadius = simd_clamp(settings.nearRadiusTexels, 0.25, 8.0)
         let farRadius = simd_clamp(settings.farRadiusTexels, nearRadius, 12.0)
         let depthScale = simd_clamp(settings.depthScale, 0.0, 2.0)
@@ -705,12 +705,34 @@ struct ShadowSystem {
     }
 }
 
+/// Sets the sun shadow's softness. Before the shadow system exists (before the renderer is
+/// created, or between two sessions) the setting is kept and given to the system when the
+/// renderer creates it, so a setting made with no space open is neither lost nor a crash.
 public func setShadowSoftness(_ settings: ShadowSoftnessSettings) {
+    guard shadowSystem != nil else {
+        shadowSoftnessBeforeSystem = settings
+        return
+    }
     shadowSystem.setSoftness(settings)
 }
 
+/// The sun shadow's softness: the system's, or, before it exists, the setting kept for it,
+/// as the system will hold it.
 public func getShadowSoftness() -> ShadowSoftnessSettings {
-    shadowSystem.softnessSettings
+    if let system = shadowSystem {
+        return system.softnessSettings
+    }
+    if let kept = shadowSoftnessBeforeSystem {
+        return ShadowSystem.sanitizedSoftnessSettings(kept)
+    }
+    return ShadowSystem().softnessSettings
+}
+
+/// Gives a shadow system just created the softness set before it existed, if any.
+func applyShadowSoftnessSetBeforeSystem() {
+    guard let settings = shadowSoftnessBeforeSystem else { return }
+    shadowSoftnessBeforeSystem = nil
+    shadowSystem?.setSoftness(settings)
 }
 
 /// Current value set via `setRendering(.maxShadowCastingDistance(_:))`.
