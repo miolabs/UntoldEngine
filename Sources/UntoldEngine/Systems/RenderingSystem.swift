@@ -1500,6 +1500,7 @@ public let lookRenderPass: RenderPasses.RenderPassExecution = { commandBuffer in
             pipeline,
             source: sourceTexture,
             destination: destinationTexture,
+            descriptor: renderInfo.lookRenderPassDescriptor,
             customization: colorGradingCustomization
         )(commandBuffer)
         return

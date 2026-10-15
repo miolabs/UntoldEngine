@@ -35,6 +35,11 @@ public struct RenderInfo {
     public var forwardRenderPassDescriptor: MTLRenderPassDescriptor!
     public var gaussianRenderPassDescriptor: MTLRenderPassDescriptor!
     public var postProcessRenderPassDescriptor: MTLRenderPassDescriptor!
+    /// The look pass's descriptor: its colour alone, no depth attachment. The post-process
+    /// descriptor carries the frame's depth for the passes that read it; the look pass does
+    /// not, and a depth attachment loaded and stored for nothing is a full-size read and
+    /// write per eye.
+    public var lookRenderPassDescriptor: MTLRenderPassDescriptor!
     // CSM: one render pass descriptor per cascade (3 total), each targeting a separate array slice.
     public var csmRenderPassDescriptors: [MTLRenderPassDescriptor] = []
     public var pointShadowRenderPassDescriptors: [MTLRenderPassDescriptor] = []

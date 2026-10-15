@@ -587,6 +587,15 @@ func initRenderPassDescriptors() {
         depthAttachment: (textureResources.depthMap, .dontCare, .store, sceneDepthClearValue())
     )
 
+    // The look pass: its colour alone (see RenderInfo.lookRenderPassDescriptor).
+    renderInfo.lookRenderPassDescriptor = createRenderPassDescriptor(
+        width: Int(renderInfo.viewPort.x),
+        height: Int(renderInfo.viewPort.y),
+        colorAttachments: [
+            (textureResources.lookTexture, .clear, .store, MTLClearColorMake(0.0, 0.0, 0.0, 0.0)),
+        ]
+    )
+
     // Gizmo Render Pass
     renderInfo.gizmoRenderPassDescriptor = createRenderPassDescriptor(
         width: Int(renderInfo.viewPort.x),

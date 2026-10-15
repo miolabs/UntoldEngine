@@ -5306,10 +5306,15 @@ public enum RenderPasses {
         #endif
     }
 
+    /// A full-screen pass of `pipeline` from `source` into `destination`. It draws into the
+    /// post-process descriptor, which carries the frame's depth loaded and stored, unless
+    /// `descriptor` names another: a pipeline built with no depth attachment (the look pass)
+    /// brings its own, colour alone.
     static func executePostProcess(
         _ pipeline: RenderPipeline,
         source: MTLTexture,
         destination: MTLTexture,
+        descriptor: MTLRenderPassDescriptor? = nil,
         customization: @escaping (_ encoder: MTLRenderCommandEncoder) -> Void
     ) -> (MTLCommandBuffer) -> Void {
         { commandBuffer in
@@ -5318,15 +5323,16 @@ public enum RenderPasses {
                 return
             }
 
-            renderInfo.postProcessRenderPassDescriptor.colorAttachments[0].texture = destination
-
-            renderInfo.postProcessRenderPassDescriptor.colorAttachments[0].loadAction = .clear
-            renderInfo.postProcessRenderPassDescriptor.colorAttachments[0].storeAction = .store
-            renderInfo.postProcessRenderPassDescriptor.depthAttachment.loadAction = .load
-
-            guard let renderPassDescriptor = renderInfo.postProcessRenderPassDescriptor else {
+            guard let renderPassDescriptor = descriptor ?? renderInfo.postProcessRenderPassDescriptor else {
                 handleError(.renderPassCreationFailed, "Post-process render pass descriptor not initialized")
                 return
+            }
+
+            renderPassDescriptor.colorAttachments[0].texture = destination
+            renderPassDescriptor.colorAttachments[0].loadAction = .clear
+            renderPassDescriptor.colorAttachments[0].storeAction = .store
+            if renderPassDescriptor.depthAttachment.texture != nil {
+                renderPassDescriptor.depthAttachment.loadAction = .load
             }
 
             // set your encoder here
