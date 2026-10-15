@@ -778,6 +778,10 @@ private func applyDeserializedMaterialData(entityId: EntityID, entityData: Entit
 
     if let heightEnabled = materialData.heightEnabled {
         updateMaterialHeightEnabled(entityId: entityId, heightEnabled: heightEnabled)
+    } else if materialData.heightURL != nil {
+        // Legacy scenes saved before `heightEnabled` existed relied on POM
+        // activating implicitly whenever a height texture was present.
+        updateMaterialHeightEnabled(entityId: entityId, heightEnabled: true)
     }
 
     if let heightRemapMin = materialData.heightRemapMin {
@@ -997,9 +1001,9 @@ public func serializeScene() -> SceneData {
         }
 
         // Kinetic properties
-        entityData.mass = getMass(entityId: entityId)
-
         entityData.hasKineticComponent = hasComponent(entityId: entityId, componentType: KineticComponent.self)
+
+        entityData.mass = entityData.hasKineticComponent ? getMass(entityId: entityId) : 0.0
 
         // Dir Light properties
         let hasDirLight: Bool = hasComponent(entityId: entityId, componentType: DirectionalLightComponent.self)
