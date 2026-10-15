@@ -938,7 +938,7 @@ func initTextureResources() {
         pixelFormat: wf.sceneColor,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1021,7 +1021,7 @@ func initTextureResources() {
         pixelFormat: wf.environment,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1042,7 +1042,7 @@ func initTextureResources() {
         pixelFormat: wf.sceneComposite,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1052,7 +1052,7 @@ func initTextureResources() {
         pixelFormat: wf.lookOutput,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
@@ -1062,7 +1062,7 @@ func initTextureResources() {
         pixelFormat: wf.lookOutput,
         width: viewportWidth,
         height: viewportHeight,
-        usage: [.shaderRead, .renderTarget, .shaderWrite],
+        usage: [.shaderRead, .renderTarget], // no shaderWrite: it would forbid the GPU's lossless compression
         storageMode: .shared
     )
 
