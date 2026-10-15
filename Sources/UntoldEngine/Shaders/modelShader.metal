@@ -163,11 +163,16 @@ vertex VertexOutModel vertexModelShader(
                    weights.w * (jointMatrices[joints.w] * normals));
     }
 
-    out.vPosition = position;
+    float4 worldPosition = uniforms.modelMatrix * position;
+    out.worldPosition = worldPosition.xyz;
     out.position = uniforms.projectionMatrix * uniforms.modelViewMatrix * position;
-    out.normal = normals.xyz;
-    //out.shadowCoords = lightOrthoView * uniforms.modelMatrix * position;
     out.uvCoords = in.uv;
+    // Where the vertex is this frame and was the previous one, on the unjittered screens, for
+    // the velocity the fragment writes (a skinned vertex takes this frame's pose for both).
+    float4 currentClip = uniforms.unjitteredViewProjectionMatrix * worldPosition;
+    float4 prevClip = uniforms.prevViewProjectionMatrix * uniforms.prevModelMatrix * position;
+    out.currentClipXYW = currentClip.xyw;
+    out.prevClipXYW = prevClip.xyw;
 
     // Compute TBN. Tangents are directions, not normals, so transform them with the model
     // matrix linear part. The inverse-transpose normal matrix is only correct for normals.
@@ -239,6 +244,95 @@ vertex MeshOccluderShellVertexOut vertexMeshOccluderShellShader(
 }
 
 
+// Whether a draw through this pipeline may discard fragments: an alpha-masked or blended
+// material, or a dither fade. The plain opaque pipeline compiles this false, and with the
+// discards gone the GPU resolves visibility before it shades — a fragment another surface
+// covers is never shaded. The general pipeline keeps them for the draws that need them.
+constant bool kModelMayDiscard [[function_constant(modelFunctionConstantMayDiscard)]];
+/// Per-fragment indirect lighting: the image-based light and the sun's cascade shadow,
+/// evaluated here once per fragment and carried in the emissive attachment (indirect light
+/// added to the emissive, the shadow factor in alpha) for the light pass to add, instead of
+/// once per sample there (`setRendering(.perFragmentIndirectLighting)`).
+constant bool kModelIndirectInGBuffer [[function_constant(modelFunctionConstantIndirectInGBuffer)]];
+/// Per-fragment lighting: the surface lit whole here, once per fragment — the direct light of
+/// the sun, the point, spot and area lights with their shadows, over the indirect light above,
+/// which it needs — and written to the lit attachment, the one the light pass would write; that
+/// pass, which lights once per sample, then stands down (`setRendering(.perFragmentLighting)`).
+constant bool kModelLitInGBuffer [[function_constant(modelFunctionConstantLitInGBuffer)]];
+/// The sun's parameters are bound for either of the two.
+constant bool kModelSunNeeded = kModelIndirectInGBuffer || kModelLitInGBuffer;
+/// The G-buffer is written when the light pass is to read it, that is unless the geometry
+/// lights itself.
+constant bool kModelGBufferOut = !kModelLitInGBuffer;
+
+/// What the model fragment stage writes: the G-buffer for the light pass to read from the
+/// tile, or — the geometry lighting itself — the lit colour alone, in the attachment the
+/// light pass would write, so the pass holds nothing else in its imageblock and the GPU runs
+/// it in its largest tiles.
+typedef struct {
+    float4 color [[color(0), function_constant(kModelGBufferOut)]];
+    float4 normals [[color(1), function_constant(kModelGBufferOut)]];
+    float4 positions [[color(2), function_constant(kModelGBufferOut)]];
+    float4 material [[color(3), function_constant(kModelGBufferOut)]];
+    float4 emmisive [[color(4), function_constant(kModelGBufferOut)]];
+    float4 lit [[color(5), function_constant(kModelLitInGBuffer)]];
+    // The pixel's motion since the previous frame, in NDC (this frame minus the previous), for
+    // the temporal resolve to find the history of a surface that moves on its own.
+    float2 velocity [[color(6), function_constant(kModelLitInGBuffer)]];
+} GBufferOut;
+
+/// The pixel's motion in NDC: this frame's unjittered position minus the previous frame's, each
+/// given as its clip x, y and w (the third component is w, not z). A vertex behind the previous
+/// eye (w <= 0) has no previous position worth a history: no motion.
+static inline float2 modelVelocity(float3 currentClipXYW, float3 prevClipXYW) {
+    const float currentW = currentClipXYW.z;
+    const float prevW = prevClipXYW.z;
+    if (currentW <= 1e-6 || prevW <= 1e-6) {
+        return float2(0.0);
+    }
+    return currentClipXYW.xy / currentW - prevClipXYW.xy / prevW;
+}
+
+/// The emissive attachment's value with the indirect light and the sun's shadow folded in.
+static inline float4 emissiveWithIndirect(
+    float3 emissive, float4 baseColor, float3 normal, float3 worldPosition, float roughness, float metallic,
+    float3 viewVector,
+    texture2d<float> iblIrradiance, texture2d<float> iblSpecular, texture2d<float> iblBRDF,
+    depth2d_array<float> csmShadowArray,
+    constant CSMUniforms &csmUniforms, constant LightParameters &lightParams,
+    constant IBLParamsUniform &iblParam, constant float &iblRotationAngle
+) {
+    float3 indirect = computeIBLContribution(iblIrradiance, iblSpecular, iblBRDF, iblRotationAngle, iblParam,
+                                             baseColor, normal, viewVector, roughness, metallic) * iblParam.ambientIntensity;
+    // The sun's shadow only ever multiplies the sun's light, so a sun at no intensity needs
+    // no shadow taps: the branch is on a per-frame constant, uniform across the draw.
+    float shadow = 1.0;
+    if (lightParams.intensity != 0.0) {
+        shadow = computeCSMShadow(csmShadowArray, csmUniforms, worldPosition, normal, normalize(lightParams.direction));
+    }
+    return float4(emissive + indirect, shadow);
+}
+
+/// The lit attachment's value: the direct light over the emissive attachment's value, which
+/// already holds the emissive with the indirect light, and the sun's shadow in its alpha. The
+/// alpha is the coverage the light pass would have written.
+static inline float4 litWithDirect(
+    float4 emissiveAndShadow, float4 baseColor, float3 normal, float4 worldPosition, float roughness, float metallic,
+    float3 viewVector,
+    constant LightParameters &lightParams,
+    constant PointLightBlock &plBlock, constant SpotLightBlock &slBlock, constant AreaLightBlock &alBlock,
+    texture2d<float> ltcMagTexture, texture2d<float> ltcMatTexture,
+    depthcube<float> pointShadowCube, depth2d<float> spotShadowMap,
+    constant PointShadowUniforms &pointShadowUniforms, constant SpotShadowUniforms &spotShadowUniforms
+) {
+    float3 direct = computeDirectLighting(
+        worldPosition, viewVector, normal, baseColor.rgb, roughness, metallic, emissiveAndShadow.a,
+        lightParams, plBlock, slBlock, alBlock, ltcMagTexture, ltcMatTexture, pointShadowCube, spotShadowMap,
+        pointShadowUniforms, spotShadowUniforms
+    );
+    return float4(direct + emissiveAndShadow.rgb, baseColor.a);
+}
+
 fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
                                         constant Uniforms & uniforms [[ buffer(modelPassFragmentUniformIndex) ]],
                                  texture2d<float> baseColor [[texture(modelPassBaseTextureIndex)]],
@@ -255,7 +349,26 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
                                   sampler heightSampler [[sampler(modelPassHeightSamplerIndex)]],
                                         constant float &stScale [[buffer(modelPassFragmentSTScaleIndex)]],
                                         constant POMQualityUniform &pomQuality [[buffer(modelPassFragmentPOMQualityIndex)]],
-                                        constant bool &normalIsPackedXY [[buffer(modelPassFragmentNormalIsPackedXYIndex)]])
+                                        constant bool &normalIsPackedXY [[buffer(modelPassFragmentNormalIsPackedXYIndex)]],
+                                        // Per-fragment indirect lighting, bound only with it on.
+                                        texture2d<float> iblIrradiance [[texture(modelPassIBLIrradianceTextureIndex), function_constant(kModelIndirectInGBuffer)]],
+                                        texture2d<float> iblSpecular [[texture(modelPassIBLSpecularTextureIndex), function_constant(kModelIndirectInGBuffer)]],
+                                        texture2d<float> iblBRDF [[texture(modelPassIBLBRDFTextureIndex), function_constant(kModelIndirectInGBuffer)]],
+                                        depth2d_array<float> csmShadowArray [[texture(modelPassCSMShadowTextureIndex), function_constant(kModelIndirectInGBuffer)]],
+                                        constant CSMUniforms &csmUniforms [[buffer(modelPassFragmentCSMUniformsIndex), function_constant(kModelIndirectInGBuffer)]],
+                                        constant LightParameters &lightParams [[buffer(modelPassFragmentLightParamsIndex), function_constant(kModelSunNeeded)]],
+                                        constant IBLParamsUniform &iblParam [[buffer(modelPassFragmentIBLParamIndex), function_constant(kModelIndirectInGBuffer)]],
+                                        constant float &iblRotationAngle [[buffer(modelPassFragmentIBLRotationAngleIndex), function_constant(kModelIndirectInGBuffer)]],
+                                        // Per-fragment lighting, bound only with it on.
+                                        constant PointLightBlock &plBlock [[buffer(modelPassFragmentPointLightsIndex), function_constant(kModelLitInGBuffer)]],
+                                        constant SpotLightBlock &slBlock [[buffer(modelPassFragmentSpotLightsIndex), function_constant(kModelLitInGBuffer)]],
+                                        constant AreaLightBlock &alBlock [[buffer(modelPassFragmentAreaLightsIndex), function_constant(kModelLitInGBuffer)]],
+                                        constant PointShadowUniforms &pointShadowUniforms [[buffer(modelPassFragmentPointShadowUniformIndex), function_constant(kModelLitInGBuffer)]],
+                                        constant SpotShadowUniforms &spotShadowUniforms [[buffer(modelPassFragmentSpotShadowUniformIndex), function_constant(kModelLitInGBuffer)]],
+                                        texture2d<float> ltcMagTexture [[texture(modelPassAreaLTCMagTextureIndex), function_constant(kModelLitInGBuffer)]],
+                                        texture2d<float> ltcMatTexture [[texture(modelPassAreaLTCMatTextureIndex), function_constant(kModelLitInGBuffer)]],
+                                        depthcube<float> pointShadowCube [[texture(modelPassPointShadowTextureIndex), function_constant(kModelLitInGBuffer)]],
+                                        depth2d<float> spotShadowMap [[texture(modelPassSpotShadowTextureIndex), function_constant(kModelLitInGBuffer)]])
 {
 
     // Base Color and Normal Maps: Linear filtering, mipmaps, repeat wrapping
@@ -285,12 +398,23 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
     float2 stDx = dfdx(st);
     float2 stDy = dfdy(st);
 
-    float4 verticesInWorldSpace=uniforms.modelMatrix*in.vPosition;
-    float3 normalVectorInWorldSpace=uniforms.normalMatrix*in.normal;
+    float4 verticesInWorldSpace = float4(in.worldPosition, 1.0);
+    float3 normalVectorInWorldSpace = in.tbNormal;
 
     //construct tbn matrix TBN (world-space basis built in the vertex stage)
     simd_float3 N=normalize(in.tbNormal);
     simd_float3 T=normalize(in.tangent.xyz);
+
+    // The model pass does not cull, so an open mesh shows its back faces — a dart's flight, a
+    // leaf, a sheet seen from behind. Those arrive with the front side's normal, pointing away
+    // from the viewer, and shade as if unlit (one wing of a flight dark, the next one lit).
+    // A face whose normal points away from the viewer is lit with it turned around. The test
+    // is geometric rather than [[front_facing]]: the pass sets no winding, and assets arrive
+    // wound either way.
+    if (dot(N, uniforms.cameraPosition - verticesInWorldSpace.xyz) < 0.0) {
+        normalVectorInWorldSpace = -normalVectorInWorldSpace;
+        N = -N;
+    }
 
     //B = (N x T) * T.w
     simd_float3 B=cross(N, T)*in.tangent.w;
@@ -354,102 +478,148 @@ fragment GBufferOut fragmentModelShader(VertexOutModel in [[stage_in]],
     // pixel-to-pixel movement near the height field's silhouette-like transitions. `hasHeight`
     // is uniform across the whole draw call, so branching between the two sampling forms here
     // is safe for the implicit-derivative branch.
-    float4 sampledColor = hasHeight
-        ? baseColor.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
-        : baseColor.sample(baseColorSampler, st, bias(0.25f));
-
+    //
+    // Each map is sampled only when the material has it. The presence flags are per-draw
+    // constants, so each branch is uniform across the draw and the implicit-derivative sample
+    // inside it is as safe as the hasHeight one; a part without the map paid the sample on a
+    // nil texture before and threw the value away.
     // A textured material whose base color factor was never set (all zeros) shows its
     // texture untinted. Without a texture, zero is a color like any other: black.
     bool isBaseColorUnset = materialParameter.hasTexture.x == 1 && all(materialParameter.baseColor.rgb < 0.001);
     float3 tint = isBaseColorUnset ? float3(1.0) : materialParameter.baseColor.rgb;
 
-    float4 inBaseColor = (materialParameter.hasTexture.x == 1)
-        ? float4(sampledColor.rgb * tint, sampledColor.a * materialParameter.baseColor.a)
-    : float4(tint, materialParameter.baseColor.a);
-
-
-    if (materialParameter.alphaMode == 2) {
-        discard_fragment();
+    float4 inBaseColor = float4(tint, materialParameter.baseColor.a);
+    if (materialParameter.hasTexture.x == 1) {
+        float4 sampledColor = hasHeight
+            ? baseColor.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
+            : baseColor.sample(baseColorSampler, st, bias(0.25f));
+        inBaseColor = float4(sampledColor.rgb * tint, sampledColor.a * materialParameter.baseColor.a);
     }
 
-    if (materialParameter.alphaMode == 1 && inBaseColor.a < materialParameter.alphaCutoff) {
-        discard_fragment();
-    }
 
-    float lodDitherMode = materialParameter.lodDither.y;
-    if (lodDitherMode > 0.5) {
-        float threshold = clamp(materialParameter.lodDither.x, 0.0, 1.0);
-        float dither = lodBayerThreshold(in.position.xy);
+    if (kModelMayDiscard) {
+        if (materialParameter.alphaMode == 2) {
+            discard_fragment();
+        }
 
-        if (lodDitherMode < 1.5) {
-            if (dither >= threshold) {
+        if (materialParameter.alphaMode == 1 && inBaseColor.a < materialParameter.alphaCutoff) {
+            discard_fragment();
+        }
+
+        float lodDitherMode = materialParameter.lodDither.y;
+        if (lodDitherMode > 0.5) {
+            float threshold = clamp(materialParameter.lodDither.x, 0.0, 1.0);
+            float dither = lodBayerThreshold(in.position.xy);
+
+            if (lodDitherMode < 1.5) {
+                if (dither >= threshold) {
+                    discard_fragment();
+                }
+            } else if (dither < threshold) {
                 discard_fragment();
             }
-        } else if (dither < threshold) {
-            discard_fragment();
         }
     }
 
     float passthroughAlpha = clamp(materialParameter.passthroughAlpha, 0.0, 1.0);
 
-    //normal map is in Tangent space
-    float4 normalSample = hasHeight
-        ? normalTexture.sample(normalSampler, sampleUV, gradient2d(stDx, stDy))
-        : normalTexture.sample(normalSampler, st, bias(0.25f));
+    // The shading normal: the vertex normal, or the normal map's, in tangent space, brought
+    // to world space.
+    float3 normalMap = normalize(normalVectorInWorldSpace);
+    if (hasNormal) {
+        float4 normalSample = hasHeight
+            ? normalTexture.sample(normalSampler, sampleUV, gradient2d(stDx, stDy))
+            : normalTexture.sample(normalSampler, st, bias(0.25f));
 
-    // Two on-disk encodings: a direct 3-component tangent-space normal (RGB, [0,1] ->
-    // [-1,1]), or astcenc's `-normal` packing (RGB=X, A=Y) used by texbake.py to get a
-    // better error metric for vector data — see NativeTexFlags.normalPackedXY. Z is
-    // reconstructed from the unit-length constraint for the packed case.
-    // [0,1] -> [-1,1] first, unit length after: normalizing the stored color instead
-    // shortens it before the remap and leaves every normal tilted (a flat texel, (0.5,
-    // 0.5, 1), came out 22 degrees off).
-    float3 normalMapStandard = normalSample.rgb * 2.0 - 1.0;
+        // Two on-disk encodings: a direct 3-component tangent-space normal (RGB, [0,1] ->
+        // [-1,1]), or astcenc's `-normal` packing (RGB=X, A=Y) used by texbake.py to get a
+        // better error metric for vector data — see NativeTexFlags.normalPackedXY. Z is
+        // reconstructed from the unit-length constraint for the packed case.
+        // [0,1] -> [-1,1] first, unit length after: normalizing the stored color instead
+        // shortens it before the remap and leaves every normal tilted (a flat texel, (0.5,
+        // 0.5, 1), came out 22 degrees off).
+        float3 normalMapStandard = normalSample.rgb * 2.0 - 1.0;
 
-    float2 packedXY = normalSample.ga * 2.0 - 1.0;
-    float3 normalMapPackedXY = float3(packedXY, sqrt(saturate(1.0 - dot(packedXY, packedXY))));
+        float2 packedXY = normalSample.ga * 2.0 - 1.0;
+        float3 normalMapPackedXY = float3(packedXY, sqrt(saturate(1.0 - dot(packedXY, packedXY))));
 
-    float3 normalMap = normalIsPackedXY ? normalMapPackedXY : normalMapStandard;
-    normalMap = applyNormalStrength(normalMap, materialParameter.normalScale);
+        float3 tangentNormal = normalIsPackedXY ? normalMapPackedXY : normalMapStandard;
+        tangentNormal = applyNormalStrength(tangentNormal, materialParameter.normalScale);
+        normalMap = normalize(TBN * tangentNormal);
+    }
 
-    //convert to normal map to world space???
-    normalMap=(hasNormal==false)?normalize(normalVectorInWorldSpace):normalize(TBN*normalMap);
-
-    float4 roughnessSample = hasHeight
-        ? roughnessTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
-        : roughnessTexture.sample(materialSampler, st, bias(0.25f));
-    float roughness=(materialParameter.hasTexture.y==1)
-        ? selectTextureChannel(roughnessSample, materialParameter.textureChannels.x) * materialParameter.roughness
-        : materialParameter.roughness;
+    float roughness = materialParameter.roughness;
+    if (materialParameter.hasTexture.y == 1) {
+        float4 roughnessSample = hasHeight
+            ? roughnessTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
+            : roughnessTexture.sample(materialSampler, st, bias(0.25f));
+        roughness = selectTextureChannel(roughnessSample, materialParameter.textureChannels.x) * materialParameter.roughness;
+    }
     roughness=clamp(roughness, 0.045, 1.0);
 
-    float4 metallicSample = hasHeight
-        ? metallicTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
-        : metallicTexture.sample(materialSampler, st, bias(0.25f));
-    float metallic=(materialParameter.hasTexture.z==1)
-        ? selectTextureChannel(metallicSample, materialParameter.textureChannels.y) * materialParameter.metallic
-        : materialParameter.metallic;
+    // Specular anti-aliasing. Normal detail finer than a pixel (a dart's knurl,
+    // sisal fibres, a thin wire's curvature) gives a tight specular lobe a
+    // different peak every frame as the view moves, which reads as sparkle;
+    // multisampling resolves coverage, not this. Widen the lobe by the
+    // screen-space variance of the shading normal (Kaplanyan 2016, Tokuyoshi &
+    // Kaplanyan 2019) so the G-buffer carries a roughness the light pass can
+    // shade stably. sigma^2 = 0.25 and a 0.18 kernel clamp are the values
+    // Unreal and Frostbite ship; a flat surface sees no change.
+    {
+        float3 dndx = dfdx(normalMap);
+        float3 dndy = dfdy(normalMap);
+        float normalVariance = 0.25 * (dot(dndx, dndx) + dot(dndy, dndy));
+        float kernelRoughness2 = min(2.0 * normalVariance, 0.18);
+        roughness = sqrt(roughness * roughness + kernelRoughness2);
+    }
+
+    float metallic = materialParameter.metallic;
+    if (materialParameter.hasTexture.z == 1) {
+        float4 metallicSample = hasHeight
+            ? metallicTexture.sample(materialSampler, sampleUV, gradient2d(stDx, stDy))
+            : metallicTexture.sample(materialSampler, st, bias(0.25f));
+        metallic = selectTextureChannel(metallicSample, materialParameter.textureChannels.y) * materialParameter.metallic;
+    }
     metallic=clamp(metallic, 0.0, 1.0);
 
     // The light the surface gives off: the emissive color, times the emissive texture when
     // the material has one (the texture carries the color, the factor its strength). It
     // shares the base color's sampler: both wrap the same way over the same coordinates.
-    float4 emissiveSample = hasHeight
-        ? emissiveTexture.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
-        : emissiveTexture.sample(baseColorSampler, st, bias(0.25f));
-    float3 emissive = (materialParameter.hasEmissiveTexture == 1)
-        ? materialParameter.emmissive * emissiveSample.rgb
-        : materialParameter.emmissive;
+    float3 emissive = materialParameter.emmissive;
+    if (materialParameter.hasEmissiveTexture == 1) {
+        float4 emissiveSample = hasHeight
+            ? emissiveTexture.sample(baseColorSampler, sampleUV, gradient2d(stDx, stDy))
+            : emissiveTexture.sample(baseColorSampler, st, bias(0.25f));
+        emissive = materialParameter.emmissive * emissiveSample.rgb;
+    }
 
     float4 color=inBaseColor;
 
-    gBufferOut.color = float4(color.rgb, passthroughAlpha);
-    gBufferOut.normals=float4(normalMap,0.0);
-    gBufferOut.positions=verticesInWorldSpace;
-    // .b/.a carry POM debug data (raw height sample, uv-offset magnitude) for
-    // RenderDebugViewMode.heightDebug / .pomOffsetDebug — see RenderingSystem.swift.
-    gBufferOut.material=float4(roughness, metallic, pomHeightSample, pomOffsetMagnitude);
-    gBufferOut.emmisive = float4(emissive, 1.0);
+    float4 base = float4(color.rgb, passthroughAlpha);
+    float4 emissiveOut = float4(emissive, 1.0);
+    // The view vector once, for the indirect and the direct light alike.
+    float3 viewVector = normalize(uniforms.cameraPosition - verticesInWorldSpace.xyz);
+    if (kModelIndirectInGBuffer) {
+        emissiveOut = emissiveWithIndirect(
+            emissive, base, normalMap, verticesInWorldSpace.xyz, roughness, metallic, viewVector,
+            iblIrradiance, iblSpecular, iblBRDF, csmShadowArray, csmUniforms, lightParams, iblParam, iblRotationAngle);
+    }
+    if (kModelGBufferOut) {
+        gBufferOut.color = base;
+        gBufferOut.normals = float4(normalMap, 0.0);
+        gBufferOut.positions = verticesInWorldSpace;
+        // .b/.a carry POM debug data (raw height sample, uv-offset magnitude) for
+        // RenderDebugViewMode.heightDebug / .pomOffsetDebug — see RenderingSystem.swift.
+        gBufferOut.material = float4(roughness, metallic, pomHeightSample, pomOffsetMagnitude);
+        gBufferOut.emmisive = emissiveOut;
+    }
+    if (kModelLitInGBuffer) {
+        gBufferOut.lit = litWithDirect(
+            emissiveOut, base, normalMap, verticesInWorldSpace, roughness, metallic,
+            viewVector, lightParams, plBlock, slBlock, alBlock, ltcMagTexture, ltcMatTexture,
+            pointShadowCube, spotShadowMap, pointShadowUniforms, spotShadowUniforms);
+        gBufferOut.velocity = modelVelocity(in.currentClipXYW, in.prevClipXYW);
+    }
     return gBufferOut;
 
 

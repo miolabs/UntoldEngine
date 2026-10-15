@@ -69,6 +69,179 @@
         // Reuse render pass descriptors to avoid allocation churn (2 eyes × 90 FPS = 180 allocs/sec)
         private let passDescriptorLeft = MTLRenderPassDescriptor()
         private let passDescriptorRight = MTLRenderPassDescriptor()
+
+        // Foveation: the parameter data of each eye's rasterization rate map, copied every frame
+        // (the maps follow the gaze) into a ring one slot deeper than the frames in flight —
+        // the depth pyramid built on a frame carries its last eye's data into the culls of the
+        // frame after (HZBPyramidFrame.rateMapData), which may still run when this frame's
+        // slot comes round again with only the usual in-flight depth.
+        private var rateMapParameterBuffers: [[MTLBuffer?]] = Array(repeating: [nil, nil], count: maxInFlightCommandBuffers + 1)
+        private var rateMapFrameCounter = 0
+        private var loggedFoveationState: Bool?
+        private var loggedCaptureTargetSkip = false
+        private var loggedDrawableCount = 0
+        /// Whether the compositor's frame timing budget has been printed (once per space).
+        private var loggedFrameTimingBudget = false
+        /// Whether the compositor clock's base has been checked against the media time (once).
+        private var loggedClockBases = false
+        /// Frames whose drawable's presentation time differed from the one predicted at the
+        /// update: the game posed those frames for a slightly different instant than the head.
+        public private(set) var presentationTimeRevisions = 0
+        private var lastPresentationRevisionLogTime: CFTimeInterval = 0
+        /// Frames whose GPU work finished after the compositor's rendering deadline. The deadline
+        /// sits well before the presentation (15 ms on the headset), so a frame a few
+        /// milliseconds past it is still shown on time; one past that margin has the display
+        /// show the previous frame again and this one a refresh late, posed for an instant
+        /// already past — a hop in a moving object that no counter of the loop's pacing sees.
+        public var deadlineMisses: Int { deadlineLock.withLock { deadlineMissCount } }
+        /// The longest a frame's GPU work finished after its deadline, in milliseconds.
+        public var worstDeadlineOverrunMs: Double { deadlineLock.withLock { worstOverrunMs } }
+        private let deadlineLock = NSLock()
+        private var deadlineMissCount = 0
+        private var worstOverrunMs = 0.0
+        private var lastDeadlineLogTime: CFTimeInterval = 0
+        /// The last second's frames: how many, how many late, their worst and summed overruns,
+        /// the least slack any had before the deadline, and the longest wait skipped.
+        private var secondFrames = 0
+        private var secondLate = 0
+        private var secondWorstMs = 0.0
+        private var secondOverrunSumMs = 0.0
+        private var secondLeastSlackMs = Double.infinity
+        private var secondSkippedWaitMaxMs = 0.0
+        private var secondGPUSumMs = 0.0
+        /// The frames' GPU time after the frame before finished: the span of a frame's command
+        /// buffer starts when the GPU takes it, which with frames queued is before the frame
+        /// before is done, so the span overstates the frame's own work.
+        private var secondOwnGPUSumMs = 0.0
+        private var lastGPUEndTime: CFTimeInterval = 0
+        private var secondPacedWaitSumMs = 0.0
+        private var secondPacedWaits = 0
+        /// The last second's frames past the deadline by more than its usable margin before the
+        /// presentation (shown a refresh late), and the refreshes the display skipped beyond
+        /// the pacing's cadence, from the spacing of the predicted presentations.
+        private var secondMissed = 0
+        private var secondSkipped = 0
+        /// The automatic mode's current choice: waiting for the optimal input time, or not.
+        private var automaticWaits = true
+        /// The half-rate pacing: its policy, whether this frame is paced, the last second's
+        /// longest GPU span, and its anchors: the last rendered frame's presentation instant,
+        /// the refresh grid the frames are taken on, and the instant the last paced frame was
+        /// taken at.
+        private var halfRate = XRHalfRatePolicy()
+        private var pacingActiveNow = false
+        private var secondMaxGPUMs = 0.0
+        private var lastRenderedPresentation: LayerRenderer.Clock.Instant?
+        /// When the compositor handed the loop its last frame, and the pacing's own grid: the
+        /// instant it started from, on which the paced queries fall every cadence.
+        private var lastFrameHandedAt: LayerRenderer.Clock.Instant?
+        private var pacingOrigin: LayerRenderer.Clock.Instant?
+        /// The last frame's predicted presentation, and the last second's spacing between
+        /// consecutive ones: its sum, shortest and longest, the evenness of the frames shown.
+        private var lastPredictedPresentation: LayerRenderer.Clock.Instant?
+        private var secondSpacingSumMs = 0.0
+        private var secondSpacingMinMs = Double.infinity
+        private var secondSpacingMaxMs = 0.0
+        private var secondSpacings = 0
+        /// The last second's loop: how long the query for a frame blocked, how long the loop
+        /// took from one handed frame to the next query, how far after the query the compositor
+        /// predicted the presentation, and how far before it the rendering deadline sat.
+        private var secondQueryBlockSumMs = 0.0
+        private var secondLoopSumMs = 0.0
+        private var secondPredictedAheadSumMs = 0.0
+        private var secondDeadlineMarginSumMs = 0.0
+        private var secondTimedFrames = 0
+        /// Whether the loop is rendering every other refresh at the moment.
+        public var halfRatePacingActive: Bool { deadlineLock.withLock { pacingActiveNow } }
+        /// Whether the last frame waited for the compositor's optimal input time: the setting,
+        /// or in the automatic mode what the measured deadline allowed.
+        public var optimalInputWaitActive: Bool { deadlineLock.withLock { lastFrameWaited } }
+        private var lastFrameWaited = true
+
+        /// Whether this frame waits for the optimal input time, by the setting and, in the
+        /// automatic mode, by what the last seconds' deadlines allowed. `skippedWaitMs` is how
+        /// long the wait would be, kept for the automatic mode to know what resuming costs.
+        private func waitsForOptimalInput(skippedWaitMs: Double) -> Bool {
+            let waits: Bool
+            deadlineLock.lock()
+            switch xrOptimalInputWaitMode {
+            case .always: waits = true
+            case .never: waits = false
+            case .automatic: waits = automaticWaits
+            }
+            if !waits {
+                secondSkippedWaitMaxMs = max(secondSkippedWaitMaxMs, skippedWaitMs)
+            }
+            lastFrameWaited = waits
+            deadlineLock.unlock()
+            return waits
+        }
+
+        /// The half-rate pacing, before the next compositor frame is taken. With the pacing
+        /// active, by the setting or by the policy when the frames run late, the queries fall
+        /// on the pacing's own grid: the instant it started from, every `cadenceRefreshes`
+        /// refreshes, exactly. The compositor hands out a frame on demand and predicts its
+        /// presentation a fixed time after the query, so queries spaced an exact number of
+        /// refreshes apart are shown an exact number of refreshes apart. (A wait aimed at the
+        /// previous frame's presentation instant made every cadence three refreshes, the
+        /// compositor predicting three ahead; a wait of a cadence less a lead spaced the frames
+        /// unevenly.) A query up to a quarter refresh late still takes its slot. Nothing waits
+        /// for the GPU: the next frame's work queues behind the previous one's, so the GPU
+        /// stays busy and keeps its clock. Every frame taken is submitted: a frame taken and
+        /// let go is never released by the compositor, and three of them abort the app.
+        private func paceForHalfRate() {
+            let active: Bool
+            let cadence: Int
+            deadlineLock.lock()
+            switch xrFramePacing {
+            case .fullRate: active = false
+            case .halfRate: active = true
+            case .halfRateWhenLate: active = halfRate.active
+            }
+            cadence = halfRate.cadenceRefreshes
+            pacingActiveNow = active
+            deadlineLock.unlock()
+            guard active, let handed = lastFrameHandedAt else {
+                pacingOrigin = nil
+                return
+            }
+            let period = currentFrameTime.period
+            guard period > 0 else { return }
+            let clock = LayerRenderer.Clock()
+            guard let origin = pacingOrigin else {
+                pacingOrigin = handed
+                return
+            }
+            let step = Double(cadence) * period
+            let elapsed = Self.seconds(origin.duration(to: clock.now))
+            let slots = max(1, ((elapsed - 0.25 * period) / step).rounded(.up))
+            let target = origin.advanced(by: .seconds(slots * step))
+            let waitMs = max(0, Self.milliseconds(clock.now.duration(to: target)))
+            if waitMs > 0 {
+                clock.wait(until: target, tolerance: .zero)
+            }
+            deadlineLock.lock()
+            secondPacedWaitSumMs += waitMs
+            secondPacedWaits += 1
+            deadlineLock.unlock()
+        }
+
+        /// How far past the compositor's predicted presentation the frame is posed for: the
+        /// refreshes the paced frames were measured to land after it, from how far past their
+        /// deadline they finish; nothing without the pacing.
+        private func presentationLeadSeconds() -> TimeInterval {
+            deadlineLock.withLock { pacingActiveNow ? Double(halfRate.landingRefreshes) * currentFrameTime.period : 0 }
+        }
+        /// Whether the layer's depth format and the drawable's depth range have been printed.
+        private var loggedDepthSetup = false
+        /// The layer's depth format and the drawable's depth range (far, near), once a drawable
+        /// has been seen: what the depth test can tell apart at a distance.
+        public private(set) var depthSetupDescription = ""
+
+        private static func milliseconds(_ duration: Duration) -> Double {
+            let parts = duration.components
+            return Double(parts.seconds) * 1000.0 + Double(parts.attoseconds) / 1e15
+        }
+
         private let spatialGestureRecognizer = XRSpatialGestureRecognizer()
         private let xrEnvironmentLightingSystem = XREnvironmentLightingSystem()
         private var runtimeLightingModeObserverId: UUID?
@@ -113,6 +286,10 @@
 
         @MainActor
         public func initUntoldXR(device: MTLDevice, commandQueue: MTLCommandQueue, layerRenderer: LayerRenderer) {
+            // The headset's render path, forward, wherever this loop renders: the platform's
+            // default on visionOS, and what a Mac rendering a remote immersive space takes too,
+            // unless the game chose a path.
+            adoptXRRenderPathUnlessChosen()
             configureSpatialEventBridge()
             configurePSVR2TrackingObserver()
             registerRuntimeLightingModeObserverIfNeeded()
@@ -146,6 +323,16 @@
             handleInput: @escaping () -> Void
         ) {
             renderer?.setupCallbacks(gameUpdate: gameUpdate, handleInput: handleInput)
+        }
+
+        /// Installs the game's per-frame callbacks with the frame's time: the instant the
+        /// compositor predicts the frame will be shown, which the head pose is predicted for
+        /// too, so an object posed for it keeps step with the head.
+        public func setupCallbacks(
+            frameUpdate: @escaping (_ frame: FrameTime) -> Void,
+            handleInput: @escaping () -> Void
+        ) {
+            renderer?.setupCallbacks(frameUpdate: frameUpdate, handleInput: handleInput)
         }
 
         public func enqueueSpatialInputSnapshot(_ snapshot: XRSpatialInputSnapshot) {
@@ -548,10 +735,49 @@
             guard let layerRenderer else { return }
             guard isRunning() else { return }
 
+            // The half-rate pacing waits here, before a frame is taken, so that the frames
+            // rendered land on every other refresh, evenly, when one refresh is not enough for
+            // a frame's GPU work; the display shows the previous frame again meanwhile.
+            paceForHalfRate()
+
+            let queryStart = LayerRenderer.Clock().now
             guard let frame = layerRenderer.queryNextFrame() else { return }
+            let handedAt = LayerRenderer.Clock().now
+            let loopMs = lastFrameHandedAt.map { Self.milliseconds($0.duration(to: queryStart)) } ?? 0
+            lastFrameHandedAt = handedAt
 
             // 2. Call predictTiming to get the predicted render deadlines for code
             guard let timing = frame.predictTiming() else { return }
+
+            // The instant the compositor predicts the frame will be shown, in the media-time
+            // base: the game poses the frame for it in the update phase, and the head is posed
+            // for the same instant at submission (the drawable's frameTiming, normally this
+            // very value; notePresentationRevision counts the frames where it is not).
+            let compositorPresentationTime = Self.mediaTime(of: timing.presentationTime)
+            let predictedPresentationTime = compositorPresentationTime + presentationLeadSeconds()
+            logClockBasesOnce()
+            if let last = lastPredictedPresentation {
+                let spacingMs = Self.milliseconds(last.duration(to: timing.presentationTime))
+                deadlineLock.lock()
+                secondSpacingSumMs += spacingMs
+                secondSpacingMinMs = min(secondSpacingMinMs, spacingMs)
+                secondSpacingMaxMs = max(secondSpacingMaxMs, spacingMs)
+                secondSpacings += 1
+                let periodMs = currentFrameTime.period * 1000.0
+                if periodMs > 0 {
+                    let expected = pacingActiveNow ? halfRate.cadenceRefreshes : 1
+                    secondSkipped += max(0, Int((spacingMs / periodMs).rounded()) - expected)
+                }
+                deadlineLock.unlock()
+            }
+            lastPredictedPresentation = timing.presentationTime
+            deadlineLock.lock()
+            secondQueryBlockSumMs += Self.milliseconds(queryStart.duration(to: handedAt))
+            secondLoopSumMs += loopMs
+            secondPredictedAheadSumMs += Self.milliseconds(handedAt.duration(to: timing.presentationTime))
+            secondDeadlineMarginSumMs += Self.milliseconds(timing.renderingDeadline.duration(to: timing.presentationTime))
+            secondTimedFrames += 1
+            deadlineLock.unlock()
 
             // 3. Call startUpdate() to mark the start of the update phase
             frame.startUpdate()
@@ -594,14 +820,36 @@
             syncStreamingCameraPosition()
 
             if !loading {
-                renderer.updateXR(useExternalStatsLifecycle: true)
+                renderer.updateXR(presentationTime: predictedPresentationTime, useExternalStatsLifecycle: true)
             }
 
             // 6. Call endupdate() to mark the end of the update phase
             frame.endUpdate()
 
             // 7. Call wait(until:tolerace) to puase your render loop until the optimal rendering time
-            LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
+            #if ENGINE_STATS_ENABLED
+                let xrWaitStart = CACurrentMediaTime()
+            #endif
+            // The wait for the compositor's optimal input time: the head pose is queried as late
+            // as the frame allows. Without it the frame is encoded now, so the GPU starts about
+            // the wait's length earlier and the head is predicted from earlier; the automatic
+            // mode waits while the frames meet the deadline and not while they do not.
+            let waitLengthMs = max(0, Self.milliseconds(LayerRenderer.Clock().now.duration(to: timing.optimalInputTime)))
+            if waitsForOptimalInput(skippedWaitMs: waitLengthMs) {
+                LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
+            }
+            #if ENGINE_STATS_ENABLED
+                let xrWaitMs = (CACurrentMediaTime() - xrWaitStart) * 1000.0
+                EngineStatsMonitor.shared.update { snapshot in
+                    snapshot.timing.xrWaitMs = xrWaitMs
+                }
+                if !loggedFrameTimingBudget {
+                    loggedFrameTimingBudget = true
+                    let toDeadline = timing.optimalInputTime.duration(to: timing.renderingDeadline)
+                    let toPresentation = timing.optimalInputTime.duration(to: timing.presentationTime)
+                    print(String(format: "XR frame timing: optimal input to rendering deadline %.2f ms, to presentation %.2f ms", Self.milliseconds(toDeadline), Self.milliseconds(toPresentation)))
+                }
+            #endif
 
             // The compositor or app state can transition while waiting. If not running anymore,
             // skip submission entirely to avoid using an invalid frame.
@@ -609,6 +857,9 @@
 
             // 8. Call startSubmission() to mark the start of submission phase
             frame.startSubmission()
+            #if ENGINE_STATS_ENABLED
+                let xrSubmissionStart = CACurrentMediaTime()
+            #endif
             var shouldEndSubmission = true
             defer {
                 if shouldEndSubmission, layerRenderer.state == .running {
@@ -616,69 +867,158 @@
                 }
             }
 
-            // 9. Encode any drawing commands that depend on the device position or orientation
-            guard let drawable = frame.queryDrawable() else {
+            // 9. Encode any drawing commands that depend on the device position or orientation.
+            // visionOS 26 hands a frame one drawable per target (the built-in display, and a
+            // capture target while the view is recorded or streamed); a layer with foveation
+            // or a render quality set aborts the app if the single-drawable query is used.
+            let drawables: [LayerRenderer.Drawable]
+            if #available(visionOS 26.0, *) {
+                drawables = frame.queryDrawables()
+            } else {
+                drawables = frame.queryDrawable().map { [$0] } ?? []
+            }
+            guard !drawables.isEmpty else {
                 #if ENGINE_STATS_ENABLED
                     renderer.finalizeXRStatsAndMonitors(frameStartTime: xrFrameStartTime)
                 #else
                     renderer.finalizeXRStatsAndMonitors(frameStartTime: 0.0)
                 #endif
-                // queryDrawable() can fail during shutdown/teardown; in that case the
+                // No drawables (shutdown/teardown, or the compositor cancelled the frame): the
                 // frame is already invalid and endSubmission() must not be called.
                 shouldEndSubmission = false
                 return
             }
-
-            // 10. Fetch the predicted device anchor from ARKit using the frameTiming information, and
-            // apply the anchor to your frame
-            let presentationInstant = drawable.frameTiming.presentationTime
-            let presentationTimeCA: TimeInterval = compositorInstantToCATime(presentationInstant)
-            var deviceAnchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: presentationTimeCA)
-
-            // If predicted-time query misses, retry at "now" to reduce one-frame anchor gaps.
-            if deviceAnchor == nil {
-                let nowTimestamp = CACurrentMediaTime()
-                if let retryAnchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: nowTimestamp) {
-                    deviceAnchor = retryAnchor
+            if drawables.count != loggedDrawableCount {
+                loggedDrawableCount = drawables.count
+                let targets = drawables.map { drawable -> String in
+                    if #available(visionOS 26.0, *) {
+                        return drawable.target == .builtIn ? "built-in" : "capture"
+                    }
+                    return "built-in"
                 }
+                print("XR: \(drawables.count) drawable(s) per frame (\(targets.joined(separator: ", ")))")
             }
-
-            // Use current anchor if valid, otherwise fall back to last valid anchor.
-            // This prevents "Presenting a drawable without a device anchor" while maintaining
-            // stable rendering. We must always present the drawable once we have it.
-            if let anchor = deviceAnchor {
-                if missingAnchorFrameCount > 0 {
-                    print("✓ XR device anchor recovered after \(missingAnchorFrameCount) missing frame(s)")
-                }
-                missingAnchorFrameCount = 0
-                lastValidDeviceAnchor = anchor
-                drawable.deviceAnchor = anchor
-            } else if let cachedAnchor = lastValidDeviceAnchor {
-                missingAnchorFrameCount += 1
-                if shouldLogAnchorDiagnostics() {
-                    printXRAnchorDiagnostics(message: "XR device anchor missing; using cached anchor")
-                }
-                drawable.deviceAnchor = cachedAnchor
-            } else {
-                missingAnchorFrameCount += 1
-                if shouldLogAnchorDiagnostics() {
-                    printXRAnchorDiagnostics(message: "XR device anchor missing; no cached anchor available")
-                }
-            }
-            // Note: If we have no cached anchor either, drawable.deviceAnchor remains nil
-            // and the render loop will skip rendering but still present (required by compositor)
 
             // Re-check loading state right before render pass to catch any mutations that started
             // after our initial snapshot. This provides a second layer of protection against races.
             let loadingNow = AssetLoadingGate.shared.isLoadingAny
             let effectiveLoading = loading || loadingNow
 
-            executeXRSystemPass(frame: frame, drawable: drawable, loading: effectiveLoading)
+            // The frame's presentation time is checked on its first drawable (the built-in
+            // display); a capture drawable shares the timing.
+            var presentationChecked = false
+            for drawable in drawables {
+                // 10. Fetch the predicted device anchor from ARKit using the frameTiming information, and
+                // apply the anchor to your frame
+                let presentationInstant = drawable.frameTiming.presentationTime
+                let presentationTimeCA: TimeInterval = Self.mediaTime(of: presentationInstant)
+                if !presentationChecked {
+                    presentationChecked = true
+                    notePresentationRevision(predicted: compositorPresentationTime, final: presentationTimeCA)
+                }
+                var deviceAnchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: presentationTimeCA)
+
+                // If predicted-time query misses, retry at "now" to reduce one-frame anchor gaps.
+                if deviceAnchor == nil {
+                    let nowTimestamp = CACurrentMediaTime()
+                    if let retryAnchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: nowTimestamp) {
+                        deviceAnchor = retryAnchor
+                    }
+                }
+
+                // Use current anchor if valid, otherwise fall back to last valid anchor.
+                // This prevents "Presenting a drawable without a device anchor" while maintaining
+                // stable rendering. We must always present the drawable once we have it.
+                if let anchor = deviceAnchor {
+                    if missingAnchorFrameCount > 0 {
+                        print("✓ XR device anchor recovered after \(missingAnchorFrameCount) missing frame(s)")
+                    }
+                    missingAnchorFrameCount = 0
+                    lastValidDeviceAnchor = anchor
+                    drawable.deviceAnchor = anchor
+                } else if let cachedAnchor = lastValidDeviceAnchor {
+                    missingAnchorFrameCount += 1
+                    if shouldLogAnchorDiagnostics() {
+                        printXRAnchorDiagnostics(message: "XR device anchor missing; using cached anchor")
+                    }
+                    drawable.deviceAnchor = cachedAnchor
+                } else {
+                    missingAnchorFrameCount += 1
+                    if shouldLogAnchorDiagnostics() {
+                        printXRAnchorDiagnostics(message: "XR device anchor missing; no cached anchor available")
+                    }
+                }
+                // Note: If we have no cached anchor either, drawable.deviceAnchor remains nil
+                // and the render loop will skip rendering but still present (required by compositor)
+
+                if drawsScene(into: drawable) {
+                    // A capture drawable (a recording or a stream of the view) is drawn from
+                    // its own pose, so it must not advance the frame-to-frame state the
+                    // built-in display relies on: the temporal history and the depth pyramid.
+                    var primary = true
+                    if #available(visionOS 26.0, *) {
+                        primary = drawable.target == .builtIn
+                    }
+                    executeXRSystemPass(frame: frame, drawable: drawable, loading: effectiveLoading, primary: primary)
+                } else {
+                    presentCleared(drawable)
+                }
+            }
             #if ENGINE_STATS_ENABLED
+                let xrEncodeMs = (CACurrentMediaTime() - xrSubmissionStart) * 1000.0
+                EngineStatsMonitor.shared.update { snapshot in
+                    snapshot.timing.encodeMs = xrEncodeMs
+                }
                 renderer.finalizeXRStatsAndMonitors(frameStartTime: xrFrameStartTime)
             #else
                 renderer.finalizeXRStatsAndMonitors(frameStartTime: 0.0)
             #endif
+            lastRenderedPresentation = timing.presentationTime
+        }
+
+        /// Whether the scene is drawn into a drawable. The built-in display always; another
+        /// target (a capture of the view for recording or streaming) only while its textures are
+        /// the size the frame's resources are allocated at — every sizeable resource is sized
+        /// to one viewport, and a second size would reallocate them twice a frame.
+        private func drawsScene(into drawable: LayerRenderer.Drawable) -> Bool {
+            if #available(visionOS 26.0, *), drawable.target != .builtIn,
+               let texture = drawable.colorTextures.first,
+               renderInfo.viewPort != simd_float2(Float(texture.width), Float(texture.height))
+            {
+                if !loggedCaptureTargetSkip {
+                    loggedCaptureTargetSkip = true
+                    print("XR: a \(texture.width)×\(texture.height) capture drawable differs from the \(Int(renderInfo.viewPort.x))×\(Int(renderInfo.viewPort.y)) frame resources; presenting it cleared")
+                }
+                return false
+            }
+            return true
+        }
+
+        /// Presents a drawable with its colour cleared (the immersion mode's alpha) and its depth
+        /// cleared, without drawing the scene: the compositor wants every drawable it handed out
+        /// presented.
+        private func presentCleared(_ drawable: LayerRenderer.Drawable) {
+            guard let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() else { return }
+            commandBuffer.label = "XR Cleared Drawable"
+            for viewIndex in drawable.views.indices
+                where viewIndex < drawable.colorTextures.count && viewIndex < drawable.depthTextures.count
+            {
+                let descriptor = MTLRenderPassDescriptor()
+                descriptor.colorAttachments[0].texture = drawable.colorTextures[viewIndex]
+                descriptor.colorAttachments[0].loadAction = .clear
+                descriptor.colorAttachments[0].storeAction = .store
+                descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: Double(getAlphaForImmersionMode()))
+                descriptor.depthAttachment.texture = drawable.depthTextures[viewIndex]
+                descriptor.depthAttachment.loadAction = .clear
+                descriptor.depthAttachment.storeAction = .store
+                descriptor.depthAttachment.clearDepth = 0.0
+                if viewIndex < drawable.rasterizationRateMaps.count {
+                    descriptor.rasterizationRateMap = drawable.rasterizationRateMaps[viewIndex]
+                }
+                commandBuffer.makeRenderCommandEncoder(descriptor: descriptor)?.endEncoding()
+            }
+            drawable.encodePresent(commandBuffer: commandBuffer)
+            commandBuffer.commit()
         }
 
         private func updateSpatialInputState() {
@@ -756,7 +1096,82 @@
             spatialGestureRecognizer.resetAllSpatialInteractionTracking()
         }
 
-        func executeXRSystemPass(frame _: LayerRenderer.Frame, drawable: LayerRenderer.Drawable, loading: Bool) {
+        /// The rasterization rate map the compositor made for a view, as the renderer draws
+        /// through it, or nil when the frame is drawn uniformly: the layer configured without
+        /// foveation (no maps; also the simulator) or `setRendering(.foveatedRendering(.disabled))`.
+        /// The map's parameters go into this frame's slot of the ring for the shaders that decode
+        /// them; the viewport is the view's in the map's screen space.
+        private func makeFoveationFrame(
+            drawable: LayerRenderer.Drawable,
+            viewport: MTLViewport,
+            viewIndex: Int,
+            slot: Int
+        ) -> XRFoveationFrame? {
+            let rateMaps = drawable.rasterizationRateMaps
+            let available = xrFoveatedRenderingEnabled && viewIndex < rateMaps.count && viewIndex < stereoEyeCount
+            if loggedFoveationState != available {
+                loggedFoveationState = available
+                if available {
+                    let rateMap = rateMaps[viewIndex]
+                    let screen = rateMap.screenSize
+                    let physical = rateMap.physicalSize(layer: 0)
+                    print("✓ XR foveation: drawing through the compositor's rasterization rate maps, screen \(screen.width)×\(screen.height), textures \(physical.width)×\(physical.height) per eye; view texture map viewport \(viewport.originX),\(viewport.originY) \(viewport.width)×\(viewport.height)")
+                } else if rateMaps.isEmpty {
+                    print("XR foveation off: the layer provides no rasterization rate maps (isFoveationEnabled is false, or the simulator); drawing uniformly")
+                } else {
+                    print("XR foveation off by setting (.foveatedRendering(.disabled)); the layer's rate maps are ignored and the picture will be warped")
+                }
+            }
+            guard available else { return nil }
+
+            let rateMap = rateMaps[viewIndex]
+            let sizeAndAlign = rateMap.parameterDataSizeAndAlign
+            let align = max(1, sizeAndAlign.align)
+            let length = max(16, (sizeAndAlign.size + align - 1) / align * align)
+            if rateMapParameterBuffers[slot][viewIndex].map({ $0.length < length }) ?? true {
+                let buffer = renderInfo.device.makeBuffer(length: length, options: .storageModeShared)
+                buffer?.label = "XR Rate Map Parameters eye \(viewIndex) slot \(slot)"
+                rateMapParameterBuffers[slot][viewIndex] = buffer
+            }
+            guard let buffer = rateMapParameterBuffers[slot][viewIndex],
+                  let data = XRRasterizationRateMapData(rateMap: rateMap, buffer: buffer)
+            else {
+                Logger.logWarning(message: "XR foveation: could not copy the rate map parameters for eye \(viewIndex); drawing this eye uniformly")
+                return nil
+            }
+            if let texture = drawable.colorTextures.indices.contains(viewIndex) ? drawable.colorTextures[viewIndex] : nil,
+               Int(data.physicalSize.x) != texture.width || Int(data.physicalSize.y) != texture.height
+            {
+                Logger.logWarning(message: "XR foveation: eye \(viewIndex) rate map physical size \(data.physicalSize) differs from its texture \(texture.width)×\(texture.height)")
+            }
+            // The eye's viewport in the map's screen space. In the dedicated layout the view
+            // is the whole texture, so it is the map's screen size at the origin; the view's own
+            // texture map viewport is logged above for the day another layout needs it.
+            let screenViewport = MTLViewport(
+                originX: 0, originY: 0,
+                width: Double(data.screenSize.x), height: Double(data.screenSize.y),
+                znear: 0, zfar: 1
+            )
+            return XRFoveationFrame(rateMap: rateMap, viewport: screenViewport, rateMapData: data)
+        }
+
+        func executeXRSystemPass(frame _: LayerRenderer.Frame, drawable: LayerRenderer.Drawable, loading: Bool, primary: Bool = true) {
+            TemporalAntiAliasing.shared.historyUpdatesEnabled = primary
+            defer { TemporalAntiAliasing.shared.historyUpdatesEnabled = true }
+            if !loggedDepthSetup, let depthTexture = drawable.depthTextures.first {
+                loggedDepthSetup = true
+                // What the depth test can tell apart: the layer's depth format and the
+                // drawable's depth range (far, near) the projection is built from.
+                let format: String
+                switch depthTexture.pixelFormat {
+                case .depth16Unorm: format = "depth16Unorm"
+                case .depth32Float: format = "depth32Float"
+                case .depth32Float_stencil8: format = "depth32Float_stencil8"
+                default: format = "pixel format \(depthTexture.pixelFormat.rawValue)"
+                }
+                depthSetupDescription = String(format: "%@, range far %.3f near %.3f", format, drawable.depthRange.x, drawable.depthRange.y)
+                print("XR depth: \(depthSetupDescription)")
+            }
             // Wait for available command buffer slot to prevent unbounded memory growth
             let semaphoreWaitStart = CACurrentMediaTime()
             let firstWaitResult = commandBufferSemaphore.wait(timeout: .now() + .milliseconds(100))
@@ -777,12 +1192,17 @@
                 commandBufferSemaphore.signal()
                 return
             }
+            GPUPassTiming.shared.beginFrame(device: renderInfo.device)
             #if ENGINE_STATS_ENABLED
                 let renderTotalStart = CACurrentMediaTime()
             #endif
             renderInfo.currentInFlightFrameSlot = acquireUniformFrameSlot()
+            let rateMapSlot = rateMapFrameCounter % rateMapParameterBuffers.count
+            rateMapFrameCounter += 1
 
-            // Update viewport to match actual drawable size (per-eye texture dimensions)
+            // Update viewport to match actual drawable size (per-eye texture dimensions). With
+            // foveation on, that is the rate map's physical size: every texture of the frame is
+            // allocated at it, while viewports and clip space live in the map's screen size.
             if let firstColorTexture = drawable.colorTextures.first {
                 let actualViewPort = simd_float2(Float(firstColorTexture.width), Float(firstColorTexture.height))
                 if renderInfo.viewPort != actualViewPort {
@@ -867,6 +1287,15 @@
                 }
 
                 renderInfo.currentEye = viewIndex
+                // The eye's rasterization rate map (foveation), for the passes that draw the
+                // scene; the final pass into the compositor's textures copies physical pixels
+                // one to one and keeps passDescriptor without it.
+                renderInfo.xrFoveation = makeFoveationFrame(
+                    drawable: drawable,
+                    viewport: view.textureMap.viewport,
+                    viewIndex: viewIndex,
+                    slot: rateMapSlot
+                )
 
                 #if ENGINE_STATS_ENABLED
                     let encodeStart = CACurrentMediaTime()
@@ -884,22 +1313,35 @@
 
             // Build the HZB depth pyramid once after both eyes are rendered.
             // In stereo mode the mono pyramid (from the last eye rendered) is used
-            // for both per-eye VP occlusion tests in executeFrustumCulling.
-            buildHZBDepthPyramid(commandBuffer)
+            // for both per-eye VP occlusion tests in executeFrustumCulling. A capture
+            // drawable's depth is seen from its own pose and does not replace it.
+            if primary {
+                buildHZBDepthPyramid(commandBuffer)
+            }
 
             drawable.encodePresent(commandBuffer: commandBuffer)
 
             EngineProfiler.shared.attach(to: commandBuffer, label: "XRFrame")
 
+            // The instant the GPU must have finished by for the compositor to show this frame at
+            // its presentation time, in the base of the command buffer's own timestamps.
+            let deadline = Self.mediaTime(of: drawable.frameTiming.renderingDeadline)
+            let presentation = Self.mediaTime(of: drawable.frameTiming.presentationTime)
+            let countsDeadline = primary
             // Add completion handler to signal semaphore when GPU work is done
-            commandBuffer.addCompletedHandler { cb in
+            commandBuffer.addCompletedHandler { [weak self] cb in
                 #if ENGINE_STATS_ENABLED
-                    let gpuExecutionMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
-                    EngineStatsMonitor.shared.recordGPUCompletion(executionMs: gpuExecutionMs)
+                    // The frame's GPU time beyond the previous frame's: the two overlap on the
+                    // GPU, and the command buffer's own span would count the overlap twice.
+                    EngineStatsMonitor.shared.recordGPUCompletion(gpuStartTime: cb.gpuStartTime, gpuEndTime: cb.gpuEndTime)
                 #endif
+                if countsDeadline {
+                    self?.noteGPUCompletion(at: cb.gpuEndTime, start: cb.gpuStartTime, deadline: deadline, presentation: presentation)
+                }
                 commandBufferSemaphore.signal()
             }
 
+            GPUPassTiming.shared.endFrame(commandBuffer)
             #if ENGINE_STATS_ENABLED
                 let submitStart = CACurrentMediaTime()
             #endif
@@ -1035,20 +1477,161 @@
             #endif
         }
 
-        @inline(__always)
-        private func compositorInstantToCATime(_ instant: LayerRenderer.Clock.Instant) -> TimeInterval {
-            let compositorClock = LayerRenderer.Clock()
-            let nowInstant = compositorClock.now
-            let nowCA = CACurrentMediaTime()
+        /// An instant of the compositor's clock as seconds in the `CACurrentMediaTime()` base:
+        /// both count mach absolute time from the boot, the compositor clock's epoch.
+        private static func mediaTime(of instant: LayerRenderer.Clock.Instant) -> TimeInterval {
+            seconds(LayerRenderer.Clock.Instant.epoch.duration(to: instant))
+        }
 
-            // Compute duration between now and the target instant
-            let duration: Duration = nowInstant.duration(to: instant)
+        private static func seconds(_ duration: Duration) -> TimeInterval {
+            let parts = duration.components
+            return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+        }
 
-            // Convert Duration → seconds
-            let components = duration.components
-            let seconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
+        /// Prints once how far the compositor clock's epoch conversion is from the media time
+        /// read at the same moment: the gap between the two reads, and nothing more, if the
+        /// clocks share their base as the engine assumes.
+        private func logClockBasesOnce() {
+            guard !loggedClockBases else { return }
+            loggedClockBases = true
+            let epochBased = Self.mediaTime(of: LayerRenderer.Clock().now)
+            let mediaTime = CACurrentMediaTime()
+            print(String(format: "XR clock: the compositor epoch's time differs from the media time by %.3f ms", (epochBased - mediaTime) * 1000.0))
+        }
 
-            return nowCA + seconds
+        /// Counts a frame whose GPU work finished after the compositor's rendering deadline, keeps
+        /// the longest overrun, and prints once a second how many of that second's frames were
+        /// late and by how much. Runs on the GPU's completion thread.
+        private func noteGPUCompletion(at gpuEnd: CFTimeInterval, start gpuStart: CFTimeInterval, deadline: TimeInterval, presentation: TimeInterval) {
+            let overrunMs = (gpuEnd - deadline) * 1000.0
+            let usableMarginMs = XRHalfRatePolicy.usableMarginMs(deadlineMarginMs: (presentation - deadline) * 1000.0)
+            let now = CACurrentMediaTime()
+            var report: String?
+            deadlineLock.lock()
+            secondFrames += 1
+            secondLeastSlackMs = min(secondLeastSlackMs, -overrunMs)
+            let gpuMs = (gpuEnd - gpuStart) * 1000.0
+            secondMaxGPUMs = max(secondMaxGPUMs, gpuMs)
+            secondGPUSumMs += gpuMs
+            secondOwnGPUSumMs += max(0, (gpuEnd - max(gpuStart, lastGPUEndTime)) * 1000.0)
+            lastGPUEndTime = max(lastGPUEndTime, gpuEnd)
+            if overrunMs > 0 {
+                deadlineMissCount += 1
+                secondLate += 1
+                secondOverrunSumMs += overrunMs
+                secondWorstMs = max(secondWorstMs, overrunMs)
+                worstOverrunMs = max(worstOverrunMs, overrunMs)
+                if overrunMs > usableMarginMs {
+                    secondMissed += 1
+                }
+            }
+            if lastDeadlineLogTime == 0 {
+                lastDeadlineLogTime = now
+            } else if now - lastDeadlineLogTime >= 1.0 {
+                if secondLate > 0 || secondSkipped > 0 {
+                    let mode: String
+                    switch xrOptimalInputWaitMode {
+                    case .always: mode = "always"
+                    case .never: mode = "never"
+                    case .automatic: mode = "automatic"
+                    }
+                    let meanOverrunMs = secondLate > 0 ? secondOverrunSumMs / Double(secondLate) : 0
+                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes, landing +%d", halfRate.cadenceRefreshes, halfRate.landingRefreshes) : "")
+                    report = (report ?? "") + String(format: "; GPU %.1f ms a frame (%.1f ms its own after the frame before), longest %.1f%@", secondGPUSumMs / Double(secondFrames), secondOwnGPUSumMs / Double(secondFrames), secondMaxGPUMs, secondPacedWaits > 0 ? String(format: ", paced wait %.1f ms", secondPacedWaitSumMs / Double(secondPacedWaits)) : "")
+                    report = (report ?? "") + String(format: "; %d past the deadline's margin, %d refreshes skipped", secondMissed, secondSkipped)
+                    if secondTimedFrames > 0 {
+                        let timed = Double(secondTimedFrames)
+                        report = (report ?? "") + String(format: "; the query blocked %.1f ms, the loop took %.1f ms between frames, the presentation was predicted %.1f ms after the query, the deadline %.1f ms before it", secondQueryBlockSumMs / timed, secondLoopSumMs / timed, secondPredictedAheadSumMs / timed, secondDeadlineMarginSumMs / timed)
+                    }
+                    if secondSpacings > 0 {
+                        report = (report ?? "") + String(format: "; presentations spaced %.1f ms (%.1f to %.1f)", secondSpacingSumMs / Double(secondSpacings), secondSpacingMinMs, secondSpacingMaxMs)
+                    }
+                    // With the GPU pass timing on, every pass of the last resolved frame, heaviest
+                    // first, with their sum: what a second of frames well past the deadline spent
+                    // its time on, and how much of the frame's span lies between passes.
+                    if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {
+                        let passes = GPUPassTiming.shared.lastFrame().passes.sorted { $0.totalMs > $1.totalMs }
+                        if !passes.isEmpty {
+                            let sum = passes.reduce(0.0) { $0 + $1.totalMs }
+                            let list = passes.map { String(format: "%@ %.2f", $0.label, $0.totalMs) }.joined(separator: ", ")
+                            report = (report ?? "") + String(format: "\nXR frame timing: the last frame's passes, %.1f ms in all (a label sums both eyes): ", sum) + list
+                        }
+                    }
+                }
+                // The automatic mode: stop waiting once a second had late frames (one in
+                // twenty or more); wait again once a second's least slack would have covered
+                // the longest wait skipped, with a margin.
+                if xrOptimalInputWaitMode == .automatic, secondFrames > 0 {
+                    if automaticWaits, secondLate * 20 >= secondFrames {
+                        automaticWaits = false
+                        let line = String(format: "XR frame timing: %d of %d frames late: encoding without the wait for the optimal input time", secondLate, secondFrames)
+                        report = report.map { $0 + "\n" + line } ?? line
+                    } else if !automaticWaits, secondLeastSlackMs.isFinite, secondLeastSlackMs > secondSkippedWaitMaxMs + 1.5 {
+                        automaticWaits = true
+                        let line = String(format: "XR frame timing: the least slack of %.2f ms covers the skipped wait of %.2f ms: waiting for the optimal input time again", secondLeastSlackMs, secondSkippedWaitMaxMs)
+                        report = report.map { $0 + "\n" + line } ?? line
+                    }
+                }
+                // The half-rate pacing, by its policy when the setting leaves it to the frames.
+                if xrFramePacing == .halfRateWhenLate {
+                    let waitStillToSkip = xrOptimalInputWaitMode == .automatic && automaticWaits
+                    let meanLateMs = secondLate > 0 ? secondOverrunSumMs / Double(secondLate) : 0
+                    let periodMs = currentFrameTime.period * 1000.0
+                    let marginMs = secondTimedFrames > 0 ? secondDeadlineMarginSumMs / Double(secondTimedFrames) : 0
+                    switch halfRate.secondEnded(frames: secondFrames, missed: secondMissed, skipped: secondSkipped, meanOverrunMs: meanLateMs, meanGPUDurationMs: secondGPUSumMs / Double(secondFrames), periodMs: periodMs, deadlineMarginMs: marginMs, waitStillToSkip: waitStillToSkip) {
+                    case .entered:
+                        let line = String(format: "XR frame timing: %d of %d frames past the deadline's margin, %d refreshes skipped, no wait left to skip: rendering every other refresh", secondMissed, secondFrames, secondSkipped)
+                        report = report.map { $0 + "\n" + line } ?? line
+                    case .left:
+                        let line = String(format: "XR frame timing: the frame's GPU work of %.2f ms fits the refresh of %.2f ms: rendering every refresh again", secondGPUSumMs / Double(secondFrames), periodMs)
+                        report = report.map { $0 + "\n" + line } ?? line
+                    case .none:
+                        break
+                    }
+                } else {
+                    halfRate.reset()
+                }
+                secondFrames = 0
+                secondLate = 0
+                secondWorstMs = 0
+                secondOverrunSumMs = 0
+                secondLeastSlackMs = .infinity
+                secondSkippedWaitMaxMs = 0
+                secondMaxGPUMs = 0
+                secondGPUSumMs = 0
+                secondOwnGPUSumMs = 0
+                secondPacedWaitSumMs = 0
+                secondPacedWaits = 0
+                secondMissed = 0
+                secondSkipped = 0
+                secondQueryBlockSumMs = 0
+                secondLoopSumMs = 0
+                secondPredictedAheadSumMs = 0
+                secondDeadlineMarginSumMs = 0
+                secondTimedFrames = 0
+                secondSpacingSumMs = 0
+                secondSpacingMinMs = .infinity
+                secondSpacingMaxMs = 0
+                secondSpacings = 0
+                lastDeadlineLogTime = now
+            }
+            deadlineLock.unlock()
+            if let report {
+                print(report)
+            }
+        }
+
+        /// Counts the frames whose final presentation time (the drawable's) differs from the
+        /// one predicted at the update, which the game posed the frame for.
+        private func notePresentationRevision(predicted: TimeInterval, final: TimeInterval) {
+            let difference = final - predicted
+            guard abs(difference) > 0.0005 else { return }
+            presentationTimeRevisions += 1
+            let now = CACurrentMediaTime()
+            if presentationTimeRevisions == 1 || now - lastPresentationRevisionLogTime >= 1.0 {
+                lastPresentationRevisionLogTime = now
+                print(String(format: "XR frame timing: the drawable's presentation time differs from the predicted one by %.2f ms (%d frames so far)", difference * 1000.0, presentationTimeRevisions))
+            }
         }
 
         public func setImmersionMode(xrImmersionMode: UntoldImmersionMode) {

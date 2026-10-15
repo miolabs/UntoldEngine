@@ -63,7 +63,7 @@ let frame = layerRenderer.queryNextFrame()
 let timing = frame.predictTiming()
 ```
 
-`queryNextFrame()` dequeues the next compositor frame. `predictTiming()` returns `optimalInputTime` — the deadline by which you must finish reading input and preparing CPU-side data for the frame. These are not suggestions; missing them causes judder.
+`queryNextFrame()` dequeues the next compositor frame. `predictTiming()` returns `optimalInputTime` — the deadline by which you must finish reading input and preparing CPU-side data for the frame. These are not suggestions; missing them causes judder. It also returns `presentationTime`, the instant the frame will be shown; the engine converts it to the media-time base (through the compositor clock's epoch, which is the boot, like `CACurrentMediaTime()`) and poses the whole update for it.
 
 ### 2b. Update Phase
 
@@ -79,7 +79,7 @@ Everything between `startUpdate` and `endUpdate` is CPU-side frame preparation:
 
 - **Spatial input processing**: `updateSpatialInputState()` drains the queued `XRSpatialInputSnapshot` events and updates the `InputSystem`. If assets are loading or the scene isn't ready, input is cleared instead to avoid acting on stale state.
 
-- **Game update**: `renderer.updateXR()` calls the user's `gameUpdate` and `handleInput` callbacks. This is where game logic runs — entity movement, animation state machines, physics steps. It is skipped entirely while `AssetLoadingGate.shared.isLoadingAny` is true.
+- **Game update**: `renderer.updateXR(presentationTime:)` calls the user's `gameUpdate` (or `frameUpdate`) and `handleInput` callbacks. This is where game logic runs — entity movement, animation state machines, physics steps. The frame is posed for the instant the compositor predicts it will be shown, the same instant the head pose is queried for at submission: the engine's delta is the time between two presentations, and the game receives the instant itself as a `FrameTime`, so a moving object steps by the display's period from frame to frame instead of by the varying time between two updates, which is what reads as judder against the head-tracked world (see [Presentation-time animation](../proposals/PresentationTimeAnimation.md)). It is skipped entirely while `AssetLoadingGate.shared.isLoadingAny` is true.
 
 - **XR lighting probe processing**: When real-world lighting mode is active, accepted environment-light probe updates are prefiltered into runtime IBL textures. The renderer uses the latest valid probe plus `realWorldLightingContribution`; if no valid probe is available, it falls back to the configured static environment path.
 
@@ -100,6 +100,8 @@ defer { frame.endSubmission() }
 
 The `defer` is important: `endSubmission()` **must** be called even if rendering fails partway through. If it isn't called, the compositor stalls. The `defer` guarantees this regardless of how the function exits.
 
+**Drawables.** On visionOS 26 the frame is queried with `frame.queryDrawables()`, which returns one drawable per target: the built-in display, plus a capture target while the view is being recorded or streamed. A layer configured with foveation or a render quality aborts the app ("BUG IN CLIENT: called cp_frame_query_drawable() which does not support setting render quality or fovea") if the older single-drawable `queryDrawable()` is used, which the engine still calls on visionOS 2. An empty array means the compositor cancelled the frame: it is left without `endSubmission()`. Every drawable is presented; the scene is drawn into the built-in one and into a capture drawable only while its textures are the size the frame's resources are allocated at — otherwise it is presented cleared, since every sizeable resource is sized to one viewport and a second size would reallocate them twice a frame.
+
 ### 2e. Device Anchor Acquisition
 
 ```swift
@@ -109,7 +111,7 @@ drawable.deviceAnchor = anchor
 
 The device anchor is the head pose — a 4×4 transform from world space to the device. The compositor requires it to be attached to the drawable before presenting; without it, the system can't reproject the frame correctly for the user's eyes.
 
-The engine queries the anchor at **presentation time** (the future moment when the frame will appear on screen), not at "now". This is predictive — it compensates for the latency between encoding and display by predicting where the head will be.
+The engine queries the anchor at **presentation time** (the future moment when the frame will appear on screen), not at "now". This is predictive — it compensates for the latency between encoding and display by predicting where the head will be. The game's objects were posed for the same instant in the update phase, so head and objects agree; `presentationTimeRevisions` counts the frames whose drawable's presentation time differs from the prediction the update used.
 
 **Resilience strategy**: ARKit can occasionally return `nil` for the anchor (e.g., tracking hiccup, recovery). A three-level fallback prevents dropped frames:
 1. Query at predicted presentation time → use it if valid
@@ -167,6 +169,15 @@ The compositor provides the exact asymmetric projection for each eye. This accou
 - `renderInfo.currentEye = viewIndex` — tells uniform uploads which eye's matrices to use
 - The base pass mode: `.mixed` immersion omits the base pass (camera passthrough is the background), `.full` immersion renders the skybox
 
+**Foveation (rasterization rate maps).** With `isFoveationEnabled` in the app's `CompositorLayerConfiguration`, the compositor hands each eye a `MTLRasterizationRateMap` and colour/depth textures of the map's *physical* size, smaller than the *screen* the eye sees; the GPU draws through the map (dense where the eyes look, coarse in the periphery) and the compositor unwarps the texture for the display. It is also the only configuration in which the compositor accepts a `maxRenderQuality` above the platform default. The engine supports it as follows (`XRFoveation.swift`, on by default, `setRendering(.foveatedRendering(.disabled))` to ignore the maps for diagnosis):
+
+- `executeXRSystemPass` makes an `XRFoveationFrame` per eye (`renderInfo.xrFoveation`): the map, the eye's viewport in the map's screen space (`view.textureMap.viewport`), and the map's parameter data copied into a ring of shared buffers for the shaders. `renderInfo.viewPort` stays the texture size, the physical size, so every sizeable resource is allocated at it.
+- After the graph is built, `applyXRFoveationToSceneRenderPassDescriptors` attaches the map to the descriptors of the passes that rasterize the scene at drawable size (G-buffer + light, the deferred colour that transparency/wireframe/debug draw into, environment/sky/grid, splats, gizmos), and each of those encoders sets the eye's viewport (`applyXRFoveationViewport`) in the map's screen space. Under a map, Metal reads a descriptor's `renderTargetWidth/Height` and the viewport in *screen* pixels (measured on a Mac GPU, and seen on the headset as a screen-fixed rectangle outside which nothing was drawn), so the attached descriptors leave the target size at 0 — the attachments' own size — and get it back when the map is detached. The full-screen passes (SSAO, post-processing, anti-aliasing, the output transform into the compositor's texture) keep plain descriptors: they copy physical pixels one to one and the layout is already the map's.
+- Two kinds of shader decode the map (`rasterization_rate_map_decoder`): SSAO, which rebuilds view positions from a depth texel's UV and must use the texel's *screen* position; and the occlusion culls (`hzbCullVisibleEntities`, `gaussianChunkCull`, the per-splat test), which project boxes and splats to screen UV and sample a pyramid laid out in physical space — the rect or point goes through the map first (`HZBOcclusion.h`). The pyramid carries the map it was drawn through into the next frame's culls (`HZBPyramidFrame.rateMapData`).
+- The Gaussian fragment takes its offset from the splat centre from a varying rather than from `[[position]]`, which the rate map places in the physical texture. Fragment position is physical everywhere else too, which is what every one-to-one texture read wants; `SmallObjectCulling` measures its pixel threshold against the screen height.
+
+Without foveation (the layer configured without it, the simulator), `drawable.rasterizationRateMaps` is empty and the frame is drawn uniformly exactly as before.
+
 ### 3c. HZB Pyramid (built once after both eyes)
 
 ```swift
@@ -220,7 +231,7 @@ Selection rays update from interaction events, not continuously as the user look
         ├─ frame.endUpdate()
         ├─ wait(until: optimalInputTime)       (sleep until compositor deadline)
         ├─ frame.startSubmission()
-        ├─ queryDrawable()                     (get per-eye textures)
+        ├─ queryDrawables()                    (one drawable per target; the old single query aborts a foveated layer)
         ├─ queryDeviceAnchor() → fallback chain → drawable.deviceAnchor = anchor
         │
         └─ executeXRSystemPass()
@@ -256,6 +267,7 @@ Selection rays update from interaction events, not continuously as the user look
 | Frame timing | MTKView drives at display rate | CompositorServices dictates via `optimalInputTime` |
 | Eyes | 1 | 2 (per-eye loop over `drawable.views`) |
 | Compute passes | Once per frame | Once per frame (shared across both eyes) |
+| Default scene | A camera and a directional light, both active | A camera, the entity the head pose is written into, and no directional light unless the configuration asks for one (`UntoldRendererConfig.defaultSun`): the passthrough room is lit by its probe and the immersive environment by its own light, so a sun is the app's to add (`DirectionalLightNode`, or `createDirLight` and `setDirectionalLight(.active(_:))`), and it casts in one cascade by default (`setRendering(.shadowCascades(_:))`) |
 | View matrix | Camera entity transform | `(originFromDevice × deviceFromView)⁻¹` from ARKit anchor |
 | Projection | Camera component FOV | `drawable.computeProjection()` — asymmetric per-eye |
 | Present call | `commandBuffer.present(drawable)` | `drawable.encodePresent(commandBuffer:)` — encoded as GPU command |

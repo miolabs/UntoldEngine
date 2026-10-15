@@ -73,12 +73,23 @@ fragment TransparencyOutput fragmentTransparencyShader(
         discard_fragment();
     }
 
-    float4 verticesInWorldSpace = uniforms.modelMatrix * in.vPosition;
+    float4 verticesInWorldSpace = float4(in.worldPosition, 1.0);
     float3 viewVector = normalize(cameraPosition - verticesInWorldSpace.xyz);
 
     // Glass is drawn in two goes (see TransparencyPassFaces): this one keeps the faces
     // turned away from the viewer, or the ones turned towards the viewer.
-    bool turnedAway = dot(normalize(uniforms.normalMatrix * in.normal), viewVector) < 0.0;
+    // Which side of the face is seen is decided by the face itself, not by the shading
+    // normal: a smooth normal bends towards the side faces at the edge of a pane, and
+    // from a little to the left or to the right (the two eyes of a headset) it would put
+    // the same edge pixels on the far side for one eye and on the near side for the
+    // other. The derivative normal's sign follows the winding on screen; the vertex
+    // normal picks the outward one of the two, so winding and mirrored transforms still
+    // do not matter. A degenerate face (no derivatives) falls back to the shading normal.
+    float3 shadingNormal = normalize(in.tbNormal);
+    float3 faceNormal = cross(dfdx(verticesInWorldSpace.xyz), dfdy(verticesInWorldSpace.xyz));
+    faceNormal = dot(faceNormal, shadingNormal) < 0.0 ? -faceNormal : faceNormal;
+    float faceLength = length(faceNormal);
+    bool turnedAway = dot(faceLength > 0.0 ? faceNormal / faceLength : shadingNormal, viewVector) < 0.0;
     if ((faces == transparencyPassFarFaces && !turnedAway) || (faces == transparencyPassNearFaces && turnedAway)) {
         discard_fragment();
     }
@@ -100,10 +111,12 @@ fragment TransparencyOutput fragmentTransparencyShader(
 
     float3 normal = hasNormal
         ? normalize(TBN * normalMap)
-        : normalize(uniforms.normalMatrix * in.normal);
+        : normalize(in.tbNormal);
     // A face of glass is lit on the side the viewer sees: the far face of a pane
     // reflects from inside it what its near face reflects from outside.
-    if (faces != transparencyPassEveryFace && turnedAway) {
+    // The shading normal of a pane faces the viewer whichever go draws the face: the
+    // face's side and the smooth normal can disagree at an edge.
+    if (faces != transparencyPassEveryFace && dot(normal, viewVector) < 0.0) {
         normal = -normal;
     }
 
@@ -135,9 +148,13 @@ fragment TransparencyOutput fragmentTransparencyShader(
     totalLight.diff = brdf.diff * (half3)lights.color * (half)lights.intensity;
     totalLight.spec = brdf.spec * lights.color * lights.intensity;
 
-    float shadow = computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, normal, lightDirection);
-    totalLight.diff *= (half)shadow;
-    totalLight.spec *= shadow;
+    // The sun's shadow only with a sun (see modelShader.metal's emissiveWithIndirect).
+    float shadow = 1.0;
+    if (lights.intensity != 0.0) {
+        shadow = computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, normal, lightDirection);
+        totalLight.diff *= (half)shadow;
+        totalLight.spec *= shadow;
+    }
 
     uint pointLightCount = min(plBlock.count.x, MAX_POINT_LIGHTS);
     for (uint i = 0; i < pointLightCount; ++i) {

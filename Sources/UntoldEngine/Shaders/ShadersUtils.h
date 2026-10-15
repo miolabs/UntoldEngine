@@ -165,8 +165,11 @@ float4 specularImportanceMap(float2 texCoords, texture2d<float> environmentTextu
 
 float4 BRDFIntegrationMap(float roughness, float NoV);
 
+float2 brdfIntegration(float NoV, float roughness, texture2d<float> brdfMap);
+float3 environmentReflectance(float3 F0, float2 brdf);
 float3 environmentReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap);
 
+float3 singleBounceReflectance(float3 F0, float2 brdf);
 float3 singleBounceReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap);
 
 float3 blurredEnvironment(float3 direction, float roughness, texture2d<float> specularMap, float3 rotationAxis, float rotationAngle);
@@ -230,6 +233,40 @@ LightContribution evaluateAreaLight(constant AreaLightUniform &light,
                                     float3 inBaseColor,
                                     float roughness,
                                     float metallic);
+
+float computePointShadow(depthcube<float> shadowCube,
+                         constant PointShadowUniforms &pointShadow,
+                         float sourceRadius,
+                         float3 worldPos,
+                         float3 normal);
+
+float computeSpotShadow(depth2d<float> shadowMap,
+                        constant SpotShadowUniforms &spotShadow,
+                        constant SpotLightUniform &light,
+                        float3 worldPos,
+                        float3 normal);
+
+// The direct light on a surface: the sun, through the shadow factor given (its cascade
+// shadow, evaluated by the caller), then the point, spot and area lights with theirs. Shared
+// by the light pass, which lights once per sample from the G-buffer, and the geometry when it
+// lights itself once per fragment.
+float3 computeDirectLighting(float4 worldPosition,
+                             float3 viewVector,
+                             float3 normal,
+                             float3 albedo,
+                             float roughness,
+                             float metallic,
+                             float sunShadow,
+                             constant LightParameters &lights,
+                             constant PointLightBlock &plBlock,
+                             constant SpotLightBlock &slBlock,
+                             constant AreaLightBlock &alBlock,
+                             texture2d<float> ltcMagTexture,
+                             texture2d<float> ltcMatTexture,
+                             depthcube<float> pointShadowCube,
+                             depth2d<float> spotShadowMap,
+                             constant PointShadowUniforms &pointShadowUniforms,
+                             constant SpotShadowUniforms &spotShadowUniforms);
 
 float3 ACESFilmicToneMapping(float3 x);
 

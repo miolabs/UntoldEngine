@@ -124,6 +124,8 @@ final class ShadowSystemMakeUniformsTests: XCTestCase {
 
     func testUsedSlotsCarryAssignedMatrices() {
         var sys = ShadowSystem()
+        // The matrices of a sun that casts: an updated system.
+        sys.isActive = true
         let m0 = sentinel(1.0)
         let m1 = sentinel(2.0)
         sys.cascadeLightSpaceMatrices[0] = m0
@@ -137,6 +139,21 @@ final class ShadowSystemMakeUniformsTests: XCTestCase {
         if csmCascadeCount > 1 {
             XCTAssertEqual(r1.columns.3.x, 2.0, accuracy: 1e-6,
                            "Cascade 1 matrix must be passed through unchanged")
+        }
+    }
+
+    /// A sun that casts no shadow (none active, or castsShadow off) draws no cascades and
+    /// the maps hold whatever was drawn last: its matrices land every point outside the maps,
+    /// which the shader reads as lit, so no stale shadow shows.
+    func testASunThatDoesNotCastShadowsNothing() {
+        var sys = ShadowSystem()
+        sys.cascadeLightSpaceMatrices[0] = sentinel(1.0)
+        XCTAssertFalse(sys.isActive)
+        let (r0, r1, _) = sys.makeUniforms().lightSpaceMatrices
+        XCTAssertEqual(r0.columns.3.x, 10.0, accuracy: 1e-6, "outside the map's [0, 1]")
+        XCTAssertEqual(r0.columns.3.w, 1.0, accuracy: 1e-6)
+        if csmCascadeCount > 1 {
+            XCTAssertEqual(r1.columns.3.x, 10.0, accuracy: 1e-6)
         }
     }
 
@@ -237,6 +254,30 @@ final class ShadowSystemMakeUniformsTests: XCTestCase {
         let u = sys.makeUniforms()
         XCTAssertEqual(u.shadowSoftnessNear, 3.0, accuracy: 1e-6)
         XCTAssertEqual(u.shadowSoftnessFar, 7.5, accuracy: 1e-6)
+    }
+
+    func testTheFilterTakesTheWholeDiskByDefaultAndHalfOfItOnAHeadset() {
+        let originalXRMode = renderInfo.isXRStereoMode
+        defer { renderInfo.isXRStereoMode = originalXRMode }
+
+        renderInfo.isXRStereoMode = false
+        XCTAssertEqual(ShadowSystem().makeUniforms().shadowFilterTaps, 16, accuracy: 1e-6)
+        renderInfo.isXRStereoMode = true
+        XCTAssertEqual(ShadowSystem().makeUniforms().shadowFilterTaps, 8, accuracy: 1e-6)
+    }
+
+    func testTheTapCountsAreTheDiskOrEverySecondOrFourthPointOfIt() {
+        let originalXRMode = renderInfo.isXRStereoMode
+        defer { renderInfo.isXRStereoMode = originalXRMode }
+
+        var sys = ShadowSystem()
+        for (asked, packed) in [(16, 16), (12, 8), (8, 8), (5, 4), (4, 4), (1, 4), (0, 4)] {
+            sys.setSoftness(ShadowSoftnessSettings(filterTaps: asked, xrFilterTaps: asked))
+            renderInfo.isXRStereoMode = false
+            XCTAssertEqual(sys.makeUniforms().shadowFilterTaps, Float(packed), accuracy: 1e-6, "\(asked) taps asked")
+            renderInfo.isXRStereoMode = true
+            XCTAssertEqual(sys.makeUniforms().shadowFilterTaps, Float(packed), accuracy: 1e-6, "\(asked) taps asked, headset")
+        }
     }
 }
 

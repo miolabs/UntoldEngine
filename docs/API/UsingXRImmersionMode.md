@@ -2,7 +2,9 @@
 
 This guide shows how to run your Vision Pro game in **mixed** (passthrough) or
 **full** immersion mode, how to enable the environment (skybox), and how to
-load a custom IBL/HDR environment.
+load a custom IBL/HDR environment. The settings a mixed-immersion frame needs to
+look like RealityKit's, and what the headset hands the engine, are measured in
+[The Vision Pro Rendering Profile](VisionProRenderingProfile.md).
 
 ---
 
@@ -257,11 +259,9 @@ Place the HDR inside your project's `GameData/HDR` folder:
 
 ```
 MyGame/
-└── Sources/
-    └── MyGame/
-        └── GameData/
-            └── HDR/
-                └── suburban_garden_2k.hdr
+└── GameData/
+    └── HDR/
+        └── suburban_garden_2k.hdr
 ```
 
 The name is resolved through the engine's standard asset search

@@ -55,6 +55,7 @@ private final class CoreRuntimeGlobals: @unchecked Sendable {
     var reduceScanScatterCompactedPipeline = ComputePipeline()
     var hzbBuildPyramidPipeline = ComputePipeline()
     var hzbOcclusionCullingPipeline = ComputePipeline()
+    var xrProbeSHPipeline = ComputePipeline()
     var gaussianResetVisibleCountPipeline = ComputePipeline()
     var gaussianFinalizeVisibleSetPipeline = ComputePipeline()
     var gaussianFrustumCullPipeline = ComputePipeline()
@@ -304,6 +305,13 @@ public var timeSinceLastUpdate: Float! {
     set { RuntimeGlobalsStore.shared.timeSinceLastUpdate = newValue }
 }
 
+/// The frame being prepared: its predicted presentation time, the delta from the frame
+/// before and whether the display skipped a frame between them. `.zero` before the first.
+public internal(set) var currentFrameTime: FrameTime {
+    get { RuntimeGlobalsStore.shared.currentFrameTime }
+    set { RuntimeGlobalsStore.shared.currentFrameTime = newValue }
+}
+
 var firstUpdateCall: Bool {
     get { RuntimeGlobalsStore.shared.firstUpdateCall }
     set { RuntimeGlobalsStore.shared.firstUpdateCall = newValue }
@@ -533,6 +541,27 @@ var hzbOcclusionCullingPipeline: ComputePipeline {
         state.lock.lock()
         defer { state.lock.unlock() }
         yield &state.hzbOcclusionCullingPipeline
+    }
+}
+
+var xrProbeSHPipeline: ComputePipeline {
+    get {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.xrProbeSHPipeline
+    }
+    set {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        state.xrProbeSHPipeline = newValue
+        state.lock.unlock()
+    }
+    _modify {
+        let state = CoreRuntimeGlobals.shared
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        yield &state.xrProbeSHPipeline
     }
 }
 
@@ -1074,6 +1103,7 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var globalEntityCounterValue: UInt32 = 0
     private var timeSinceLastUpdatePreviousTimeValue: TimeInterval?
     private var timeSinceLastUpdateValue: Float?
+    private var currentFrameTimeValue: FrameTime = .zero
     private var firstUpdateCallValue: Bool = false
     private var frameCountValue: Int = 0
     private var timePassedSinceLastFrameValue: Float = 0.0
@@ -1103,6 +1133,10 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var activeEntityValue: EntityID = .invalid
     private var enableEngineMetricsValue: Bool = false
     private var bypassPostProcessingValue: Bool = false
+    private var xrFoveatedRenderingEnabledValue: Bool = true
+    private var xrOptimalInputWaitModeValue: XRInputWaitMode = .automatic
+    private var xrFramePacingValue: XRFramePacing = .halfRateWhenLate
+    private var shadowSoftnessBeforeSystemValue: ShadowSoftnessSettings?
     private var antiAliasingModeValue: AntiAliasingMode = .fxaa
     private var renderDebugViewModeValue: RenderDebugViewMode = .lit
     private var pomQualitySettingsValue: POMQualitySettings = .platformDefault
@@ -1168,6 +1202,20 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         set {
             lock.lock()
             timeSinceLastUpdateValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var currentFrameTime: FrameTime {
+        get {
+            lock.lock()
+            let value = currentFrameTimeValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            currentFrameTimeValue = newValue
             lock.unlock()
         }
     }
@@ -1590,6 +1638,62 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         set {
             lock.lock()
             bypassPostProcessingValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var xrFoveatedRenderingEnabled: Bool {
+        get {
+            lock.lock()
+            let value = xrFoveatedRenderingEnabledValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            xrFoveatedRenderingEnabledValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var xrOptimalInputWaitMode: XRInputWaitMode {
+        get {
+            lock.lock()
+            let value = xrOptimalInputWaitModeValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            xrOptimalInputWaitModeValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var xrFramePacing: XRFramePacing {
+        get {
+            lock.lock()
+            let value = xrFramePacingValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            xrFramePacingValue = newValue
+            lock.unlock()
+        }
+    }
+
+    var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
+        get {
+            lock.lock()
+            let value = shadowSoftnessBeforeSystemValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            shadowSoftnessBeforeSystemValue = newValue
             lock.unlock()
         }
     }
@@ -2093,16 +2197,54 @@ public var bypassPostProcessing: Bool {
     set { RuntimeGlobalsStore.shared.bypassPostProcessing = newValue }
 }
 
+/// Whether the XR frame draws through the rasterization rate maps the compositor provides
+/// (visionOS foveation), the default. See `RenderingProperty.foveatedRendering`.
+public var xrFoveatedRenderingEnabled: Bool {
+    get { RuntimeGlobalsStore.shared.xrFoveatedRenderingEnabled }
+    set { RuntimeGlobalsStore.shared.xrFoveatedRenderingEnabled = newValue }
+}
+
+/// When the XR loop waits for the compositor's optimal input time before it queries the head
+/// pose and encodes the frame: always, never, or by the measured deadline (the default). See
+/// `RenderingProperty.optimalInputWait`.
+public var xrOptimalInputWaitMode: XRInputWaitMode {
+    get { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode }
+    set { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode = newValue }
+}
+
+/// How the XR loop paces its frames against the display's refreshes: every one, every other
+/// one while the frames run late (the default), or every other one always. See
+/// `RenderingProperty.framePacing`.
+public var xrFramePacing: XRFramePacing {
+    get { RuntimeGlobalsStore.shared.xrFramePacing }
+    set { RuntimeGlobalsStore.shared.xrFramePacing = newValue }
+}
+
+/// The sun shadow's softness set while no shadow system existed, for the system the renderer
+/// creates next. See `setShadowSoftness`.
+var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
+    get { RuntimeGlobalsStore.shared.shadowSoftnessBeforeSystem }
+    set { RuntimeGlobalsStore.shared.shadowSoftnessBeforeSystem = newValue }
+}
+
 /// Selects the active anti-aliasing pass inserted after the look pass.
 public enum AntiAliasingMode: Sendable {
     case none
     case fxaa
     case smaa
     case msaa
+    /// Temporal: the projection jittered by a sub-pixel amount each frame and the frame
+    /// blended with its reprojected history after the look pass (TemporalAntiAliasing.swift).
+    /// Averages the sub-pixel detail a single sample flickers on. An object moving on its own
+    /// has its motion written by the forward path's opaque pass; on the deferred and hybrid
+    /// paths it relies on the neighbourhood clip (see `RenderPath`).
+    case taa
+    /// 4× MSAA on the G-buffer and the temporal resolve on top.
+    case msaaTaa
 
     var usesPostLookPass: Bool {
         switch self {
-        case .fxaa, .smaa:
+        case .fxaa, .smaa, .taa, .msaaTaa:
             return true
         case .none, .msaa:
             return false
@@ -2324,11 +2466,37 @@ public final class ColorGradeLUTParams: @unchecked Sendable {
 public enum TonemapOperator: String, Sendable, Codable, Equatable {
     case aces
     case agx
+    /// No tone map: the scene's linear colour as it is. For a mixed-immersion space, where
+    /// the passthrough sets the display's response and the compositor applies it to the
+    /// scene as well; a filmic curve there compresses the object's whites and lifts its
+    /// blacks against the room (measured on a dartboard: whites at 87 of 255 against the
+    /// room's 113 for the same object, blacks at 15 against 9).
+    case none
 
     var shaderValue: Int32 {
         switch self {
         case .aces: Int32(tonemapOperatorACES.rawValue)
         case .agx: Int32(tonemapOperatorAgX.rawValue)
+        case .none: Int32(tonemapOperatorNone.rawValue)
+        }
+    }
+}
+
+/// The primaries the look pass shows the scene with.
+public enum ColorPrimaries: String, Sendable, Codable, Equatable {
+    /// The scene's sRGB colour as it is.
+    case sRGB
+    /// The colour taken as Display P3 coordinates: every saturated colour widened to the
+    /// panel's primaries, as RealityKit shows a mixed-immersion scene (its swatches measure as
+    /// the P3→sRGB matrix of their sRGB values, to a count), so a scene shown next to one
+    /// matches it. A channel the matrix takes negative is outside sRGB and clips to black, as
+    /// it does there. Set with `setPostFX(.colorPrimaries(.displayP3))`.
+    case displayP3
+
+    var shaderValue: Int32 {
+        switch self {
+        case .sRGB: Int32(colorPrimariesSRGB.rawValue)
+        case .displayP3: Int32(colorPrimariesDisplayP3.rawValue)
         }
     }
 }
@@ -2341,6 +2509,7 @@ public final class TonemapParams: @unchecked Sendable {
     // setPostFX(.tonemapOperator(.agx)) for scenes that want to match it.
     private let lock = NSLock()
     private var _operator: TonemapOperator = .aces
+    private var _primaries: ColorPrimaries = .sRGB
 
     public var `operator`: TonemapOperator {
         get {
@@ -2355,9 +2524,24 @@ public final class TonemapParams: @unchecked Sendable {
         }
     }
 
+    /// The primaries the look pass shows the scene with; sRGB unless set.
+    public var primaries: ColorPrimaries {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _primaries
+        }
+        set {
+            lock.lock()
+            _primaries = newValue
+            lock.unlock()
+        }
+    }
+
     public func resetToDefaults() {
         lock.lock()
         _operator = .aces
+        _primaries = .sRGB
         lock.unlock()
     }
 }
