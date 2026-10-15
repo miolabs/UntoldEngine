@@ -11,22 +11,24 @@
 @testable import UntoldEngine
 import XCTest
 
-/// The half-rate pacing enters after two seconds of mostly late frames with no wait left to
-/// skip, spaces the frames by the refreshes their GPU work with its encode needs, and leaves
-/// after two seconds in which the frames' GPU work fitted most of a refresh.
+/// The half-rate pacing enters after two seconds of skipped refreshes or missed frames with no
+/// wait left to skip, spaces the frames by the refreshes their GPU work with its encode needs,
+/// aims the pose where the frames land past the deadline's margin, and leaves after two seconds
+/// in which the frames' GPU work fitted most of a refresh.
 final class XRHalfRatePolicyTests: XCTestCase {
     private let period = 10.0
+    private let margin = 15.0
 
     private func lateSecond(_ policy: inout XRHalfRatePolicy, waitStillToSkip: Bool = false, meanGPU: Double = 12.0) -> XRHalfRatePolicy.Change {
-        policy.secondEnded(frames: 100, late: 80, meanOverrunMs: 3.0, meanGPUDurationMs: meanGPU, periodMs: period, waitStillToSkip: waitStillToSkip)
+        policy.secondEnded(frames: 100, missed: 30, skipped: 5, meanOverrunMs: 14.0, meanGPUDurationMs: meanGPU, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: waitStillToSkip)
     }
 
     private func goodSecond(_ policy: inout XRHalfRatePolicy, meanGPU: Double = 7.0) -> XRHalfRatePolicy.Change {
-        policy.secondEnded(frames: 100, late: 2, meanOverrunMs: 0.2, meanGPUDurationMs: meanGPU, periodMs: period, waitStillToSkip: false)
+        policy.secondEnded(frames: 100, missed: 0, skipped: 0, meanOverrunMs: 0.2, meanGPUDurationMs: meanGPU, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: false)
     }
 
     private func pacedSecond(_ policy: inout XRHalfRatePolicy, overrun: Double, meanGPU: Double) -> XRHalfRatePolicy.Change {
-        policy.secondEnded(frames: 40, late: 40, meanOverrunMs: overrun, meanGPUDurationMs: meanGPU, periodMs: period, waitStillToSkip: false)
+        policy.secondEnded(frames: 40, missed: 0, skipped: 0, meanOverrunMs: overrun, meanGPUDurationMs: meanGPU, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: false)
     }
 
     func testEntersAfterTwoLateSecondsNotOne() {
@@ -52,12 +54,25 @@ final class XRHalfRatePolicyTests: XCTestCase {
         XCTAssertFalse(policy.active)
     }
 
-    func testDoesNotEnterForSlightlyLateFrames() {
+    func testDoesNotEnterForFramesWithinTheDeadlinesMargin() {
         var policy = XRHalfRatePolicy()
+        // Past the deadline but within its margin, nothing skipped: shown on time.
         for _ in 0 ..< 3 {
-            XCTAssertEqual(policy.secondEnded(frames: 100, late: 60, meanOverrunMs: 0.4, meanGPUDurationMs: 10.2, periodMs: period, waitStillToSkip: false), .none)
+            XCTAssertEqual(policy.secondEnded(frames: 100, missed: 0, skipped: 0, meanOverrunMs: 4.0, meanGPUDurationMs: 10.2, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: false), .none)
         }
         XCTAssertFalse(policy.active)
+        // Fewer than one frame in ten missed or a refresh skipped: still below the bar.
+        for _ in 0 ..< 3 {
+            XCTAssertEqual(policy.secondEnded(frames: 100, missed: 9, skipped: 9, meanOverrunMs: 4.0, meanGPUDurationMs: 10.2, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: false), .none)
+        }
+        XCTAssertFalse(policy.active)
+    }
+
+    func testEntersOnSkippedRefreshesAlone() {
+        var policy = XRHalfRatePolicy()
+        XCTAssertEqual(policy.secondEnded(frames: 100, missed: 0, skipped: 10, meanOverrunMs: 2.0, meanGPUDurationMs: 10.5, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.secondEnded(frames: 100, missed: 0, skipped: 10, meanOverrunMs: 2.0, meanGPUDurationMs: 10.5, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: false), .entered)
+        XCTAssertTrue(policy.active)
     }
 
     func testWhileActiveTheCadenceFollowsTheTypicalGPUCostWithItsEncode() {
@@ -96,23 +111,25 @@ final class XRHalfRatePolicyTests: XCTestCase {
         XCTAssertTrue(policy.active)
     }
 
-    func testThePoseAimsAtTheRefreshTheOverrunReaches() {
+    func testThePoseAimsAtTheRefreshTheOverrunReachesBeyondTheMargin() {
         var policy = XRHalfRatePolicy()
         XCTAssertEqual(policy.landingRefreshes, 0)
         _ = lateSecond(&policy)
         _ = lateSecond(&policy)
-        // Finished 9 ms past the deadline: shown one refresh after the prediction.
+        // Finished 9 ms past the deadline, within its 15 ms margin less the safety: shown on time.
         XCTAssertEqual(pacedSecond(&policy, overrun: 9.0, meanGPU: 14.0), .none)
-        XCTAssertEqual(policy.landingRefreshes, 1)
-        // 15 ms past: two.
-        XCTAssertEqual(pacedSecond(&policy, overrun: 15.0, meanGPU: 14.0), .none)
-        XCTAssertEqual(policy.landingRefreshes, 2)
-        // Within a millisecond: the predicted one.
-        XCTAssertEqual(pacedSecond(&policy, overrun: 0.5, meanGPU: 14.0), .none)
         XCTAssertEqual(policy.landingRefreshes, 0)
+        // 14 ms past, a millisecond beyond the usable margin: one refresh after the prediction.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 14.0, meanGPU: 14.0), .none)
+        XCTAssertEqual(policy.landingRefreshes, 1)
+        // 28 ms past: two.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 28.0, meanGPU: 14.0), .none)
+        XCTAssertEqual(policy.landingRefreshes, 2)
         // Never beyond three.
-        XCTAssertEqual(pacedSecond(&policy, overrun: 80.0, meanGPU: 14.0), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 90.0, meanGPU: 14.0), .none)
         XCTAssertEqual(policy.landingRefreshes, 3)
+        XCTAssertEqual(XRHalfRatePolicy.usableMarginMs(deadlineMarginMs: 15.0), 13.0)
+        XCTAssertEqual(XRHalfRatePolicy.usableMarginMs(deadlineMarginMs: 1.0), 0.0)
         XCTAssertEqual(goodSecond(&policy), .none)
         XCTAssertEqual(goodSecond(&policy), .left)
         XCTAssertEqual(policy.landingRefreshes, 0)
@@ -142,7 +159,7 @@ final class XRHalfRatePolicyTests: XCTestCase {
 
     func testAnEmptySecondChangesNothingAndResetForgetsEverything() {
         var policy = XRHalfRatePolicy()
-        XCTAssertEqual(policy.secondEnded(frames: 0, late: 0, meanOverrunMs: 0, meanGPUDurationMs: 0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.secondEnded(frames: 0, missed: 0, skipped: 0, meanOverrunMs: 0, meanGPUDurationMs: 0, periodMs: period, deadlineMarginMs: margin, waitStillToSkip: false), .none)
         _ = lateSecond(&policy)
         _ = lateSecond(&policy)
         policy.reset()

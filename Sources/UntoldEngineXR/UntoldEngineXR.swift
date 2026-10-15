@@ -88,8 +88,10 @@
         /// update: the game posed those frames for a slightly different instant than the head.
         public private(set) var presentationTimeRevisions = 0
         private var lastPresentationRevisionLogTime: CFTimeInterval = 0
-        /// Frames whose GPU work finished after the compositor's rendering deadline: the display
-        /// showed the previous frame again and this one a refresh late, posed for an instant
+        /// Frames whose GPU work finished after the compositor's rendering deadline. The deadline
+        /// sits well before the presentation (15 ms on the headset), so a frame a few
+        /// milliseconds past it is still shown on time; one past that margin has the display
+        /// show the previous frame again and this one a refresh late, posed for an instant
         /// already past — a hop in a moving object that no counter of the loop's pacing sees.
         public var deadlineMisses: Int { deadlineLock.withLock { deadlineMissCount } }
         /// The longest a frame's GPU work finished after its deadline, in milliseconds.
@@ -109,6 +111,11 @@
         private var secondGPUSumMs = 0.0
         private var secondPacedWaitSumMs = 0.0
         private var secondPacedWaits = 0
+        /// The last second's frames past the deadline by more than its usable margin before the
+        /// presentation (shown a refresh late), and the refreshes the display skipped beyond
+        /// the pacing's cadence, from the spacing of the predicted presentations.
+        private var secondMissed = 0
+        private var secondSkipped = 0
         /// The automatic mode's current choice: waiting for the optimal input time, or not.
         private var automaticWaits = true
         /// The half-rate pacing: its policy, whether this frame is paced, the last second's
@@ -746,6 +753,11 @@
                 secondSpacingMinMs = min(secondSpacingMinMs, spacingMs)
                 secondSpacingMaxMs = max(secondSpacingMaxMs, spacingMs)
                 secondSpacings += 1
+                let periodMs = currentFrameTime.period * 1000.0
+                if periodMs > 0 {
+                    let expected = pacingActiveNow ? halfRate.cadenceRefreshes : 1
+                    secondSkipped += max(0, Int((spacingMs / periodMs).rounded()) - expected)
+                }
                 deadlineLock.unlock()
             }
             lastPredictedPresentation = timing.presentationTime
@@ -1304,6 +1316,7 @@
             // The instant the GPU must have finished by for the compositor to show this frame at
             // its presentation time, in the base of the command buffer's own timestamps.
             let deadline = Self.mediaTime(of: drawable.frameTiming.renderingDeadline)
+            let presentation = Self.mediaTime(of: drawable.frameTiming.presentationTime)
             let countsDeadline = primary
             // Add completion handler to signal semaphore when GPU work is done
             commandBuffer.addCompletedHandler { [weak self] cb in
@@ -1313,7 +1326,7 @@
                     EngineStatsMonitor.shared.recordGPUCompletion(gpuStartTime: cb.gpuStartTime, gpuEndTime: cb.gpuEndTime)
                 #endif
                 if countsDeadline {
-                    self?.noteGPUCompletion(at: cb.gpuEndTime, start: cb.gpuStartTime, deadline: deadline)
+                    self?.noteGPUCompletion(at: cb.gpuEndTime, start: cb.gpuStartTime, deadline: deadline, presentation: presentation)
                 }
                 commandBufferSemaphore.signal()
             }
@@ -1479,8 +1492,9 @@
         /// Counts a frame whose GPU work finished after the compositor's rendering deadline, keeps
         /// the longest overrun, and prints once a second how many of that second's frames were
         /// late and by how much. Runs on the GPU's completion thread.
-        private func noteGPUCompletion(at gpuEnd: CFTimeInterval, start gpuStart: CFTimeInterval, deadline: TimeInterval) {
+        private func noteGPUCompletion(at gpuEnd: CFTimeInterval, start gpuStart: CFTimeInterval, deadline: TimeInterval, presentation: TimeInterval) {
             let overrunMs = (gpuEnd - deadline) * 1000.0
+            let usableMarginMs = XRHalfRatePolicy.usableMarginMs(deadlineMarginMs: (presentation - deadline) * 1000.0)
             let now = CACurrentMediaTime()
             var report: String?
             deadlineLock.lock()
@@ -1495,20 +1509,24 @@
                 secondOverrunSumMs += overrunMs
                 secondWorstMs = max(secondWorstMs, overrunMs)
                 worstOverrunMs = max(worstOverrunMs, overrunMs)
+                if overrunMs > usableMarginMs {
+                    secondMissed += 1
+                }
             }
             if lastDeadlineLogTime == 0 {
                 lastDeadlineLogTime = now
             } else if now - lastDeadlineLogTime >= 1.0 {
-                if secondLate > 0 {
+                if secondLate > 0 || secondSkipped > 0 {
                     let mode: String
                     switch xrOptimalInputWaitMode {
                     case .always: mode = "always"
                     case .never: mode = "never"
                     case .automatic: mode = "automatic"
                     }
-                    let meanOverrunMs = secondOverrunSumMs / Double(secondLate)
+                    let meanOverrunMs = secondLate > 0 ? secondOverrunSumMs / Double(secondLate) : 0
                     report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes, landing +%d", halfRate.cadenceRefreshes, halfRate.landingRefreshes) : "")
                     report = (report ?? "") + String(format: "; GPU %.1f ms a frame, longest %.1f%@", secondGPUSumMs / Double(secondFrames), secondMaxGPUMs, secondPacedWaits > 0 ? String(format: ", paced wait %.1f ms", secondPacedWaitSumMs / Double(secondPacedWaits)) : "")
+                    report = (report ?? "") + String(format: "; %d past the deadline's margin, %d refreshes skipped", secondMissed, secondSkipped)
                     if secondTimedFrames > 0 {
                         let timed = Double(secondTimedFrames)
                         report = (report ?? "") + String(format: "; the query blocked %.1f ms, the loop took %.1f ms between frames, the presentation was predicted %.1f ms after the query, the deadline %.1f ms before it", secondQueryBlockSumMs / timed, secondLoopSumMs / timed, secondPredictedAheadSumMs / timed, secondDeadlineMarginSumMs / timed)
@@ -1545,9 +1563,10 @@
                     let waitStillToSkip = xrOptimalInputWaitMode == .automatic && automaticWaits
                     let meanLateMs = secondLate > 0 ? secondOverrunSumMs / Double(secondLate) : 0
                     let periodMs = currentFrameTime.period * 1000.0
-                    switch halfRate.secondEnded(frames: secondFrames, late: secondLate, meanOverrunMs: meanLateMs, meanGPUDurationMs: secondGPUSumMs / Double(secondFrames), periodMs: periodMs, waitStillToSkip: waitStillToSkip) {
+                    let marginMs = secondTimedFrames > 0 ? secondDeadlineMarginSumMs / Double(secondTimedFrames) : 0
+                    switch halfRate.secondEnded(frames: secondFrames, missed: secondMissed, skipped: secondSkipped, meanOverrunMs: meanLateMs, meanGPUDurationMs: secondGPUSumMs / Double(secondFrames), periodMs: periodMs, deadlineMarginMs: marginMs, waitStillToSkip: waitStillToSkip) {
                     case .entered:
-                        let line = String(format: "XR frame timing: %d of %d frames late with no wait left to skip: rendering every other refresh", secondLate, secondFrames)
+                        let line = String(format: "XR frame timing: %d of %d frames past the deadline's margin, %d refreshes skipped, no wait left to skip: rendering every other refresh", secondMissed, secondFrames, secondSkipped)
                         report = report.map { $0 + "\n" + line } ?? line
                     case .left:
                         let line = String(format: "XR frame timing: the frame's GPU work of %.2f ms fits the refresh of %.2f ms: rendering every refresh again", secondGPUSumMs / Double(secondFrames), periodMs)
@@ -1568,6 +1587,8 @@
                 secondGPUSumMs = 0
                 secondPacedWaitSumMs = 0
                 secondPacedWaits = 0
+                secondMissed = 0
+                secondSkipped = 0
                 secondQueryBlockSumMs = 0
                 secondLoopSumMs = 0
                 secondPredictedAheadSumMs = 0

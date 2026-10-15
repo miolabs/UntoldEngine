@@ -24,9 +24,12 @@ public enum XRFramePacing: Sendable, Equatable {
 }
 
 /// The half-rate decision from each second's deadline measurements. Enter when, with no wait
-/// for the optimal input time left to skip, half the frames or more were late by over a
-/// millisecond on average for two seconds running; leave when the rendered frames' mean GPU
-/// work has fitted 80% of the refresh for two seconds running. While active, the refreshes
+/// for the optimal input time left to skip, the display skipped a refresh for one frame in
+/// ten or more, or one frame in ten or more missed its presentation (finishing past the
+/// compositor's deadline by more than the deadline's margin before the presentation, less a
+/// safety), for two seconds running: fewer hops than that are fewer than the steps the half
+/// rate would add. Leave when the rendered frames' mean GPU work has fitted 80% of the
+/// refresh for two seconds running. While active, the refreshes
 /// between two frames follow the measured GPU cost: two, or more when a frame's typical work
 /// (the mean span plus a fifth) with its encode does not fit two. The mean, not the longest
 /// span: a GPU used on half the refreshes runs at a lower clock, and its longest spans would
@@ -38,7 +41,8 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
     /// with its encode fits, two at least, four at most.
     public private(set) var cadenceRefreshes = 2
     /// Refreshes after the compositor's predicted presentation at which the paced frames are
-    /// shown, from how far past their deadline they finish: the pose aims there.
+    /// shown, from how far past their deadline they finish beyond the deadline's margin before
+    /// the presentation: the pose aims there.
     public private(set) var landingRefreshes = 0
     private(set) var lateSeconds = 0
     private(set) var fitSeconds = 0
@@ -65,17 +69,29 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
     /// How far past a cadence's boundary the typical frame must be for the cadence to change,
     /// in milliseconds: a frame on the boundary would otherwise change it every few seconds.
     public static let cadenceDeadbandMs = 1.0
+    /// The part of the deadline's margin before the presentation not counted on, in
+    /// milliseconds: a frame past the deadline by less than the margin less this is taken as
+    /// shown on time.
+    public static let marginSafetyMs = 2.0
 
-    /// A second of frames ended: `frames` rendered, `late` of them past the deadline by
-    /// `meanOverrunMs` on average, their GPU spans `meanGPUDurationMs` on average, the
-    /// display's refresh `periodMs`, and whether the loop still has a wait it could skip first.
-    public mutating func secondEnded(frames: Int, late: Int, meanOverrunMs: Double, meanGPUDurationMs: Double, periodMs: Double, waitStillToSkip: Bool) -> Change {
+    /// How far past the deadline a frame may finish and still be taken as shown on time.
+    public static func usableMarginMs(deadlineMarginMs: Double) -> Double {
+        max(0, deadlineMarginMs - marginSafetyMs)
+    }
+
+    /// A second of frames ended: `frames` rendered, `missed` of them past the deadline by more
+    /// than its usable margin, `skipped` refreshes the display showed no new frame at beyond
+    /// the cadence, the frames past the deadline by `meanOverrunMs` on average, their GPU
+    /// spans `meanGPUDurationMs` on average, the display's refresh `periodMs`, the deadline
+    /// `deadlineMarginMs` before the presentation, and whether the loop still has a wait it
+    /// could skip first.
+    public mutating func secondEnded(frames: Int, missed: Int, skipped: Int, meanOverrunMs: Double, meanGPUDurationMs: Double, periodMs: Double, deadlineMarginMs: Double, waitStillToSkip: Bool) -> Change {
         guard frames > 0 else { return .none }
-        let mostlyLate = late * 2 >= frames
+        let hopping = skipped * 10 >= frames || missed * 10 >= frames
         if !active {
             cadenceRefreshes = 2
             landingRefreshes = 0
-            if !waitStillToSkip, mostlyLate, meanOverrunMs > 1.0 {
+            if !waitStillToSkip, hopping {
                 lateSeconds += 1
             } else {
                 lateSeconds = 0
@@ -88,9 +104,11 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
             return .none
         }
         if periodMs > 0 {
-            // Where the frames land: a frame finished past its deadline is shown at the next
-            // refresh its overrun reaches; one within a millisecond makes its predicted one.
-            landingRefreshes = meanOverrunMs > 1.0 ? min(Self.mostRefreshes - 1, Int((meanOverrunMs / periodMs).rounded(.up))) : 0
+            // Where the frames land: a frame finished past its deadline by more than the
+            // deadline's usable margin is shown at the next refresh the rest reaches; one
+            // within the margin makes its predicted one.
+            let beyond = meanOverrunMs - Self.usableMarginMs(deadlineMarginMs: deadlineMarginMs)
+            landingRefreshes = beyond > 0 ? min(Self.mostRefreshes - 1, Int((beyond / periodMs).rounded(.up))) : 0
             // The cadence rises at once when the frame's work needs more refreshes, and falls
             // only after two seconds running that fit the shorter one: a cadence that changed
             // every second would itself be a hop. Both ways with a deadband past the boundary.
