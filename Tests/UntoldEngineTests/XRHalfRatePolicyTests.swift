@@ -17,12 +17,16 @@ import XCTest
 final class XRHalfRatePolicyTests: XCTestCase {
     private let period = 10.0
 
-    private func lateSecond(_ policy: inout XRHalfRatePolicy, waitStillToSkip: Bool = false, maxGPU: Double = 12.0) -> XRHalfRatePolicy.Change {
-        policy.secondEnded(frames: 100, late: 80, meanOverrunMs: 3.0, maxGPUDurationMs: maxGPU, periodMs: period, waitStillToSkip: waitStillToSkip)
+    private func lateSecond(_ policy: inout XRHalfRatePolicy, waitStillToSkip: Bool = false, meanGPU: Double = 12.0) -> XRHalfRatePolicy.Change {
+        policy.secondEnded(frames: 100, late: 80, meanOverrunMs: 3.0, meanGPUDurationMs: meanGPU, periodMs: period, waitStillToSkip: waitStillToSkip)
     }
 
-    private func goodSecond(_ policy: inout XRHalfRatePolicy, maxGPU: Double = 7.0) -> XRHalfRatePolicy.Change {
-        policy.secondEnded(frames: 100, late: 2, meanOverrunMs: 0.2, maxGPUDurationMs: maxGPU, periodMs: period, waitStillToSkip: false)
+    private func goodSecond(_ policy: inout XRHalfRatePolicy, meanGPU: Double = 7.0) -> XRHalfRatePolicy.Change {
+        policy.secondEnded(frames: 100, late: 2, meanOverrunMs: 0.2, meanGPUDurationMs: meanGPU, periodMs: period, waitStillToSkip: false)
+    }
+
+    private func pacedSecond(_ policy: inout XRHalfRatePolicy, overrun: Double, meanGPU: Double) -> XRHalfRatePolicy.Change {
+        policy.secondEnded(frames: 40, late: 40, meanOverrunMs: overrun, meanGPUDurationMs: meanGPU, periodMs: period, waitStillToSkip: false)
     }
 
     func testEntersAfterTwoLateSecondsNotOne() {
@@ -51,47 +55,69 @@ final class XRHalfRatePolicyTests: XCTestCase {
     func testDoesNotEnterForSlightlyLateFrames() {
         var policy = XRHalfRatePolicy()
         for _ in 0 ..< 3 {
-            XCTAssertEqual(policy.secondEnded(frames: 100, late: 60, meanOverrunMs: 0.4, maxGPUDurationMs: 10.2, periodMs: period, waitStillToSkip: false), .none)
+            XCTAssertEqual(policy.secondEnded(frames: 100, late: 60, meanOverrunMs: 0.4, meanGPUDurationMs: 10.2, periodMs: period, waitStillToSkip: false), .none)
         }
         XCTAssertFalse(policy.active)
     }
 
-    func testWhileActiveTheCadenceFollowsTheGPUCostWithItsEncode() {
+    func testWhileActiveTheCadenceFollowsTheTypicalGPUCostWithItsEncode() {
         var policy = XRHalfRatePolicy()
         _ = lateSecond(&policy)
         _ = lateSecond(&policy)
         XCTAssertTrue(policy.active)
         XCTAssertEqual(policy.cadenceRefreshes, 2)
-        // 12 ms of GPU work and 3 ms of encode fit two refreshes of 10 ms.
-        XCTAssertEqual(policy.secondEnded(frames: 50, late: 50, meanOverrunMs: 8.0, maxGPUDurationMs: 12.0, periodMs: period, waitStillToSkip: false), .none)
+        // A mean of 14 ms, a fifth more and 3 ms of encode: 19.8 ms, two refreshes of 10 ms.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 14.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 2)
-        // 18 ms and 3 ms need three.
-        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 18.0, periodMs: period, waitStillToSkip: false), .none)
+        // A mean of 16 ms: 22.2 ms, three.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 16.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 3)
         // Never more than four.
-        XCTAssertEqual(policy.secondEnded(frames: 20, late: 20, meanOverrunMs: 8.0, maxGPUDurationMs: 60.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 60.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 4)
         // A shorter cadence is taken only after two seconds running that fit it.
-        XCTAssertEqual(policy.secondEnded(frames: 50, late: 50, meanOverrunMs: 8.0, maxGPUDurationMs: 9.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 9.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 4)
-        XCTAssertEqual(policy.secondEnded(frames: 50, late: 50, meanOverrunMs: 8.0, maxGPUDurationMs: 9.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 9.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 2)
         // A longer one at once, and a single fitting second between two needing it does not shorten it.
-        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 18.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 16.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 3)
-        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 12.0, periodMs: period, waitStillToSkip: false), .none)
-        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 18.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 12.0), .none)
+        XCTAssertEqual(pacedSecond(&policy, overrun: 8.0, meanGPU: 16.0), .none)
         XCTAssertEqual(policy.cadenceRefreshes, 3)
         XCTAssertTrue(policy.active)
+    }
+
+    func testThePoseAimsAtTheRefreshTheOverrunReaches() {
+        var policy = XRHalfRatePolicy()
+        XCTAssertEqual(policy.landingRefreshes, 0)
+        _ = lateSecond(&policy)
+        _ = lateSecond(&policy)
+        // Finished 9 ms past the deadline: shown one refresh after the prediction.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 9.0, meanGPU: 14.0), .none)
+        XCTAssertEqual(policy.landingRefreshes, 1)
+        // 15 ms past: two.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 15.0, meanGPU: 14.0), .none)
+        XCTAssertEqual(policy.landingRefreshes, 2)
+        // Within a millisecond: the predicted one.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 0.5, meanGPU: 14.0), .none)
+        XCTAssertEqual(policy.landingRefreshes, 0)
+        // Never beyond three.
+        XCTAssertEqual(pacedSecond(&policy, overrun: 80.0, meanGPU: 14.0), .none)
+        XCTAssertEqual(policy.landingRefreshes, 3)
+        XCTAssertEqual(goodSecond(&policy), .none)
+        XCTAssertEqual(goodSecond(&policy), .left)
+        XCTAssertEqual(policy.landingRefreshes, 0)
     }
 
     func testLeavesAfterTwoSecondsThatFitMostOfARefresh() {
         var policy = XRHalfRatePolicy()
         _ = lateSecond(&policy)
         _ = lateSecond(&policy)
-        XCTAssertEqual(goodSecond(&policy, maxGPU: 7.9), .none)
+        XCTAssertEqual(goodSecond(&policy, meanGPU: 7.9), .none)
         XCTAssertTrue(policy.active)
-        XCTAssertEqual(goodSecond(&policy, maxGPU: 7.9), .left)
+        XCTAssertEqual(goodSecond(&policy, meanGPU: 7.9), .left)
         XCTAssertFalse(policy.active)
         XCTAssertEqual(policy.cadenceRefreshes, 2)
     }
@@ -100,16 +126,16 @@ final class XRHalfRatePolicyTests: XCTestCase {
         var policy = XRHalfRatePolicy()
         _ = lateSecond(&policy)
         _ = lateSecond(&policy)
-        XCTAssertEqual(goodSecond(&policy, maxGPU: 7.0), .none)
-        XCTAssertEqual(goodSecond(&policy, maxGPU: 9.0), .none)
-        XCTAssertEqual(goodSecond(&policy, maxGPU: 7.0), .none)
+        XCTAssertEqual(goodSecond(&policy, meanGPU: 7.0), .none)
+        XCTAssertEqual(goodSecond(&policy, meanGPU: 9.0), .none)
+        XCTAssertEqual(goodSecond(&policy, meanGPU: 7.0), .none)
         XCTAssertTrue(policy.active)
-        XCTAssertEqual(goodSecond(&policy, maxGPU: 7.0), .left)
+        XCTAssertEqual(goodSecond(&policy, meanGPU: 7.0), .left)
     }
 
     func testAnEmptySecondChangesNothingAndResetForgetsEverything() {
         var policy = XRHalfRatePolicy()
-        XCTAssertEqual(policy.secondEnded(frames: 0, late: 0, meanOverrunMs: 0, maxGPUDurationMs: 0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.secondEnded(frames: 0, late: 0, meanOverrunMs: 0, meanGPUDurationMs: 0, periodMs: period, waitStillToSkip: false), .none)
         _ = lateSecond(&policy)
         _ = lateSecond(&policy)
         policy.reset()

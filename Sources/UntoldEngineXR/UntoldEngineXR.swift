@@ -193,11 +193,11 @@
             deadlineLock.unlock()
         }
 
-        /// How far past the compositor's predicted presentation (one refresh after the frame is
-        /// taken) the frame is posed for: the refreshes of the pacing's cadence beyond that
-        /// first one, where the display shows a paced frame; nothing without the pacing.
+        /// How far past the compositor's predicted presentation the frame is posed for: the
+        /// refreshes the paced frames were measured to land after it, from how far past their
+        /// deadline they finish; nothing without the pacing.
         private func presentationLeadSeconds() -> TimeInterval {
-            deadlineLock.withLock { pacingActiveNow ? Double(halfRate.cadenceRefreshes - 1) * currentFrameTime.period : 0 }
+            deadlineLock.withLock { pacingActiveNow ? Double(halfRate.landingRefreshes) * currentFrameTime.period : 0 }
         }
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
@@ -1466,7 +1466,7 @@
                     case .automatic: mode = "automatic"
                     }
                     let meanOverrunMs = secondOverrunSumMs / Double(secondLate)
-                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes", halfRate.cadenceRefreshes) : "")
+                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes, landing +%d", halfRate.cadenceRefreshes, halfRate.landingRefreshes) : "")
                     report = (report ?? "") + String(format: "; GPU %.1f ms a frame, longest %.1f%@", secondGPUSumMs / Double(secondFrames), secondMaxGPUMs, secondPacedWaits > 0 ? String(format: ", paced wait %.1f ms", secondPacedWaitSumMs / Double(secondPacedWaits)) : "")
                     // With the GPU pass timing on, the heaviest passes of the last resolved frame
                     // name what a second of frames well past the deadline spent its time on.
@@ -1497,12 +1497,12 @@
                     let waitStillToSkip = xrOptimalInputWaitMode == .automatic && automaticWaits
                     let meanLateMs = secondLate > 0 ? secondOverrunSumMs / Double(secondLate) : 0
                     let periodMs = currentFrameTime.period * 1000.0
-                    switch halfRate.secondEnded(frames: secondFrames, late: secondLate, meanOverrunMs: meanLateMs, maxGPUDurationMs: secondMaxGPUMs, periodMs: periodMs, waitStillToSkip: waitStillToSkip) {
+                    switch halfRate.secondEnded(frames: secondFrames, late: secondLate, meanOverrunMs: meanLateMs, meanGPUDurationMs: secondGPUSumMs / Double(secondFrames), periodMs: periodMs, waitStillToSkip: waitStillToSkip) {
                     case .entered:
                         let line = String(format: "XR frame timing: %d of %d frames late with no wait left to skip: rendering every other refresh", secondLate, secondFrames)
                         report = report.map { $0 + "\n" + line } ?? line
                     case .left:
-                        let line = String(format: "XR frame timing: the frame's GPU work of %.2f ms fits the refresh of %.2f ms: rendering every refresh again", secondMaxGPUMs, periodMs)
+                        let line = String(format: "XR frame timing: the frame's GPU work of %.2f ms fits the refresh of %.2f ms: rendering every refresh again", secondGPUSumMs / Double(secondFrames), periodMs)
                         report = report.map { $0 + "\n" + line } ?? line
                     case .none:
                         break
