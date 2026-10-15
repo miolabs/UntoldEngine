@@ -16,17 +16,25 @@ public struct UntoldRendererConfig {
     var updateRenderingSystemCallback: UpdateRenderingSystemCallback
 
     var updateXRRenderingSystemCallback: UpdateXRRenderingSystemCallback?
+    /// Whether the scene starts with a directional light, made active, beside its camera.
+    /// Unset, the platform decides: a sun on every path but the headset, where the
+    /// passthrough room is lit by its probe and the immersive environment by its own light,
+    /// so a sun is the app's to add. A project sets it to keep a sun on the headset (for
+    /// shadows its environment cannot cast) or to start without one elsewhere.
+    public var defaultSun: Bool?
 
     public init(
         metalView: MTKView? = nil,
         initPipelineBlocks: [(RenderPipelineType, RenderPipelineInitBlock)],
         updateRenderingSystemCallback: @escaping UpdateRenderingSystemCallback,
-        updateXRRenderingSystemCallback: UpdateXRRenderingSystemCallback? = nil
+        updateXRRenderingSystemCallback: UpdateXRRenderingSystemCallback? = nil,
+        defaultSun: Bool? = nil
     ) {
         self.metalView = metalView
         initRenderPipelineBlocks = initPipelineBlocks
         self.updateRenderingSystemCallback = updateRenderingSystemCallback
         self.updateXRRenderingSystemCallback = updateXRRenderingSystemCallback
+        self.defaultSun = defaultSun
     }
 }
 

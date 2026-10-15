@@ -130,17 +130,21 @@ static inline float4 taaResolveColor(
     const float2 texel = 1.0 / max(taa.physicalSize, float2(1.0));
     const float4 current = colorTexture.sample(pointSampler, uv);
 
-    // This pixel's position in space, from its depth, and where it was on the previous
-    // frame's screen and in the history texture. Computed for every pixel, before any pixel
-    // leaves: the local rates of the two maps are read below from the derivatives of these
-    // across the 2×2 quad, which need every lane of the quad to have computed them.
     // A texel at the clear depth has no position: nothing opaque was drawn there — the
     // background, or a transparent quad over it — and reprojecting it from the far plane
     // would fetch the wrong history and ghost or wipe it under a moving camera; such a pixel
-    // keeps its own frame, and in passthrough most of the frame is such pixels.
+    // keeps its own frame, and in passthrough most of the frame is such pixels. It leaves
+    // here, before the rate-map decodes and the reprojection: nothing below reads the
+    // neighbouring lanes (the maps' local rates come from a second decode a texel over, not
+    // from derivatives across the quad), so a lane that leaves early is safe.
     const float depth = depthTexture.sample(pointSampler, uv);
     const bool cleared = (taa.reverseZ != 0u) ? (depth <= 1e-6) : (depth >= 1.0 - 1e-6);
+    if (taa.historyValid == 0u || cleared) {
+        return current;
+    }
 
+    // This pixel's position in space, from its depth, and where it was on the previous
+    // frame's screen and in the history texture.
     const float2 physical = in.position.xy;
     const float2 screen = taaScreenFromPhysical(physical, taa.rateMapSizes, rateMap);
     const float2 screenSize = taa.rateMapSizes.x > 0.0 ? taa.rateMapSizes.xy : taa.physicalSize;
@@ -162,24 +166,7 @@ static inline float4 taaResolveColor(
     const float2 prevScreen = float2((prevNdc.x * 0.5 + 0.5) * prevScreenSize.x, (1.0 - (prevNdc.y * 0.5 + 0.5)) * prevScreenSize.y);
     const float2 prevPhysical = taaPhysicalFromScreen(prevScreen, taa.prevRateMapSizes, prevRateMap);
 
-    // Under foveation the history may be coarser here than this frame: the spot was in the
-    // periphery of the previous map (one texel spanning several screen pixels) and the gaze
-    // has moved onto it. Trusting such a history at full weight shows the sharp frame with a
-    // blurry shadow that fades over twenty frames; its weight is cut by how much coarser it
-    // was, measured from the two maps' local rates (texels per screen pixel), per axis: a map
-    // is coarser in one axis than the other wherever its rows and columns differ, so the
-    // ratio is taken on the axis where the history is coarsest relative to this frame. The
-    // rates are the derivatives of the mappings across the quad — this frame's screen
-    // position per texel, and the history's texel per screen pixel — instead of a second
-    // decode of each map a pixel over.
-    const float2 screenStep = float2(abs(dfdx(screen.x)), abs(dfdy(screen.y)));
-    const float2 currentRate = 1.0 / max(screenStep, float2(1e-3));
-    const float2 prevScreenStep = float2(abs(dfdx(prevScreen.x)), abs(dfdy(prevScreen.y)));
-    const float2 prevPhysicalStep = float2(abs(dfdx(prevPhysical.x)), abs(dfdy(prevPhysical.y)));
-    const float2 prevRate = prevPhysicalStep / max(prevScreenStep, float2(1e-4));
-    const float2 ratio = prevRate / currentRate;
-
-    if (taa.historyValid == 0u || cleared || !worldValid || !prevInFront) {
+    if (!worldValid || !prevInFront) {
         return current;
     }
     const float2 historyUV = prevPhysical * texel;
@@ -208,6 +195,26 @@ static inline float4 taaResolveColor(
 
     float weight = taa.historyWeight;
     if (taa.rateMapSizes.x > 0.0 || taa.prevRateMapSizes.x > 0.0) {
+        // Under foveation the history may be coarser here than this frame: the spot was in
+        // the periphery of the previous map (one texel spanning several screen pixels) and
+        // the gaze has moved onto it. Trusting such a history at full weight shows the sharp
+        // frame with a blurry shadow that fades over twenty frames; its weight is cut by how
+        // much coarser it was, measured from the two maps' local rates (texels per screen
+        // pixel), per axis: a map is coarser in one axis than the other wherever its rows and
+        // columns differ, so the ratio is taken on the axis where the history is coarsest
+        // relative to this frame. Both rates are read as texels per screen pixel over the
+        // same screen interval, one pixel on from this pixel's screen position (or back,
+        // at either screen's far edge), each from its own map a second time: the maps' rows
+        // and columns are separable, so one decode gives both axes. The same interval for
+        // both keeps the ratio exactly 1 wherever the two maps agree, zone boundaries
+        // included. Not from derivatives across the quad: the pixels that left above would
+        // leave those undefined. Where the maps differ, the band before a boundary weighs a
+        // little differently than the quad's span did; it is at most a pixel wide.
+        const float2 delta = select(float2(1.0), float2(-1.0),
+                                    screen + 1.0 >= screenSize || prevScreen + 1.0 >= prevScreenSize);
+        const float2 currentRate = abs(taaPhysicalFromScreen(screen + delta, taa.rateMapSizes, rateMap) - physical);
+        const float2 prevRate = abs(taaPhysicalFromScreen(prevScreen + delta, taa.prevRateMapSizes, prevRateMap) - prevPhysical);
+        const float2 ratio = prevRate / max(currentRate, float2(1e-4));
         weight *= saturate(min(ratio.x, ratio.y));
     }
 

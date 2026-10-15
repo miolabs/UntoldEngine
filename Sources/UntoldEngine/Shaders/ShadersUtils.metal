@@ -315,7 +315,9 @@ float2 equirectUVFromCubeDirection(float3 v){
     const float2 biases {0.5f,0.5f};
 
     //assume +z is forward. for -x forward, use atan2(v.z,v.x)
-    float2 uv=float2(atan2(-v.x, v.z),asin(-v.y))*scales+biases;
+    // The latitude's asin is clamped: a reflection of two unit vectors can round a hair past
+    // 1 at the poles, and asin of that is NaN.
+    float2 uv=float2(atan2(-v.x, v.z),asin(clamp(-v.y, -1.0, 1.0)))*scales+biases;
 
     return uv;
 }
@@ -498,11 +500,10 @@ float4 BRDFIntegrationMap(float roughness, float NoV){
 
 }
 
-// The share of the light around it that a surface reflects in a single bounce off its
-// microfacets: F0 head on (4 % for a non-metal, its own color for a metal), more when it
-// is seen at a slant. This is the share diffuse scattering gives up to specular, before
-// any later-bounce energy compensation.
-float3 singleBounceReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap) {
+// The lookup table's two values for a surface seen at an angle (NoV) with a roughness: the
+// scale and the bias the reflectance at that slant puts on F0. Read once per pixel and
+// handed to the two reflectances below.
+float2 brdfIntegration(float NoV, float roughness, texture2d<float> brdfMap) {
 
     // The lookup table is read right at its edges (a surface seen head on, a roughness
     // of 1), so it clamps: wrapping there reads the far edge and leaves a white spot.
@@ -511,23 +512,26 @@ float3 singleBounceReflectance(float3 F0, float roughness, float NoV, texture2d<
                         mip_filter::none,
                         address::clamp_to_edge);
 
-    float4 brdfIntegration=brdfMap.sample(s,float2(NoV,roughness));
+    return brdfMap.sample(s, float2(NoV, roughness)).xy;
+}
 
-    return F0 * float(brdfIntegration.x) + float(brdfIntegration.y);
+// The share of the light around it that a surface reflects in a single bounce off its
+// microfacets: F0 head on (4 % for a non-metal, its own color for a metal), more when it
+// is seen at a slant. This is the share diffuse scattering gives up to specular, before
+// any later-bounce energy compensation. `brdf` is the lookup table's pair for the surface.
+float3 singleBounceReflectance(float3 F0, float2 brdf) {
+    return F0 * brdf.x + brdf.y;
+}
+
+float3 singleBounceReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap) {
+    return singleBounceReflectance(F0, brdfIntegration(NoV, roughness, brdfMap));
 }
 
 // The share of the light around it that a surface reflects: F0 head on (4 % for a
 // non-metal, its own color for a metal), more when it is seen at a slant.
-float3 environmentReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap) {
+float3 environmentReflectance(float3 F0, float2 brdf) {
 
-    constexpr sampler s(coord::normalized,
-                        filter::linear,
-                        mip_filter::none,
-                        address::clamp_to_edge);
-
-    float4 brdfIntegration=brdfMap.sample(s,float2(NoV,roughness));
-
-    float3 reflectedInOneBounce = F0 * float(brdfIntegration.x) + float(brdfIntegration.y);
+    float3 reflectedInOneBounce = F0 * brdf.x + brdf.y;
 
     // A rough surface bounces part of the light between its own bumps before it lets it
     // go. The table counts a single bounce and takes the rest for lost: up to two thirds
@@ -535,10 +539,14 @@ float3 environmentReflectance(float3 F0, float roughness, float NoV, texture2d<f
     // what a white mirror of this roughness reflects in one bounce; what is missing from
     // 1 left on a later bounce, tinted again by the surface each time (Kulla and Conty's
     // approximation, in the form Filament uses). An empty table stays an empty result.
-    float whiteInOneBounce = float(brdfIntegration.x) + float(brdfIntegration.y);
+    float whiteInOneBounce = brdf.x + brdf.y;
     float3 laterBounces = 1.0 + F0 * (1.0 / max(whiteInOneBounce, 0.05) - 1.0);
 
     return reflectedInOneBounce * laterBounces;
+}
+
+float3 environmentReflectance(float3 F0, float roughness, float NoV, texture2d<float> brdfMap) {
+    return environmentReflectance(F0, brdfIntegration(NoV, roughness, brdfMap));
 }
 
 // The environment in a direction, as blurred as a roughness makes it.
@@ -556,8 +564,14 @@ float3 blurredEnvironment(float3 direction, float roughness, texture2d<float> sp
 
     int mipCount=6;
 
-    //Rotate the direction
-    float3 rotatedDirection=normalize(rotateDirection(direction, rotationAxis, rotationAngle));
+    // Rotate the direction, unless the environment is not rotated (the headset's room probe
+    // never is): the angle is a per-frame constant, so the branch is uniform. Either way the
+    // direction comes out unit length, which the equirectangular lookup's asin needs: the
+    // simulator's light pass hands in a G-buffer normal as stored.
+    float3 rotatedDirection = normalize(direction);
+    if (rotationAngle != 0.0) {
+        rotatedDirection = rotateDirection(direction, rotationAxis, rotationAngle);
+    }
 
     float2 uv = equirectUVFromCubeDirection(rotatedDirection);
     float mipLevel = roughness * float(mipCount - 1);
@@ -586,8 +600,11 @@ float3 diffuseIBL(float3 normal, texture2d<float> irradianceMap, float3 rotation
                         mip_filter::linear,
                         address::repeat);
 
-    //Rotate the normal
-    float3 rotatedNormal=rotateDirection(normal, rotationAxis, rotationAngle);
+    // Rotate the normal, unless the environment is not rotated (see blurredEnvironment).
+    float3 rotatedNormal = normalize(normal);
+    if (rotationAngle != 0.0) {
+        rotatedNormal = rotateDirection(normal, rotationAxis, rotationAngle);
+    }
     float2 uv = equirectUVFromCubeDirection(rotatedNormal);
     return float3(irradianceMap.sample(s,uv).rgb);
 }

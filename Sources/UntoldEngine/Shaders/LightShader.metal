@@ -305,8 +305,12 @@ EnvironmentLight computeIBLParts(texture2d<float> irradianceTexture,
     //compute ibl ambient contribution
     // The angle to the surface, whichever side of it is seen (see specularIBL).
     float NoV = min(abs(dot(normalMap.xyz, viewVector)), 1.0);
-    
-    float3 irradiance=diffuseIBL(normalMap.xyz, irradianceTexture, float3(0.0,1.0,0.0),degreesToRadians(iblRotationAngle));
+    // The rotation of the environment, in radians, once; the lookup table's two values at
+    // this angle and roughness, once, for the reflection and the share it takes from diffuse.
+    float rotation = degreesToRadians(iblRotationAngle);
+    float2 brdf = brdfIntegration(NoV, roughness, iblBRDFTexture);
+
+    float3 irradiance=diffuseIBL(normalMap.xyz, irradianceTexture, float3(0.0,1.0,0.0), rotation);
     
     float3 diffuse = irradiance*inBaseColor.rgb;
 
@@ -315,7 +319,8 @@ EnvironmentLight computeIBLParts(texture2d<float> irradianceTexture,
     // grows when the surface is seen at a slant.
     float3 f0 = mix(0.04, inBaseColor.rgb, metallic);
 
-    float3 specular=specularIBL(f0, roughness, normalMap.xyz, viewVector, specularTexture, iblBRDFTexture,float3(0.0,1.0,0.0),degreesToRadians(iblRotationAngle));
+    float3 specular = blurredEnvironment(reflect(-viewVector, normalMap.xyz), roughness, specularTexture, float3(0.0,1.0,0.0), rotation)
+        * environmentReflectance(f0, brdf);
 
     // Every surface reflects the environment, a non-metal too: that is the sheen of
     // polished plastic, glass or lacquer. What it reflects it does not scatter, so the
@@ -323,7 +328,7 @@ EnvironmentLight computeIBLParts(texture2d<float> irradianceTexture,
     // single-bounce share only: the multi-bounce energy compensation in
     // environmentReflectance exists to correct the specular term's own approximation,
     // not to measure how much the surface diverts away from diffuse scattering.
-    float3 reflected = singleBounceReflectance(f0, roughness, NoV, iblBRDFTexture);
+    float3 reflected = singleBounceReflectance(f0, brdf);
 
     EnvironmentLight light;
     light.diff = max(1.0 - reflected, 0.0) * (1.0 - metallic) * diffuse;
@@ -636,8 +641,11 @@ fragment float4 fragmentLightShader(VertexCompositeOutput vertexOut [[stage_in]]
     color.diff = brdf.diff * (half3)lights.color * (half)lights.intensity;
     color.spec = brdf.spec*lights.color*lights.intensity;
     
-    // Compute shadow using cascaded shadow maps
-    float shadow = computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, surfaceNormal, lightRayDirection);
+    // Compute shadow using cascaded shadow maps, only with a sun (see modelShader.metal).
+    float shadow = 1.0;
+    if (lights.intensity != 0.0) {
+        shadow = computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, surfaceNormal, lightRayDirection);
+    }
 
     // shadows affect directional light for now
     color.diff = color.diff*(half)shadow;
@@ -753,15 +761,18 @@ float3 computeDirectLighting(
     constant PointShadowUniforms &pointShadowUniforms,
     constant SpotShadowUniforms &spotShadowUniforms
 ) {
-    float3 lightRayDirection = normalize(lights.direction);
-
-    LightContribution brdf = computeBRDF(lightRayDirection, viewVector, normal, albedo, float3(1.0), roughness, metallic);
-
     LightContribution color;
-    color.diff = brdf.diff * (half3)lights.color * (half)lights.intensity;
-    color.spec = brdf.spec * lights.color * lights.intensity;
-    color.diff *= (half)sunShadow;
-    color.spec *= sunShadow;
+    // A sun at no intensity adds nothing, so its BRDF is not evaluated: the branch is on a
+    // per-frame constant, uniform across the draw. Any other intensity takes the old path,
+    // in the old order of products.
+    if (lights.intensity != 0.0) {
+        float3 lightRayDirection = normalize(lights.direction);
+        LightContribution brdf = computeBRDF(lightRayDirection, viewVector, normal, albedo, float3(1.0), roughness, metallic);
+        color.diff = brdf.diff * (half3)lights.color * (half)lights.intensity;
+        color.spec = brdf.spec * lights.color * lights.intensity;
+        color.diff *= (half)sunShadow;
+        color.spec *= sunShadow;
+    }
 
     LightContribution pointColor;
     uint lightCount = min(plBlock.count.x, MAX_POINT_LIGHTS);
@@ -881,9 +892,13 @@ static inline float4 lightTBDRSample(
         indirectLighting *= ambientOcclusion * iblParam.ambientIntensity;
     }
 
-    float shadow = indirectFromGBuffer
-        ? float(gbEmissive.a)
-        : computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, surfaceNormal, lightRayDirection);
+    // The sun's shadow: the one the geometry wrote, else the cascades, only with a sun.
+    float shadow = 1.0;
+    if (indirectFromGBuffer) {
+        shadow = float(gbEmissive.a);
+    } else if (lights.intensity != 0.0) {
+        shadow = computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, surfaceNormal, lightRayDirection);
+    }
     float3 direct = computeDirectLighting(
         verticesInWorldSpace, viewVector, surfaceNormal, albedo.rgb, roughness, metallic, shadow,
         lights, plBlock, slBlock, alBlock, ltcMagTexture, ltcMatTexture, pointShadowCube, spotShadowMap,

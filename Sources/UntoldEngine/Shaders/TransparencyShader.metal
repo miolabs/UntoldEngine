@@ -148,9 +148,13 @@ fragment TransparencyOutput fragmentTransparencyShader(
     totalLight.diff = brdf.diff * (half3)lights.color * (half)lights.intensity;
     totalLight.spec = brdf.spec * lights.color * lights.intensity;
 
-    float shadow = computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, normal, lightDirection);
-    totalLight.diff *= (half)shadow;
-    totalLight.spec *= shadow;
+    // The sun's shadow only with a sun (see modelShader.metal's emissiveWithIndirect).
+    float shadow = 1.0;
+    if (lights.intensity != 0.0) {
+        shadow = computeCSMShadow(csmShadowArray, csmUniforms, verticesInWorldSpace.xyz, normal, lightDirection);
+        totalLight.diff *= (half)shadow;
+        totalLight.spec *= shadow;
+    }
 
     uint pointLightCount = min(plBlock.count.x, MAX_POINT_LIGHTS);
     for (uint i = 0; i < pointLightCount; ++i) {
