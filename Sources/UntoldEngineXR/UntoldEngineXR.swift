@@ -1381,7 +1381,13 @@
                 lastDeadlineLogTime = now
             } else if now - lastDeadlineLogTime >= 1.0 {
                 if secondLate > 0 {
-                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far)", secondLate, secondFrames, secondWorstMs, secondOverrunSumMs / Double(secondLate), deadlineMissCount)
+                    let mode: String
+                    switch xrOptimalInputWaitMode {
+                    case .always: mode = "always"
+                    case .never: mode = "never"
+                    case .automatic: mode = "automatic"
+                    }
+                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@)", secondLate, secondFrames, secondWorstMs, secondOverrunSumMs / Double(secondLate), deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited")
                 }
                 // The automatic mode: stop waiting once a second had late frames (one in
                 // twenty or more); wait again once a second's least slack would have covered
