@@ -267,7 +267,7 @@ Selection rays update from interaction events, not continuously as the user look
 | Frame timing | MTKView drives at display rate | CompositorServices dictates via `optimalInputTime` |
 | Eyes | 1 | 2 (per-eye loop over `drawable.views`) |
 | Compute passes | Once per frame | Once per frame (shared across both eyes) |
-| Default scene | A camera and a directional light, both active | A camera, the entity the head pose is written into, and no directional light unless the configuration asks for one (`UntoldRendererConfig.defaultSun`): the passthrough room is lit by its probe and the immersive environment by its own light, so a sun is the app's to add (`DirectionalLightNode`, or `createDirLight` and `setDirectionalLight(.active(_:))`) |
+| Default scene | A camera and a directional light, both active | A camera, the entity the head pose is written into, and no directional light unless the configuration asks for one (`UntoldRendererConfig.defaultSun`): the passthrough room is lit by its probe and the immersive environment by its own light, so a sun is the app's to add (`DirectionalLightNode`, or `createDirLight` and `setDirectionalLight(.active(_:))`), and it casts in one cascade by default (`setRendering(.shadowCascades(_:))`) |
 | View matrix | Camera entity transform | `(originFromDevice × deviceFromView)⁻¹` from ARKit anchor |
 | Projection | Camera component FOV | `drawable.computeProjection()` — asymmetric per-eye |
 | Present call | `commandBuffer.present(drawable)` | `drawable.encodePresent(commandBuffer:)` — encoded as GPU command |

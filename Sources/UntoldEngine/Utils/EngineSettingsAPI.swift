@@ -71,6 +71,13 @@ public enum RenderingProperty: Sendable {
     /// existing texel budget on it instead, sharpening shadow edges without needing a larger
     /// shadow map. See `getMaxShadowCastingDistance()` to read the current value.
     case maxShadowCastingDistance(Float)
+    /// The cascades the sun's shadow is drawn in and read from, 1 or 2. Each cascade draws
+    /// every caster once more into its own 2048² depth map, and the band where two meet
+    /// samples both. The headset's default is one: a room or a tabletop never shows the
+    /// distance the second covers, and with `maxShadowCastingDistance` set to the scene's
+    /// size one cascade is sharp on it. Elsewhere the default is two. See
+    /// `getShadowCascades()`.
+    case shadowCascades(Int)
     /// Objects whose bounds are under this many pixels tall on screen are not drawn and
     /// cast no shadow. A scene with tens of thousands of small parts shows most of them
     /// at a pixel or less from any distance, and each would still cost a draw. The size
@@ -244,6 +251,8 @@ public func setRendering(_ property: RenderingProperty) {
         applyRenderExtensionProperty(property)
     case let .maxShadowCastingDistance(distance):
         RenderPasses.maxShadowCastingDistance = max(distance, 0.001)
+    case let .shadowCascades(count):
+        ShadowSystem.cascadesWanted = count
     case let .smallObjectCulling(pixels):
         SmallObjectCulling.minimumPixels = pixels.isFinite ? max(pixels, 0) : 0
     case let .occlusionCullingMinimumEntities(entities):
@@ -298,6 +307,11 @@ public func getFoveatedRenderingEnabled() -> Bool {
 
 /// When the XR loop waits for the compositor's optimal input time before it encodes the
 /// frame. See `RenderingProperty.optimalInputWait`.
+/// The cascades the sun's shadow is drawn in and read from.
+public func getShadowCascades() -> Int {
+    shadowSystem?.cascadeCount ?? min(max(ShadowSystem.cascadesWanted ?? csmCascadeCount, 1), csmCascadeCount)
+}
+
 public func getOptimalInputWaitMode() -> XRInputWaitMode {
     xrOptimalInputWaitMode
 }

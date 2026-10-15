@@ -286,6 +286,17 @@ struct ShadowSystem {
     var cascadeBlendStarts: [Float] = Array(repeating: 0, count: csmCascadeCount)
     var softnessSettings: ShadowSoftnessSettings = .init()
     var isActive: Bool = false
+    /// The cascades the sun's shadow is drawn in and read from, one to `csmCascadeCount`:
+    /// what `setRendering(.shadowCascades(_:))` asked for, else the platform's default: one
+    /// on the headset, where the scene is a room or a tabletop and the second cascade's
+    /// draw of every caster and the cross-fade's double taps cost a frame's budget for a
+    /// distance it never shows; every cascade elsewhere. `maxShadowCastingDistance` sets how
+    /// far the cascades reach, so one cascade stays sharp on a small scene.
+    nonisolated(unsafe) static var cascadesWanted: Int?
+    var cascadeCount: Int {
+        let wanted = Self.cascadesWanted ?? (renderInfo.isXRStereoMode ? 1 : csmCascadeCount)
+        return min(max(wanted, 1), csmCascadeCount)
+    }
 
     /// Legacy accessor used by callers that only need to know "is there a shadow?"
     var dirLightSpaceMatrix: simd_float4x4? {
@@ -328,14 +339,14 @@ struct ShadowSystem {
         return max(cameraNear, cascadeBlendStart(cascadeIdx: cascadeIdx - 1, splits: splits, blendFraction: blendFraction))
     }
 
-    /// Fills the 3 fixed GPU slots from a per-cascade array, padding unused slots
-    /// (beyond csmCascadeCount) with `fallback` so the shader's cascadeCount field
-    /// controls which slots are actually read.
-    private static func pack3<T>(_ values: [T], fallback: T) -> (T, T, T) {
+    /// Fills the 3 fixed GPU slots from a per-cascade array, padding the slots past the
+    /// `count` cascades in use with `fallback`, so the shader's cascadeCount field controls
+    /// which slots are actually read.
+    private static func pack3<T>(_ values: [T], count: Int, fallback: T) -> (T, T, T) {
         (
             values[0],
-            csmCascadeCount > 1 ? values[1] : fallback,
-            csmCascadeCount > 2 ? values[2] : fallback
+            count > 1 && values.count > 1 ? values[1] : fallback,
+            count > 2 && values.count > 2 ? values[2] : fallback
         )
     }
 
@@ -344,12 +355,13 @@ struct ShadowSystem {
     /// left as identity/zero so the shader's cascadeCount field controls which are read.
     func makeUniforms() -> CSMUniforms {
         var u = CSMUniforms()
-        u.lightSpaceMatrices = Self.pack3(cascadeLightSpaceMatrices, fallback: matrix_identity_float4x4)
-        u.cascadeSplits = Self.pack3(cascadeSplitDistances, fallback: 0)
-        u.cascadeCount = Int32(csmCascadeCount)
-        u.cascadeWorldTexelSizes = Self.pack3(cascadeWorldTexelSizes, fallback: cascadeWorldTexelSizes[0])
-        u.cascadeDepthSpans = Self.pack3(cascadeDepthSpans, fallback: cascadeDepthSpans[0])
-        u.cascadeBlendStarts = Self.pack3(cascadeBlendStarts, fallback: cascadeBlendStarts[0])
+        let count = cascadeCount
+        u.lightSpaceMatrices = Self.pack3(cascadeLightSpaceMatrices, count: count, fallback: matrix_identity_float4x4)
+        u.cascadeSplits = Self.pack3(cascadeSplitDistances, count: count, fallback: 0)
+        u.cascadeCount = Int32(count)
+        u.cascadeWorldTexelSizes = Self.pack3(cascadeWorldTexelSizes, count: count, fallback: cascadeWorldTexelSizes[0])
+        u.cascadeDepthSpans = Self.pack3(cascadeDepthSpans, count: count, fallback: cascadeDepthSpans[0])
+        u.cascadeBlendStarts = Self.pack3(cascadeBlendStarts, count: count, fallback: cascadeBlendStarts[0])
         let softness = Self.sanitizedSoftnessSettings(softnessSettings)
         let xrScale = renderInfo.isXRStereoMode ? softness.xrRadiusScale : 1.0
         u.shadowSoftnessNear = softness.nearRadiusTexels * xrScale
@@ -453,8 +465,9 @@ struct ShadowSystem {
 
         // Practical split scheme (blend of log and uniform, λ=0.5).
         let splits = computeCascadeSplits(cameraNear: near, cameraFar: cameraFar)
-        cascadeSplitDistances = splits
-        for i in 0 ..< csmCascadeCount {
+        // The arrays keep every slot; the ones past the cascades in use repeat the last split.
+        cascadeSplitDistances = splits + Array(repeating: splits.last ?? cameraFar, count: csmCascadeCount - splits.count)
+        for i in 0 ..< cascadeCount {
             cascadeBlendStarts[i] = Self.cascadeBlendStart(
                 cascadeIdx: i, splits: splits, blendFraction: csmCascadeBlendFraction
             )
@@ -469,7 +482,7 @@ struct ShadowSystem {
             lightSpaceBounds(for: $0, lightView: lightView)
         }
 
-        for i in 0 ..< csmCascadeCount {
+        for i in 0 ..< cascadeCount {
             let cascadeFar = splits[i]
             let cascadeNear = Self.cascadeNearDistance(
                 cascadeIdx: i,
@@ -571,8 +584,8 @@ struct ShadowSystem {
     private func computeCascadeSplits(cameraNear: Float, cameraFar: Float) -> [Float] {
         let lambda: Float = 0.5
         var splits: [Float] = []
-        for i in 1 ... csmCascadeCount {
-            let fi = Float(i) / Float(csmCascadeCount)
+        for i in 1 ... cascadeCount {
+            let fi = Float(i) / Float(cascadeCount)
             let logSplit = cameraNear * pow(cameraFar / cameraNear, fi)
             let uniformSplit = cameraNear + (cameraFar - cameraNear) * fi
             splits.append(lambda * logSplit + (1.0 - lambda) * uniformSplit)
