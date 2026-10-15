@@ -109,14 +109,14 @@
         /// The automatic mode's current choice: waiting for the optimal input time, or not.
         private var automaticWaits = true
         /// The half-rate pacing: its policy, whether this frame is paced, the last second's
-        /// longest GPU span, and its anchors: the last rendered frame's command buffer, waited
-        /// for before the next frame is taken, and that frame's presentation instant, the
-        /// refresh grid the next frame is taken on.
+        /// longest GPU span, and its anchors: the last rendered frame's presentation instant,
+        /// the refresh grid the frames are taken on, and the instant the last paced frame was
+        /// taken at.
         private var halfRate = XRHalfRatePolicy()
         private var pacingActiveNow = false
         private var secondMaxGPUMs = 0.0
-        private var lastRenderedCommandBuffer: MTLCommandBuffer?
         private var lastRenderedPresentation: LayerRenderer.Clock.Instant?
+        private var lastPacedQuery: LayerRenderer.Clock.Instant?
         /// Whether the loop is rendering every other refresh at the moment.
         public var halfRatePacingActive: Bool { deadlineLock.withLock { pacingActiveNow } }
         /// Whether the last frame waited for the compositor's optimal input time: the setting,
@@ -144,37 +144,52 @@
         }
 
         /// The half-rate pacing, before the next compositor frame is taken. With the pacing
-        /// active, by the setting or by the policy when the frames run late, the loop first
-        /// waits for the last rendered frame's GPU work to finish and then for the next refresh
-        /// after that, counted from that frame's presentation instant. Every frame taken is
-        /// submitted (a frame taken and let go is never released by the compositor, and three
-        /// of them abort the app), nothing queues on the GPU, and the frames land on every
-        /// other refresh while one refresh is not enough for a frame's work.
+        /// active, by the setting or by the policy when the frames run late, the frames are
+        /// taken on the refresh grid (the last rendered frame's presentation instant and its
+        /// multiples of the period) every `cadenceRefreshes` refreshes: two, or as many as the
+        /// frame's GPU work with its encode needs. Nothing waits for the GPU: the next frame's
+        /// work queues behind the previous one's, so the GPU stays busy and keeps its clock
+        /// (idling it between frames made every frame a third longer). Every frame taken is
+        /// submitted: a frame taken and let go is never released by the compositor, and three
+        /// of them abort the app.
         private func paceForHalfRate() {
             let active: Bool
+            let cadence: Int
             deadlineLock.lock()
             switch xrFramePacing {
             case .fullRate: active = false
             case .halfRate: active = true
             case .halfRateWhenLate: active = halfRate.active
             }
+            cadence = halfRate.cadenceRefreshes
             pacingActiveNow = active
             deadlineLock.unlock()
-            guard active, let anchor = lastRenderedPresentation else { return }
-            lastRenderedCommandBuffer?.waitUntilCompleted()
+            guard active, let grid = lastRenderedPresentation else {
+                lastPacedQuery = nil
+                return
+            }
             let period = currentFrameTime.period
             guard period > 0 else { return }
             let clock = LayerRenderer.Clock()
-            let behind = Self.seconds(anchor.duration(to: clock.now))
+            // The earliest the next frame may be taken: a cadence after the last paced one, and
+            // not before now; snapped up to the refresh grid.
+            var earliest = clock.now
+            if let last = lastPacedQuery {
+                let due = last.advanced(by: .seconds(Double(cadence) * period))
+                if due > earliest { earliest = due }
+            }
+            let behind = Self.seconds(grid.duration(to: earliest))
             let refreshes = behind > 0 ? (behind / period).rounded(.up) : 0
-            clock.wait(until: anchor.advanced(by: .seconds(refreshes * period)), tolerance: .zero)
+            let target = grid.advanced(by: .seconds(refreshes * period))
+            clock.wait(until: target, tolerance: .zero)
+            lastPacedQuery = target
         }
 
-        /// How far past the compositor's predicted presentation the frame is posed for: one
-        /// refresh while the half-rate pacing's rendered frames land a refresh late, where the
-        /// display then shows them; nothing otherwise.
+        /// How far past the compositor's predicted presentation (one refresh after the frame is
+        /// taken) the frame is posed for: the refreshes of the pacing's cadence beyond that
+        /// first one, where the display shows a paced frame; nothing without the pacing.
         private func presentationLeadSeconds() -> TimeInterval {
-            deadlineLock.withLock { pacingActiveNow && halfRate.framesLandLate ? currentFrameTime.period : 0 }
+            deadlineLock.withLock { pacingActiveNow ? Double(halfRate.cadenceRefreshes - 1) * currentFrameTime.period : 0 }
         }
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
@@ -1259,9 +1274,6 @@
                 let submitStart = CACurrentMediaTime()
             #endif
             commandBuffer.commit()
-            if primary {
-                lastRenderedCommandBuffer = commandBuffer
-            }
             #if ENGINE_STATS_ENABLED
                 let submitMs = (CACurrentMediaTime() - submitStart) * 1000.0
                 let renderTotalMs = (CACurrentMediaTime() - renderTotalStart) * 1000.0
@@ -1444,7 +1456,7 @@
                     case .automatic: mode = "automatic"
                     }
                     let meanOverrunMs = secondOverrunSumMs / Double(secondLate)
-                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? "; half rate" : "")
+                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes", halfRate.cadenceRefreshes) : "")
                     // With the GPU pass timing on, the heaviest passes of the last resolved frame
                     // name what a second of frames well past the deadline spent its time on.
                     if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {

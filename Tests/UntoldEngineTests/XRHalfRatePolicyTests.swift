@@ -12,8 +12,8 @@
 import XCTest
 
 /// The half-rate pacing enters after two seconds of mostly late frames with no wait left to
-/// skip, aims the pose a refresh later while the rendered frames land late, and leaves after
-/// two seconds in which the frames' GPU work fitted most of a refresh.
+/// skip, spaces the frames by the refreshes their GPU work with its encode needs, and leaves
+/// after two seconds in which the frames' GPU work fitted most of a refresh.
 final class XRHalfRatePolicyTests: XCTestCase {
     private let period = 10.0
 
@@ -56,16 +56,24 @@ final class XRHalfRatePolicyTests: XCTestCase {
         XCTAssertFalse(policy.active)
     }
 
-    func testWhileActiveThePoseAimsLaterOnlyWhileTheFramesLandLate() {
+    func testWhileActiveTheCadenceFollowsTheGPUCostWithItsEncode() {
         var policy = XRHalfRatePolicy()
         _ = lateSecond(&policy)
         _ = lateSecond(&policy)
         XCTAssertTrue(policy.active)
-        XCTAssertFalse(policy.framesLandLate)
-        XCTAssertEqual(policy.secondEnded(frames: 50, late: 40, meanOverrunMs: 0.5, maxGPUDurationMs: 12.0, periodMs: period, waitStillToSkip: false), .none)
-        XCTAssertTrue(policy.framesLandLate)
-        XCTAssertEqual(policy.secondEnded(frames: 50, late: 5, meanOverrunMs: 0.1, maxGPUDurationMs: 12.0, periodMs: period, waitStillToSkip: false), .none)
-        XCTAssertFalse(policy.framesLandLate)
+        XCTAssertEqual(policy.cadenceRefreshes, 2)
+        // 12 ms of GPU work and 3 ms of encode fit two refreshes of 10 ms.
+        XCTAssertEqual(policy.secondEnded(frames: 50, late: 50, meanOverrunMs: 8.0, maxGPUDurationMs: 12.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 2)
+        // 18 ms and 3 ms need three.
+        XCTAssertEqual(policy.secondEnded(frames: 33, late: 33, meanOverrunMs: 8.0, maxGPUDurationMs: 18.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 3)
+        // Never more than four.
+        XCTAssertEqual(policy.secondEnded(frames: 20, late: 20, meanOverrunMs: 8.0, maxGPUDurationMs: 60.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 4)
+        // Never fewer than two while active.
+        XCTAssertEqual(policy.secondEnded(frames: 50, late: 50, meanOverrunMs: 8.0, maxGPUDurationMs: 9.0, periodMs: period, waitStillToSkip: false), .none)
+        XCTAssertEqual(policy.cadenceRefreshes, 2)
         XCTAssertTrue(policy.active)
     }
 
@@ -77,7 +85,7 @@ final class XRHalfRatePolicyTests: XCTestCase {
         XCTAssertTrue(policy.active)
         XCTAssertEqual(goodSecond(&policy, maxGPU: 7.9), .left)
         XCTAssertFalse(policy.active)
-        XCTAssertFalse(policy.framesLandLate)
+        XCTAssertEqual(policy.cadenceRefreshes, 2)
     }
 
     func testAHeavySecondWhileActiveStartsTheFitCountAgain() {
