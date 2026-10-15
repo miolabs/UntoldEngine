@@ -86,9 +86,11 @@ public enum RenderingProperty: Sendable {
     /// frustum keeps. In scene units; the default is 0.5. See
     /// `getOcclusionCullingMaxCameraStep()` to read the current value.
     case occlusionCullingMaxCameraStep(Float)
-    /// The fewest mesh entities in the culling set for which the occlusion test runs and the
-    /// depth pyramid it reads is built and its depth copied, every frame. 2 by default: one
-    /// entity hides nothing but itself. A scene with splats keeps the pyramid regardless.
+    /// The fewest objects in the culling set for which the occlusion test runs and the depth
+    /// pyramid it reads is built and its depth copied, every frame. An entity with its
+    /// children is one object: the parts of a model loaded from a file hide nothing but
+    /// themselves. 2 by default: one object hides nothing but itself. A scene with splats
+    /// keeps the pyramid regardless.
     case occlusionCullingMinimumEntities(Int)
     /// Whether the XR frame is drawn through the rasterization rate maps the visionOS
     /// compositor provides when the layer is configured with foveation enabled

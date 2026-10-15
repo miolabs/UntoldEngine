@@ -655,6 +655,8 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     var entityAABBContainer: [EntityAABB] = []
     entityAABBContainer.reserveCapacity(sceneSnapshot.entityCapacity) // Pre-allocate to avoid reallocation churn
+    // The objects the entities belong to (an entity with its children), for the pyramid's gate.
+    var objects = Set<EntityID>()
 
     let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
 
@@ -690,6 +692,8 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             }
         }
 
+        objects.insert(sceneSnapshot.object(of: entity))
+
         // In XR stereo mode, use a single AABB per entity.  The tighter sub-AABBs
         // produced by segmentation amplify temporal false-culling from 90 Hz head-
         // tracking drift and cause segment-level occlusion popping.  The unsegmented
@@ -719,6 +723,7 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     }
 
     let count = entityAABBContainer.count
+    let objectCount = objects.count
 
     // ensure we have enough capacity
     entityAABBTripleBuffer.ensureCapacity(count)
@@ -803,7 +808,7 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         // few centimetres apart, the frames a camera step. The per-eye pyramids
         // (hzbDepthPyramidEye) are allocated, but nothing renders the per-eye depth they
         // would be built from.
-        renderInfo.hzbCandidateCount = count
+        renderInfo.hzbCandidateCount = objectCount
         let ran0 = executeHZBOcclusionCulling(
             commandBuffer,
             cameraPosition: eyePosition(ofView: SceneRootTransform.shared.effectiveViewMatrix(renderInfo.xrEye0View)),
@@ -860,7 +865,7 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     } else {
         // Mono path (macOS / non-stereo)
-        renderInfo.hzbCandidateCount = count
+        renderInfo.hzbCandidateCount = objectCount
         let didRunOcclusion = executeHZBOcclusionCulling(
             commandBuffer,
             cameraPosition: eyePosition(ofView: effectiveViewMatrix),
@@ -990,6 +995,8 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
 
     var entityAABBContainer: [EntityAABB] = []
     entityAABBContainer.reserveCapacity(sceneSnapshot.entityCapacity) // Pre-allocate to avoid reallocation churn
+    // The objects the entities belong to (an entity with its children), for the pyramid's gate.
+    var objects = Set<EntityID>()
 
     let smallObjectCulling = SmallObjectCulling.forCurrentFrame()
 
@@ -1025,6 +1032,8 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             }
         }
 
+        objects.insert(sceneSnapshot.object(of: entity))
+
         // get object AABB — elongated meshes are split into segments.
         let segments = makeSegmentedEntityAABBs(
             localMin: localTransformComponent.boundingBox.min,
@@ -1037,6 +1046,7 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     }
 
     let count = entityAABBContainer.count
+    let objectCount = objects.count
 
     // ensure we have enough capacity
     entityAABBTripleBuffer.ensureCapacity(count)
@@ -1174,7 +1184,7 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
     let finalVisibleCountBuffer = visibleCountTriple.bufferForWrite(frame: submitFrameIndex)
     let finalVisibilityBuffer = visibilityTriple.bufferForWrite(frame: submitFrameIndex)
 
-    renderInfo.hzbCandidateCount = count
+    renderInfo.hzbCandidateCount = objectCount
     let didRunOcclusion = executeHZBOcclusionCulling(
         commandBuffer,
         cameraPosition: eyePosition(ofView: effectiveViewMatrix),
@@ -1252,15 +1262,18 @@ public enum HZBOcclusionCulling {
     /// `setRendering(.occlusionCullingMaxCameraStep(_:))`.
     nonisolated(unsafe) static var maxCameraStep: Float = 0.5
 
-    /// The fewest mesh entities in the culling set for which the test, and the depth pyramid
-    /// it reads, built from a copy of the frame's depth every frame, are worth their cost:
-    /// below it nothing can hide anything. 2 by default, since one entity hides nothing but
-    /// itself. A frame with splat entities keeps the pyramid regardless: their cull reads it.
-    /// Set it with `setRendering(.occlusionCullingMinimumEntities(_:))`.
+    /// The fewest objects in the culling set for which the test, and the depth pyramid it
+    /// reads, built from a copy of the frame's depth every frame, are worth their cost: below
+    /// it nothing can hide anything. An object is an entity with its children: a model loaded
+    /// from a file is one entity per node under the entity it was set on, and the test
+    /// never hides one part of a model behind another, their bounds overlapping. 2 by
+    /// default, since one object hides nothing but itself. A frame with splat entities keeps
+    /// the pyramid regardless: their cull reads it. Set it with
+    /// `setRendering(.occlusionCullingMinimumEntities(_:))`.
     nonisolated(unsafe) static var minimumEntities: Int = 2
 
     /// Whether the frame's depth is worth a pyramid: the test is on, and the scene has enough
-    /// mesh entities or any splats for it to hide something next frame.
+    /// objects or any splats for it to hide something next frame.
     static func pyramidWanted() -> Bool {
         guard maxCameraStep > 0 else { return false }
         if renderInfo.hzbCandidateCount >= minimumEntities { return true }
@@ -1269,7 +1282,8 @@ public enum HZBOcclusionCulling {
     }
 }
 
-/// The fewest mesh entities for which the occlusion test runs and its depth pyramid is built.
+/// The fewest objects (entities with their children) for which the occlusion test runs and
+/// its depth pyramid is built.
 public func getOcclusionCullingMinimumEntities() -> Int {
     HZBOcclusionCulling.minimumEntities
 }

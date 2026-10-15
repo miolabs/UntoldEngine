@@ -125,9 +125,9 @@ public struct RenderInfo {
         perFragmentLightingBuilt ? forwardRenderPassDescriptor : offscreenRenderPassDescriptor
     }
 
-    /// The mesh entities the frame's culling put to the occlusion test (the culling set's
-    /// size), which decides with `HZBOcclusionCulling.minimumEntities` whether the frame's
-    /// depth is worth a pyramid.
+    /// The objects the frame's culling put to the occlusion test: entities with their
+    /// children, so a model's parts count as one. With `HZBOcclusionCulling.minimumEntities`
+    /// it decides whether the frame's depth is worth a pyramid.
     public var hzbCandidateCount: Int = 0
     /// Whether the output transform pass follows the temporal resolve directly in the frame's
     /// graph (nothing registered between them), so the resolve may present the frame itself
