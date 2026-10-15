@@ -1135,6 +1135,7 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var bypassPostProcessingValue: Bool = false
     private var xrFoveatedRenderingEnabledValue: Bool = true
     private var xrOptimalInputWaitModeValue: XRInputWaitMode = .automatic
+    private var shadowSoftnessBeforeSystemValue: ShadowSoftnessSettings?
     private var antiAliasingModeValue: AntiAliasingMode = .fxaa
     private var renderDebugViewModeValue: RenderDebugViewMode = .lit
     private var pomQualitySettingsValue: POMQualitySettings = .platformDefault
@@ -1668,6 +1669,20 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         }
     }
 
+    var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
+        get {
+            lock.lock()
+            let value = shadowSoftnessBeforeSystemValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            shadowSoftnessBeforeSystemValue = newValue
+            lock.unlock()
+        }
+    }
+
     var antiAliasingMode: AntiAliasingMode {
         get {
             lock.lock()
@@ -2180,6 +2195,13 @@ public var xrFoveatedRenderingEnabled: Bool {
 public var xrOptimalInputWaitMode: XRInputWaitMode {
     get { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode }
     set { RuntimeGlobalsStore.shared.xrOptimalInputWaitMode = newValue }
+}
+
+/// The sun shadow's softness set while no shadow system existed, for the system the renderer
+/// creates next. See `setShadowSoftness`.
+var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
+    get { RuntimeGlobalsStore.shared.shadowSoftnessBeforeSystem }
+    set { RuntimeGlobalsStore.shared.shadowSoftnessBeforeSystem = newValue }
 }
 
 /// Selects the active anti-aliasing pass inserted after the look pass.
