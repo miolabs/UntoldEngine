@@ -1387,7 +1387,17 @@
                     case .never: mode = "never"
                     case .automatic: mode = "automatic"
                     }
-                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@)", secondLate, secondFrames, secondWorstMs, secondOverrunSumMs / Double(secondLate), deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited")
+                    let meanOverrunMs = secondOverrunSumMs / Double(secondLate)
+                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited")
+                    // With the GPU pass timing on, the heaviest passes of the last resolved frame
+                    // name what a second of frames well past the deadline spent its time on.
+                    if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {
+                        let passes = GPUPassTiming.shared.lastFrame().passes.sorted { $0.totalMs > $1.totalMs }.prefix(3)
+                        if !passes.isEmpty {
+                            let heaviest = passes.map { String(format: "%@ %.2f ms", $0.label, $0.totalMs) }.joined(separator: ", ")
+                            report = (report ?? "") + "\nXR frame timing: the heaviest passes of the last frame: " + heaviest
+                        }
+                    }
                 }
                 // The automatic mode: stop waiting once a second had late frames (one in
                 // twenty or more); wait again once a second's least slack would have covered
