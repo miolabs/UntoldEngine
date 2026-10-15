@@ -211,17 +211,12 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
 
         initScriptingSystem()
 
-        // Create defautls objects.
-        let gameCamera = createEntity()
-        setEntityName(entityId: gameCamera, name: "Main Camera")
-        createGameCamera(entityId: gameCamera)
-
-        let light = createEntity()
-        setEntityName(entityId: light, name: "Directional Light")
-        createDirLight(entityId: light)
-
-        setCamera(.active(gameCamera))
-        setDirectionalLight(.active(light))
+        // The default objects: a camera, which every path needs (on the headset it carries the
+        // head pose), and a sun, which the configuration decides and the headset by default
+        // does not get: in passthrough the room's light is the ARKit probe's, and a sun the room
+        // does not have would light and shadow the scene until the app replaced it; in full
+        // immersion the environment carries the light, and a sun is the app's to add.
+        createDefaultEntities(sun: configuration.defaultSun ?? !renderInfo.isXRStereoMode)
 
         #if os(visionOS)
             BatchingSystem.shared.applyRuntimeBatchingTuning(.visionOSBalanced)
@@ -230,6 +225,23 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         #endif
 
         Logger.log(message: "Untold Engine Starting. Version 0.23.0")
+    }
+
+    /// The default camera, made active, and with `sun` the default directional light, made
+    /// active too: what a scene has before the app adds anything.
+    @discardableResult
+    func createDefaultEntities(sun: Bool) -> (camera: EntityID, sun: EntityID?) {
+        let gameCamera = createEntity()
+        setEntityName(entityId: gameCamera, name: "Main Camera")
+        createGameCamera(entityId: gameCamera)
+        setCamera(.active(gameCamera))
+        guard sun else { return (gameCamera, nil) }
+
+        let light = createEntity()
+        setEntityName(entityId: light, name: "Directional Light")
+        createDirLight(entityId: light)
+        setDirectionalLight(.active(light))
+        return (gameCamera, light)
     }
 
     public func initSizeableResources() {
