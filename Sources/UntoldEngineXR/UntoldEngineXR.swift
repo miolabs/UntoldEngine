@@ -88,6 +88,16 @@
         /// update: the game posed those frames for a slightly different instant than the head.
         public private(set) var presentationTimeRevisions = 0
         private var lastPresentationRevisionLogTime: CFTimeInterval = 0
+        /// Frames whose GPU work finished after the compositor's rendering deadline: the display
+        /// showed the previous frame again and this one a refresh late, posed for an instant
+        /// already past — a hop in a moving object that no counter of the loop's pacing sees.
+        public var deadlineMisses: Int { deadlineLock.withLock { deadlineMissCount } }
+        /// The longest a frame's GPU work finished after its deadline, in milliseconds.
+        public var worstDeadlineOverrunMs: Double { deadlineLock.withLock { worstOverrunMs } }
+        private let deadlineLock = NSLock()
+        private var deadlineMissCount = 0
+        private var worstOverrunMs = 0.0
+        private var lastDeadlineLogTime: CFTimeInterval = 0
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
         /// The layer's depth format and the drawable's depth range (far, near), once a drawable
@@ -1135,13 +1145,20 @@
 
             EngineProfiler.shared.attach(to: commandBuffer, label: "XRFrame")
 
+            // The instant the GPU must have finished by for the compositor to show this frame at
+            // its presentation time, in the base of the command buffer's own timestamps.
+            let deadline = Self.mediaTime(of: drawable.frameTiming.renderingDeadline)
+            let countsDeadline = primary
             // Add completion handler to signal semaphore when GPU work is done
-            commandBuffer.addCompletedHandler { cb in
+            commandBuffer.addCompletedHandler { [weak self] cb in
                 #if ENGINE_STATS_ENABLED
                     // The frame's GPU time beyond the previous frame's: the two overlap on the
                     // GPU, and the command buffer's own span would count the overlap twice.
                     EngineStatsMonitor.shared.recordGPUCompletion(gpuStartTime: cb.gpuStartTime, gpuEndTime: cb.gpuEndTime)
                 #endif
+                if countsDeadline {
+                    self?.noteGPUCompletion(at: cb.gpuEndTime, deadline: deadline)
+                }
                 commandBufferSemaphore.signal()
             }
 
@@ -1301,6 +1318,24 @@
             let epochBased = Self.mediaTime(of: LayerRenderer.Clock().now)
             let mediaTime = CACurrentMediaTime()
             print(String(format: "XR clock: the compositor epoch's time differs from the media time by %.3f ms", (epochBased - mediaTime) * 1000.0))
+        }
+
+        /// Counts a frame whose GPU work finished after the compositor's rendering deadline, and
+        /// keeps the longest overrun. Runs on the GPU's completion thread.
+        private func noteGPUCompletion(at gpuEnd: CFTimeInterval, deadline: TimeInterval) {
+            let overrunMs = (gpuEnd - deadline) * 1000.0
+            guard overrunMs > 0 else { return }
+            deadlineLock.lock()
+            deadlineMissCount += 1
+            worstOverrunMs = max(worstOverrunMs, overrunMs)
+            let count = deadlineMissCount
+            let now = CACurrentMediaTime()
+            let logs = count == 1 || now - lastDeadlineLogTime >= 1.0
+            if logs { lastDeadlineLogTime = now }
+            deadlineLock.unlock()
+            if logs {
+                print(String(format: "XR frame timing: the GPU finished %.2f ms after the rendering deadline (%d late frames so far)", overrunMs, count))
+            }
         }
 
         /// Counts the frames whose final presentation time (the drawable's) differs from the
