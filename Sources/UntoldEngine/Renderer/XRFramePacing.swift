@@ -26,13 +26,15 @@ public enum XRFramePacing: Sendable, Equatable {
 /// The half-rate decision from each second's deadline measurements. Enter when, with no wait
 /// for the optimal input time left to skip, half the frames or more were late by over a
 /// millisecond on average for two seconds running; leave when the rendered frames' GPU work
-/// has fitted 80% of the refresh for two seconds running.
+/// has fitted 80% of the refresh for two seconds running. While active, the refreshes between
+/// two frames follow the measured GPU cost: two, or more when a frame's work with its encode
+/// does not fit two.
 public struct XRHalfRatePolicy: Equatable, Sendable {
-    /// Whether the frames are being paced to every other refresh.
+    /// Whether the frames are being paced to every other refresh (or more).
     public private(set) var active = false
-    /// Whether the last second's rendered frames mostly landed a refresh late: the pose then
-    /// aims one refresh later, where the display shows them.
-    public private(set) var framesLandLate = false
+    /// Refreshes between two frames while active: the fewest the frame's GPU work with its
+    /// encode fits, two at least, four at most.
+    public private(set) var cadenceRefreshes = 2
     private(set) var lateSeconds = 0
     private(set) var fitSeconds = 0
 
@@ -47,6 +49,10 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
 
     /// The share of a refresh the rendered frames' GPU work must fit for the pacing to end.
     public static let fitShare = 0.8
+    /// The CPU encode allowed for between the frame's query and its GPU work, in milliseconds,
+    /// when the cadence is chosen.
+    public static let encodeAllowanceMs = 3.0
+    public static let mostRefreshes = 4
 
     /// A second of frames ended: `frames` rendered, `late` of them past the deadline by
     /// `meanOverrunMs` on average, the longest GPU span among them `maxGPUDurationMs`, the
@@ -55,7 +61,7 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
         guard frames > 0 else { return .none }
         let mostlyLate = late * 2 >= frames
         if !active {
-            framesLandLate = false
+            cadenceRefreshes = 2
             if !waitStillToSkip, mostlyLate, meanOverrunMs > 1.0 {
                 lateSeconds += 1
             } else {
@@ -68,7 +74,10 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
             }
             return .none
         }
-        framesLandLate = mostlyLate
+        if periodMs > 0 {
+            let needed = Int(((maxGPUDurationMs + Self.encodeAllowanceMs) / periodMs).rounded(.up))
+            cadenceRefreshes = min(Self.mostRefreshes, max(2, needed))
+        }
         if periodMs > 0, maxGPUDurationMs < Self.fitShare * periodMs {
             fitSeconds += 1
         } else {
@@ -77,7 +86,7 @@ public struct XRHalfRatePolicy: Equatable, Sendable {
         if fitSeconds >= 2 {
             active = false
             fitSeconds = 0
-            framesLandLate = false
+            cadenceRefreshes = 2
             return .left
         }
         return .none
