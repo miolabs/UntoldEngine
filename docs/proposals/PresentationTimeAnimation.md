@@ -118,12 +118,30 @@ Recommendation: A. It fixes the judder with no budget change. If fresher input m
 
 The compositor part cannot run in `swift test`; section 8 is its check.
 
-## 8. Headset check (to do)
+## 8. Headset check
 
 1. The start-up line `XR clock: the compositor epoch's time differs from the media time by N ms`: N should be the microseconds between two reads. A large constant N means the epoch assumption is wrong and the loop must go back to converting through "now" on both clocks.
 2. `presentationTimeRevisions` (and its log line) over a minute of the tour: near zero means the predicted and final presentation times agree and the object is posed for the head's instant; a steady count means the prediction is revised by the compositor and the game should be posed for the drawable's time instead (option B's place), or the revision applied as a per-frame correction.
 3. The viewer's run summary: "N skipped refreshes" over the run against the fps shortfall (6 in 100, 5 in 90): they should match. "N presentation revisions" is check 2.
 4. The tour, with the viewer's change of section 3.4: the small per-frame steps should be gone; the occasional larger jump remains for every skipped refresh and should now be one clean double step with no drift after it.
+
+### Results, 2026-10-15, the viewer's dartboard tour at 90 Hz
+
+1. `XR clock: the compositor epoch's time differs from the media time by -0.000 ms`: the clock bases agree.
+2. Presentation revisions: none. The drawable's presentation time is the one predicted at the update.
+3. Skipped refreshes: none. The loop never saw a presentation slot go by without a frame.
+4. The small per-frame steps are gone. A hop remained on the tour's lateral sweep only (0.63 m/s peak, 0.15° per frame at 2.37 m, where a frame shown a refresh late is a 12 mm sideways hop), with every counter above at zero.
+
+The hop is the GPU finishing after the compositor's rendering deadline, which no counter of the loop's pacing sees; `deadlineMisses` and its per-second line (`XR frame timing: the GPU finished after the rendering deadline on N of M frames in the last second`) found it:
+
+| Run | Late frames per second | Mean overrun | Worst |
+| --- | --- | --- | --- |
+| Wait for the optimal input time (default), board close | 80 to 91 of 90 | 0.5 to 1.3 ms | 2.6 ms |
+| The same, board far (fewer pixels) | 15 to 44 of 90 | 0.2 to 0.7 ms | 3.0 ms |
+| `setRendering(.optimalInputWait(.disabled))`: encode right after the update | 56 of 92 | 0.42 ms | 2.2 ms |
+| A room probe's prefilter, either run, for about six seconds | every frame, at 71 to 78 fps | 5 to 15 ms | 21 ms |
+
+The compositor keeps some slack past its stated deadline (the loop still gets 90 frames a second with nearly every frame a millisecond late), and the frames beyond that slack are the hops. Encoding right after the update starts the GPU about 6 ms earlier and brought the hops down to a few; it does not make the frames finish before the deadline, so the frame's GPU work is close to the whole window. The remedies, in order of what they keep: late-latching the head pose (encode before the wait, write the eye matrices after it: the early GPU start and the fresh head pose), cutting the frame's GPU cost (the temporal resolve, the render quality), and spreading a probe's prefilter over frames so a new probe does not cost six seconds at 74 fps.
 
 ## 9. Size, and the risk to the three draft pull requests
 
@@ -143,4 +161,5 @@ Behaviour changes to note in review: `timeSinceLastUpdate` is the presentation d
 - A `TransformTrackComponent` with a system that samples it at `currentFrameTime.presentationTime` every frame, so a track plays with no game code; `TransformTrack` is the value type it would hold.
 - `updateCameraPath(frame:)` sampling from an absolute time.
 - A presented-time feedback for the `MTKView` estimate (section 6).
-- A late-input hook after the wait (section 4).
+- A late-input hook after the wait (section 4), or its stronger form from the headset results: late-latching the head pose, so the frame is encoded before the wait and only the eye matrices are written after it.
+- The room probe's prefilter spread over frames (section 8).
