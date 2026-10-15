@@ -14,8 +14,9 @@ import simd
 import XCTest
 
 /// The depth pyramid, and the depth copy that feeds it, are built only for a frame whose depth
-/// could hide something next frame: the occlusion test on, and enough mesh entities (or any
-/// splats) in the scene. The GPU's own pass timing says which passes ran.
+/// could hide something next frame: the occlusion test on, and enough objects (entities with
+/// their children, or any splats) in the scene. The GPU's own pass timing says which passes
+/// ran.
 @MainActor
 final class HZBPyramidGateTests: BaseRenderSetup {
     private var savedMinimum = 2
@@ -95,5 +96,31 @@ final class HZBPyramidGateTests: BaseRenderSetup {
         passes = passesRun()
         XCTAssertFalse(passes.contains("HZB"), "the test off: no pyramid")
         XCTAssertFalse(passes.contains("DepthCopy"))
+    }
+
+    func testTheModelsPartsCountAsOneObject() throws {
+        try XCTSkipUnless(renderInfo.device.supportsCounterSampling(.atStageBoundary), "no pass timing here")
+        // A model loaded from a file is one entity per node under the entity it was set on:
+        // its parts hide nothing but themselves, so they count as one object, like the box.
+        let model = createEntity()
+        for part in 0 ..< 3 {
+            let entity = createEntity()
+            setEntityMeshDirect(entityId: entity, meshes: BasicPrimitives.createCube(extent: 0.3), assetName: "Part\(part)")
+            setParent(childId: entity, parentId: model, offset: simd_float3(0.8 + Float(part) * 0.4, 0.5, -1))
+        }
+        setVisibleEntities()
+        setRendering(.occlusionCullingMinimumEntities(2))
+        setRendering(.occlusionCullingMaxCameraStep(0.5))
+        var passes = passesRun()
+        XCTAssertEqual(renderInfo.hzbCandidateCount, 2, "the box and the model, not the box and three parts")
+        XCTAssertTrue(passes.contains("HZB"), "two objects: the pyramid is built: \(passes.sorted())")
+
+        // Three parts and a box are four entities but two objects: below a minimum of three.
+        setRendering(.occlusionCullingMinimumEntities(3))
+        passes = passesRun()
+        XCTAssertEqual(renderInfo.hzbCandidateCount, 2)
+        XCTAssertFalse(passes.contains("HZB"), "two objects below a minimum of three: no pyramid: \(passes.sorted())")
+        XCTAssertFalse(passes.contains("DepthCopy"))
+        XCTAssertFalse(renderInfo.hzbIsValid)
     }
 }

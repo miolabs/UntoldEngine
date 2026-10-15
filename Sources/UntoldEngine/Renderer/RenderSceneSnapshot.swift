@@ -169,6 +169,18 @@ struct RenderSceneSnapshot {
         component(.tileLODTag, pools.tileLODTag, of: entity)
     }
 
+    /// The object `entity` is drawn as a part of: its parent in the scenegraph when it has
+    /// one, else itself. A model loaded from a file is one entity per node under the entity
+    /// the model was set on, so the parts of one model share this.
+    @inline(__always)
+    func object(of entity: Entity) -> EntityID {
+        guard entities[entity.index].mask.test(ids.scenegraph),
+              let scenegraph = pools.scenegraph?.component(at: entity.index, as: ScenegraphComponent.self),
+              scenegraph.parent != .invalid
+        else { return entity.entityId }
+        return scenegraph.parent
+    }
+
     /// The scene channels of `entity`: those of its channel component, or the ones an
     /// entity without the component gets from its name.
     @inline(__always)
@@ -208,6 +220,7 @@ struct RenderSceneSnapshot {
         let deformation = getComponentId(for: DeformationComponent.self)
         let skeleton = getComponentId(for: SkeletonComponent.self)
         let tileLODTag = getComponentId(for: TileLODTagComponent.self)
+        let scenegraph = getComponentId(for: ScenegraphComponent.self)
 
         @inline(__always)
         func traits(of mask: ComponentMask) -> RenderEntityTraits {
@@ -245,6 +258,7 @@ struct RenderSceneSnapshot {
         let tileRepresentationFade: ComponentPool?
         let deformation: ComponentPool?
         let tileLODTag: ComponentPool?
+        let scenegraph: ComponentPool?
 
         init(ids: ComponentIds, scene: Scene) {
             render = scene.componentPool[ids.render]
@@ -257,6 +271,7 @@ struct RenderSceneSnapshot {
             tileRepresentationFade = scene.componentPool[ids.tileRepresentationFade]
             deformation = scene.componentPool[ids.deformation]
             tileLODTag = scene.componentPool[ids.tileLODTag]
+            scenegraph = scene.componentPool[ids.scenegraph]
         }
     }
 }
