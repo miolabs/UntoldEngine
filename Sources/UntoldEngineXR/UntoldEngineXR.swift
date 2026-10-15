@@ -109,6 +109,11 @@
         private var secondLeastSlackMs = Double.infinity
         private var secondSkippedWaitMaxMs = 0.0
         private var secondGPUSumMs = 0.0
+        /// The frames' GPU time after the frame before finished: the span of a frame's command
+        /// buffer starts when the GPU takes it, which with frames queued is before the frame
+        /// before is done, so the span overstates the frame's own work.
+        private var secondOwnGPUSumMs = 0.0
+        private var lastGPUEndTime: CFTimeInterval = 0
         private var secondPacedWaitSumMs = 0.0
         private var secondPacedWaits = 0
         /// The last second's frames past the deadline by more than its usable margin before the
@@ -1503,6 +1508,8 @@
             let gpuMs = (gpuEnd - gpuStart) * 1000.0
             secondMaxGPUMs = max(secondMaxGPUMs, gpuMs)
             secondGPUSumMs += gpuMs
+            secondOwnGPUSumMs += max(0, (gpuEnd - max(gpuStart, lastGPUEndTime)) * 1000.0)
+            lastGPUEndTime = max(lastGPUEndTime, gpuEnd)
             if overrunMs > 0 {
                 deadlineMissCount += 1
                 secondLate += 1
@@ -1525,7 +1532,7 @@
                     }
                     let meanOverrunMs = secondLate > 0 ? secondOverrunSumMs / Double(secondLate) : 0
                     report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far; input-time wait %@, %@%@)", secondLate, secondFrames, secondWorstMs, meanOverrunMs, deadlineMissCount, mode, lastFrameWaited ? "waited" : "not waited", pacingActiveNow ? String(format: "; half rate, every %d refreshes, landing +%d", halfRate.cadenceRefreshes, halfRate.landingRefreshes) : "")
-                    report = (report ?? "") + String(format: "; GPU %.1f ms a frame, longest %.1f%@", secondGPUSumMs / Double(secondFrames), secondMaxGPUMs, secondPacedWaits > 0 ? String(format: ", paced wait %.1f ms", secondPacedWaitSumMs / Double(secondPacedWaits)) : "")
+                    report = (report ?? "") + String(format: "; GPU %.1f ms a frame (%.1f ms its own after the frame before), longest %.1f%@", secondGPUSumMs / Double(secondFrames), secondOwnGPUSumMs / Double(secondFrames), secondMaxGPUMs, secondPacedWaits > 0 ? String(format: ", paced wait %.1f ms", secondPacedWaitSumMs / Double(secondPacedWaits)) : "")
                     report = (report ?? "") + String(format: "; %d past the deadline's margin, %d refreshes skipped", secondMissed, secondSkipped)
                     if secondTimedFrames > 0 {
                         let timed = Double(secondTimedFrames)
@@ -1534,13 +1541,15 @@
                     if secondSpacings > 0 {
                         report = (report ?? "") + String(format: "; presentations spaced %.1f ms (%.1f to %.1f)", secondSpacingSumMs / Double(secondSpacings), secondSpacingMinMs, secondSpacingMaxMs)
                     }
-                    // With the GPU pass timing on, the heaviest passes of the last resolved frame
-                    // name what a second of frames well past the deadline spent its time on.
+                    // With the GPU pass timing on, every pass of the last resolved frame, heaviest
+                    // first, with their sum: what a second of frames well past the deadline spent
+                    // its time on, and how much of the frame's span lies between passes.
                     if meanOverrunMs > 2.0, GPUPassTiming.shared.isEnabled {
-                        let passes = GPUPassTiming.shared.lastFrame().passes.sorted { $0.totalMs > $1.totalMs }.prefix(3)
+                        let passes = GPUPassTiming.shared.lastFrame().passes.sorted { $0.totalMs > $1.totalMs }
                         if !passes.isEmpty {
-                            let heaviest = passes.map { String(format: "%@ %.2f ms", $0.label, $0.totalMs) }.joined(separator: ", ")
-                            report = (report ?? "") + "\nXR frame timing: the heaviest passes of the last frame: " + heaviest
+                            let sum = passes.reduce(0.0) { $0 + $1.totalMs }
+                            let list = passes.map { String(format: "%@ %.2f", $0.label, $0.totalMs) }.joined(separator: ", ")
+                            report = (report ?? "") + String(format: "\nXR frame timing: the last frame's passes, %.1f ms in all (a label sums both eyes): ", sum) + list
                         }
                     }
                 }
@@ -1585,6 +1594,7 @@
                 secondSkippedWaitMaxMs = 0
                 secondMaxGPUMs = 0
                 secondGPUSumMs = 0
+                secondOwnGPUSumMs = 0
                 secondPacedWaitSumMs = 0
                 secondPacedWaits = 0
                 secondMissed = 0
