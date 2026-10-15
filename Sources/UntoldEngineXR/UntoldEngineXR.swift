@@ -98,6 +98,11 @@
         private var deadlineMissCount = 0
         private var worstOverrunMs = 0.0
         private var lastDeadlineLogTime: CFTimeInterval = 0
+        /// The last second's frames: how many, how many late, their worst and summed overruns.
+        private var secondFrames = 0
+        private var secondLate = 0
+        private var secondWorstMs = 0.0
+        private var secondOverrunSumMs = 0.0
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
         /// The layer's depth format and the drawable's depth range (far, near), once a drawable
@@ -660,7 +665,12 @@
             #if ENGINE_STATS_ENABLED
                 let xrWaitStart = CACurrentMediaTime()
             #endif
-            LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
+            // The wait for the compositor's optimal input time: the head pose is queried as late
+            // as the frame allows. Off (a diagnostic), the frame is encoded now, so the GPU
+            // starts about the wait's length earlier and the head is predicted from earlier.
+            if xrOptimalInputWaitEnabled {
+                LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
+            }
             #if ENGINE_STATS_ENABLED
                 let xrWaitMs = (CACurrentMediaTime() - xrWaitStart) * 1000.0
                 EngineStatsMonitor.shared.update { snapshot in
@@ -1320,21 +1330,37 @@
             print(String(format: "XR clock: the compositor epoch's time differs from the media time by %.3f ms", (epochBased - mediaTime) * 1000.0))
         }
 
-        /// Counts a frame whose GPU work finished after the compositor's rendering deadline, and
-        /// keeps the longest overrun. Runs on the GPU's completion thread.
+        /// Counts a frame whose GPU work finished after the compositor's rendering deadline, keeps
+        /// the longest overrun, and prints once a second how many of that second's frames were
+        /// late and by how much. Runs on the GPU's completion thread.
         private func noteGPUCompletion(at gpuEnd: CFTimeInterval, deadline: TimeInterval) {
             let overrunMs = (gpuEnd - deadline) * 1000.0
-            guard overrunMs > 0 else { return }
-            deadlineLock.lock()
-            deadlineMissCount += 1
-            worstOverrunMs = max(worstOverrunMs, overrunMs)
-            let count = deadlineMissCount
             let now = CACurrentMediaTime()
-            let logs = count == 1 || now - lastDeadlineLogTime >= 1.0
-            if logs { lastDeadlineLogTime = now }
+            var report: String?
+            deadlineLock.lock()
+            secondFrames += 1
+            if overrunMs > 0 {
+                deadlineMissCount += 1
+                secondLate += 1
+                secondOverrunSumMs += overrunMs
+                secondWorstMs = max(secondWorstMs, overrunMs)
+                worstOverrunMs = max(worstOverrunMs, overrunMs)
+            }
+            if lastDeadlineLogTime == 0 {
+                lastDeadlineLogTime = now
+            } else if now - lastDeadlineLogTime >= 1.0 {
+                if secondLate > 0 {
+                    report = String(format: "XR frame timing: the GPU finished after the rendering deadline on %d of %d frames in the last second (worst +%.2f ms, mean +%.2f ms; %d late frames so far)", secondLate, secondFrames, secondWorstMs, secondOverrunSumMs / Double(secondLate), deadlineMissCount)
+                }
+                secondFrames = 0
+                secondLate = 0
+                secondWorstMs = 0
+                secondOverrunSumMs = 0
+                lastDeadlineLogTime = now
+            }
             deadlineLock.unlock()
-            if logs {
-                print(String(format: "XR frame timing: the GPU finished %.2f ms after the rendering deadline (%d late frames so far)", overrunMs, count))
+            if let report {
+                print(report)
             }
         }
 

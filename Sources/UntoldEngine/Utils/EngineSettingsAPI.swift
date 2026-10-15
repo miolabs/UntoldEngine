@@ -100,6 +100,13 @@ public enum RenderingProperty: Sendable {
     /// compositor still unwarps, so the picture is distorted. See
     /// `getFoveatedRenderingEnabled()` to read the current value.
     case foveatedRendering(RenderingToggle)
+    /// Whether the XR loop waits for the compositor's optimal input time before it queries the
+    /// head pose and encodes the frame. Enabled by default: the head pose is as fresh as the
+    /// frame allows. Disabled, a diagnostic, the frame is encoded as soon as the update is
+    /// done, so the GPU starts about the wait's length earlier (a frame that finished after
+    /// the rendering deadline may then make it) and the head pose is predicted from earlier,
+    /// which the compositor's reprojection must cover. See `getOptimalInputWaitEnabled()`.
+    case optimalInputWait(RenderingToggle)
     /// Whether the pre-composite pass is skipped on a frame it would only copy the lit scene
     /// (XR passthrough with no environment, splat, ambient-occlusion or gizmo layer to join;
     /// the lit debug view; no render extension). Enabled by default; disabling it runs the
@@ -227,6 +234,10 @@ public func setRendering(_ property: RenderingProperty) {
         xrFoveatedRenderingEnabled = true
     case .foveatedRendering(.disabled):
         xrFoveatedRenderingEnabled = false
+    case .optimalInputWait(.enabled):
+        xrOptimalInputWaitEnabled = true
+    case .optimalInputWait(.disabled):
+        xrOptimalInputWaitEnabled = false
     case .preCompositeBypass(.enabled):
         renderInfo.preCompositeBypassEnabled = true
     case .preCompositeBypass(.disabled):
@@ -263,6 +274,12 @@ public func setRendering(_ property: RenderingProperty) {
 /// provides them. See `RenderingProperty.foveatedRendering`.
 public func getFoveatedRenderingEnabled() -> Bool {
     xrFoveatedRenderingEnabled
+}
+
+/// Whether the XR loop waits for the compositor's optimal input time before it encodes the
+/// frame. See `RenderingProperty.optimalInputWait`.
+public func getOptimalInputWaitEnabled() -> Bool {
+    xrOptimalInputWaitEnabled
 }
 
 public enum RenderResourceQuery {
