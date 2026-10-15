@@ -1,0 +1,106 @@
+diff -ruN a/Viewer/App/EngineSession.swift b/Viewer/App/EngineSession.swift
+--- a/Viewer/App/EngineSession.swift	2026-10-14 23:22:53
++++ b/Viewer/App/EngineSession.swift	2026-10-14 23:22:52
+@@ -103,6 +103,12 @@
+     var textureBudgetMB = 0
+     /// Seconds into the debug tour's loop, or nil when the object stands still.
+     var tourTime: Double?
++    /// Refreshes at which the display showed the previous frame again because the engine's
++    /// next was not ready, over all frames: the fps shortfall. And the frames whose final
++    /// presentation time differed from the one predicted at the update, which the tour's
++    /// pose was taken at.
++    var skippedFrames = 0
++    var presentationRevisions = 0
+     /// The frame's draw calls and triangles, from the engine's own counters.
+     var drawCalls = 0
+     var triangles = 0
+@@ -168,6 +174,8 @@
+     private let lock = NSLock()
+     private var diagnosticsStorage = EngineDiagnostics()
+     private var frames: UInt64 = 0
++    /// Refreshes the display skipped over those frames (the previous frame shown again).
++    private var skippedFrames = 0
+     private var objectName = ""
+     private var phase: OSSignpostIntervalState?
+     /// Exponential moving averages of the GPU time: all frames, and the frames before the object.
+@@ -227,13 +235,16 @@
+             .rotateBy(angle: -50, axis: [.x])
+             .rotateBy(angle: 30, axis: [.y])
+         frames = 0
++        skippedFrames = 0
+         phase = MeasurementRun.signposter.beginInterval("Engine", id: MeasurementRun.signposter.makeSignpostID(), "empty")
+         // A pinch-drag moves the object (closer, farther, up, down): the engine
+         // reports the pinching hand's position from the layer's spatial events.
+         InputSystem.shared.registerXREvents()
+         setInput(.xr(.sceneReady(true)))
++        // The frame's time: the instant the compositor predicts the frame will be shown, which
++        // the head pose is predicted for too, so the tour's pose for it keeps step with the head.
+         xr.setupCallbacks(
+-            gameUpdate: { [weak self] _ in self?.update() },
++            frameUpdate: { [weak self] frame in self?.update(frame: frame) },
+             handleInput: { [weak self] in self?.handleInput() }
+         )
+         let thread = Thread { [self] in
+@@ -326,9 +337,13 @@
+         Self.log.log("engine: \(placement.object.id, privacy: .public) centred at (\(placement.centre.x, format: .fixed(precision: 2)), \(placement.centre.y, format: .fixed(precision: 2)), \(placement.centre.z, format: .fixed(precision: 2))), \(head == nil ? "room frame" : "in front of the wearer", privacy: .public)")
+     }
+ 
+-    /// Once per frame on the render thread.
+-    private func update() {
+-        lock.withLock { frames &+= 1 }
++    /// Once per frame on the render thread, with the frame's time: the instant the compositor
++    /// predicts the frame will be shown.
++    private func update(frame: FrameTime) {
++        lock.withLock {
++            frames &+= 1
++            skippedFrames += frame.skippedFrames
++        }
+         // About a second's window at 90 Hz; the first frames after a mode change are noisy.
+         let timing = EngineStatsMonitor.shared.snapshot().timing
+         let gpu = timing.gpuExecutionMs
+@@ -374,7 +389,11 @@
+         var tourTime: Double?
+         if let object = lock.withLock({ object }) {
+             if Catalog.motionIsTour {
+-                tourTime = (ProcessInfo.processInfo.systemUptime - object.placed).truncatingRemainder(dividingBy: Catalog.Tour.period)
++                // The tour's time at the instant the frame will be shown, not at this update:
++                // the pose then steps by the display's period from one frame to the next, and by
++                // two after a skipped one, instead of by the varying lag of the update behind
++                // the presentation. `placed` is in the same clock base (the system uptime).
++                tourTime = (frame.presentationTime - object.placed).truncatingRemainder(dividingBy: Catalog.Tour.period)
+             }
+             let pose = object.placement.pose(tourTime: tourTime)
+             translateTo(entityId: object.entity, position: pose.position)
+@@ -422,6 +441,8 @@
+             textureMemoryUsedMB: MemoryBudgetManager.shared.getStats().textureMemoryUsed / (1024 * 1024),
+             textureBudgetMB: MemoryBudgetManager.shared.textureBudget / (1024 * 1024),
+             tourTime: tourTime,
++            skippedFrames: lock.withLock { skippedFrames },
++            presentationRevisions: xr?.presentationTimeRevisions ?? 0,
+             drawCalls: stats.render.drawCallsTotal,
+             triangles: stats.render.trianglesTotal,
+             opaqueDrawsLeast: opaqueDrawsLeast == Int.max ? 0 : opaqueDrawsLeast,
+diff -ruN a/Viewer/App/MeasurementRun.swift b/Viewer/App/MeasurementRun.swift
+--- a/Viewer/App/MeasurementRun.swift	2026-10-14 23:22:53
++++ b/Viewer/App/MeasurementRun.swift	2026-10-14 23:22:52
+@@ -213,7 +213,7 @@
+                                   object, d.gpuMilliseconds, d.emptyGpuMilliseconds, d.objectGpuMilliseconds ?? 0, fps, emptyFps,
+                                   d.antiAliasing, d.opaqueSampleCount, d.viewport.x, d.viewport.y,
+                                   d.screenSize.x > 0 ? String(format: " fov %d×%d", d.screenSize.x, d.screenSize.y) : "",
+-                                  d.drawCalls, d.triangles, (d.compositeSkipped ? ", composite skipped" : "") + ", " + d.renderPath + (d.tileLightStage ? " (tile light)" : "") + String(format: ", draws %d plain / %d discarding", d.plainDraws, d.discardingDraws) + (d.foveation ? "" : ", no foveation") + String(format: ", cull set %d", d.cullCandidates) + (d.shadowTaps == 8 ? "" : String(format: ", shadow taps %d", d.shadowTaps)) + (d.opaqueDrawsMost > 0 ? String(format: ", opaque draws %d–%d%@", d.opaqueDrawsLeast, d.opaqueDrawsMost, d.batchedDrawsMost > 0 ? String(format: " + %d batched", d.batchedDrawsMost) : "") : "") + (d.depthFormat.isEmpty ? "" : String(format: ", depth %@ (engine near %.3f)", d.depthFormat, d.nearPlane)) + (d.toneMap == "none" ? "" : ", tone map " + d.toneMap) + String(format: ", textures %d up / %d down, %d at full, %d in flight, %d of %d MB", d.textureUpgrades, d.textureDowngrades, d.textureEntitiesAtFull, d.textureOpsInFlight, d.textureMemoryUsedMB, d.textureBudgetMB) + (d.sun ? "" : ", no sun") + (d.roomLightScale > 0 ? String(format: ", room light scale %.2f (camera ref %.0f, published %.2f) × %.0f", d.roomLightScale, d.roomLightCameraReference, d.roomLightPublished, d.roomLightFactor) : "") + (d.probe.isEmpty ? "" : String(format: ", probe %@, %d publishes (%d updates accepted, %d skipped, last %.0f s ago)", d.probe, d.probePublishes, d.probeAccepted, d.probeSkipped, d.probeAge)) + (d.probeFaces.count == 6 ? String(format: ", probe faces +x %.3f −x %.3f +y %.3f −y %.3f +z %.3f −z %.3f", d.probeFaces[0], d.probeFaces[1], d.probeFaces[2], d.probeFaces[3], d.probeFaces[4], d.probeFaces[5]) : "") + (d.wideGamut ? "" : ", sRGB primaries") + (d.occlusionCull ? "" : ", occlusion off") + (d.taaJitter ? "" : ", jitter off") + (d.textureStreaming ? "" : ", streaming off") + (d.lighting == "room" ? "" : ", studio light") + String(format: ", %d dark frames%@", d.darkFrames, d.darkFrameTimes.isEmpty ? "" : " (tour " + d.darkFrameTimes.map { String(format: "%.1f", $0) }.joined(separator: " ") + " s)") + (d.engineOptimized ? "" : ", UNOPTIMIZED ENGINE") + (d.drawCalls == 0 && d.gpuMilliseconds == 0 ? ", NO ENGINE STATS (build with -DENGINE_STATS_ENABLED)" : ""))
++                                  d.drawCalls, d.triangles, (d.compositeSkipped ? ", composite skipped" : "") + ", " + d.renderPath + (d.tileLightStage ? " (tile light)" : "") + String(format: ", draws %d plain / %d discarding", d.plainDraws, d.discardingDraws) + (d.foveation ? "" : ", no foveation") + String(format: ", cull set %d", d.cullCandidates) + (d.shadowTaps == 8 ? "" : String(format: ", shadow taps %d", d.shadowTaps)) + (d.opaqueDrawsMost > 0 ? String(format: ", opaque draws %d–%d%@", d.opaqueDrawsLeast, d.opaqueDrawsMost, d.batchedDrawsMost > 0 ? String(format: " + %d batched", d.batchedDrawsMost) : "") : "") + (d.depthFormat.isEmpty ? "" : String(format: ", depth %@ (engine near %.3f)", d.depthFormat, d.nearPlane)) + (d.toneMap == "none" ? "" : ", tone map " + d.toneMap) + String(format: ", textures %d up / %d down, %d at full, %d in flight, %d of %d MB", d.textureUpgrades, d.textureDowngrades, d.textureEntitiesAtFull, d.textureOpsInFlight, d.textureMemoryUsedMB, d.textureBudgetMB) + (d.sun ? "" : ", no sun") + (d.roomLightScale > 0 ? String(format: ", room light scale %.2f (camera ref %.0f, published %.2f) × %.0f", d.roomLightScale, d.roomLightCameraReference, d.roomLightPublished, d.roomLightFactor) : "") + (d.probe.isEmpty ? "" : String(format: ", probe %@, %d publishes (%d updates accepted, %d skipped, last %.0f s ago)", d.probe, d.probePublishes, d.probeAccepted, d.probeSkipped, d.probeAge)) + (d.probeFaces.count == 6 ? String(format: ", probe faces +x %.3f −x %.3f +y %.3f −y %.3f +z %.3f −z %.3f", d.probeFaces[0], d.probeFaces[1], d.probeFaces[2], d.probeFaces[3], d.probeFaces[4], d.probeFaces[5]) : "") + (d.wideGamut ? "" : ", sRGB primaries") + (d.occlusionCull ? "" : ", occlusion off") + (d.taaJitter ? "" : ", jitter off") + (d.textureStreaming ? "" : ", streaming off") + (d.lighting == "room" ? "" : ", studio light") + String(format: ", %d dark frames%@", d.darkFrames, d.darkFrameTimes.isEmpty ? "" : " (tour " + d.darkFrameTimes.map { String(format: "%.1f", $0) }.joined(separator: " ") + " s)") + String(format: ", %d skipped refreshes, %d presentation revisions", d.skippedFrames, d.presentationRevisions) + (d.engineOptimized ? "" : ", UNOPTIMIZED ENGINE") + (d.drawCalls == 0 && d.gpuMilliseconds == 0 ? ", NO ENGINE STATS (build with -DENGINE_STATS_ENABLED)" : ""))
+                 summary.append(line)
+                 consoleLine("measure: " + line)
+                 Self.log.log("measure: \(line, privacy: .public)")
+diff -ruN a/Viewer/UI/ControlsView.swift b/Viewer/UI/ControlsView.swift
+--- a/Viewer/UI/ControlsView.swift	2026-10-14 23:22:53
++++ b/Viewer/UI/ControlsView.swift	2026-10-14 23:22:52
+@@ -383,7 +383,7 @@
+                     .lineLimit(2)
+             }
+             Text(engineOpen
+-                ? "engine · \(d.object.isEmpty ? "placing…" : d.object)\(d.tourTime.map { String(format: " · tour %.1f s", $0) } ?? "") · frames \(d.frames) · AA \(d.antiAliasing) ×\(d.opaqueSampleCount) · \(d.viewport.x)×\(d.viewport.y)\(d.screenSize.x > 0 ? " fov \(d.screenSize.x)×\(d.screenSize.y)" : "") · \(gpu)\(fps)\(d.compositeSkipped ? " · composite skipped" : "") · \(d.renderPath)\(d.tileLightStage ? " (tile light)" : "")"
++                ? "engine · \(d.object.isEmpty ? "placing…" : d.object)\(d.tourTime.map { String(format: " · tour %.1f s", $0) } ?? "") · frames \(d.frames)\(d.skippedFrames > 0 ? " (\(d.skippedFrames) skipped)" : "") · AA \(d.antiAliasing) ×\(d.opaqueSampleCount) · \(d.viewport.x)×\(d.viewport.y)\(d.screenSize.x > 0 ? " fov \(d.screenSize.x)×\(d.screenSize.y)" : "") · \(gpu)\(fps)\(d.compositeSkipped ? " · composite skipped" : "") · \(d.renderPath)\(d.tileLightStage ? " (tile light)" : "")"
+                 : (rkOpen ? "realitykit · \(Catalog.selectedID) · updates \(String(format: "%.0f", rkRate)) Hz · gpu: out of process — Instruments ▸ RealityKit Trace, with and without the object" : "no space open · \(EngineSession.shared.lastOpenResult)"))
+                 .font(.system(size: 11, design: .monospaced))
+                 .foregroundStyle(.secondary)
