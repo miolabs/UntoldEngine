@@ -246,6 +246,7 @@ public extension RenderPassContext {
         descriptor.depthAttachment.loadAction = .load
         descriptor.depthAttachment.storeAction = .store
 
+        GPUPassTiming.shared.attach(descriptor, label)
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
             handleError(.renderPassCreationFailed, label)
             return

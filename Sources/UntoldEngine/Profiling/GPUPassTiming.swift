@@ -24,7 +24,7 @@ public final class GPUPassTiming: @unchecked Sendable {
 
     /// One pass's time per frame, in milliseconds: a render pass's vertex and fragment stages;
     /// a compute or blit pass has only `fragmentMs`, the whole pass.
-    public struct PassTime: Sendable, Equatable {
+    public struct PassTime: Codable, Sendable, Equatable {
         public let label: String
         public let vertexMs: Double
         public let fragmentMs: Double
