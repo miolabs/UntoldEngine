@@ -50,11 +50,73 @@ public class WorldTransformComponent: Component {
 }
 
 public class RenderComponent: Component {
-    public var mesh: [Mesh]
+    public var mesh: [Mesh] {
+        didSet {
+            // Whatever changed (a material, a texture, the level of detail), the
+            // renderer has to look again at what the component draws.
+            instanceKey = .unresolved
+            if instancedSubmeshDraws != nil {
+                instancedSubmeshDraws = nil
+            }
+            if instancedShadowDraws != nil {
+                instancedShadowDraws = nil
+            }
+            blendedSubmeshes = nil
+        }
+    }
+
+    /// Whether any submesh of `mesh` is blended or lets light through: what the
+    /// transparency pass draws of the entity. Most entities have none, and the pass asks
+    /// every visible one each frame, so the answer is kept until the meshes change.
+    var hasBlendedSubmeshes: Bool {
+        if let known = blendedSubmeshes {
+            return known
+        }
+        var found = false
+        search: for meshIndex in mesh.indices {
+            for submeshIndex in mesh[meshIndex].submeshes.indices
+                where mesh[meshIndex].submeshes[submeshIndex].material?.hasTransparency == true
+            {
+                found = true
+                break search
+            }
+        }
+        blendedSubmeshes = found
+        return found
+    }
+
+    private var blendedSubmeshes: Bool?
+
+    /// What `mesh` draws, as a number the renderer groups instanced draws by: see
+    /// `RenderInstanceKeyTable`. Any change to `mesh` clears it.
+    var instanceKey: RenderInstanceKey = .unresolved
+
+    /// The draws of `mesh` in the opaque pass with everything they bind, prepared the
+    /// first time the component stands for its group in an instanced draw. Any change
+    /// to `mesh` clears them.
+    var instancedSubmeshDraws: [InstancedSubmeshDraw]?
+
+    /// The draws of `mesh` in a shadow pass, prepared the first time the component
+    /// stands for its group there: every submesh but those of glass, which casts no
+    /// shadow. Any change to `mesh` clears them.
+    var instancedShadowDraws: [InstancedShadowDraw]?
     var assetURL: URL = .init(fileURLWithPath: "")
     var assetName: String = ""
-    public var isVisible: Bool = true // Visibility flag for bulk loading
-    public var castsShadow: Bool = true
+    /// Whether the entity is drawn. A batch draws all of its entities, and casts a shadow
+    /// for all of them or for none, so the batching system is told when either flag
+    /// changes: a hidden entity leaves its batch, and one whose `castsShadow` changed
+    /// moves to a batch of entities that cast as it does.
+    public var isVisible: Bool = true { // Visibility flag for bulk loading
+        didSet {
+            if isVisible != oldValue { BatchingSystem.shared.noteRenderFlagsChanged() }
+        }
+    }
+
+    public var castsShadow: Bool = true {
+        didSet {
+            if castsShadow != oldValue { BatchingSystem.shared.noteRenderFlagsChanged() }
+        }
+    }
 
     public required init() {
         mesh = []
