@@ -728,6 +728,9 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             }
         #endif
 
+        // An entity that the update moved is out of its batch before the frame is drawn.
+        BatchingSystem.shared.releaseMovedEntities()
+
         // render hook (platform-specific)
         render?()
 

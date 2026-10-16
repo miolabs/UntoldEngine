@@ -142,7 +142,20 @@ func makeSegmentedEntityAABBs(localMin: simd_float3,
                               index: UInt32, version: UInt32) -> [EntityAABB]
 {
     let (center, halfExtent) = worldAABB_CenterExtent(localMin: localMin, localMax: localMax, worldMatrix: M)
+    var result: [EntityAABB] = []
+    appendSegmentedEntityAABBs(center: center, halfExtent: halfExtent, index: index, version: version, to: &result)
+    return result
+}
 
+/// `makeSegmentedEntityAABBs` for a caller that has the world box of the entity at hand
+/// and a list to add to: the culling gather, which does this for every entity of the
+/// scene each frame and would otherwise make an array per entity.
+@inline(__always)
+func appendSegmentedEntityAABBs(center: simd_float3,
+                                halfExtent: simd_float3,
+                                index: UInt32, version: UInt32,
+                                to container: inout [EntityAABB])
+{
     // Find the dominant (longest) half-extent axis.
     let dominantAxis: Int
     if halfExtent.x >= halfExtent.y && halfExtent.x >= halfExtent.z {
@@ -160,16 +173,15 @@ func makeSegmentedEntityAABBs(localMin: simd_float3,
 
     guard (dominantHalf / minShort) > kSegmentAspectThreshold else {
         // Not elongated – emit a single AABB.
-        return [EntityAABB(
+        container.append(EntityAABB(
             center: simd_float4(center.x, center.y, center.z, 0),
             halfExtent: simd_float4(halfExtent.x, halfExtent.y, halfExtent.z, 0),
             index: index, version: version, pad0: 0, pad1: 0
-        )]
+        ))
+        return
     }
 
     // Split into kSegmentCount equal segments along the dominant axis.
-    var result: [EntityAABB] = []
-    result.reserveCapacity(kSegmentCount)
     let segHalfLen = dominantHalf / Float(kSegmentCount)
     let startOffset = -dominantHalf + segHalfLen // offset of first segment centre from entity centre
 
@@ -179,13 +191,12 @@ func makeSegmentedEntityAABBs(localMin: simd_float3,
         var segHalf = halfExtent
         segHalf[dominantAxis] = segHalfLen
 
-        result.append(EntityAABB(
+        container.append(EntityAABB(
             center: simd_float4(segCenter.x, segCenter.y, segCenter.z, 0),
             halfExtent: simd_float4(segHalf.x, segHalf.y, segHalf.z, 0),
             index: index, version: version, pad0: 0, pad1: 0
         ))
     }
-    return result
 }
 
 public func performFrustumCulling(commandBuffer: MTLCommandBuffer) {
@@ -680,16 +691,17 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             return
         }
 
+        // The entity's world box, made once for the size test and for the cull.
+        let boundingBox = localTransformComponent.boundingBox
+        let (center, halfExtent) = worldAABB_CenterExtent(
+            localMin: boundingBox.min,
+            localMax: boundingBox.max,
+            worldMatrix: worldTransformComponent.space
+        )
+
         // Objects that would be a pixel or so tall are not worth a draw.
-        if let smallObjectCulling {
-            let (center, halfExtent) = worldAABB_CenterExtent(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space
-            )
-            if smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
-                return
-            }
+        if let smallObjectCulling, smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
+            return
         }
 
         objects.insert(sceneSnapshot.object(of: entity))
@@ -700,25 +712,24 @@ public func executeFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
         // AABB has a conservative nearDepth (closest corner of the full entity) that
         // is far less likely to fall behind a stale occluder in the HZB.
         if isXRStereoMode {
-            let singleAABB = makeObjectAABB(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space,
+            entityAABBContainer.append(EntityAABB(
+                center: simd_float4(center.x, center.y, center.z, 0.0),
+                halfExtent: simd_float4(halfExtent.x, halfExtent.y, halfExtent.z, 0.0),
                 index: getEntityIndex(entityId),
-                version: getEntityVersion(entityId)
-            )
-            entityAABBContainer.append(singleAABB)
+                version: getEntityVersion(entityId),
+                pad0: 0,
+                pad1: 0
+            ))
         } else {
             // get object AABB — elongated meshes are split into segments so a solid
             // occluder covering only part of the entity cannot falsely cull the whole entity.
-            let segments = makeSegmentedEntityAABBs(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space,
+            appendSegmentedEntityAABBs(
+                center: center,
+                halfExtent: halfExtent,
                 index: getEntityIndex(entityId),
-                version: getEntityVersion(entityId)
+                version: getEntityVersion(entityId),
+                to: &entityAABBContainer
             )
-            entityAABBContainer.append(contentsOf: segments)
         }
     }
 
@@ -1020,29 +1031,29 @@ func executeReduceScanFrustumCulling(_ commandBuffer: MTLCommandBuffer) {
             return
         }
 
+        // The entity's world box, made once for the size test and for the cull.
+        let boundingBox = localTransformComponent.boundingBox
+        let (center, halfExtent) = worldAABB_CenterExtent(
+            localMin: boundingBox.min,
+            localMax: boundingBox.max,
+            worldMatrix: worldTransformComponent.space
+        )
+
         // Objects that would be a pixel or so tall are not worth a draw.
-        if let smallObjectCulling {
-            let (center, halfExtent) = worldAABB_CenterExtent(
-                localMin: localTransformComponent.boundingBox.min,
-                localMax: localTransformComponent.boundingBox.max,
-                worldMatrix: worldTransformComponent.space
-            )
-            if smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
-                return
-            }
+        if let smallObjectCulling, smallObjectCulling.culls(center: center, radius: simd_length(halfExtent)) {
+            return
         }
 
         objects.insert(sceneSnapshot.object(of: entity))
 
         // get object AABB — elongated meshes are split into segments.
-        let segments = makeSegmentedEntityAABBs(
-            localMin: localTransformComponent.boundingBox.min,
-            localMax: localTransformComponent.boundingBox.max,
-            worldMatrix: worldTransformComponent.space,
+        appendSegmentedEntityAABBs(
+            center: center,
+            halfExtent: halfExtent,
             index: getEntityIndex(entityId),
-            version: getEntityVersion(entityId)
+            version: getEntityVersion(entityId),
+            to: &entityAABBContainer
         )
-        entityAABBContainer.append(contentsOf: segments)
     }
 
     let count = entityAABBContainer.count

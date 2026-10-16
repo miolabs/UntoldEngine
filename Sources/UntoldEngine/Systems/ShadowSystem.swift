@@ -256,12 +256,14 @@ private func stableSpotShadowUp(for direction: simd_float3) -> simd_float3 {
     return simd_float3(1.0, 0.0, 0.0)
 }
 
-struct ShadowSystem {
-    private struct ShadowCasterBounds {
-        var min: simd_float3
-        var max: simd_float3
-    }
+/// The box around something the cascades are fitted to, in the space the cascade corners
+/// are in (the scene root's transform folded in).
+struct ShadowCasterBounds {
+    var min: simd_float3
+    var max: simd_float3
+}
 
+struct ShadowSystem {
     private struct LightSpaceBounds {
         var min: simd_float3
         var max: simd_float3
@@ -412,6 +414,16 @@ struct ShadowSystem {
 
     /// Main per-frame update — computes one tight ortho matrix per cascade.
     mutating func updateCascades() {
+        updateCascades(entityCasterBounds: nil)
+    }
+
+    /// Fits the cascades to the camera and to what can cast into them.
+    ///
+    /// - Parameter entityCasterBounds: the bounds of the entities the cascades are fitted
+    ///   to, from a caller that walks the scene anyway (the shadow pass, which finds its
+    ///   casters in the same walk). It is asked only when a directional light casts
+    ///   shadows. Nil, the system walks the scene itself.
+    mutating func updateCascades(entityCasterBounds: (() -> [ShadowCasterBounds])?) {
         // In XR stereo mode the shadow map is shared between both eyes.
         // Only compute (and overwrite) on eye 0; eye 1 reuses the matrices.
         if renderInfo.isXRStereoMode && renderInfo.currentEye > 0 {
@@ -488,9 +500,13 @@ struct ShadowSystem {
             ? simd_float3(0, 1, 0)
             : simd_float3(0, 0, 1)
         let lightView = matrix_look_at_right_hand(-lightForward * 150.0, simd_float3(0, 0, 0), lightUp)
-        let casterLightSpaceBounds = collectShadowCasterBounds().map {
-            lightSpaceBounds(for: $0, lightView: lightView)
-        }
+        // The light-space box of a caster costs eight transforms, and it only matters for
+        // a caster that overlaps a cascade seen from the light. The sphere around a caster
+        // costs one, and says which casters cannot: most of them, in a scene much larger
+        // than its cascades. The boxes of the others are made when a cascade first asks.
+        let casterBounds = collectShadowCasterBounds(entityBounds: entityCasterBounds?())
+        let casterSpheres = casterBounds.map { lightSpaceSphere(for: $0, lightView: lightView) }
+        var casterLightSpaceBounds = [LightSpaceBounds?](repeating: nil, count: casterBounds.count)
 
         for i in 0 ..< cascadeCount {
             let cascadeFar = splits[i]
@@ -557,7 +573,25 @@ struct ShadowSystem {
             }
 
             let casterXYMargin = max(texelSize * 4.0, diameter * 0.03)
-            for boundsLS in casterLightSpaceBounds {
+            for casterIndex in casterBounds.indices {
+                // The box lies inside the sphere: where the sphere does not reach the
+                // cascade, the box does not either.
+                let sphere = casterSpheres[casterIndex]
+                if sphere.center.x + sphere.radius < minX - casterXYMargin
+                    || sphere.center.x - sphere.radius > maxX + casterXYMargin
+                    || sphere.center.y + sphere.radius < minY - casterXYMargin
+                    || sphere.center.y - sphere.radius > maxY + casterXYMargin
+                {
+                    continue
+                }
+
+                let boundsLS: LightSpaceBounds
+                if let made = casterLightSpaceBounds[casterIndex] {
+                    boundsLS = made
+                } else {
+                    boundsLS = lightSpaceBounds(for: casterBounds[casterIndex], lightView: lightView)
+                    casterLightSpaceBounds[casterIndex] = boundsLS
+                }
                 guard lightSpaceXYIntersects(
                     boundsLS,
                     minX: minX - casterXYMargin,
@@ -636,12 +670,31 @@ struct ShadowSystem {
     /// directly, since their effect on cascade output (e.g. cascadeDepthSpans) can otherwise be
     /// masked by other, already-correct mechanisms like camera-frustum culling.
     func collectShadowCasterBoundsForTesting() -> [(min: simd_float3, max: simd_float3)] {
-        collectShadowCasterBounds().map { (min: $0.min, max: $0.max) }
+        collectShadowCasterBounds(entityBounds: nil).map { (min: $0.min, max: $0.max) }
     }
 
-    private func collectShadowCasterBounds() -> [ShadowCasterBounds] {
-        let sceneSnapshot = RenderSceneSnapshot()
+    /// The bounds of everything the cascades are fitted to: the entities (`entityBounds`
+    /// when the caller has them, else from a walk of the scene) and the batch groups.
+    private func collectShadowCasterBounds(entityBounds: [ShadowCasterBounds]?) -> [ShadowCasterBounds] {
         let batchingEnabled = BatchingSystem.shared.isEnabled()
+        var bounds = entityBounds ?? collectEntityShadowCasterBounds(batchingEnabled: batchingEnabled)
+
+        if batchingEnabled {
+            for group in BatchingSystem.shared.batchGroups where shouldRenderSceneChannelsOpaque(group.sceneChannels) {
+                let (worldMin, worldMax) = worldAABB_MinMax(
+                    localMin: group.boundingBox.min,
+                    localMax: group.boundingBox.max,
+                    worldMatrix: SceneRootTransform.shared.matrix
+                )
+                bounds.append(ShadowCasterBounds(min: worldMin, max: worldMax))
+            }
+        }
+
+        return bounds
+    }
+
+    private func collectEntityShadowCasterBounds(batchingEnabled: Bool) -> [ShadowCasterBounds] {
+        let sceneSnapshot = RenderSceneSnapshot()
         let sceneRootMatrix = SceneRootTransform.shared.matrix
         var renderModes = SceneChannelRenderModeMemo()
 
@@ -652,8 +705,12 @@ struct ShadowSystem {
             if !entity.traits.isDisjoint(with: [.sceneCamera, .camera, .light, .gizmo]) { return }
             let renderMode = renderModes.mode(of: sceneSnapshot.sceneChannels(of: entity))
             if renderMode == .hidden || renderMode == .wireframe { return }
-            if batchingEnabled, entity.traits.contains(.staticBatch) { return }
-            if batchingEnabled, BatchingSystem.shared.isBatched(entityId: entity.entityId) { return }
+            // The cascades are fitted to what casts: a marked entity that is in a batch, or
+            // waits for one, is not drawn by itself (see gatherDirectionalShadowCasters).
+            if batchingEnabled,
+               entity.traits.contains(.staticBatch),
+               !BatchingSystem.shared.castsShadowByItself(entity)
+            { return }
 
             guard let components = sceneSnapshot.drawComponents(of: entity),
                   components.render.isVisible
@@ -673,18 +730,19 @@ struct ShadowSystem {
             bounds.append(ShadowCasterBounds(min: worldMin, max: worldMax))
         }
 
-        if batchingEnabled {
-            for group in BatchingSystem.shared.batchGroups where shouldRenderSceneChannelsOpaque(group.sceneChannels) {
-                let (worldMin, worldMax) = worldAABB_MinMax(
-                    localMin: group.boundingBox.min,
-                    localMax: group.boundingBox.max,
-                    worldMatrix: SceneRootTransform.shared.matrix
-                )
-                bounds.append(ShadowCasterBounds(min: worldMin, max: worldMax))
-            }
-        }
-
         return bounds
+    }
+
+    /// The sphere around a caster's box, in light space: where its centre lands and a
+    /// radius that holds every corner. The radius is taken a little large, so that the
+    /// rounding of the transform cannot leave a corner outside.
+    private func lightSpaceSphere(
+        for caster: ShadowCasterBounds,
+        lightView: simd_float4x4
+    ) -> (center: simd_float2, radius: Float) {
+        let center = lightView * simd_float4((caster.min + caster.max) * 0.5, 1.0)
+        let radius = simd_length(caster.max - caster.min) * 0.5
+        return (simd_float2(center.x, center.y), radius * 1.001 + 0.001)
     }
 
     private func lightSpaceBounds(
