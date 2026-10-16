@@ -60,6 +60,10 @@ class BaseRenderSetup: XCTestCase {
 
     private func resetGlobalEngineState() {
         ProgressiveAssetLoader.shared.cancelAll()
+        // A scene dropped with entities still in it leaks them (see releaseSceneAndRenderer),
+        // so whatever a previous test left behind is destroyed before the scene is replaced.
+        destroyAllEntities()
+        finalizePendingDestroys()
         scene = Scene()
         CameraSystem.shared.activeCamera = nil
         visibleEntityIds.removeAll(keepingCapacity: true)
@@ -203,6 +207,24 @@ class BaseRenderSetup: XCTestCase {
     override func tearDown() async throws {
         await waitForOutstandingAssetLoadsToFinish(context: "tearDown")
         LoadingSystem.shared.resourceURLFn = getResourceURL
+        releaseSceneAndRenderer()
+    }
+
+    /// Lets go of what this test loaded, so that it does not stay in the process for every
+    /// test after it.
+    ///
+    /// XCTest keeps every test case instance alive until the whole run ends, so a renderer
+    /// left in `renderer` lives on, and with it its MTKView, whose display link keeps a
+    /// thread and a 60 Hz main-thread callback going for as long as the view exists.
+    /// Replacing `scene` in setUp does not release the entities either: a component pool
+    /// keeps its components in chunks it never frees (see ComponentPool), so a scene that
+    /// is dropped with entities in it leaks them, their meshes and their textures. The
+    /// entities are destroyed and finalized here, the way the end of a frame would.
+    private func releaseSceneAndRenderer() {
+        destroyAllEntities()
+        finalizePendingDestroys()
+        renderer?.metalView.isPaused = true
+        renderer = nil
     }
 
     /// Seed visibleEntityIds and tripleVisibleEntities so rendering works without GPU culling.
