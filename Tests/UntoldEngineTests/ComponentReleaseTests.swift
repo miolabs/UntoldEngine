@@ -627,21 +627,26 @@ final class ComponentReleaseTests: XCTestCase {
 
     func testASceneSetAsideForAnEmptyOneAndPutBackStillReleases() {
         // What a test that wants an empty scene does: nothing left the scene that was
-        // set aside, so it is as good as it was.
+        // set aside, so it is as good as it was. The empty scene takes its own
+        // component with it when it is dropped.
         let entity = createEntity()
         let probe = makeProbe(on: entity)
 
+        let other: Watched<ProbeComponent>
         do {
             let saved = scene
             scene = Scene()
-            _ = scene.assign(to: createEntity(), component: ProbeComponent.self)
+            other = Watched(scene.assign(to: createEntity(), component: ProbeComponent.self))
             scene = saved
         }
+        XCTAssertFalse(other.isAlive)
+        XCTAssertEqual(probeReleases.value, 1)
+
         scene.remove(component: ProbeComponent.self, from: entity)
         releaseQuarantinedComponents()
 
         XCTAssertFalse(probe.isAlive)
-        XCTAssertEqual(probeReleases.value, 1)
+        XCTAssertEqual(probeReleases.value, 2)
     }
 
     // MARK: - Where the release happens
@@ -673,5 +678,64 @@ final class ComponentReleaseTests: XCTestCase {
 
         XCTAssertFalse(probe.isAlive)
         XCTAssertEqual(probeReleases.value, 2)
+    }
+
+    // MARK: - A scene dropped with its entities
+
+    func testASceneDroppedWithItsEntitiesReleasesTheirComponents() {
+        // Nothing left these entities: their components are still in their slots when
+        // the scene goes, and go with it.
+        let entity = createEntity()
+        let probe = makeProbe(on: entity)
+        _ = scene.assign(to: entity, component: SceneReadingComponent.self)
+        let payload = Watched(scene.assign(to: createEntity(), component: ValueComponent.self)?.payload)
+
+        scene = Scene()
+
+        XCTAssertFalse(probe.isAlive)
+        XCTAssertFalse(payload.isAlive)
+        XCTAssertEqual(probeReleases.value, 3)
+    }
+
+    func testACopyThatOutlivesItsSceneReleasesTheQuarantineAndTheSlotsOnce() {
+        // The copy keeps the chunk list: the component that left is in the quarantine,
+        // the one that took its slot is in the slot, and each is released once, when
+        // the copy goes.
+        let entity = createEntity()
+        let probe = makeProbe(on: entity)
+        var copy: Scene? = scene
+        scene.remove(component: ProbeComponent.self, from: entity)
+        let replacement = Watched(scene.assign(to: entity, component: ProbeComponent.self))
+
+        scene = Scene()
+
+        XCTAssertTrue(probe.isAlive)
+        XCTAssertTrue(replacement.isAlive)
+        XCTAssertEqual(probeReleases.value, 0)
+
+        copy = nil
+
+        XCTAssertFalse(probe.isAlive)
+        XCTAssertFalse(replacement.isAlive)
+        XCTAssertEqual(probeReleases.value, 2)
+    }
+
+    func testACopyOfThePoolDroppedLastReleasesTheComponentsItsSlotsOwn() {
+        // A render pass that outlives the scene it read keeps the components, and the
+        // last copy of the pool to go takes them with it.
+        let entity = createEntity()
+        let probe = makeProbe(on: entity)
+        let index = Int(getEntityIndex(entity))
+        var pool = scene.componentPool[getComponentId(for: ProbeComponent.self)]
+
+        scene = Scene()
+
+        XCTAssertTrue(probe.isAlive)
+        XCTAssertTrue(pool?.component(at: index, as: ProbeComponent.self) === probe.object)
+
+        pool = nil
+
+        XCTAssertFalse(probe.isAlive)
+        XCTAssertEqual(probeReleases.value, 1)
     }
 }

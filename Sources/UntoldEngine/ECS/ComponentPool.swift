@@ -183,13 +183,68 @@ final class ComponentQuarantine {
     }
 }
 
+/// One chunk of a pool's slots: the memory, and which slots own a component.
+///
+/// Every chunk list that reaches the chunk holds it, and the chunk goes with the last
+/// of them (see ComponentPool). The slots that still own a component then release it:
+/// that is how a scene dropped with entities in it, or an old copy of a pool that could
+/// not quarantine what left it, lets go of its components.
+private final class ComponentChunk {
+    let base: UnsafeMutableRawPointer
+    private let elementSize: Int
+    /// One bit per slot, set while the slot owns a component.
+    private var owning = [UInt64](repeating: 0, count: ComponentPool.chunkCapacity / 64)
+    /// Lets go of what the slot at the pointer owns.
+    private let release: (UnsafeMutableRawPointer) -> Void
+
+    /// Slots of references start as no reference: a slot is read before it is first
+    /// written (ComponentSlot.store exchanges what the slot holds), and one that never
+    /// held a component then reads as none.
+    init(elementSize: Int, holdsReferences: Bool, release: @escaping (UnsafeMutableRawPointer) -> Void) {
+        self.elementSize = elementSize
+        self.release = release
+        let byteCount = elementSize * ComponentPool.chunkCapacity
+        guard holdsReferences else {
+            base = .allocate(byteCount: byteCount, alignment: MemoryLayout<UInt8>.alignment)
+            return
+        }
+        base = .allocate(byteCount: byteCount, alignment: MemoryLayout<UnsafeRawPointer?>.alignment)
+        base.initializeMemory(as: UnsafeRawPointer?.self, repeating: nil, count: ComponentPool.chunkCapacity)
+    }
+
+    deinit {
+        for word in owning.indices {
+            var bits = owning[word]
+            while bits != 0 {
+                let slot = word * 64 + bits.trailingZeroBitCount
+                release(base.advanced(by: slot * elementSize))
+                bits &= bits - 1
+            }
+        }
+        base.deallocate()
+    }
+
+    /// The slot at `index` in this chunk owns a component from here on.
+    func slotOwns(_ index: Int) {
+        owning[index / 64] |= 1 << UInt64(index % 64)
+    }
+
+    /// The slot at `index` in this chunk owns nothing any more: what it held left for
+    /// the quarantine, which owns it from here on.
+    func slotLetGo(_ index: Int) {
+        owning[index / 64] &= ~(1 << UInt64(index % 64))
+    }
+}
+
 /// Storage for one component type, indexed by entity index.
 ///
 /// Memory comes in fixed-size chunks added as the scene grows (see reserve), so the
-/// number of entities is not capped. A chunk is never moved or freed before
-/// deallocate(): the scene is handed out by value under a lock, and a copy taken on
-/// another thread keeps reading through its own chunk list while this one grows.
-/// An index past the chunks reserved so far reads as no component.
+/// number of entities is not capped. A chunk is never moved: the scene is handed out by
+/// value under a lock, and a copy taken on another thread keeps reading through its
+/// own chunk list while this one grows. Every chunk list holds its chunks, and a chunk
+/// is freed with the last chunk list that holds it; the components its slots still own
+/// are released then (see ComponentChunk). An index past the chunks reserved so far
+/// reads as no component.
 ///
 /// A slot owns its component for as long as the entity's mask says the entity has it.
 /// When that ends the component moves to the quarantine, which every copy of the pool
@@ -205,6 +260,11 @@ public struct ComponentPool {
         /// Whether a slot holds one reference to an object (see ComponentSlot).
         let holdsReferences: Bool
         var quarantine: ComponentQuarantine
+        /// The chunks the elements point into, held so that a chunk lives as long as a
+        /// chunk list that reaches it.
+        let chunks: [ComponentChunk]
+        /// Lets go of what a slot owns, for the chunk that is freed (see ComponentChunk).
+        let release: (UnsafeMutableRawPointer) -> Void
     }
 
     /// The chunk list as a copy of the pool reads it. It is never changed: a pool that
@@ -217,19 +277,31 @@ public struct ComponentPool {
     private var departures: UInt64 = 0
 
     init<T: Component>(for type: T.Type) {
+        let holdsReferences = ComponentSlot.holdsReference(T.self)
+        let release: (UnsafeMutableRawPointer) -> Void = holdsReferences
+            ? { Unmanaged<AnyObject>.fromOpaque($0.load(as: UnsafeRawPointer.self)).release() }
+            : { $0.assumingMemoryBound(to: T.self).deinitialize(count: 1) }
         storage = Self.makeStorage(
-            chunks: [], elementSize: MemoryLayout<T>.stride, holdsReferences: ComponentSlot.holdsReference(T.self),
-            quarantine: ComponentQuarantine(of: type)
+            chunks: [], elementSize: MemoryLayout<T>.stride, holdsReferences: holdsReferences,
+            quarantine: ComponentQuarantine(of: type), release: release
         )
     }
 
     private static func makeStorage(
-        chunks: [UnsafeMutableRawPointer], elementSize: Int, holdsReferences: Bool, quarantine: ComponentQuarantine
+        chunks: [ComponentChunk], elementSize: Int, holdsReferences: Bool, quarantine: ComponentQuarantine,
+        release: @escaping (UnsafeMutableRawPointer) -> Void
     ) -> Storage {
         let storage = Storage.create(minimumCapacity: chunks.count) { _ in
-            Header(chunkCount: chunks.count, elementSize: elementSize, holdsReferences: holdsReferences, quarantine: quarantine)
+            Header(
+                chunkCount: chunks.count, elementSize: elementSize, holdsReferences: holdsReferences,
+                quarantine: quarantine, chunks: chunks, release: release
+            )
         }
-        storage.withUnsafeMutablePointerToElements { $0.initialize(from: chunks, count: chunks.count) }
+        storage.withUnsafeMutablePointerToElements { elements in
+            for (index, chunk) in chunks.enumerated() {
+                (elements + index).initialize(to: chunk.base)
+            }
+        }
         return storage
     }
 
@@ -237,10 +309,8 @@ public struct ComponentPool {
         storage.withUnsafeMutablePointerToHeader { $0.pointee.holdsReferences }
     }
 
-    private var chunks: [UnsafeMutableRawPointer] {
-        storage.withUnsafeMutablePointers { header, chunks in
-            Array(UnsafeBufferPointer(start: chunks, count: header.pointee.chunkCount))
-        }
+    private var chunks: [ComponentChunk] {
+        storage.withUnsafeMutablePointerToHeader { $0.pointee.chunks }
     }
 
     private var elementSize: Int {
@@ -251,16 +321,19 @@ public struct ComponentPool {
         storage.withUnsafeMutablePointerToHeader { $0.pointee.quarantine }
     }
 
+    private var release: (UnsafeMutableRawPointer) -> Void {
+        storage.withUnsafeMutablePointerToHeader { $0.pointee.release }
+    }
+
     /// The number of entity indices the pool can hold without adding a chunk.
     var capacity: Int {
         storage.withUnsafeMutablePointerToHeader { $0.pointee.chunkCount } * Self.chunkCapacity
     }
 
+    /// Lets go of this copy's chunks. A chunk is freed once no copy of the pool holds
+    /// it, and releases the components its slots still own.
     public mutating func deallocate() {
-        for chunk in chunks {
-            chunk.deallocate()
-        }
-        storage = Self.makeStorage(chunks: [], elementSize: elementSize, holdsReferences: holdsReferences, quarantine: quarantine)
+        storage = Self.makeStorage(chunks: [], elementSize: elementSize, holdsReferences: holdsReferences, quarantine: quarantine, release: release)
     }
 
     /// Adds chunks until `index` has storage.
@@ -269,23 +342,9 @@ public struct ComponentPool {
         guard capacity <= index else { return }
         var chunks = chunks
         while chunks.count * Self.chunkCapacity <= index {
-            chunks.append(Self.makeChunk(elementSize: elementSize, holdsReferences: holdsReferences))
+            chunks.append(ComponentChunk(elementSize: elementSize, holdsReferences: holdsReferences, release: release))
         }
-        storage = Self.makeStorage(chunks: chunks, elementSize: elementSize, holdsReferences: holdsReferences, quarantine: quarantine)
-    }
-
-    /// The memory of one chunk. Slots of references start as no reference: a slot is
-    /// read before it is first written (ComponentSlot.store exchanges what the slot
-    /// holds), and one that never held a component then reads as none.
-    private static func makeChunk(elementSize: Int, holdsReferences: Bool) -> UnsafeMutableRawPointer {
-        guard holdsReferences else {
-            return .allocate(byteCount: elementSize * chunkCapacity, alignment: MemoryLayout<UInt8>.alignment)
-        }
-        let chunk = UnsafeMutableRawPointer.allocate(
-            byteCount: elementSize * chunkCapacity, alignment: MemoryLayout<UnsafeRawPointer?>.alignment
-        )
-        chunk.initializeMemory(as: UnsafeRawPointer?.self, repeating: nil, count: chunkCapacity)
-        return chunk
+        storage = Self.makeStorage(chunks: chunks, elementSize: elementSize, holdsReferences: holdsReferences, quarantine: quarantine, release: release)
     }
 
     public func get(_ index: Int) -> UnsafeMutableRawPointer? {
@@ -305,6 +364,11 @@ public struct ComponentPool {
             let address = chunks[index / Self.chunkCapacity].advanced(by: (index % Self.chunkCapacity) * header.pointee.elementSize)
             return (address, header.pointee.holdsReferences)
         }
+    }
+
+    /// The chunk that holds the slot at `index`. Only for an index the pool has storage for.
+    private func chunk(holding index: Int) -> ComponentChunk {
+        storage.withUnsafeMutablePointerToHeader { $0.pointee.chunks[index / Self.chunkCapacity] }
     }
 
     /// The component in the slot at `index`, read as a `T`. Only for a slot the entity's
@@ -329,11 +393,12 @@ public struct ComponentPool {
     /// changed on its own, or an old copy put back as the scene, has masks that no longer
     /// say which slots hold a component: it has not seen every component leave. Such a
     /// pool moves nothing to the quarantine and releases nothing from it. Its components
-    /// stay for good, as they did before components were released.
+    /// stay in their slots, which release them when their chunk is freed.
     mutating func quarantineComponent(at index: Int) {
         let quarantine = quarantine
         guard departures == quarantine.departures, let slot = get(index) else { return }
         quarantine.components.append(quarantine.takeOut(of: slot))
+        chunk(holding: index).slotLetGo(index % Self.chunkCapacity)
         quarantine.departures += 1
         departures += 1
     }
@@ -361,11 +426,13 @@ public struct ComponentPool {
         }
     }
 
-    /// Add a new component to the pool at a specified index
+    /// Puts `component` in the slot at `index`, which owns it from here on. A copy of
+    /// the scene taken before this may be reading the slot (see ComponentSlot).
     public mutating func add(component: some Component, at index: Int) {
         reserve(upTo: index)
         guard let slot = slot(at: index) else { fatalError("No storage for entity index \(index) in ComponentPool.") }
         ComponentSlot.store(component, in: slot.address, asReference: slot.holdsReference)
+        chunk(holding: index).slotOwns(index % Self.chunkCapacity)
     }
 }
 

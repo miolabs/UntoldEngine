@@ -173,21 +173,10 @@ public struct Scene {
             quarantineComponent(componentId, at: Int(entityIndex))
         }
 
-        // Retrieve the specific component pool
-        guard let pool = componentPool[componentId] else {
-            handleError(.componentNotFound)
-            return nil
-        }
-
-        // Allocate and initialize a new component in the pool
-        guard let slot = pool.slot(at: Int(entityIndex)) else {
-            handleError(.failedToGetComponentPointer)
-            return nil
-        }
-
-        // A copy of the scene taken before this may be reading the slot (see ComponentSlot).
+        // The pool puts the component in its slot, in place: a copy of the pool made for
+        // it would hold back the release of what left the pool.
         let component = T()
-        ComponentSlot.store(component, in: slot.address, asReference: slot.holdsReference)
+        componentPool[componentId]?.add(component: component, at: Int(entityIndex))
 
         // Set the bit for this component to true
         entities[Int(entityIndex)].mask.set(componentId)
