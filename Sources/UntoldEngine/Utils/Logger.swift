@@ -89,8 +89,9 @@ public enum Logger {
         #if canImport(AppKit)
             let sinkBox = WeakBox(value: sink)
             sinkQueue.async {
-                // Replay backlog to the new sink (in order).
-                let snapshot = state.addSinkAndSnapshotBacklog(sinkBox)
+                // Replay backlog to the new sink (in order). A sink that is already
+                // registered is left as it is: it is not added twice and gets no replay.
+                guard let snapshot = state.addSinkAndSnapshotBacklog(sinkBox) else { return }
                 guard let sink = sinkBox.value else { return }
                 for event in snapshot {
                     sink.didLog(event)
@@ -244,12 +245,17 @@ public enum Logger {
             private var sinks: [WeakBox] = []
             private var backlog: [LogEvent] = []
 
-            func addSinkAndSnapshotBacklog(_ sinkBox: WeakBox) -> [LogEvent] {
+            /// Registers the sink and returns the backlog to replay to it, or nil when the
+            /// sink is registered already.
+            func addSinkAndSnapshotBacklog(_ sinkBox: WeakBox) -> [LogEvent]? {
                 lock.lock()
+                defer { lock.unlock() }
+                sinks = sinks.filter { $0.value != nil }
+                if let sink = sinkBox.value, sinks.contains(where: { $0.value === sink }) {
+                    return nil
+                }
                 sinks.append(sinkBox)
-                let snapshot = backlog
-                lock.unlock()
-                return snapshot
+                return backlog
             }
 
             func appendEventAndSnapshotSinks(_ event: LogEvent, backlogLimit: Int) -> [LoggerSink] {
