@@ -10,6 +10,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import Foundation
+import os
 
 struct TypeInfo {
     var id: Int
@@ -26,27 +27,18 @@ public struct ComponentTypeRegistration: Equatable, Sendable {
     }
 }
 
-private final class ComponentIDState: @unchecked Sendable {
-    let lock = NSLock()
-    var componentIDs: [ObjectIdentifier: TypeInfo] = [:]
-}
-
-private let componentIDState = ComponentIDState()
+/// Component type → id map. Read on every component access and written only when a new type
+/// registers, so it sits behind an unfair lock rather than an NSLock.
+private let componentIDState = OSAllocatedUnfairLock<[ObjectIdentifier: TypeInfo]>(initialState: [:])
 
 @inline(__always)
 func componentTypeInfosSnapshot() -> [ObjectIdentifier: TypeInfo] {
-    componentIDState.lock.lock()
-    let snapshot = componentIDState.componentIDs
-    componentIDState.lock.unlock()
-    return snapshot
+    componentIDState.withLock { $0 }
 }
 
 @inline(__always)
 func componentTypeInfo(for typeId: ObjectIdentifier) -> TypeInfo? {
-    componentIDState.lock.lock()
-    let typeInfo = componentIDState.componentIDs[typeId]
-    componentIDState.lock.unlock()
-    return typeInfo
+    componentIDState.withLock { $0[typeId] }
 }
 
 public func registeredComponentTypes() -> [ComponentTypeRegistration] {
@@ -84,9 +76,7 @@ public func getComponentId(for type: (some Any).Type) -> Int {
         let id = componentCounter
         componentCounter += 1
 
-        componentIDState.lock.lock()
-        componentIDState.componentIDs[typeId] = TypeInfo(id: id, type: type)
-        componentIDState.lock.unlock()
+        componentIDState.withLock { $0[typeId] = TypeInfo(id: id, type: type) }
         return id
     }
 }
