@@ -309,7 +309,7 @@ let package = Package(
         // Render-specific test target
         .testTarget(
             name: "UntoldEngineRenderTests",
-            dependencies: ["UntoldEngine", "UntoldEngineMeshCook"],
+            dependencies: ["UntoldEngine", "UntoldEngineMeshCook", "UntoldEngineXR"],
             path: "Tests/UntoldEngineRenderTests",
             exclude: ["Resources/compare_psnr.py"],
             resources: [
