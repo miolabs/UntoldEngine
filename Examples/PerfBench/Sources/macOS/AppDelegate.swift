@@ -50,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         render.vsync = true
         render.displayRefreshHz = Double(screen?.maximumFramesPerSecond ?? 60)
         runner = BenchRunner(config: config, render: render)
+        runner.isAppActive = { NSApp.isActive }
 
         guard let renderer = UntoldRenderer.create() else {
             print("PERFBENCH_FAILED renderer")
