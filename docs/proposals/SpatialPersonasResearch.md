@@ -164,7 +164,7 @@ Keep the engine for everything but drawing (ECS, physics, animation, streaming, 
 
 ## 8. Decision (2026-10-16) and what the hybrid gives up
 
-The user chose option C, the hybrid, after the discussion of 2026-10-16. It is an **optional presentation mode per game**: games that do not need Personas keep the Compositor Services path unchanged and lose nothing. For the games that opt in, this is the honest list of what changes against Compositor Services, with how much of it can be won back.
+Option C, the hybrid, was chosen on 2026-10-16. It is an **optional presentation mode per game**: games that do not need Personas keep the Compositor Services path unchanged and lose nothing. For the games that opt in, this is the honest list of what changes against Compositor Services, with how much of it can be won back.
 
 | What Compositor Services gives today | In the hybrid | Recoverable? |
 |---|---|---|
@@ -172,7 +172,7 @@ The user chose option C, the hybrid, after the discussion of 2026-10-16. It is a
 | Exact per-pixel depth for passthrough compositing | Per-vertex depth on a grid: stretched triangles at depth jumps, smears on disocclusion during fast head turns | Partly: finer grid where depth varies, discard triangles whose depth span exceeds a threshold (a tear instead of a stretch), per-eye rendering so parallax disocclusions are already right at the render pose |
 | One depth per pixel also for glass | Glass has no depth of its own: a Persona behind a pane is either composited in front of the pane's tint and reflection (opaque depth) or hidden by it (glass depth) | No; choose per scene which depth the grid uses. Matters for the BIM site, not for an arena |
 | System foveation (rasterization rate maps) and dynamic render quality | Our texture is rendered uniformly, RealityKit foveates only its raster of the grid | Not really; today the engine renders uniformly anyway (foveation off), so nothing is lost now, only the future gain of phase 0 in the virtualized-geometry note |
-| True per-eye view transforms (the user's IPD) | We render at a nominal IPD; RealityKit shows the grids from the true eye positions, so depth cues stay right and only view-dependent shading is slightly off | Minor and permanent |
+| True per-eye view transforms (the wearer's IPD) | We render at a nominal IPD; RealityKit shows the grids from the true eye positions, so depth cues stay right and only view-dependent shading is slightly off | Minor and permanent |
 | Hover effects on our content through the tracking-areas texture | None on engine-rendered pixels | Only for native entities (`HoverEffectComponent`) |
 | Progressive immersion through the portal stencil | RealityKit does progressive immersion itself | Regained for free |
 | The frame clock and predicted timing of `LayerRenderer` | We pace from RealityView's per-frame update and predict with ARKit timestamps | Mostly; some jitter risk to measure |
@@ -187,7 +187,7 @@ Permanent residuals, then: one frame of lag on engine-rendered moving objects, s
 
 ## Appendix A. Feedback Assistant draft
 
-Filed by the user with Apple on 2026-10-16 (number FB________, to record here and to post in forum thread 791591 as the engineer asked). Type: Suggestion. Area: visionOS > Compositor Services (or SharePlay / Group Activities if the picker has no Compositor Services entry).
+Filed with Apple on 2026-10-16 (number FB________, to record here and to post in forum thread 791591 as the engineer asked). Type: Suggestion. Area: visionOS > Compositor Services (or SharePlay / Group Activities if the picker has no Compositor Services entry).
 
 **Title:** Compositor Services: Spatial Personas are not shown in a SharePlay group immersive space rendered with Metal
 
