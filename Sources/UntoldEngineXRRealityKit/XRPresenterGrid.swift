@@ -15,8 +15,8 @@ import simd
 /// One eye's grid: `columns × rows` vertices the unprojection kernel places in the origin's
 /// space every frame, a static index buffer of two triangles per cell, one part bounded well
 /// past the far shell. The vertex layout (24 bytes) is the kernel's `XRGridVertex`: a packed
-/// position, a packed uv with v = 0 at the texture's top row, and a half2 whose x is the tear
-/// mask.
+/// position, a packed uv with v = 0 at the texture's top row, and a half2 tear mask (x the far
+/// side of a depth jump, y the near side).
 public struct XRPresenterGrid: Sendable, Equatable {
     public static let vertexStride = 24
     public static let positionOffset = 0

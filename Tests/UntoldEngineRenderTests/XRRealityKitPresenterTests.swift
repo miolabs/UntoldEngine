@@ -273,7 +273,15 @@ final class XRGridUnprojectTests: XCTestCase {
     private struct Vertex {
         var position: SIMD3<Float>
         var uv: SIMD2<Float>
+        /// The tear mask's x: the far side of a depth jump.
         var mask: Float
+        /// The tear mask's y: the near side.
+        var nearSide: Float
+    }
+
+    /// The texture position of a grid vertex of the 33 × 25 grid the kernel test uses.
+    private func uvOf(column: Int, row: Int) -> SIMD2<Float> {
+        SIMD2<Float>(Float(column) / 32, Float(row) / 24)
     }
 
     private func readVertices(_ buffer: MTLBuffer, grid: XRPresenterGrid) -> [Vertex] {
@@ -290,7 +298,8 @@ final class XRGridUnprojectTests: XCTestCase {
                 raw.load(fromByteOffset: base + XRPresenterGrid.uvOffset + 4, as: Float.self)
             )
             let mask = Float(raw.load(fromByteOffset: base + XRPresenterGrid.maskOffset, as: Float16.self))
-            return Vertex(position: position, uv: uv, mask: mask)
+            let nearSide = Float(raw.load(fromByteOffset: base + XRPresenterGrid.maskOffset + 2, as: Float16.self))
+            return Vertex(position: position, uv: uv, mask: mask, nearSide: nearSide)
         }
     }
 
@@ -299,7 +308,10 @@ final class XRGridUnprojectTests: XCTestCase {
         let textureSize = SIMD2<Int>(256, 192)
         var configuration = XRRealityKitPresenterConfiguration()
         configuration.farShellMetres = 50
-        configuration.tearThresholdMetres = 0.5
+        // The jumps here are 3 m (the seam) and 45 m (the hole). The threshold stays above the
+        // distance a diagonal step covers on the oblique far plane at this coarse grid's corner
+        // (0.56 m), which is no tear.
+        configuration.tearThresholdMetres = 1
         let projection = configuration.projection
         let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y, projection: projection)
         let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
@@ -355,16 +367,66 @@ final class XRGridUnprojectTests: XCTestCase {
         XCTAssertGreaterThan(nearPlane, 200)
         XCTAssertGreaterThan(farPlane, 200)
         XCTAssertGreaterThan(shell, 20, "the hole sees the shell")
-        // Tears along the two planes' seam and around the hole, nowhere inside the planes.
+        // The far-side mask on the far side of the two planes' seam and on the shell around the
+        // hole, the near-side mask across from it, nothing inside the planes.
         XCTAssertGreaterThan(tears, 20)
         XCTAssertLessThan(tears, grid.vertexCount / 4)
         let insideNearPlane = result[12 * grid.columns + 3]
         XCTAssertEqual(insideNearPlane.mask, 0, "no tear inside a plane")
+        XCTAssertEqual(insideNearPlane.nearSide, 0)
         let onTheSeam = result[2 * grid.columns + 16]
-        XCTAssertEqual(onTheSeam.mask, 1, "a tear where the two planes meet")
+        let pastTheSeam = result[2 * grid.columns + 17]
+        XCTAssertEqual(onTheSeam.mask, 0, "the near plane's side of the seam is not the far side")
+        XCTAssertEqual(onTheSeam.nearSide, 1, "the near plane's side of the seam is the near side")
+        XCTAssertEqual(pastTheSeam.mask, 1, "the far plane's side of the seam is the far side")
+        XCTAssertEqual(pastTheSeam.nearSide, 0)
+        XCTAssertEqual(result[2 * grid.columns + 18].mask, 0, "one column further the far plane is flat again")
+        XCTAssertEqual(result[2 * grid.columns + 15].nearSide, 0, "one column before the seam the near plane is flat")
         // The seam column's footprint straddles both planes: the nearer one wins, so that a
         // near silhouette is kept whole.
         XCTAssertEqual(onTheSeam.position.z, -Self.nearPlaneDistance, accuracy: 0.01, "the seam column lies on the near plane")
+        XCTAssertEqual(pastTheSeam.position.z, -Self.farPlaneDistance, accuracy: 0.02, "the column past the seam lies on the far plane")
+        // The hole: the plane's vertices at its rim stay at 0, the shell's vertices inside are
+        // marked, and a vertex at the hole's centre, with shell all around it, is not.
+        let centre = result[12 * grid.columns + 16]
+        XCTAssertEqual(simd_length(SIMD3<Float>(centre.position.x - 0.5, centre.position.y - 1, centre.position.z)), configuration.farShellMetres, accuracy: 0.05, "the hole's centre lies on the shell")
+        for (column, row) in [(16, 12), (16, 11), (16, 13), (15, 12), (17, 12)] {
+            XCTAssertEqual(result[row * grid.columns + column].mask, 0, "no tear around the hole's centre (\(column),\(row))")
+            XCTAssertEqual(result[row * grid.columns + column].nearSide, 0, "no tear around the hole's centre (\(column),\(row))")
+        }
+        // Every far-side mark is either on the shell (the hole's rim, seen from inside) or in
+        // the far plane's column past the seam; every near-side mark is on a plane, at the
+        // hole's rim or in the near plane's seam column; the shell never carries a near-side mark.
+        var farSideOnTheShell = 0, farSidePastTheSeam = 0, nearSideAtTheHole = 0, nearSideAtTheSeam = 0
+        for row in 0 ..< grid.rows {
+            for column in 0 ..< grid.columns {
+                let vertex = result[row * grid.columns + column]
+                let eyeDistance = simd_length(SIMD3<Float>(vertex.position.x - 0.5, vertex.position.y - 1, vertex.position.z))
+                let onTheShell = eyeDistance > configuration.farShellMetres - 0.1
+                if vertex.mask > 0.5 {
+                    if onTheShell {
+                        farSideOnTheShell += 1
+                    } else {
+                        farSidePastTheSeam += 1
+                        XCTAssertEqual(column, 17, "a far-side mark off the shell is the far plane's side of the seam (\(column),\(row))")
+                    }
+                }
+                if vertex.nearSide > 0.5 {
+                    XCTAssertFalse(onTheShell, "the shell is never the near side (\(column),\(row))")
+                    if column == 16, abs(uvOf(column: column, row: row).y - 0.5) > Self.holeRadius + 0.1 {
+                        nearSideAtTheSeam += 1
+                    } else {
+                        nearSideAtTheHole += 1
+                        XCTAssertLessThan(simd_length(uvOf(column: column, row: row) - SIMD2<Float>(0.5, 0.5)), Self.holeRadius + 0.1, "a near-side mark off the seam is at the hole's rim (\(column),\(row))")
+                    }
+                }
+            }
+        }
+        XCTAssertGreaterThan(farSideOnTheShell, 10, "the shell's vertices along the hole's rim are the far side")
+        XCTAssertGreaterThan(farSidePastTheSeam, 10, "the far plane's column past the seam is the far side")
+        XCTAssertEqual(farSideOnTheShell + farSidePastTheSeam, tears)
+        XCTAssertGreaterThan(nearSideAtTheHole, 10, "the planes' vertices along the hole's rim are the near side")
+        XCTAssertGreaterThanOrEqual(nearSideAtTheSeam, 10, "the near plane's seam column is the near side: its ten rows away from the hole")
     }
 
     func test_theUniforms_haveTheKernelsLayout() {

@@ -10,9 +10,18 @@
 # Parameters: colorTexture (that eye's frame) and eye (1 left, 2 right).
 # The Camera Index Switch yields 0 (mono), 1 (left) or 2 (right) for the view being drawn;
 # the surface is visible only when that matches `eye`, and in a mono view (the simulator,
-# a 2D preview) the left eye's grid stands in. Opacity = texture alpha x that visibility,
-# through an Unlit Surface with the post-process tone map off and an opacity threshold of
-# 0.5, so the other eye's grid is discarded and alpha below the threshold shows passthrough.
+# a 2D preview) the left eye's grid stands in. The second uv set is the grid's tear mask: x is
+# 1 on the far side of a depth jump, y is 1 on its near side, both 0 elsewhere. A triangle
+# stretched from an object to what lies behind it has both above zero everywhere inside it
+# (x rises from the object, y falls), a triangle of the object's own surface has x = 0 and one
+# of the far surface has y = 0. Opacity = texture alpha x that visibility, times 0 where
+# min(x, y) exceeds a small epsilon, through an Unlit Surface with the post-process tone map
+# off and an opacity threshold of 0.5: the other eye's grid is discarded, alpha below the
+# threshold shows passthrough, and the stretched triangles go while the object and the surface
+# behind it keep their outlines. The cut is at an epsilon rather than at 0.5 because the mask
+# is interpolated linearly in distance along the stretched triangle, whose midpoint lies far
+# behind the object: in a view shifted from the eye it was drawn for, the visible part of the
+# stretch is its first metre.
 
 def Xform "Root"
 {
@@ -126,11 +135,52 @@ def Xform "Root"
             float outputs:out
         }
 
-        def Shader "Opacity"
+        def Shader "Shown"
         {
             uniform token info:id = "ND_multiply_float"
             float inputs:in1.connect = </Root/XRPresenterMaterial/Channels.outputs:outa>
             float inputs:in2.connect = </Root/XRPresenterMaterial/Visible.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "TearCoord"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 1
+            float2 outputs:out
+        }
+
+        def Shader "Tear"
+        {
+            uniform token info:id = "ND_separate2_vector2"
+            float2 inputs:in.connect = </Root/XRPresenterMaterial/TearCoord.outputs:out>
+            float outputs:outx
+            float outputs:outy
+        }
+
+        def Shader "Stretch"
+        {
+            uniform token info:id = "ND_min_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Tear.outputs:outx>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Tear.outputs:outy>
+            float outputs:out
+        }
+
+        def Shader "Kept"
+        {
+            uniform token info:id = "ND_ifgreater_float"
+            float inputs:in1 = 0
+            float inputs:in2 = 1
+            float inputs:value1.connect = </Root/XRPresenterMaterial/Stretch.outputs:out>
+            float inputs:value2 = 0.001
+            float outputs:out
+        }
+
+        def Shader "Opacity"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Shown.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Kept.outputs:out>
             float outputs:out
         }
     }

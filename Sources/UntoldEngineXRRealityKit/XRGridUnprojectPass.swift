@@ -25,7 +25,8 @@ public struct XRGridUnprojectUniforms {
     public var textureSize: SIMD2<UInt32>
     /// Where rays that hit nothing end, metres from the eye.
     public var farShell: Float
-    /// A jump in view distance to a neighbour above this, metres, sets the tear mask.
+    /// A difference in view distance to a neighbour above this, metres, is a depth jump: the
+    /// vertex is marked as its far side, or its near side, in the tear mask.
     public var tearThreshold: Float
     public var flags: UInt32
     public var padding: UInt32
@@ -56,6 +57,13 @@ public struct XRGridUnprojectUniforms {
 /// Depth 0, the far plane under reverse Z, and anything past the far shell land on the shell,
 /// so that the sky and passthrough areas keep a surface.
 ///
+/// The tear mask has two channels: x is 1 on the FAR side of a depth jump (a vertex further from
+/// the eye than a neighbour by more than the threshold), y is 1 on its NEAR side. A triangle
+/// that stretches from an object to what lies behind it has both: x rises from 0 at the object
+/// to 1 behind it and y falls the other way, so the material can discard it wherever both are
+/// above zero, while a triangle of the object's own surface (x = 0) and one of the far surface
+/// (y = 0) are kept whole, up to the jump.
+///
 /// The kernel is compiled from source once per device: the engine's prebuilt metallibs stay as
 /// they are, and the tests run it on a Mac.
 public final class XRGridUnprojectPass: @unchecked Sendable {
@@ -69,7 +77,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     struct XRGridVertex {
         packed_float3 position;   // the origin's space
         packed_float2 uv;         // v = 0 at the texture's top row
-        half2 mask;               // x: 1 where the vertex stretches across a depth jump
+        half2 mask;               // x: 1 on the far side of a depth jump, y: 1 on the near side
     };
     struct XRGridUnprojectUniforms {
         float4x4 originFromEye;
@@ -120,20 +128,25 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         float2 uv = float2(gid) * step;
         float3 eye = eyePoint(uv, nearestDepth(depth, uv, u), u);
         float distance = length(eye);
-        // The tear mask: a jump in view distance to any of the four neighbours above the threshold.
-        float mask = 0.0f;
-        const int2 offsets[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
-        for (int k = 0; k < 4; ++k) {
+        // The tear mask against the eight neighbours: x when this vertex is further from the eye
+        // than a neighbour by more than the threshold, y when it is nearer by that much. The
+        // diagonals count too: a cell's triangles share its diagonal, and a jump along that
+        // diagonal alone would otherwise leave a stretched edge unmarked.
+        float farSide = 0.0f;
+        float nearSide = 0.0f;
+        const int2 offsets[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(1, -1), int2(-1, 1), int2(-1, -1) };
+        for (int k = 0; k < 8; ++k) {
             int2 n = int2(gid) + offsets[k];
             if (n.x < 0 || n.y < 0 || n.x >= int(u.gridSize.x) || n.y >= int(u.gridSize.y)) { continue; }
             float2 nuv = float2(n) * step;
             float neighbour = length(eyePoint(nuv, nearestDepth(depth, nuv, u), u));
-            if (fabs(neighbour - distance) > u.tearThreshold) { mask = 1.0f; }
+            if (distance - neighbour > u.tearThreshold) { farSide = 1.0f; }
+            if (neighbour - distance > u.tearThreshold) { nearSide = 1.0f; }
         }
         device XRGridVertex &v = vertices[gid.y * u.gridSize.x + gid.x];
         v.position = (u.originFromEye * float4(eye, 1.0f)).xyz;
         v.uv = uv;
-        v.mask = half2(half(mask), 0.0h);
+        v.mask = half2(half(farSide), half(nearSide));
     }
     """
 

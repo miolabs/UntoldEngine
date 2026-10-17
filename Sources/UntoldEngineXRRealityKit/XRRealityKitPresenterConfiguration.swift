@@ -37,9 +37,9 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// Where grid vertices that see nothing (the sky, passthrough) are placed: a shell this far
     /// from the eye, so that those areas keep a surface for the material to discard or show.
     public var farShellMetres: Float = 100
-    /// A jump in view distance between neighbouring grid vertices above this, metres, marks the
-    /// vertex as a tear: a silhouette the grid stretches across (stage 3 decides what the
-    /// material does with it).
+    /// A difference in view distance between neighbouring grid vertices above this, metres, is a
+    /// tear: a silhouette the grid stretches across. The vertices on its two sides are marked
+    /// (far side, near side) and the material discards the triangles that span both.
     public var tearThresholdMetres: Float = 0.5
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50
