@@ -58,6 +58,12 @@ let package = Package(
 
         .library(name: "UntoldEngineXR", targets: ["UntoldEngineXR"]),
 
+        // The engine's XR frame presented by RealityKit (a RealityView immersive space instead of
+        // a CompositorLayer), for the games that want the system's space: Spatial Personas in a
+        // SharePlay session, native entities, SwiftUI attachments. Games on Compositor Services
+        // never import it.
+        .library(name: "UntoldEngineXRRealityKit", targets: ["UntoldEngineXRRealityKit"]),
+
         .library(name: "UntoldEngineAR", targets: ["UntoldEngineAR"]),
 
         // Components and editor extensions authored in code: base classes, @UntoldAttribute,
@@ -170,6 +176,27 @@ let package = Package(
                 .linkedFramework("Metal", .when(platforms: [.visionOS])),
                 .linkedFramework("CompositorServices", .when(platforms: [.visionOS])),
                 .linkedFramework("ARKit", .when(platforms: [.visionOS])),
+            ]
+        ),
+        // The RealityKit presenter of the XR frame. The parts without RealityKit's scene (the
+        // grid, the unprojection kernel, the ticket mailbox, the presenter's resources) compile
+        // on every platform, so the tests run them on a Mac; the frame source needs macOS 15,
+        // the view visionOS.
+        .target(
+            name: "UntoldEngineXRRealityKit",
+            dependencies: ["UntoldEngineXR"],
+            path: "Sources/UntoldEngineXRRealityKit",
+            resources: [
+                // The hand-written MaterialX graph of the eye material, loaded by URL.
+                .copy("Resources/XRPresenter.usda"),
+            ],
+            swiftSettings: [
+                .define("ENGINE_STATS_ENABLED", .when(configuration: .debug)),
+                .swiftLanguageMode(.v6),
+            ],
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("RealityKit"),
             ]
         ),
         // iOS AR target
@@ -309,7 +336,7 @@ let package = Package(
         // Render-specific test target
         .testTarget(
             name: "UntoldEngineRenderTests",
-            dependencies: ["UntoldEngine", "UntoldEngineMeshCook"],
+            dependencies: ["UntoldEngine", "UntoldEngineMeshCook", "UntoldEngineXR", "UntoldEngineXRRealityKit"],
             path: "Tests/UntoldEngineRenderTests",
             exclude: ["Resources/compare_psnr.py"],
             resources: [
