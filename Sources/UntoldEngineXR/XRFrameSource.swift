@@ -106,9 +106,18 @@ public protocol XRFrame: AnyObject {
     /// The targets to draw, the headset's display first. Empty when the presenter gives none
     /// for this frame: nothing is drawn or presented then, and the drawing is not ended.
     func acquireEyes() -> [XREyes]
+    /// The command buffer a target is drawn in, when the presenter has one of its own for the
+    /// frame (RealityKit binds a frame's textures to the command buffer its replace calls were
+    /// made on); nil, the default, and the loop makes one on the engine's queue. The loop
+    /// commits it after the target's presentation.
+    func makeCommandBuffer(for target: XREyes) -> MTLCommandBuffer?
     /// Hands a target to the presenter, encoded after its eyes.
     func present(_ target: XREyes, commandBuffer: MTLCommandBuffer)
     func endDrawing()
+}
+
+public extension XRFrame {
+    func makeCommandBuffer(for _: XREyes) -> MTLCommandBuffer? { nil }
 }
 
 /// Where the frames come from: the headset through Compositor Services, another presenter,

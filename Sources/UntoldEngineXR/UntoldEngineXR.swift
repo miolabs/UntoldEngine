@@ -21,6 +21,11 @@
         case full
     }
 
+    /// The same enum under a name of its own: the module and the class `UntoldEngineXR` share a
+    /// name, so another module that also imports `UntoldEngine` (which has an `UntoldImmersionMode`
+    /// too) cannot spell `UntoldEngineXR.UntoldImmersionMode` to tell this one apart.
+    public typealias XRImmersionMode = UntoldImmersionMode
+
     /// The engine on a headset, in three pieces: the runtime (`XRRuntime`: the ARKit session,
     /// the device anchors, the lighting probe, the spatial input), the source of its frames
     /// (`XRFrameSource`: Compositor Services through `CompositorFrameSource`, or another

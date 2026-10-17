@@ -1,0 +1,137 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# The per-eye material of the RealityKit presenter (docs/proposals/XRRealityKitPresenter.md), written by hand.
+#
+# Parameters: colorTexture (that eye's frame) and eye (1 left, 2 right).
+# The Camera Index Switch yields 0 (mono), 1 (left) or 2 (right) for the view being drawn;
+# the surface is visible only when that matches `eye`, and in a mono view (the simulator,
+# a 2D preview) the left eye's grid stands in. Opacity = texture alpha x that visibility,
+# through an Unlit Surface with the post-process tone map off and an opacity threshold of
+# 0.5, so the other eye's grid is discarded and alpha below the threshold shows passthrough.
+
+def Xform "Root"
+{
+    def Material "XRPresenterMaterial"
+    {
+        asset inputs:colorTexture = @@
+        int inputs:eye = 1
+        token outputs:mtlx:surface.connect = </Root/XRPresenterMaterial/UnlitSurface.outputs:out>
+        token outputs:realitykit:vertex
+
+        def Shader "UnlitSurface"
+        {
+            uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+            bool inputs:applyPostProcessToneMap = 0
+            color3f inputs:color.connect = </Root/XRPresenterMaterial/ColorRGB.outputs:out>
+            bool inputs:hasPremultipliedAlpha = 0
+            float inputs:opacity.connect = </Root/XRPresenterMaterial/Opacity.outputs:out>
+            float inputs:opacityThreshold = 0.5
+            token outputs:out
+        }
+
+        def Shader "TexCoord"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 0
+            float2 outputs:out
+        }
+
+        def Shader "ColorImage"
+        {
+            uniform token info:id = "ND_RealityKitTexture2D_color4"
+            asset inputs:file.connect = </Root/XRPresenterMaterial.inputs:colorTexture>
+            string inputs:mag_filter = "linear"
+            string inputs:min_filter = "linear"
+            string inputs:mip_filter = "none"
+            float2 inputs:texcoord.connect = </Root/XRPresenterMaterial/TexCoord.outputs:out>
+            string inputs:u_wrap_mode = "clamp_to_edge"
+            string inputs:v_wrap_mode = "clamp_to_edge"
+            color4f outputs:out
+        }
+
+        def Shader "ColorRGB"
+        {
+            uniform token info:id = "ND_convert_color4_color3"
+            color4f inputs:in.connect = </Root/XRPresenterMaterial/ColorImage.outputs:out>
+            color3f outputs:out
+        }
+
+        def Shader "Channels"
+        {
+            uniform token info:id = "ND_separate4_color4"
+            color4f inputs:in.connect = </Root/XRPresenterMaterial/ColorImage.outputs:out>
+            float outputs:outa
+            float outputs:outb
+            float outputs:outg
+            float outputs:outr
+        }
+
+        def Shader "CameraIndex"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_integer"
+            int inputs:left = 1
+            int inputs:mono = 0
+            int inputs:right = 2
+            int outputs:out
+        }
+
+        def Shader "EyeMatches"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterMaterial/CameraIndex.outputs:out>
+            int inputs:value2.connect = </Root/XRPresenterMaterial.inputs:eye>
+            float outputs:out
+        }
+
+        def Shader "CameraIsMono"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterMaterial/CameraIndex.outputs:out>
+            int inputs:value2 = 0
+            float outputs:out
+        }
+
+        def Shader "EyeIsLeft"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterMaterial.inputs:eye>
+            int inputs:value2 = 1
+            float outputs:out
+        }
+
+        def Shader "MonoShowsLeft"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/CameraIsMono.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/EyeIsLeft.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "Visible"
+        {
+            uniform token info:id = "ND_max_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/EyeMatches.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/MonoShowsLeft.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "Opacity"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Channels.outputs:outa>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Visible.outputs:out>
+            float outputs:out
+        }
+    }
+}

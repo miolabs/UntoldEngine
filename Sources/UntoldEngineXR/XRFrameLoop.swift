@@ -220,7 +220,8 @@ public final class XRFrameLoop: @unchecked Sendable {
             runtime?.noteCommandBufferStall(waitMs: semaphoreWaitMs, phase: "acquired")
         }
 
-        guard let commandBuffer = renderInfo.commandQueue.makeCommandBuffer() else {
+        // The presenter's own command buffer for the target when it has one, else one of ours.
+        guard let commandBuffer = frame.makeCommandBuffer(for: target) ?? renderInfo.commandQueue.makeCommandBuffer() else {
             // Failed to create command buffer - release semaphore
             commandBufferSemaphore.signal()
             return
