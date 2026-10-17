@@ -1,6 +1,6 @@
 # A second presenter for the engine's XR frame: RealityKit — Plan
 
-Status: plan, nothing built. Written 2026-10-16 against the fork develop checkout of that day (the main `UntoldEngine` folder), after the decision recorded in `SpatialPersonasResearch.md` section 8: the engine keeps rendering every frame itself, and for the games that want Spatial Personas a `RealityView` immersive space presents the frame instead of a `CompositorLayer`.
+Status: plan; stages 0 and 1 built (see Progress). Tracked as untoldengine/UntoldEngine#1371; the notes are on the fork as draft PR miolabs/UntoldEngine#80. Written 2026-10-16 against the fork develop checkout of that day (the main `UntoldEngine` folder), after the decision recorded in `SpatialPersonasResearch.md` section 8: the engine keeps rendering every frame itself, and for the games that want Spatial Personas a `RealityView` immersive space presents the frame instead of a `CompositorLayer`.
 
 Question: how does the engine support a second way of presenting its stereo frame on visionOS, next to Compositor Services, without a second renderer and without touching the games that stay on Compositor Services?
 

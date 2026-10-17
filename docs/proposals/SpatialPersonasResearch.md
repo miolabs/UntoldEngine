@@ -1,6 +1,6 @@
 # Spatial Personas in Untold games on visionOS — Research
 
-Status: research only, no implementation. Researched 2026-10-16 against the XROS 27.0 SDK (Xcode 27.0, 27A266a), Apple's documentation and forum answers, and the engine as checked out that day. Question: we want FaceTime/SharePlay Spatial Personas inside some games, but the engine draws its immersive space with Metal through Compositor Services, where Personas never appear. What can the engine do about it?
+Status: research, concluded; the decision and the plan are in `XRRealityKitPresenter.md`, tracked as untoldengine/UntoldEngine#1371 (fork draft PR miolabs/UntoldEngine#80). Researched 2026-10-16 against the XROS 27.0 SDK (Xcode 27.0, 27A266a), Apple's documentation and forum answers, and the engine as checked out that day. Question: we want FaceTime/SharePlay Spatial Personas inside some games, but the engine draws its immersive space with Metal through Compositor Services, where Personas never appear. What can the engine do about it?
 
 ## TL;DR
 
