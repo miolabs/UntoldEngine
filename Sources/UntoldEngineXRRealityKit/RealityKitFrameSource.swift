@@ -30,6 +30,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
 
     let mailbox: XRTicketMailbox
     let depthTextures: [MTLTexture]
+    let nearestDepthBuffers: [MTLBuffer]
     let unproject: XRGridUnprojectPass
     let grid: XRPresenterGrid
     let configuration: XRRealityKitPresenterConfiguration
@@ -42,6 +43,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
     public init(presenter: XRRealityKitPresenter, pose: @escaping PoseProvider) {
         mailbox = presenter.mailbox
         depthTextures = presenter.depthTextures
+        nearestDepthBuffers = presenter.nearestDepthBuffers
         unproject = presenter.unproject
         grid = presenter.grid
         configuration = presenter.configuration
@@ -140,6 +142,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                     source.unproject.encode(
                         commandBuffer: commandBuffer,
                         depth: eye.depthTexture,
+                        nearestDepths: source.nearestDepthBuffers[index],
                         vertices: ticket.gridBuffers[index],
                         grid: source.grid,
                         originFromEye: simd_mul(originFromDevice, eye.deviceFromView),

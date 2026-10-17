@@ -173,25 +173,44 @@ final class XRGridUnprojectTests: XCTestCase {
         return clip.z / clip.w
     }
 
-    /// What the synthetic depth holds at a texture position (uv, v = 0 at the top).
-    private func syntheticDepth(uv: SIMD2<Float>, projection: simd_float4x4) -> Float {
+    /// A one-texel line over the synthetic depth: the texel column and the texel row at `depth`
+    /// (reverse Z), either -1 for none.
+    private struct Line {
+        var column: Int32 = -1
+        var row: Int32 = -1
+        var depth: Float = 0
+    }
+
+    /// What the synthetic depth holds at a texel, without a line: the fragment shader's rule, at
+    /// the texel's centre.
+    private func syntheticDepth(texel: SIMD2<Int>, textureSize: SIMD2<Int>, projection: simd_float4x4) -> Float {
+        let uv = (SIMD2<Float>(Float(texel.x), Float(texel.y)) + 0.5) / SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
         let centred = uv - SIMD2<Float>(0.5, 0.5)
         if simd_length(centred) < Self.holeRadius { return 0 }
         return depth(ofDistance: uv.x < 0.5 ? Self.nearPlaneDistance : Self.farPlaneDistance, projection: projection)
     }
 
-    /// Draws the synthetic depth into a depth texture with a fragment shader writing the depth.
-    private func makeDepthTexture(width: Int, height: Int, projection: simd_float4x4) throws -> MTLTexture {
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: width, height: height, mipmapped: false)
-        descriptor.usage = [.renderTarget, .shaderRead]
-        descriptor.storageMode = .private
-        let texture = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+    /// The fragment shader's `Depths`.
+    private struct DepthsUniforms {
+        var near: Float
+        var far: Float
+        var holeRadius: Float
+        var line: Float
+        var lineAt: SIMD2<Int32>
+        var padding = SIMD2<Int32>(0, 0)
+    }
 
+    private var depthPipeline: (pipeline: MTLRenderPipelineState, depthStencil: MTLDepthStencilState)?
+
+    /// The pass that draws the synthetic depth, a fragment shader writing the depth: made once
+    /// per test.
+    private func makeDepthPipeline() throws -> (pipeline: MTLRenderPipelineState, depthStencil: MTLDepthStencilState) {
+        if let depthPipeline { return depthPipeline }
         let source = """
         #include <metal_stdlib>
         using namespace metal;
         struct V { float4 position [[position]]; float2 uv; };
-        struct Depths { float near; float far; float holeRadius; float padding; };
+        struct Depths { float near; float far; float holeRadius; float line; int2 lineAt; int2 padding; };
         vertex V fullscreen(uint id [[vertex_id]]) {
             float2 ndc = float2((id == 2) ? 3.0f : -1.0f, (id == 1) ? 3.0f : -1.0f);
             V out; out.position = float4(ndc, 0, 1); out.uv = float2(ndc.x * 0.5f + 0.5f, 1.0f - (ndc.y * 0.5f + 0.5f));
@@ -200,8 +219,10 @@ final class XRGridUnprojectTests: XCTestCase {
         struct Out { float depth [[depth(any)]]; };
         fragment Out depths(V in [[stage_in]], constant Depths &d [[buffer(0)]]) {
             Out out;
+            int2 texel = int2(in.position.xy);
             float2 centred = in.uv - 0.5f;
-            if (length(centred) < d.holeRadius) { out.depth = 0.0f; }
+            if (texel.x == d.lineAt.x || texel.y == d.lineAt.y) { out.depth = d.line; }
+            else if (length(centred) < d.holeRadius) { out.depth = 0.0f; }
             else { out.depth = in.uv.x < 0.5f ? d.near : d.far; }
             return out;
         }
@@ -216,7 +237,20 @@ final class XRGridUnprojectTests: XCTestCase {
         depthStencilDescriptor.depthCompareFunction = .always
         depthStencilDescriptor.isDepthWriteEnabled = true
         let depthStencil = try XCTUnwrap(device.makeDepthStencilState(descriptor: depthStencilDescriptor))
+        depthPipeline = (pipeline, depthStencil)
+        return (pipeline, depthStencil)
+    }
 
+    private func makeDepthTexture(width: Int, height: Int) throws -> MTLTexture {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: width, height: height, mipmapped: false)
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        return try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+    }
+
+    /// Draws the synthetic depth, and `line` over it, into `texture`.
+    private func drawDepth(into texture: MTLTexture, projection: simd_float4x4, line: Line = Line()) throws {
+        let (pipeline, depthStencil) = try makeDepthPipeline()
         let pass = MTLRenderPassDescriptor()
         pass.depthAttachment.texture = texture
         pass.depthAttachment.loadAction = .clear
@@ -226,18 +260,18 @@ final class XRGridUnprojectTests: XCTestCase {
         let encoder = try XCTUnwrap(commandBuffer.makeRenderCommandEncoder(descriptor: pass))
         encoder.setRenderPipelineState(pipeline)
         encoder.setDepthStencilState(depthStencil)
-        var depths = SIMD4<Float>(
-            depth(ofDistance: Self.nearPlaneDistance, projection: projection),
-            depth(ofDistance: Self.farPlaneDistance, projection: projection),
-            Self.holeRadius,
-            0
+        var depths = DepthsUniforms(
+            near: depth(ofDistance: Self.nearPlaneDistance, projection: projection),
+            far: depth(ofDistance: Self.farPlaneDistance, projection: projection),
+            holeRadius: Self.holeRadius,
+            line: line.depth,
+            lineAt: SIMD2<Int32>(line.column, line.row)
         )
-        encoder.setFragmentBytes(&depths, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+        encoder.setFragmentBytes(&depths, length: MemoryLayout<DepthsUniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-        return texture
     }
 
     /// The kernel's `eyePoint`, in Swift.
@@ -252,19 +286,26 @@ final class XRGridUnprojectTests: XCTestCase {
         return point
     }
 
-    /// The kernel's `nearestDepth`, in Swift, over the synthetic depth.
-    private func referenceNearestDepth(uv: SIMD2<Float>, grid: XRPresenterGrid, textureSize: SIMD2<Int>, projection: simd_float4x4) -> Float {
+    /// The kernel's footprint of a grid vertex, in Swift: the texels of the cell about the vertex
+    /// plus a one-texel margin, `lo ... hi` on each axis, clamped to the texture.
+    private func referenceFootprint(column: Int, row: Int, grid: XRPresenterGrid, textureSize: SIMD2<Int>) -> (lo: SIMD2<Int>, hi: SIMD2<Int>) {
         let size = SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
-        let cell = size / SIMD2<Float>(Float(grid.columns - 1), Float(grid.rows - 1))
-        let centre = uv * (size - 1)
-        let taps = SIMD2<Int>(min(4, max(1, Int(ceil(cell.x)))), min(4, max(1, Int(ceil(cell.y)))))
+        let cells = SIMD2<Float>(Float(grid.columns - 1), Float(grid.rows - 1))
+        let halfCell = size / cells * 0.5
+        let centre = SIMD2<Float>(Float(column), Float(row)) * (1 / cells) * (size - 1)
+        let lo = SIMD2<Int>(Int(ceil(centre.x - halfCell.x - 1e-3)) - 1, Int(ceil(centre.y - halfCell.y - 1e-3)) - 1)
+        let hi = SIMD2<Int>(Int(floor(centre.x + halfCell.x + 1e-3)) + 1, Int(floor(centre.y + halfCell.y + 1e-3)) + 1)
+        return (simd_max(lo, SIMD2<Int>(0, 0)), simd_min(hi, textureSize &- 1))
+    }
+
+    /// The kernel's first dispatch, in Swift: the nearest depth over the footprint of a grid
+    /// vertex, over the synthetic depth.
+    private func referenceNearestDepth(column: Int, row: Int, grid: XRPresenterGrid, textureSize: SIMD2<Int>, projection: simd_float4x4) -> Float {
+        let (lo, hi) = referenceFootprint(column: column, row: row, grid: grid, textureSize: textureSize)
         var nearest: Float = 0
-        for j in 0 ..< taps.y {
-            for i in 0 ..< taps.x {
-                let offset = (SIMD2<Float>(Float(i), Float(j)) + 0.5) / SIMD2<Float>(Float(taps.x), Float(taps.y)) - 0.5
-                let p = simd_clamp((centre + offset * cell).rounded(.toNearestOrEven), SIMD2<Float>(0, 0), size - 1)
-                let pixelUV = p / (size - 1)
-                nearest = max(nearest, syntheticDepth(uv: pixelUV, projection: projection))
+        for y in lo.y ... hi.y {
+            for x in lo.x ... hi.x {
+                nearest = max(nearest, syntheticDepth(texel: SIMD2<Int>(x, y), textureSize: textureSize, projection: projection))
             }
         }
         return nearest
@@ -303,6 +344,16 @@ final class XRGridUnprojectTests: XCTestCase {
         }
     }
 
+    private func readNearestDepths(_ buffer: MTLBuffer, grid: XRPresenterGrid) -> [Float] {
+        let raw = UnsafeRawBufferPointer(start: buffer.contents(), count: buffer.length)
+        return (0 ..< grid.vertexCount).map { raw.load(fromByteOffset: $0 * MemoryLayout<Float>.stride, as: Float.self) }
+    }
+
+    /// The scratch buffer of the two dispatches, readable by the test.
+    private func makeNearestDepthBuffer(grid: XRPresenterGrid) throws -> MTLBuffer {
+        try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * MemoryLayout<Float>.stride, options: .storageModeShared))
+    }
+
     func test_theKernel_placesTheVertices_asTheReferenceDoes() throws {
         let grid = XRPresenterGrid(columns: 33, rows: 25)
         let textureSize = SIMD2<Int>(256, 192)
@@ -313,19 +364,22 @@ final class XRGridUnprojectTests: XCTestCase {
         // (0.56 m), which is no tear.
         configuration.tearThresholdMetres = 1
         let projection = configuration.projection
-        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y, projection: projection)
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        try drawDepth(into: depthTexture, projection: projection)
+        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
         let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
         // The eye one metre up and half a metre to the right of the origin, looking straight ahead.
         let originFromEye = matrix4x4Translation(0.5, 1, 0)
 
         let pass = try XRGridUnprojectPass(device: device)
         let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
-        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, vertices: vertices, grid: grid, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
+        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, grid: grid, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         XCTAssertEqual(commandBuffer.status, .completed)
 
         let result = readVertices(vertices, grid: grid)
+        let nearest = readNearestDepths(nearestDepths, grid: grid)
         let inverseProjection = simd_inverse(projection)
         let nearDepth = depth(ofDistance: Self.nearPlaneDistance, projection: projection)
         let farDepth = depth(ofDistance: Self.farPlaneDistance, projection: projection)
@@ -337,7 +391,8 @@ final class XRGridUnprojectTests: XCTestCase {
                 XCTAssertEqual(vertex.uv.x, uv.x, accuracy: 1e-6)
                 XCTAssertEqual(vertex.uv.y, uv.y, accuracy: 1e-6, "v = 0 at the top row, unflipped")
 
-                let sampled = referenceNearestDepth(uv: uv, grid: grid, textureSize: textureSize, projection: projection)
+                let sampled = referenceNearestDepth(column: column, row: row, grid: grid, textureSize: textureSize, projection: projection)
+                XCTAssertEqual(nearest[row * grid.columns + column], sampled, accuracy: 1e-6, "the first dispatch's nearest depth of vertex \(column),\(row)")
                 let eye = referenceEyePoint(uv: uv, depth: sampled, inverseProjection: inverseProjection, farShell: configuration.farShellMetres)
                 let expected = originFromEye * SIMD4<Float>(eye, 1)
                 let tolerance: Float = sampled <= 0 ? 0.05 : 0.01
@@ -427,6 +482,92 @@ final class XRGridUnprojectTests: XCTestCase {
         XCTAssertEqual(farSideOnTheShell + farSidePastTheSeam, tears)
         XCTAssertGreaterThan(nearSideAtTheHole, 10, "the planes' vertices along the hole's rim are the near side")
         XCTAssertGreaterThanOrEqual(nearSideAtTheSeam, 10, "the near plane's seam column is the near side: its ten rows away from the hole")
+    }
+
+    /// A one-texel feature between two grid vertices is caught by one of them. By the rule: the
+    /// footprints along a row take in every texel column and neighbouring ones overlap, and the
+    /// same down a column. By the kernel: a one-texel line at each texel column and each texel
+    /// row of the texture, nearer than anything else, pulls one of the two vertices it lies
+    /// between onto its depth, and the first dispatch reads it at exactly the vertices whose
+    /// footprint holds the line's column or row.
+    func test_aOneTexelFeature_betweenTwoGridVertices_isCaughtByOneOfThem() throws {
+        let grid = XRPresenterGrid(columns: 33, rows: 25)
+        let textureSize = SIMD2<Int>(256, 192)
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.farShellMetres = 50
+        configuration.tearThresholdMetres = 1
+        let projection = configuration.projection
+
+        var columnCovered = [Bool](repeating: false, count: textureSize.x)
+        var previous: (lo: SIMD2<Int>, hi: SIMD2<Int>)?
+        for column in 0 ..< grid.columns {
+            let footprint = referenceFootprint(column: column, row: 0, grid: grid, textureSize: textureSize)
+            for x in footprint.lo.x ... footprint.hi.x { columnCovered[x] = true }
+            if let previous { XCTAssertLessThanOrEqual(footprint.lo.x, previous.hi.x, "the footprints of columns \(column - 1) and \(column) overlap") }
+            previous = footprint
+        }
+        XCTAssertFalse(columnCovered.contains(false), "every texel column is in some vertex's footprint")
+        var rowCovered = [Bool](repeating: false, count: textureSize.y)
+        previous = nil
+        for row in 0 ..< grid.rows {
+            let footprint = referenceFootprint(column: 0, row: row, grid: grid, textureSize: textureSize)
+            for y in footprint.lo.y ... footprint.hi.y { rowCovered[y] = true }
+            if let previous { XCTAssertLessThanOrEqual(footprint.lo.y, previous.hi.y, "the footprints of rows \(row - 1) and \(row) overlap") }
+            previous = footprint
+        }
+        XCTAssertFalse(rowCovered.contains(false), "every texel row is in some vertex's footprint")
+
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
+        let pass = try XRGridUnprojectPass(device: device)
+        let lineDistance: Float = 1
+        let lineDepth = depth(ofDistance: lineDistance, projection: projection)
+        // Without a line, the reference per vertex; with one, a vertex reads the line's depth
+        // (the largest there is) exactly when its footprint holds the line's column or row.
+        let footprints = (0 ..< grid.vertexCount).map { referenceFootprint(column: $0 % grid.columns, row: $0 / grid.columns, grid: grid, textureSize: textureSize) }
+        let withoutALine = (0 ..< grid.vertexCount).map { referenceNearestDepth(column: $0 % grid.columns, row: $0 / grid.columns, grid: grid, textureSize: textureSize, projection: projection) }
+        func vertexBefore(texel: Int, vertices: Int, texels: Int) -> Int {
+            // The vertex at or before the texel along an axis: the line lies between it and the next.
+            min(vertices - 2, Int(Float(texel) * Float(vertices - 1) / Float(texels - 1)))
+        }
+        for texel in 0 ..< max(textureSize.x, textureSize.y) {
+            let line = Line(column: texel < textureSize.x ? Int32(texel) : -1, row: texel < textureSize.y ? Int32(texel) : -1, depth: lineDepth)
+            try drawDepth(into: depthTexture, projection: projection, line: line)
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, grid: grid, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            let nearest = readNearestDepths(nearestDepths, grid: grid)
+            let result = readVertices(vertices, grid: grid)
+
+            for index in 0 ..< grid.vertexCount {
+                let footprint = footprints[index]
+                let holdsTheLine = (footprint.lo.x ... footprint.hi.x).contains(Int(line.column)) || (footprint.lo.y ... footprint.hi.y).contains(Int(line.row))
+                let expected = holdsTheLine ? lineDepth : withoutALine[index]
+                XCTAssertEqual(nearest[index], expected, accuracy: 1e-6, "line at texel \(texel): the nearest depth of vertex \(index % grid.columns),\(index / grid.columns)")
+            }
+            // The vertical line, checked on a grid row whose footprint the horizontal line misses.
+            if line.column >= 0 {
+                let row = texel < textureSize.y / 2 ? grid.rows - 4 : 3
+                let before = vertexBefore(texel: texel, vertices: grid.columns, texels: textureSize.x)
+                let caught = [before, before + 1].first { abs(nearest[row * grid.columns + $0] - lineDepth) < 1e-6 }
+                XCTAssertNotNil(caught, "the one-texel column \(texel) lies between vertices \(before) and \(before + 1) of row \(row): one of them catches it")
+                if let caught {
+                    XCTAssertEqual(-result[row * grid.columns + caught].position.z, lineDistance, accuracy: 0.01, "the vertex that caught column \(texel) is placed on the line")
+                }
+            }
+            // The horizontal line, checked on a grid column whose footprint the vertical line misses.
+            if line.row >= 0 {
+                let column = texel < textureSize.x / 2 ? grid.columns - 4 : 3
+                let before = vertexBefore(texel: texel, vertices: grid.rows, texels: textureSize.y)
+                let caught = [before, before + 1].first { abs(nearest[$0 * grid.columns + column] - lineDepth) < 1e-6 }
+                XCTAssertNotNil(caught, "the one-texel row \(texel) lies between vertices \(before) and \(before + 1) of column \(column): one of them catches it")
+                if let caught {
+                    XCTAssertEqual(-result[caught * grid.columns + column].position.z, lineDistance, accuracy: 0.01, "the vertex that caught row \(texel) is placed on the line")
+                }
+            }
+        }
     }
 
     func test_theUniforms_haveTheKernelsLayout() {

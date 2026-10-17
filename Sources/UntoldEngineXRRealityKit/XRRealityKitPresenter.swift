@@ -37,6 +37,9 @@ public final class XRRealityKitPresenter {
     public let depthTextures: [MTLTexture]
     public let grid: XRPresenterGrid
     public let unproject: XRGridUnprojectPass
+    /// The unprojection's scratch per eye (each vertex's nearest depth, between its two
+    /// dispatches), kept across frames: the tickets' command buffers run in order on one queue.
+    public let nearestDepthBuffers: [MTLBuffer]
     /// Whether the grids show through the shader graph (each eye its own grid) or the fallback
     /// material (both grids in both eyes).
     public private(set) var usesShaderGraphMaterial = false
@@ -86,6 +89,13 @@ public final class XRRealityKitPresenter {
             return texture
         }
 
+        nearestDepthBuffers = try (0 ..< stereoEyeCount).map { eye in
+            guard let buffer = XRGridUnprojectPass.makeNearestDepthBuffer(device: device, grid: grid, label: "XR presenter nearest depth eye \(eye)") else {
+                throw PresenterError.nearestDepthBuffer
+            }
+            return buffer
+        }
+
         let meshes = try (0 ..< stereoEyeCount).map { _ in try grid.makeMesh(farShell: configuration.farShellMetres) }
         self.meshes = meshes
 
@@ -116,8 +126,14 @@ public final class XRRealityKitPresenter {
 
     public enum PresenterError: Swift.Error, CustomStringConvertible {
         case depthTexture
+        case nearestDepthBuffer
 
-        public var description: String { "Metal gave no depth texture for the presenter" }
+        public var description: String {
+            switch self {
+            case .depthTexture: return "Metal gave no depth texture for the presenter"
+            case .nearestDepthBuffer: return "Metal gave no scratch buffer for the presenter's grids"
+            }
+        }
     }
 
     /// Lets `update` post tickets, with command buffers from `commandQueue`: the engine's own

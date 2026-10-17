@@ -50,12 +50,17 @@ public struct XRGridUnprojectUniforms {
     }
 }
 
-/// Turns one eye's depth into its grid: one thread per vertex reads the nearest depth of the
-/// vertex's footprint in the texture (so that near silhouettes are kept), unprojects it through
-/// the eye's inverse projection and pose into the origin's space, and writes the position, the
-/// uv (v = 0 at the top row, as RealityKit samples a `LowLevelTexture`) and the tear mask.
-/// Depth 0, the far plane under reverse Z, and anything past the far shell land on the shell,
-/// so that the sky and passthrough areas keep a surface.
+/// Turns one eye's depth into its grid, in two dispatches on the same command buffer. The
+/// first, one thread per vertex, reads the nearest depth (the largest, under reverse Z) over
+/// the vertex's whole footprint in the texture, the cell about the vertex plus a one-texel
+/// margin, into a scratch buffer of one float per vertex: every texel row and column is read
+/// by some vertex and adjacent footprints overlap, so a thin feature or an edge between two
+/// vertices is caught by one of them, and near silhouettes are kept. The second reads its own
+/// and its eight neighbours' depths from that buffer, unprojects through the eye's inverse
+/// projection and pose into the origin's space, and writes the position, the uv (v = 0 at the
+/// top row, as RealityKit samples a `LowLevelTexture`) and the tear mask. Depth 0, the far
+/// plane under reverse Z, and anything past the far shell land on the shell, so that the sky
+/// and passthrough areas keep a surface.
 ///
 /// The tear mask has two channels: x is 1 on the FAR side of a depth jump (a vertex further from
 /// the eye than a neighbour by more than the threshold), y is 1 on its NEAR side. A triangle
@@ -64,12 +69,15 @@ public struct XRGridUnprojectUniforms {
 /// above zero, while a triangle of the object's own surface (x = 0) and one of the far surface
 /// (y = 0) are kept whole, up to the jump.
 ///
-/// The kernel is compiled from source once per device: the engine's prebuilt metallibs stay as
-/// they are, and the tests run it on a Mac.
+/// The kernels are compiled from source once per device: the engine's prebuilt metallibs stay
+/// as they are, and the tests run them on a Mac.
 public final class XRGridUnprojectPass: @unchecked Sendable {
+    /// The first dispatch: each vertex's nearest depth into the scratch buffer.
+    public static let nearestDepthKernelName = "xrGridNearestDepth"
+    /// The second: the vertices from the scratch buffer.
     public static let kernelName = "xrGridUnproject"
 
-    /// The kernel. Its `XRGridVertex` is the grid's vertex layout; its uniforms are
+    /// The kernels. Their `XRGridVertex` is the grid's vertex layout; their uniforms are
     /// `XRGridUnprojectUniforms`.
     public static let source = """
     #include <metal_stdlib>
@@ -101,32 +109,40 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         }
         return p;
     }
-    // The nearest depth (the largest, under reverse Z) over up to 4 x 4 taps across the footprint
-    // of a grid vertex in the texture.
-    static float nearestDepth(depth2d<float, access::read> depth, float2 uv, constant XRGridUnprojectUniforms &u) {
+    // Pass 1: the nearest depth (the largest, under reverse Z) over the vertex's footprint, the
+    // cell about the vertex (half a cell to each side, in texels) plus a one-texel margin, so
+    // that every texel is read by some vertex and adjacent footprints overlap. The bounds are
+    // taken with a tolerance of a thousandth of a texel, so that a cell edge that lands on a
+    // texel is the same texel whichever way the arithmetic rounds.
+    kernel void xrGridNearestDepth(device float *depths [[buffer(0)]],
+                                   constant XRGridUnprojectUniforms &u [[buffer(1)]],
+                                   depth2d<float, access::read> depth [[texture(0)]],
+                                   uint2 gid [[thread_position_in_grid]])
+    {
+        if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) { return; }
         float2 size = float2(u.textureSize);
-        float2 cell = size / float2(u.gridSize - 1);
-        float2 centre = uv * (size - 1.0f);
-        uint2 taps = clamp(uint2(ceil(cell)), uint2(1), uint2(4));
+        float2 halfCell = size / float2(u.gridSize - 1) * 0.5f;
+        float2 centre = float2(gid) * (1.0f / float2(u.gridSize - 1)) * (size - 1.0f);
+        int2 lo = max(int2(ceil(centre - halfCell - 1e-3f)) - 1, int2(0));
+        int2 hi = min(int2(floor(centre + halfCell + 1e-3f)) + 1, int2(u.textureSize) - 1);
         float nearest = 0.0f;
-        for (uint j = 0; j < taps.y; ++j) {
-            for (uint i = 0; i < taps.x; ++i) {
-                float2 offset = (float2(i, j) + 0.5f) / float2(taps) - 0.5f;
-                float2 p = clamp(round(centre + offset * cell), float2(0.0f), size - 1.0f);
-                nearest = max(nearest, depth.read(uint2(p)));
+        for (int y = lo.y; y <= hi.y; ++y) {
+            for (int x = lo.x; x <= hi.x; ++x) {
+                nearest = max(nearest, depth.read(uint2(x, y)));
             }
         }
-        return nearest;
+        depths[gid.y * u.gridSize.x + gid.x] = nearest;
     }
+    // Pass 2: the vertex from its own and its neighbours' nearest depths.
     kernel void xrGridUnproject(device XRGridVertex *vertices [[buffer(0)]],
                                 constant XRGridUnprojectUniforms &u [[buffer(1)]],
-                                depth2d<float, access::read> depth [[texture(0)]],
+                                const device float *depths [[buffer(2)]],
                                 uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) { return; }
         float2 step = 1.0f / float2(u.gridSize - 1);
         float2 uv = float2(gid) * step;
-        float3 eye = eyePoint(uv, nearestDepth(depth, uv, u), u);
+        float3 eye = eyePoint(uv, depths[gid.y * u.gridSize.x + gid.x], u);
         float distance = length(eye);
         // The tear mask against the eight neighbours: x when this vertex is further from the eye
         // than a neighbour by more than the threshold, y when it is nearer by that much. The
@@ -139,7 +155,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             int2 n = int2(gid) + offsets[k];
             if (n.x < 0 || n.y < 0 || n.x >= int(u.gridSize.x) || n.y >= int(u.gridSize.y)) { continue; }
             float2 nuv = float2(n) * step;
-            float neighbour = length(eyePoint(nuv, nearestDepth(depth, nuv, u), u));
+            float neighbour = length(eyePoint(nuv, depths[n.y * u.gridSize.x + n.x], u));
             if (distance - neighbour > u.tearThreshold) { farSide = 1.0f; }
             if (neighbour - distance > u.tearThreshold) { nearSide = 1.0f; }
         }
@@ -151,28 +167,48 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     """
 
     public enum Error: Swift.Error, CustomStringConvertible {
-        case kernelMissing
+        case kernelMissing(String)
 
-        public var description: String { "the kernel \(XRGridUnprojectPass.kernelName) is not in the compiled library" }
+        public var description: String {
+            switch self {
+            case let .kernelMissing(name): return "the kernel \(name) is not in the compiled library"
+            }
+        }
     }
 
+    private let nearestDepthPipeline: MTLComputePipelineState
     private let pipeline: MTLComputePipelineState
 
-    /// Compiles the kernel for `device`; throws what the Metal compiler reports.
+    /// Compiles the kernels for `device`; throws what the Metal compiler reports.
     public init(device: MTLDevice) throws {
         let library = try device.makeLibrary(source: Self.source, options: nil)
-        guard let function = library.makeFunction(name: Self.kernelName) else {
-            throw Error.kernelMissing
+        func makePipeline(_ name: String) throws -> MTLComputePipelineState {
+            guard let function = library.makeFunction(name: name) else { throw Error.kernelMissing(name) }
+            return try device.makeComputePipelineState(function: function)
         }
-        pipeline = try device.makeComputePipelineState(function: function)
+        nearestDepthPipeline = try makePipeline(Self.nearestDepthKernelName)
+        pipeline = try makePipeline(Self.kernelName)
+    }
+
+    /// The scratch buffer between the two dispatches for one eye's `grid`: one float per vertex,
+    /// private to the GPU. The caller keeps it across frames (the presenter owns one per eye):
+    /// the command buffers of one queue run in order, so a frame's second dispatch reads what
+    /// its own first one wrote.
+    public static func makeNearestDepthBuffer(device: MTLDevice, grid: XRPresenterGrid, label: String = "XR grid nearest depth") -> MTLBuffer? {
+        let buffer = device.makeBuffer(length: grid.vertexCount * MemoryLayout<Float>.stride, options: .storageModePrivate)
+        buffer?.label = label
+        return buffer
     }
 
     /// Encodes one eye's unprojection: `depth` is the eye's depth as the engine left it (reverse
-    /// Z), `vertices` the grid's vertex buffer for this frame, `originFromEye` the inverse of the
-    /// view matrix the eye was drawn with and `projection` its projection.
+    /// Z), `nearestDepths` the eye's scratch buffer (`makeNearestDepthBuffer`), `vertices` the
+    /// grid's vertex buffer for this frame, `originFromEye` the inverse of the view matrix the
+    /// eye was drawn with and `projection` its projection. Both dispatches go into one compute
+    /// encoder, a memory barrier between them.
     public func encode(
         commandBuffer: MTLCommandBuffer,
         depth: MTLTexture,
+        nearestDepths: MTLBuffer,
         vertices: MTLBuffer,
         grid: XRPresenterGrid,
         originFromEye: simd_float4x4,
@@ -183,7 +219,6 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = label
-        encoder.setComputePipelineState(pipeline)
         var uniforms = XRGridUnprojectUniforms(
             originFromEye: originFromEye,
             inverseProjection: simd_inverse(projection),
@@ -192,9 +227,23 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             farShell: farShell,
             tearThreshold: tearThreshold
         )
-        encoder.setBuffer(vertices, offset: 0, index: 0)
         encoder.setBytes(&uniforms, length: MemoryLayout<XRGridUnprojectUniforms>.stride, index: 1)
+
+        encoder.setComputePipelineState(nearestDepthPipeline)
+        encoder.setBuffer(nearestDepths, offset: 0, index: 0)
         encoder.setTexture(depth, index: 0)
+        dispatch(encoder, pipeline: nearestDepthPipeline, grid: grid)
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(vertices, offset: 0, index: 0)
+        encoder.setBuffer(nearestDepths, offset: 0, index: 2)
+        dispatch(encoder, pipeline: pipeline, grid: grid)
+        encoder.endEncoding()
+    }
+
+    /// One thread per vertex.
+    private func dispatch(_ encoder: MTLComputeCommandEncoder, pipeline: MTLComputePipelineState, grid: XRPresenterGrid) {
         let width = min(pipeline.threadExecutionWidth, grid.columns)
         let height = max(1, min(pipeline.maxTotalThreadsPerThreadgroup / width, grid.rows))
         let threadsPerThreadgroup = MTLSize(width: width, height: height, depth: 1)
@@ -204,6 +253,5 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             depth: 1
         )
         encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
-        encoder.endEncoding()
     }
 }
