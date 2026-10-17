@@ -262,6 +262,40 @@ the dark part does not show through; what is seen from outside is never moved,
 and what is seen through glass stays where it is. The simplifier is
 [meshoptimizer](https://github.com/zeux/meshoptimizer).
 
+### Reducing a high-poly model
+
+`untoldengine reduce` simplifies the model itself, in place, where `bake-lods`
+writes simplified copies beside it. It is for high-poly source exported as it is
+(a modelled-for-render prop, a scan): reduce it to what the game draws up close,
+then cook its LOD chain from the result.
+
+```bash
+untoldengine reduce --input GameData/Models/table/table.untoldpack --target-triangles 45000
+untoldengine bake-lods --input GameData/Models/table/table.untoldpack
+
+# A share of the triangles; one model, written elsewhere
+untoldengine reduce --input chair.untold --output chair_low.untold --ratio 0.1
+```
+
+| Flag | Description |
+|---|---|
+| `--input <path>` | A `.untold` model, or a `.untoldpack` whose models are reduced together |
+| `--target-triangles <n>` | Triangle budget for the whole input (a pack's models counted once each) |
+| `--ratio <r>` | Share of the triangles to keep, above 0 and below 1 |
+| `--output <path>` | Write a `.untold` input's result here instead of over it |
+
+The budget is not shared out in proportion. The command searches for one
+deviation, the same for every mesh of every model, at which the input holds the
+budget: flat or finely tessellated parts (lettering, fluted turnings, bevelled
+boxes cut into many faces) give up their triangles and parts whose shape needs
+them keep them. The deviation never goes above 1 % of the input's diameter; a
+budget that would need more is left unmet. The borders two meshes share and the
+texture seams of textured meshes stay where they are, and names, entities,
+materials and textures are carried over. An input already within its budget is
+left untouched, so the command can be run again; with `--ratio` it reduces again
+each time. LOD levels cooked from the full model (files and the pack's
+`lodChains`) are removed: run `bake-lods` afterwards.
+
 ### Animation-only exports → `.untoldanim`
 
 `--animation` exports clip data only (no mesh geometry) and requires a

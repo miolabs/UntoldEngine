@@ -249,7 +249,7 @@ public enum UntoldMeshLODCooker {
 
     /// The meshes of a decoded model with their simplifier flags, the transform that takes
     /// each to model space, and the model's diameter.
-    private static func unpackGeometry(of decoded: UntoldDecodedAsset, fileData: Data, path: String) throws -> ([UntoldLODMesh], [simd_float4x4], Float) {
+    static func unpackGeometry(of decoded: UntoldDecodedAsset, fileData: Data, path: String) throws -> ([UntoldLODMesh], [simd_float4x4], Float) {
         var unpacked: [UntoldLODMesh]
         let transforms: [simd_float4x4]
         do {
@@ -303,7 +303,7 @@ public enum UntoldMeshLODCooker {
         }
     }
 
-    private static func isGeneratedLevel(_ url: URL) -> Bool {
+    static func isGeneratedLevel(_ url: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
         guard let head = try? handle.read(upToCount: 256),
@@ -373,7 +373,7 @@ public enum UntoldMeshLODCooker {
         }
     }
 
-    private static func largestAxisScale(_ transform: simd_float4x4) -> Float {
+    static func largestAxisScale(_ transform: simd_float4x4) -> Float {
         max(
             simd_length(simd_make_float3(transform.columns.0)),
             simd_length(simd_make_float3(transform.columns.1)),

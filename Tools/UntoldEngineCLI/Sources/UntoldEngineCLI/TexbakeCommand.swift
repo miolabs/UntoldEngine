@@ -41,6 +41,9 @@ struct TexbakeCommand: ParsableCommand {
     @Option(name: .long, help: "Quality: fastest, fast, medium, thorough, or exhaustive")
     var quality: String = "thorough"
 
+    @Option(name: .customLong("max-size"), help: "Scale larger images down so their longer side is at most this many texels before baking")
+    var maxSize: Int?
+
     @Flag(name: .long, help: "Retain intermediate files")
     var keepTemp = false
 
@@ -63,6 +66,10 @@ struct TexbakeCommand: ParsableCommand {
         if let dir { arguments += ["--dir", resolvePath(dir).standardizedFileURL.path] }
         arguments += ["--quality", quality]
         if keepTemp { arguments.append("--keep-temp") }
+        if let maxSize {
+            guard maxSize >= 1 else { throw ValidationError("--max-size must be at least 1.") }
+            arguments += ["--max-size", String(maxSize)]
+        }
         if let patchRefs { arguments += ["--patch-refs", resolvePath(patchRefs).standardizedFileURL.path] }
 
         let process = Process()

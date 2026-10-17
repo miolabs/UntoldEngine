@@ -273,12 +273,14 @@ enum UntoldMeshLODSimplifier {
     /// the simplifier stops at the error limit and at what the topology allows.
     /// `sunkPieces` flags the components of `parts` that the cook sank behind another
     /// surface: they are simplified apart from the rest.
-    static func level(of mesh: UntoldLODMesh, parts: UntoldLODMeshParts, ratio: Float, errorLimit: Float, sunkPieces: [Bool] = []) -> UntoldLODMeshLevel {
+    /// `releaseSeams` false keeps the texture seams whatever they cost: for a model's own
+    /// mesh (`UntoldMeshReducer`), seen from up close, where a level is not.
+    static func level(of mesh: UntoldLODMesh, parts: UntoldLODMeshParts, ratio: Float, errorLimit: Float, sunkPieces: [Bool] = [], releaseSeams: Bool = true) -> UntoldLODMeshLevel {
         var positions = mesh.positions
         var movedVertices: [Int] = []
         var error: Float = 0
 
-        var indices = simplifyBody(mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, sunkPieces: sunkPieces, error: &error)
+        var indices = simplifyBody(mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, sunkPieces: sunkPieces, releaseSeams: releaseSeams, error: &error)
         if !parts.clutterIndices.isEmpty {
             indices += simplifyClutter(
                 mesh: mesh,
@@ -301,6 +303,7 @@ enum UntoldMeshLODSimplifier {
         ratio: Float,
         errorLimit: Float,
         sunkPieces: [Bool],
+        releaseSeams: Bool,
         error: inout Float
     ) -> [UInt32] {
         let source = parts.bodyIndices
@@ -320,11 +323,11 @@ enum UntoldMeshLODSimplifier {
                 }
             }
             if !sunk.isEmpty, !kept.isEmpty {
-                return simplifyBody(indices: sunk, mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, error: &error)
-                    + simplifyBody(indices: kept, mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, error: &error)
+                return simplifyBody(indices: sunk, mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, releaseSeams: releaseSeams, error: &error)
+                    + simplifyBody(indices: kept, mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, releaseSeams: releaseSeams, error: &error)
             }
         }
-        return simplifyBody(indices: source, mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, error: &error)
+        return simplifyBody(indices: source, mesh: mesh, parts: parts, ratio: ratio, errorLimit: errorLimit, releaseSeams: releaseSeams, error: &error)
     }
 
     /// Reduces the triangles `source` of `mesh` towards `ratio` of them.
@@ -334,6 +337,7 @@ enum UntoldMeshLODSimplifier {
         parts: UntoldLODMeshParts,
         ratio: Float,
         errorLimit: Float,
+        releaseSeams: Bool,
         error: inout Float
     ) -> [UInt32] {
         let target = targetIndexCount(source.count, ratio: ratio)
@@ -354,7 +358,7 @@ enum UntoldMeshLODSimplifier {
         func collapse(_ options: UInt32) -> (indices: [UInt32], error: Float) {
             var keptError: Float = 0
             let kept = simplify(mesh: mesh, indices: source, flags: mesh.flags, target: target, errorLimit: errorLimit, options: options, error: &keptError)
-            guard Float(kept.count) > Float(target) * seamReleaseOvershoot, mesh.flags != mesh.lockFlags else {
+            guard releaseSeams, Float(kept.count) > Float(target) * seamReleaseOvershoot, mesh.flags != mesh.lockFlags else {
                 return (kept, keptError)
             }
             var releasedError: Float = 0

@@ -452,12 +452,26 @@ def write_utex(
 # Main bake routine for a single texture
 # ──────────────────────────────────────────────
 
+def limit_size(img: "Image.Image", max_size: int | None) -> "Image.Image":
+    """Scales `img` down (LANCZOS, aspect kept) so its longer side is at most
+    `max_size`; smaller images and `max_size` None are returned as they are.
+    Tiling maps and textures seen from afar rarely need their source resolution."""
+    if not max_size or max(img.size) <= max_size:
+        return img
+    scale = max_size / max(img.size)
+    size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+    # LANCZOS works on 8-bit and float modes; 16-bit integer images go through 32-bit.
+    source = img.convert("I") if img.mode in ("I;16", "I;16B", "I;16L", "I;16N") else img
+    return source.resize(size, Image.LANCZOS)
+
+
 def bake_texture(
     input_path: Path,
     output_path: Path,
     slot: str,
     quality: str,
     keep_temp: bool,
+    max_size: int | None = None,
 ) -> None:
     if not _HAS_PILLOW:
         raise RuntimeError("Pillow is required. Install with: pip install Pillow")
@@ -469,6 +483,10 @@ def bake_texture(
 
     print(f"  Loading   {input_path.name}")
     img = Image.open(input_path)
+    if max_size and max(img.size) > max_size:
+        original = img.size
+        img = limit_size(img, max_size)
+        print(f"  Resized   {original[0]}×{original[1]} → {img.width}×{img.height}")
     has_alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
 
     if cfg.encoding == "rgba16f":
@@ -695,6 +713,7 @@ def bake_directory(
     keep_temp: bool,
     progress_callback: Callable[[int, int, str], None] | None = None,
     untold_files: list[Path] | None = None,
+    max_size: int | None = None,
 ) -> None:
     sources = sorted(
         p for p in directory.iterdir()
@@ -721,7 +740,7 @@ def bake_directory(
         out = src.with_suffix(".utex")
         print(f"[{slot}] {src.name}")
         try:
-            bake_texture(src, out, slot, quality, keep_temp)
+            bake_texture(src, out, slot, quality, keep_temp, max_size)
         except Exception as exc:
             errors.append((src, str(exc)))
             print(f"  [error] {exc}")
@@ -1200,6 +1219,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--keep-temp", action="store_true", help="Retain intermediate temp files")
     parser.add_argument(
+        "--max-size",
+        type=int,
+        metavar="TEXELS",
+        help="Scale larger images down so their longer side is at most this many texels before baking",
+    )
+    parser.add_argument(
         "--untold",
         type=Path,
         action="append",
@@ -1267,7 +1292,10 @@ def main(argv: list[str] | None = None) -> int:
             if hint.is_dir():
                 print(f"error: --untold takes a .untold file or a .untoldpack, not a folder: '{hint}'", file=sys.stderr)
                 return 1
-        bake_directory(args.dir, args.quality, args.keep_temp, untold_files=args.untold)
+        if args.max_size is not None and args.max_size < 1:
+            print("error: --max-size must be at least 1", file=sys.stderr)
+            return 1
+        bake_directory(args.dir, args.quality, args.keep_temp, untold_files=args.untold, max_size=args.max_size)
         return 0
 
     if args.input is None:
@@ -1287,7 +1315,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Quality {args.quality}\n")
 
     try:
-        bake_texture(args.input, output, slot, args.quality, args.keep_temp)
+        bake_texture(args.input, output, slot, args.quality, args.keep_temp, args.max_size)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

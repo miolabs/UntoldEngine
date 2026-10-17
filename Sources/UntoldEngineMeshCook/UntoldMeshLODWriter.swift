@@ -27,7 +27,10 @@ enum UntoldMeshLODWriter {
     }
 
     /// The file for `levels`, one per mesh record of `source`, in the records' order.
-    static func levelFile(source: UntoldDecodedAsset, sourceData: Data, levels: [UntoldLODMeshLevel]) throws -> Data {
+    /// `markAsLevel` makes it a level of `source` (a `.lod` file with the
+    /// `generatedLODLevel` flag); without it the file stays a model of `source`'s type,
+    /// which is what `UntoldMeshReducer` writes in place of the model.
+    static func levelFile(source: UntoldDecodedAsset, sourceData: Data, levels: [UntoldLODMeshLevel], markAsLevel: Bool = true) throws -> Data {
         precondition(levels.count == source.meshes.count, "one level per mesh record")
 
         var vertexChunk = Data()
@@ -94,8 +97,10 @@ enum UntoldMeshLODWriter {
         payloads.append(geometryPayload(.indexData, bytes: indexChunk, compress: compressGeometry))
 
         var header = source.header
-        header.fileType = .lod
-        header.flags |= UntoldFileFlags.generatedLODLevel
+        if markAsLevel {
+            header.fileType = .lod
+            header.flags |= UntoldFileFlags.generatedLODLevel
+        }
         header.chunkCount = UInt32(payloads.count)
         let headerSize = encodedSize(of: header)
         let entrySize = encodedSize(of: UntoldChunkEntryV1(chunkType: .stringTable, fileOffset: 0, compressedSize: 0, uncompressedSize: 0))

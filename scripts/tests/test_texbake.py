@@ -325,5 +325,28 @@ class TexbakeSlotDetectionTests(unittest.TestCase):
         self.assertIsNone(t._slot_from_texture_flags(0))
 
 
+
+@unittest.skipUnless(t._HAS_PILLOW, "Pillow is not installed")
+class TexbakeMaxSizeTests(unittest.TestCase):
+    def test_limit_size_scales_the_longer_side_down_and_keeps_the_aspect(self) -> None:
+        from PIL import Image
+
+        scaled = t.limit_size(Image.new("RGBA", (4096, 2048)), 1024)
+        self.assertEqual(scaled.size, (1024, 512))
+
+    def test_limit_size_leaves_smaller_images_and_no_limit_alone(self) -> None:
+        from PIL import Image
+
+        small = Image.new("RGB", (512, 512))
+        self.assertIs(t.limit_size(small, 1024), small)
+        self.assertIs(t.limit_size(small, None), small)
+
+    def test_limit_size_handles_16_bit_images(self) -> None:
+        from PIL import Image
+
+        scaled = t.limit_size(Image.new("I;16", (2048, 2048)), 512)
+        self.assertEqual(scaled.size, (512, 512))
+
+
 if __name__ == "__main__":
     unittest.main()

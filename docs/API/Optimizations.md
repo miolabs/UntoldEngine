@@ -85,6 +85,17 @@ untoldengine texbake --patch-refs GameData/Models/dungeon/tile_exports/
 2. Rewrites the `.untold` binary to point each texture reference at the new `.utex` file and sets the `textureFormat` field to the correct ASTC variant.
 3. The original PNG/JPEG files are left in place. The engine loads `.utex` when present and falls back to PNG/JPEG otherwise.
 
+### Capping the texture size
+
+`--max-size <texels>` scales every larger image down (LANCZOS, aspect kept) so its
+longer side is at most that many texels before it is compressed, for tiling maps or
+textures only ever seen from a distance. The source images are not changed:
+
+```bash
+untoldengine texbake --dir GameData/Models/cabinet/Textures/ --max-size 1024
+untoldengine texbake --patch-refs GameData/Models/cabinet/
+```
+
 ### Single-file bake with slot override
 
 For cases where filename-based slot detection is insufficient, pass `--input` and `--slot` directly:
