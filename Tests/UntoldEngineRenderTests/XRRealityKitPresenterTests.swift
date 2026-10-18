@@ -1370,52 +1370,58 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         presenter.stop()
     }
 
-    /// RealityKit, drawing the presenter's grids from the engine's own eye, shows the engine's
-    /// picture: the grid's geometry and the projective uv put every texel back where the engine
-    /// drew it. A symmetric frustum here, so that RealityKit's perspective camera matches the
-    /// engine's projection exactly; the eyes at the device's point (no eye distance) and the
-    /// camera there, so that the left eye's grid is what a mono camera sees through the eye switch.
-    func test_realityKitShowsTheEnginesPicture_fromTheEnginesEye() async throws {
-        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+    /// The configuration of the picture tests: a symmetric 90° frustum, so that RealityKit's
+    /// perspective camera matches the engine's projection exactly; the eyes at the device's point
+    /// (no eye distance), so that the left eye's grid is what a mono camera there sees through
+    /// the eye switch; cells of four texels, and a tear threshold for this scale: a texel is 39 mm
+    /// at the cubes, five metres off through this 90° frustum, and a turned cube's grazing side
+    /// face changes its distance to the eye by half a metre between neighbouring vertices, which
+    /// the headset's 2 mm texels never reach on such a face. The threshold stays well under the
+    /// 45 m between a cube and the far shell.
+    private static var pictureConfiguration: XRRealityKitPresenterConfiguration {
         var configuration = XRRealityKitPresenterConfiguration()
         configuration.textureSize = [256, 256]
         configuration.frustumTangents = [1, 1, 1, 1]
         configuration.interpupillaryDistance = 0
-        // Cells of four texels, and a tear threshold for this scale: a texel is 39 mm at the
-        // cubes, five metres off through this 90° frustum, and a turned cube's grazing side face
-        // changes its distance to the eye by half a metre between neighbouring vertices, which
-        // the headset's 2 mm texels never reach on such a face. The threshold stays well under
-        // the 45 m between a cube and the far shell.
         configuration.gridColumns = 65
         configuration.gridRows = 65
         configuration.tearThresholdMetres = 1
         configuration.farShellMetres = 50
-        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
-        presenter.reportInterval = 0
-        guard presenter.usesShaderGraphMaterial else { throw XCTSkip("the eye material did not load") }
-        // Mixed immersion: the engine leaves the room transparent, as on the headset. (With an
-        // opaque background the grid shows the halo of background lost around every silhouette,
-        // where the triangles stretched to the far shell are torn away: a later stage's.)
-        let styleBefore = renderInfo.immersionStyle
-        renderInfo.immersionStyle = .mixed
-        defer { renderInfo.immersionStyle = styleBefore }
-        // The cubes turned, so that their faces run across cells at changing depth: an affine
-        // uv keystones there by a measurable fraction of a texel (64.6 dB against the engine's
-        // picture with the cubes square to the eye; the projective one is exact at 8 bits).
+        return configuration
+    }
+
+    /// The headset of the picture tests: five metres back, looking at the cubes.
+    private static let picturePose = matrix4x4Translation(0, 0, 5)
+
+    /// The cubes turned, so that their faces run across cells at changing depth: an affine uv
+    /// keystones there by a measurable fraction of a texel (64.6 dB against the engine's picture
+    /// with the cubes square to the eye; the projective one is exact at 8 bits).
+    private func turnTheCubes() throws {
         for index in 0 ..< 3 {
             let cube = try XCTUnwrap(findEntity(name: "Cube\(index)"))
             rotateTo(entityId: cube, angle: 35, axis: simd_float3(0, 1, 0))
         }
-        func reach(_ what: String, _ condition: () -> Bool) throws {
-            // A stalled loop is a failure here, not an unavailable environment.
-            let deadline = Date().addingTimeInterval(10)
-            while !condition() {
-                guard Date() < deadline else { throw PictureError.stalled(what) }
-                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
-            }
+    }
+
+    /// Waits for `condition`; a stalled loop is a failure here, not an unavailable environment.
+    private func reach(_ what: String, _ condition: () -> Bool) throws {
+        let deadline = Date().addingTimeInterval(10)
+        while !condition() {
+            guard Date() < deadline else { throw PictureError.stalled(what) }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
-        let devicePose = matrix4x4Translation(0, 0, 5)
-        let source = RealityKitFrameSource(presenter: presenter) { _ in devicePose }
+    }
+
+    /// The engine's left eye for `configuration`, drawn by the loop from the picture pose, as
+    /// linear rgba pixels of the texture's size; and the presenter, stopped, with its grids as the
+    /// last frame placed them, for RealityKit to draw.
+    @available(macOS 15.0, *)
+    private func drawEngineEye(_ configuration: XRRealityKitPresenterConfiguration) async throws -> (presenter: XRRealityKitPresenter, pixels: [Float], size: SIMD2<Int>) {
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        guard presenter.usesShaderGraphMaterial else { throw XCTSkip("the eye material did not load") }
+        let pose = Self.picturePose
+        let source = RealityKitFrameSource(presenter: presenter) { _ in pose }
         let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
         loop.start()
         let thread = Thread { loop.run() }
@@ -1429,33 +1435,32 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         try reach("the last ticket completed") { lastTicket.commandBuffer.status == .completed }
         presenter.stop()
         try reach("the loop's thread finished") { thread.isFinished }
-
-        // The engine's left eye, linear: the cubes over the transparent room.
         let eyeTexture = lastTicket.colorTextures[0]
-        let engine = try linearPixels(ofSRGB: eyeTexture)
-        let width = configuration.textureSize.x, height = configuration.textureSize.y
-        func coloured(_ pixels: [Float]) -> Int {
-            (0 ..< width * height).filter { index in (0 ..< 3).contains { pixels[index * 4 + $0] > 0.05 } }.count
-        }
-        XCTAssertGreaterThan(coloured(engine), 1000, "the engine drew the cubes into the eye")
+        let pixels = try linearPixels(ofSRGB: eyeTexture)
+        return (presenter, pixels, SIMD2<Int>(eyeTexture.width, eyeTexture.height))
+    }
 
-        // RealityKit's picture of the grids from the same point, through the same projection.
+    /// RealityKit's picture of `presenter`'s grids from the picture pose through a 90° camera,
+    /// `size` pixels, linear rgba over an opaque black background. The materials load
+    /// asynchronously, with a placeholder in the meantime: the picture is read back when it stops
+    /// changing and shows something.
+    @available(macOS 15.0, *)
+    private func realityKitPicture(of presenter: XRRealityKitPresenter, size: SIMD2<Int>) async throws -> [Float] {
+        let configuration = presenter.configuration
         let rkRenderer = try RealityRenderer()
         rkRenderer.cameraSettings.isToneMappingEnabled = false
         rkRenderer.cameraSettings.colorBackground = .color(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         rkRenderer.cameraSettings.antialiasing = .none
         let camera = Entity()
         camera.components.set(PerspectiveCameraComponent(near: configuration.nearPlane, far: configuration.farPlane, fieldOfViewInDegrees: 90))
-        camera.transform = Transform(matrix: devicePose)
+        camera.transform = Transform(matrix: Self.picturePose)
         rkRenderer.activeCamera = camera
         rkRenderer.entities.replaceAll([camera, presenter.root])
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: size.x, height: size.y, mipmapped: false)
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .shared
         let output = try XCTUnwrap(renderInfo.device.makeTexture(descriptor: descriptor))
         let cameraOutput = try RealityRenderer.CameraOutput(.singleProjection(colorTexture: output))
-        // Frames enough for the materials to load (they load asynchronously, with a placeholder
-        // in the meantime); the picture is read back when it stops changing.
         var previous: [Float] = []
         var shown: [Float] = []
         for _ in 0 ..< 60 {
@@ -1466,33 +1471,143 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
             }
             try await Task.sleep(nanoseconds: 20_000_000)
             shown = halfPixels(of: output)
-            if shown == previous, coloured(shown) > 0 { break }
+            if shown == previous, coloured(shown, size: size) > 0 { break }
             previous = shown
         }
-        // The output's alpha is the opaque background's everywhere: colour says what was drawn.
-        XCTAssertGreaterThan(coloured(shown), 1000, "RealityKit drew the grids")
+        return shown
+    }
 
-        // The two pictures agree: the mean squared difference over the colour channels of every
-        // pixel, as a peak signal-to-noise ratio. The engine's cubes are lit over a transparent
-        // room, black in both pictures; through the grid and the material they come back where
-        // they were, to the bilinear resampling of a texel-aligned grid and the edges' blend.
+    /// How many pixels show colour (any channel above 0.05): the cubes, over a black or
+    /// transparent room.
+    private func coloured(_ pixels: [Float], size: SIMD2<Int>) -> Int {
+        (0 ..< size.x * size.y).filter { index in (0 ..< 3).contains { pixels[index * 4 + $0] > 0.05 } }.count
+    }
+
+    /// The bounds of the coloured pixels, in pixels: where the cubes are in the picture.
+    private func colouredBounds(_ pixels: [Float], size: SIMD2<Int>) -> (min: SIMD2<Int>, max: SIMD2<Int>)? {
+        var bounds: (min: SIMD2<Int>, max: SIMD2<Int>)?
+        for y in 0 ..< size.y {
+            for x in 0 ..< size.x where (0 ..< 3).contains(where: { pixels[(y * size.x + x) * 4 + $0] > 0.05 }) {
+                let point = SIMD2<Int>(x, y)
+                bounds = bounds.map { (simd_min($0.min, point), simd_max($0.max, point)) } ?? (point, point)
+            }
+        }
+        return bounds
+    }
+
+    /// How two pictures agree: the mean squared difference over the colour channels of every
+    /// pixel, as a peak signal-to-noise ratio in dB. A floor on the error keeps the ratio finite
+    /// when the pictures are the same at 8 bits.
+    private func peakSignalToNoise(_ a: [Float], _ b: [Float], size: SIMD2<Int>) -> Double {
         var squared = 0.0
-        for index in 0 ..< width * height {
+        for index in 0 ..< size.x * size.y {
             for channel in 0 ..< 3 {
-                let difference = Double(shown[index * 4 + channel] - engine[index * 4 + channel])
+                let difference = Double(a[index * 4 + channel] - b[index * 4 + channel])
                 squared += difference * difference
             }
         }
-        // A floor on the error keeps the ratio finite when the pictures are the same at 8 bits.
-        let meanSquared = max(squared / Double(width * height * 3), 1e-9)
-        let psnr = 10 * log10(1 / meanSquared)
-        print("RealityKit's picture of the presenter's grids against the engine's eye: PSNR \(psnr) dB")
-        if let folder = ProcessInfo.processInfo.environment["XR_PRESENTER_DUMP"] {
-            try writePNG(shown, width: width, height: height, to: URL(fileURLWithPath: folder).appendingPathComponent("realitykit.png"))
-            try writePNG(engine, width: width, height: height, to: URL(fileURLWithPath: folder).appendingPathComponent("engine.png"))
+        let meanSquared = max(squared / Double(size.x * size.y * 3), 1e-9)
+        return 10 * log10(1 / meanSquared)
+    }
+
+    /// Writes two compared pictures as PNGs when `XR_PRESENTER_DUMP` names a folder.
+    private func dumpPictures(_ pictures: [(name: String, pixels: [Float], size: SIMD2<Int>)]) throws {
+        guard let folder = ProcessInfo.processInfo.environment["XR_PRESENTER_DUMP"] else { return }
+        for picture in pictures {
+            try writePNG(picture.pixels, width: picture.size.x, height: picture.size.y, to: URL(fileURLWithPath: folder).appendingPathComponent(picture.name))
         }
+    }
+
+    /// RealityKit, drawing the presenter's grids from the engine's own eye, shows the engine's
+    /// picture: the grid's geometry and the projective uv put every texel back where the engine
+    /// drew it.
+    func test_realityKitShowsTheEnginesPicture_fromTheEnginesEye() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        let configuration = Self.pictureConfiguration
+        // Mixed immersion: the engine leaves the room transparent, as on the headset. (With an
+        // opaque background the grid shows the halo of background lost around every silhouette,
+        // where the triangles stretched to the far shell are torn away: a later stage's.)
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        try turnTheCubes()
+
+        // The engine's left eye, linear: the cubes over the transparent room.
+        let (presenter, engine, size) = try await drawEngineEye(configuration)
+        XCTAssertEqual(size, configuration.textureSize)
+        XCTAssertGreaterThan(coloured(engine, size: size), 1000, "the engine drew the cubes into the eye")
+
+        // RealityKit's picture of the grids from the same point, through the same projection.
+        let shown = try await realityKitPicture(of: presenter, size: size)
+        // The output's alpha is the opaque background's everywhere: colour says what was drawn.
+        XCTAssertGreaterThan(coloured(shown, size: size), 1000, "RealityKit drew the grids")
+
+        // The two pictures agree. The engine's cubes are lit over a transparent room, black in
+        // both pictures; through the grid and the material they come back where they were, to
+        // the bilinear resampling of a texel-aligned grid and the edges' blend.
+        let psnr = peakSignalToNoise(shown, engine, size: size)
+        print("RealityKit's picture of the presenter's grids against the engine's eye: PSNR \(psnr) dB")
+        try dumpPictures([("realitykit.png", shown, size), ("engine.png", engine, size)])
         XCTAssertTrue(psnr.isFinite)
         XCTAssertGreaterThan(psnr, 70, "RealityKit shows the engine's picture from the engine's eye (the affine uv scores under 65 dB)")
+    }
+
+    /// Through the presenter's rate map, RealityKit's picture of the grids is the engine's
+    /// picture unwarped: the eye is drawn into the map's physical texels, dense at the centre of
+    /// view and sparse at the edges, and the grid, a vertex every cell of those texels, puts each
+    /// back on its ray, so what RealityKit shows at the map's screen size is the scene as the
+    /// engine's uniform frame of that size draws it. Against that uniform frame: the cubes land
+    /// where it has them, to three pixels (a periphery texel is two pixels wide and the alpha
+    /// ramp's foot reaches one more; a mapping of texels to rays that took the physical texel for
+    /// the screen pixel would move an edge by up to a quarter of the screen), and the pictures
+    /// agree to the resampling, which magnifies a texel at the periphery to about two pixels, so
+    /// edges there are a pixel softer than the uniform frame's (the headset's eye reads them at
+    /// its own resolution either way; the centre of view is what gains).
+    func test_realityKitShowsTheEnginesPicture_throughTheRateMap() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        guard renderInfo.device.supportsRasterizationRateMap(layerCount: 1) else { throw XCTSkip("this GPU has no rasterization rate maps") }
+        var configuration = Self.pictureConfiguration
+        configuration.foveation = .equiAngular
+        configuration.foveatedCellTexels = 4
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        try turnTheCubes()
+
+        // The eye through the map: physical texels within the budget, the screen larger.
+        let (foveated, _, physical) = try await drawEngineEye(configuration)
+        let map = try XCTUnwrap(foveated.foveation, "the presenter made its map")
+        let screen = map.screenSize
+        XCTAssertEqual(physical, map.physicalSize)
+        XCTAssertLessThanOrEqual(physical.x, 256)
+        XCTAssertGreaterThan(screen.x, physical.x, "the screen is larger than the texture")
+        XCTAssertEqual(foveated.grid.columns, (physical.x + 3) / 4 + 1, "a vertex every four texels")
+
+        // The reference: the engine's uniform frame at the map's screen size, cells of four texels.
+        var uniform = Self.pictureConfiguration
+        uniform.textureSize = screen
+        uniform.gridColumns = (screen.x - 1) / 4 + 1
+        uniform.gridRows = (screen.y - 1) / 4 + 1
+        let (_, reference, referenceSize) = try await drawEngineEye(uniform)
+        XCTAssertEqual(referenceSize, screen)
+        XCTAssertGreaterThan(coloured(reference, size: screen), 1000, "the engine drew the cubes into the uniform eye")
+
+        // RealityKit's picture of the foveated grids at the screen size.
+        let shown = try await realityKitPicture(of: foveated, size: screen)
+        XCTAssertGreaterThan(coloured(shown, size: screen), 1000, "RealityKit drew the grids")
+        let shownBounds = try XCTUnwrap(colouredBounds(shown, size: screen))
+        let referenceBounds = try XCTUnwrap(colouredBounds(reference, size: screen))
+        XCTAssertLessThanOrEqual(abs(shownBounds.min.x - referenceBounds.min.x), 3, "the cubes' left edge is where the uniform frame has it: \(shownBounds) against \(referenceBounds)")
+        XCTAssertLessThanOrEqual(abs(shownBounds.max.x - referenceBounds.max.x), 3, "the cubes' right edge is where the uniform frame has it: \(shownBounds) against \(referenceBounds)")
+        XCTAssertLessThanOrEqual(abs(shownBounds.min.y - referenceBounds.min.y), 3, "the cubes' top edge is where the uniform frame has it: \(shownBounds) against \(referenceBounds)")
+        XCTAssertLessThanOrEqual(abs(shownBounds.max.y - referenceBounds.max.y), 3, "the cubes' bottom edge is where the uniform frame has it: \(shownBounds) against \(referenceBounds)")
+        XCTAssertGreaterThan(referenceBounds.max.x - referenceBounds.min.x, screen.x / 3, "the cubes span a good part of the picture, so a wrong mapping would show")
+
+        let psnr = peakSignalToNoise(shown, reference, size: screen)
+        print("RealityKit's picture of the presenter's grids through the rate map (screen \(screen.x)×\(screen.y) over \(physical.x)×\(physical.y) texels) against the engine's uniform frame of the screen size: PSNR \(psnr) dB; cubes at \(shownBounds) against \(referenceBounds)")
+        try dumpPictures([("realitykit-rate-map.png", shown, screen), ("engine-uniform-screen.png", reference, screen)])
+        XCTAssertTrue(psnr.isFinite)
+        XCTAssertGreaterThan(psnr, 30, "RealityKit shows the engine's picture through the map, to the resampling of the periphery")
     }
 
     private enum PictureError: Swift.Error { case stalled(String) }
