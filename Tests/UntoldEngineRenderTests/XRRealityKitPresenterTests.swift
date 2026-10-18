@@ -8,6 +8,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import CoreGraphics
+import ImageIO
 import Metal
 import QuartzCore
 import RealityKit
@@ -372,6 +374,8 @@ final class XRGridUnprojectTests: XCTestCase {
         var mask: Float
         /// The tear mask's y: the near side.
         var nearSide: Float
+        /// The projective uv: (u, v) times the eye-space depth, that depth, 0.
+        var uvw: SIMD4<Float>
     }
 
     /// The texture position of a grid vertex of the 33 × 25 grid the kernel test uses.
@@ -394,7 +398,13 @@ final class XRGridUnprojectTests: XCTestCase {
             )
             let mask = Float(raw.load(fromByteOffset: base + XRPresenterGrid.maskOffset, as: Float16.self))
             let nearSide = Float(raw.load(fromByteOffset: base + XRPresenterGrid.maskOffset + 2, as: Float16.self))
-            return Vertex(position: position, uv: uv, mask: mask, nearSide: nearSide)
+            let uvw = SIMD4<Float>(
+                raw.load(fromByteOffset: base + XRPresenterGrid.uvwOffset, as: Float.self),
+                raw.load(fromByteOffset: base + XRPresenterGrid.uvwOffset + 4, as: Float.self),
+                raw.load(fromByteOffset: base + XRPresenterGrid.uvwOffset + 8, as: Float.self),
+                raw.load(fromByteOffset: base + XRPresenterGrid.uvwOffset + 12, as: Float.self)
+            )
+            return Vertex(position: position, uv: uv, mask: mask, nearSide: nearSide, uvw: uvw)
         }
     }
 
@@ -439,6 +449,17 @@ final class XRGridUnprojectTests: XCTestCase {
         let result = readVertices(vertices, grid: grid)
         let nearest = readNearestDepths(nearestDepths, grid: grid)
         let inverseProjection = simd_inverse(projection)
+        // The projective uv of every vertex: its uv times its own eye-space depth, which is the
+        // depth of its position seen from the eye (affine in the point, so RealityKit's
+        // interpolation reproduces the engine's projection across each triangle).
+        let eyeFromOrigin = simd_inverse(originFromEye)
+        for vertex in result {
+            let eyeSpace = simd_mul(eyeFromOrigin, SIMD4<Float>(vertex.position, 1))
+            XCTAssertEqual(vertex.uvw.z, -eyeSpace.z, accuracy: 1e-3 * max(1, -eyeSpace.z), "the projective uv's depth is the vertex's eye-space depth")
+            XCTAssertEqual(vertex.uvw.x, vertex.uv.x * vertex.uvw.z, accuracy: 1e-4 * max(1, vertex.uvw.z), "u times the depth")
+            XCTAssertEqual(vertex.uvw.y, vertex.uv.y * vertex.uvw.z, accuracy: 1e-4 * max(1, vertex.uvw.z), "v times the depth")
+            XCTAssertEqual(vertex.uvw.w, 0)
+        }
         let nearDepth = depth(ofDistance: Self.nearPlaneDistance, projection: projection)
         let farDepth = depth(ofDistance: Self.farPlaneDistance, projection: projection)
         var nearPlane = 0, farPlane = 0, shell = 0, tears = 0, rims = 0
@@ -1028,6 +1049,156 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
             XCTAssertTrue(presenter.drawsEdgeBand)
         }
         presenter.stop()
+    }
+
+    /// RealityKit, drawing the presenter's grids from the engine's own eye, shows the engine's
+    /// picture: the grid's geometry and the projective uv put every texel back where the engine
+    /// drew it. A symmetric frustum here, so that RealityKit's perspective camera matches the
+    /// engine's projection exactly; the eyes at the device's point (no eye distance) and the
+    /// camera there, so that the left eye's grid is what a mono camera sees through the eye switch.
+    func test_realityKitShowsTheEnginesPicture_fromTheEnginesEye() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.textureSize = [256, 256]
+        configuration.frustumTangents = [1, 1, 1, 1]
+        configuration.interpupillaryDistance = 0
+        configuration.gridColumns = 33
+        configuration.gridRows = 33
+        configuration.farShellMetres = 50
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        guard presenter.usesShaderGraphMaterial else { throw XCTSkip("the eye material did not load") }
+        // Mixed immersion: the engine leaves the room transparent, as on the headset. (With an
+        // opaque background the grid shows the halo of background lost around every silhouette,
+        // where the triangles stretched to the far shell are torn away: a later stage's.)
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        let devicePose = matrix4x4Translation(0, 0, 5)
+        let source = RealityKitFrameSource(presenter: presenter) { _ in devicePose }
+        let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
+        loop.start()
+        let thread = Thread { loop.run() }
+        thread.start()
+        presenter.start(commandQueue: renderInfo.commandQueue)
+        try waitUntil {
+            presenter.update()
+            return loop.framesDrawn >= 6
+        }
+        let lastTicket = try XCTUnwrap(presenter.lastTicket)
+        try waitUntil { lastTicket.commandBuffer.status == .completed }
+        presenter.stop()
+        try waitUntil { thread.isFinished }
+
+        // The engine's left eye, linear.
+        let eyeTexture = lastTicket.colorTextures[0]
+        let engine = try linearPixels(ofSRGB: eyeTexture)
+
+        // RealityKit's picture of the grids from the same point, through the same projection.
+        let rkRenderer = try RealityRenderer()
+        rkRenderer.cameraSettings.isToneMappingEnabled = false
+        rkRenderer.cameraSettings.colorBackground = .color(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        rkRenderer.cameraSettings.antialiasing = .none
+        let camera = Entity()
+        camera.components.set(PerspectiveCameraComponent(near: configuration.nearPlane, far: configuration.farPlane, fieldOfViewInDegrees: 90))
+        camera.transform = Transform(matrix: devicePose)
+        rkRenderer.activeCamera = camera
+        rkRenderer.entities.replaceAll([camera, presenter.root])
+        let width = configuration.textureSize.x, height = configuration.textureSize.y
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let output = try XCTUnwrap(renderInfo.device.makeTexture(descriptor: descriptor))
+        let cameraOutput = try RealityRenderer.CameraOutput(.singleProjection(colorTexture: output))
+        // Frames enough for the materials to load (they load asynchronously, with a placeholder
+        // in the meantime); the picture is read back when it stops changing.
+        var previous: [Float] = []
+        var shown: [Float] = []
+        for _ in 0 ..< 60 {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                do {
+                    try rkRenderer.updateAndRender(deltaTime: 1.0 / 60.0, cameraOutput: cameraOutput, onComplete: { _ in continuation.resume() })
+                } catch { continuation.resume(throwing: error) }
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+            shown = halfPixels(of: output)
+            if shown == previous, shown.contains(where: { $0 > 0.05 }) { break }
+            previous = shown
+        }
+        XCTAssertTrue(shown.contains(where: { $0 > 0.05 }), "RealityKit drew the grids")
+
+        // The two pictures agree: the mean squared difference over the colour channels of every
+        // pixel, as a peak signal-to-noise ratio. The engine's cubes are lit over a transparent
+        // room, black in both pictures; through the grid and the material they come back where
+        // they were, to the bilinear resampling of a texel-aligned grid and the edges' blend.
+        var squared = 0.0
+        for index in 0 ..< width * height {
+            for channel in 0 ..< 3 {
+                let difference = Double(shown[index * 4 + channel] - engine[index * 4 + channel])
+                squared += difference * difference
+            }
+        }
+        let psnr = 10 * log10(1 / (squared / Double(width * height * 3)))
+        print("RealityKit's picture of the presenter's grids against the engine's eye: PSNR \(psnr) dB")
+        if let folder = ProcessInfo.processInfo.environment["XR_PRESENTER_DUMP"] {
+            try writePNG(shown, width: width, height: height, to: URL(fileURLWithPath: folder).appendingPathComponent("realitykit.png"))
+            try writePNG(engine, width: width, height: height, to: URL(fileURLWithPath: folder).appendingPathComponent("engine.png"))
+        }
+        XCTAssertGreaterThan(psnr, 30, "RealityKit shows the engine's picture from the engine's eye")
+    }
+
+    /// The texture's pixels, linear floats, rgba, row by row from the top.
+    private func linearPixels(ofSRGB texture: MTLTexture) throws -> [Float] {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: texture.pixelFormat, width: texture.width, height: texture.height, mipmapped: false)
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
+        let copy = try XCTUnwrap(renderInfo.device.makeTexture(descriptor: descriptor))
+        let commandBuffer = try XCTUnwrap(renderInfo.commandQueue.makeCommandBuffer())
+        let blit = try XCTUnwrap(commandBuffer.makeBlitCommandEncoder())
+        blit.copy(from: texture, to: copy)
+        blit.endEncoding()
+        commandBuffer.commit()
+        try waitUntil { commandBuffer.status == .completed }
+        var bytes = [UInt8](repeating: 0, count: texture.width * texture.height * 4)
+        copy.getBytes(&bytes, bytesPerRow: texture.width * 4, from: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0)
+        func linear(_ byte: UInt8) -> Float {
+            let value = Float(byte) / 255
+            return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+        }
+        // bgra in memory.
+        return (0 ..< texture.width * texture.height).flatMap { index -> [Float] in
+            let base = index * 4
+            return [linear(bytes[base + 2]), linear(bytes[base + 1]), linear(bytes[base]), Float(bytes[base + 3]) / 255]
+        }
+    }
+
+    /// Linear rgba floats as an 8-bit sRGB PNG, for looking at a picture a test compared.
+    private func writePNG(_ pixels: [Float], width: Int, height: Int, to url: URL) throws {
+        func encoded(_ value: Float) -> UInt8 {
+            let clamped = min(max(value, 0), 1)
+            let srgb = clamped <= 0.0031308 ? clamped * 12.92 : 1.055 * pow(clamped, 1 / 2.4) - 0.055
+            return UInt8((srgb * 255).rounded())
+        }
+        var bytes = [UInt8](repeating: 255, count: width * height * 4)
+        for index in 0 ..< width * height {
+            for channel in 0 ..< 3 { bytes[index * 4 + channel] = encoded(pixels[index * 4 + channel]) }
+        }
+        let data = Data(bytes)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue), provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
+              let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil)
+        else { throw XCTSkip("no PNG") }
+        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationFinalize(destination)
+    }
+
+    /// An rgba16Float texture's pixels as floats.
+    private func halfPixels(of texture: MTLTexture) -> [Float] {
+        var halves = [Float16](repeating: 0, count: texture.width * texture.height * 4)
+        halves.withUnsafeMutableBytes { raw in
+            texture.getBytes(raw.baseAddress!, bytesPerRow: texture.width * 8, from: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0)
+        }
+        return halves.map { Float($0) }
     }
 
     func test_aFrameWithoutAPose_clearsTheEyes_andKeepsTheGrids() async throws {

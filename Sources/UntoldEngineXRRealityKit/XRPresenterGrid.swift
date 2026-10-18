@@ -14,14 +14,16 @@ import simd
 
 /// One eye's grid: `columns × rows` vertices the unprojection kernel places in the origin's
 /// space every frame, a static index buffer of two triangles per cell, one part bounded well
-/// past the far shell. The vertex layout (24 bytes) is the kernel's `XRGridVertex`: a packed
-/// position, a packed uv with v = 0 at the texture's top row, and a half2 tear mask (x the far
-/// side of a depth jump, y the near side).
+/// past the far shell. The vertex layout (40 bytes) is the kernel's `XRGridVertex`: a packed
+/// position, a packed uv with v = 0 at the texture's top row (affine, the fallback material's),
+/// a half2 tear mask (x the far side of a depth jump, y the near side), and the projective uv
+/// (u, v times the eye-space depth, that depth, 0) the shader graph divides per pixel.
 public struct XRPresenterGrid: Sendable, Equatable {
-    public static let vertexStride = 24
+    public static let vertexStride = 40
     public static let positionOffset = 0
     public static let uvOffset = 12
     public static let maskOffset = 20
+    public static let uvwOffset = 24
 
     public let columns: Int
     public let rows: Int
@@ -68,6 +70,9 @@ public struct XRPresenterGrid: Sendable, Equatable {
                     raw.storeBytes(of: -2, toByteOffset: base + 8, as: Float.self)
                     raw.storeBytes(of: u, toByteOffset: base + Self.uvOffset, as: Float.self)
                     raw.storeBytes(of: v, toByteOffset: base + Self.uvOffset + 4, as: Float.self)
+                    raw.storeBytes(of: u * 2, toByteOffset: base + Self.uvwOffset, as: Float.self)
+                    raw.storeBytes(of: v * 2, toByteOffset: base + Self.uvwOffset + 4, as: Float.self)
+                    raw.storeBytes(of: Float(2), toByteOffset: base + Self.uvwOffset + 8, as: Float.self)
                 }
             }
         }
@@ -90,6 +95,7 @@ public extension XRPresenterGrid {
             .init(semantic: .position, format: .float3, layoutIndex: 0, offset: Self.positionOffset),
             .init(semantic: .uv0, format: .float2, layoutIndex: 0, offset: Self.uvOffset),
             .init(semantic: .uv1, format: .half2, layoutIndex: 0, offset: Self.maskOffset),
+            .init(semantic: .uv2, format: .float4, layoutIndex: 0, offset: Self.uvwOffset),
         ]
         descriptor.vertexLayouts = [.init(bufferIndex: 0, bufferOffset: 0, bufferStride: Self.vertexStride)]
         let mesh = try LowLevelMesh(descriptor: descriptor)

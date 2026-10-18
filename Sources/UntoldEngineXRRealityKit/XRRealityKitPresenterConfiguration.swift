@@ -58,6 +58,11 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     public var edgeBlending = true
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50
+    /// An offset of both eyes' viewpoints on the device, metres, zero in use: a deliberate
+    /// offset (a few centimetres up) makes RealityKit show the grids from a point the engine did
+    /// not draw them from, so a silhouette defect that changes with it comes from a vertex at a
+    /// wrong depth, and one that does not from the texture or its mapping.
+    public var viewOffsetMetres = SIMD3<Float>(0, 0, 0)
 
     public init() {}
 
@@ -73,7 +78,7 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     public func deviceFromView(eye: Int) -> simd_float4x4 {
         let x = eye == 0 ? -interpupillaryDistance / 2 : interpupillaryDistance / 2
         var transform = matrix_identity_float4x4
-        transform.columns.3 = SIMD4<Float>(x, 0, 0, 1)
+        transform.columns.3 = SIMD4<Float>(x + viewOffsetMetres.x, viewOffsetMetres.y, viewOffsetMetres.z, 1)
         return transform
     }
 }
