@@ -22,14 +22,18 @@ public struct XRPresenterTicket: @unchecked Sendable {
     public let colorTextures: [MTLTexture]
     /// One per eye, left first: the grids' vertex buffers for this frame.
     public let gridBuffers: [MTLBuffer]
+    /// One per eye, left first: the grids' index buffers for this frame (the cells' split
+    /// follows the depth); empty when the mesh keeps its indices.
+    public let indexBuffers: [MTLBuffer]
     /// `CACurrentMediaTime()` when the ticket was posted.
     public let postedAt: TimeInterval
 
-    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], postedAt: TimeInterval) {
+    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], indexBuffers: [MTLBuffer] = [], postedAt: TimeInterval) {
         self.serial = serial
         self.commandBuffer = commandBuffer
         self.colorTextures = colorTextures
         self.gridBuffers = gridBuffers
+        self.indexBuffers = indexBuffers
         self.postedAt = postedAt
     }
 }

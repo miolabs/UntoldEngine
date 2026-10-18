@@ -158,6 +158,7 @@ public final class XRRealityKitPresenter {
         let replaceStart = CACurrentMediaTime()
         let textures = colorTextures.map { $0.replace(using: commandBuffer) }
         let buffers = meshes.map { $0.replace(bufferIndex: 0, using: commandBuffer) }
+        let indexBuffers = meshes.map { $0.replaceIndices(using: commandBuffer) }
         let posted = CACurrentMediaTime()
         statistics.noteTicketPosted(replaceSeconds: posted - replaceStart)
 
@@ -167,6 +168,7 @@ public final class XRRealityKitPresenter {
             commandBuffer: commandBuffer,
             colorTextures: textures,
             gridBuffers: buffers,
+            indexBuffers: indexBuffers,
             postedAt: posted
         )
         lastTicket = ticket

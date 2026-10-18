@@ -14,7 +14,10 @@
 # 1 on the far side of a depth jump, y is 1 on its near side, both 0 elsewhere. A triangle
 # stretched from an object to what lies behind it has both above zero everywhere inside it
 # (x rises from the object, y falls), a triangle of the object's own surface has x = 0 and one
-# of the far surface has y = 0. Opacity = texture alpha x that visibility, times 0 where
+# of the far surface has y = 0. The colour is divided by the alpha (the engine's frame is
+# premultiplied): with the grid's skirt the pixels shown between an object's rim texel and the
+# alpha threshold's crossing have alpha under 1, and undivided they would draw a dark line
+# along every edge. Opacity = texture alpha x that visibility, times 0 where
 # min(x, y) exceeds a small epsilon, through an Unlit Surface with the post-process tone map
 # off and an opacity threshold of 0.5: the other eye's grid is discarded, alpha below the
 # threshold shows passthrough, and the stretched triangles go while the object and the surface
@@ -36,7 +39,7 @@ def Xform "Root"
         {
             uniform token info:id = "ND_realitykit_unlit_surfaceshader"
             bool inputs:applyPostProcessToneMap = 0
-            color3f inputs:color.connect = </Root/XRPresenterMaterial/ColorRGB.outputs:out>
+            color3f inputs:color.connect = </Root/XRPresenterMaterial/StraightRGB.outputs:out>
             bool inputs:hasPremultipliedAlpha = 0
             float inputs:opacity.connect = </Root/XRPresenterMaterial/Opacity.outputs:out>
             float inputs:opacityThreshold = 0.5
@@ -78,6 +81,22 @@ def Xform "Root"
             float outputs:outb
             float outputs:outg
             float outputs:outr
+        }
+
+        def Shader "Straight"
+        {
+            uniform token info:id = "ND_max_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Channels.outputs:outa>
+            float inputs:in2 = 0.001
+            float outputs:out
+        }
+
+        def Shader "StraightRGB"
+        {
+            uniform token info:id = "ND_divide_color3FA"
+            color3f inputs:in1.connect = </Root/XRPresenterMaterial/ColorRGB.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Straight.outputs:out>
+            color3f outputs:out
         }
 
         def Shader "CameraIndex"

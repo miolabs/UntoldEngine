@@ -41,6 +41,11 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// tear: a silhouette the grid stretches across. The vertices on its two sides are marked
     /// (far side, near side) and the material discards the triangles that span both.
     public var tearThresholdMetres: Float = 0.5
+    /// How far, in texels of the eye texture, a grid vertex at an object's rim is pushed outward
+    /// past the edge texel it was placed on, so that the silhouette seen is where the filtered
+    /// texture's alpha crosses the material's threshold rather than the mesh boundary through
+    /// rim texels (which is quantised to the texel and flips with the predicted pose); 0 for none.
+    public var skirtTexels: Float = 3
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50
 
