@@ -121,7 +121,8 @@
                 thread.qualityOfService = .userInteractive
                 self.thread = thread
                 thread.start()
-                print("XR presenter: running, \(configuration.textureSize.x)×\(configuration.textureSize.y) per eye, grids \(configuration.gridColumns)×\(configuration.gridRows), \(presenter.usesShaderGraphMaterial ? "eye material" : "fallback material")")
+                let foveated = presenter.foveation.map { " through its \($0.profile.rawValue) rate map (screen \($0.screenSize.x)×\($0.screenSize.y))" } ?? ""
+                print("XR presenter: running, \(presenter.textureSize.x)×\(presenter.textureSize.y) per eye\(foveated), grids \(presenter.grid.columns)×\(presenter.grid.rows), \(presenter.usesShaderGraphMaterial ? "eye material" : "fallback material")")
             } catch {
                 Logger.logWarning(message: "XR presenter: could not be created: \(error)")
             }

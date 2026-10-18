@@ -21,7 +21,8 @@ import UntoldEngineXR
 /// instant; the frame is drawn in the ticket's own command buffer, which after the eyes carries
 /// the grids' unprojection and, committed by the loop, hands RealityKit the frame. No wait and
 /// no deadline: RealityKit shows the previous frame again while a frame takes longer than its
-/// refresh.
+/// refresh. With the presenter's rate map, every eye carries it (`XREye.foveation`) with the
+/// map's screen as its viewport, and the grids are unprojected through it.
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
     /// The headset's pose (the origin from the device) for a presentation instant, or nil while
@@ -33,6 +34,8 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
     let nearestDepthBuffers: [MTLBuffer]
     let unproject: XRGridUnprojectPass
     let grid: XRPresenterGrid
+    let foveation: XRPresenterFoveation?
+    let textureSize: SIMD2<Int>
     let configuration: XRRealityKitPresenterConfiguration
     let statistics: XRPresenterStatistics
     let pose: PoseProvider
@@ -46,6 +49,8 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         nearestDepthBuffers = presenter.nearestDepthBuffers
         unproject = presenter.unproject
         grid = presenter.grid
+        foveation = presenter.foveation
+        textureSize = presenter.textureSize
         configuration = presenter.configuration
         statistics = presenter.statistics
         projection = presenter.configuration.projection
@@ -58,7 +63,9 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
 
     public var depthPixelFormat: MTLPixelFormat { .depth32Float }
 
-    public var eyeSize: simd_float2 { configuration.eyeSize }
+    /// The presenter's textures' size: the rate map's physical size when it has one, since the
+    /// loop sizes the renderer's targets from the eyes' textures.
+    public var eyeSize: simd_float2 { simd_float2(Float(textureSize.x), Float(textureSize.y)) }
 
     /// The next ticket as a frame, waiting for the presenter to post one; nil once the presenter
     /// stopped or the source was.
@@ -108,11 +115,15 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
 
         /// One target: the headset's pose for the frame's instant, and the two eyes a nominal
         /// distance apart on it, drawn into the ticket's textures and the presenter's depth.
+        /// Through the presenter's rate map, each eye carries it and its viewport is the map's
+        /// screen (the loop's scene passes draw through the map in that space; the final pass
+        /// into the texture copies physical pixels one to one); without one, the texture.
         func acquireEyes() -> [XREyes] {
             let originFromDevice = source.pose(timing.presentationTime)
             if originFromDevice == nil {
                 source.statistics.notePoseMissing()
             }
+            let foveation = source.foveation?.frame
             let eyes = ticket.colorTextures.indices.map { eye in
                 let color = ticket.colorTextures[eye]
                 return XREye(
@@ -120,7 +131,8 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                     depthTexture: source.depthTextures[eye],
                     deviceFromView: source.configuration.deviceFromView(eye: eye),
                     projection: source.projection,
-                    viewport: MTLViewport(originX: 0, originY: 0, width: Double(color.width), height: Double(color.height), znear: 0, zfar: 1)
+                    viewport: foveation?.viewport ?? MTLViewport(originX: 0, originY: 0, width: Double(color.width), height: Double(color.height), znear: 0, zfar: 1),
+                    foveation: foveation
                 )
             }
             return [XREyes(originFromDevice: originFromDevice, eyes: eyes, primary: true, index: 0)]
@@ -154,6 +166,8 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                         tearThreshold: ticket.settings.tearThresholdMetres,
                         skirtTexels: ticket.settings.skirtTexels,
                         adaptiveDiagonal: ticket.settings.adaptiveDiagonal,
+                        rateMapData: source.foveation?.rateMapData,
+                        cellTexels: Float(source.foveation?.cellTexels ?? 0),
                         label: "XR grid unproject eye \(index)"
                     )
                 }

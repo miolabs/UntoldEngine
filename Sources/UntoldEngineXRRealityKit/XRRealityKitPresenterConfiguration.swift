@@ -17,9 +17,23 @@ import simd
 public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// Pixels per eye: the headset's per-eye drawable size by default (the plan's D5).
     public var textureSize = SIMD2<Int>(1920, 1824)
-    /// Vertices per row, and rows, of each eye's grid.
+    /// Vertices per row, and rows, of each eye's grid (uniform; a foveated grid is the map's).
     public var gridColumns = 256
     public var gridRows = 240
+    /// Whether each eye is drawn through the presenter's own rasterization rate map, fixed and
+    /// head-centred (RealityKit gives no gaze). `textureSize` is then the budget of PHYSICAL
+    /// pixels per eye, which the map never exceeds; the eye's screen is larger by the profile,
+    /// so the centre of view is denser than a uniform frame of the same pixel count; and the
+    /// grid is made from the physical size in cells of `foveatedCellTexels` (`gridColumns` and
+    /// `gridRows` are not used). None by default, until the headset has judged it against the
+    /// uniform frame.
+    public var foveation: XRPresenterFoveationProfile = .none
+    /// The side of a grid cell in physical texels when foveated. The map's mapping of texels to
+    /// the screen changes slope at its tile boundaries (`physicalGranularity`, 32 on Apple
+    /// GPUs), so a cell that divides the tile puts a vertex on every boundary and the grid
+    /// interpolates the map exactly within each cell; the presenter halves this once if it does
+    /// not divide, and draws uniformly if that does not either.
+    public var foveatedCellTexels = 8
     /// Tangents of the half angles of each eye's frustum: left, right, up, down, all positive. A
     /// few degrees wider than the headset's view, so that a head turn between the frame's pose
     /// and its display still finds pixels at the edges.
@@ -61,6 +75,8 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
 
     public init() {}
 
+    /// `textureSize` as floats: the uniform eye's size, or the foveated eye's pixel budget (the
+    /// presenter's `textureSize` is the size its textures were made at).
     public var eyeSize: simd_float2 { simd_float2(Float(textureSize.x), Float(textureSize.y)) }
 
     /// The eyes' projection for the configured frustum: right-handed, reverse Z (the near plane
@@ -93,4 +109,16 @@ public enum XRPresenterProjection {
             SIMD4<Float>(0, 0, zs * far, 0)
         ))
     }
+}
+
+/// The density profile of the presenter's rasterization rate map (`XRPresenterFoveation`).
+public enum XRPresenterFoveationProfile: String, Sendable, Equatable, CaseIterable {
+    /// No map: uniform pixels over the frustum's tangent plane, which are sparsest at the
+    /// centre of view.
+    case none
+    /// Texels uniform in angle: the rate at a screen position whose tangent is x is 1 / (1 + x²)
+    /// along each axis, the derivative of the angle in the tangent, so the texels per degree
+    /// are the same at the centre and at the edges; the centre of view gains what the periphery
+    /// gives up.
+    case equiAngular
 }

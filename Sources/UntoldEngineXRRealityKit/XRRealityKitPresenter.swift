@@ -22,7 +22,10 @@ import UntoldEngine
 /// command buffer, asks RealityKit for the frame's textures and grid buffers with its replace
 /// calls, and posts them as a ticket; `RealityKitFrameSource` turns each ticket into a frame
 /// for the engine's loop, which draws the eyes, unprojects the grids and commits the ticket's
-/// command buffer, on whose completion RealityKit shows the new content.
+/// command buffer, on whose completion RealityKit shows the new content. With a foveation
+/// profile in the configuration, both eyes are drawn through the presenter's own fixed
+/// rasterization rate map (`XRPresenterFoveation`): the textures are its physical size, within
+/// the configured pixel budget, and the grids a vertex every cell of physical texels.
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 @MainActor
 public final class XRRealityKitPresenter {
@@ -35,7 +38,15 @@ public final class XRRealityKitPresenter {
     /// The engine's depth per eye (`depth32Float`, reverse Z), the presenter's own: drawn into
     /// with the eye, read by the unprojection kernel after it.
     public let depthTextures: [MTLTexture]
+    /// Each eye's grid: the configuration's, or, through a rate map, the map's physical texels
+    /// in cells.
     public let grid: XRPresenterGrid
+    /// The rate map both eyes are drawn through, when the configuration asks for one and the
+    /// device has them; nil, and the eyes are drawn uniformly.
+    public let foveation: XRPresenterFoveation?
+    /// The size of each eye's textures in pixels: the configuration's `textureSize`, or the rate
+    /// map's physical size within it.
+    public let textureSize: SIMD2<Int>
     public let unproject: XRGridUnprojectPass
     /// The unprojection's scratch per eye (each vertex's nearest depth, between its two
     /// dispatches), kept across frames: the tickets' command buffers run in order on one queue.
@@ -77,14 +88,19 @@ public final class XRRealityKitPresenter {
         self.device = device
         self.configuration = configuration
         settings = XRPresenterSettings(configuration: configuration)
-        let grid = XRPresenterGrid(columns: configuration.gridColumns, rows: configuration.gridRows)
+        // The rate map first: the textures and the grid take their sizes from it.
+        let foveation = XRPresenterFoveation.make(device: device, configuration: configuration)
+        self.foveation = foveation
+        let textureSize = foveation?.physicalSize ?? configuration.textureSize
+        self.textureSize = textureSize
+        let grid = foveation?.grid ?? XRPresenterGrid(columns: configuration.gridColumns, rows: configuration.gridRows)
         self.grid = grid
         fixedIndices = grid.indices().withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
         fixedIndices?.label = "XR presenter fixed split"
         unproject = try XRGridUnprojectPass(device: device)
 
-        let width = configuration.textureSize.x
-        let height = configuration.textureSize.y
+        let width = textureSize.x
+        let height = textureSize.y
         var colorDescriptor = LowLevelTexture.Descriptor()
         colorDescriptor.textureType = .type2D
         colorDescriptor.pixelFormat = .bgra8Unorm_srgb

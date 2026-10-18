@@ -11,9 +11,10 @@
 import Foundation
 import Metal
 import simd
+import UntoldEngine
 
 /// The uniforms of one eye's unprojection, laid out as the kernel's `XRGridUnprojectUniforms`
-/// (160 bytes).
+/// (176 bytes).
 public struct XRGridUnprojectUniforms {
     /// The eye's pose in the origin's space: the inverse of the view matrix the eye was drawn with.
     public var originFromEye: simd_float4x4
@@ -34,6 +35,16 @@ public struct XRGridUnprojectUniforms {
     /// pushed outward past the edge texel it was placed on, so that the alpha test of the
     /// filtered texture, not the mesh boundary, draws the silhouette; 0 for none.
     public var skirtTexels: Float
+    /// The rate map's screen size in pixels when the eye was drawn through one (`foveated` is
+    /// 1): the space the map's decoder puts physical texels in, which the kernels take to NDC.
+    public var screenSize: SIMD2<Float>
+    /// The grid's cell in physical texels when foveated: vertex k of a row sits on texel
+    /// k × cellTexels, the last on the last texel.
+    public var cellTexels: Float
+    /// 1 when the eye was drawn through a rate map, whose parameters are bound at buffer 3, 0
+    /// for the uniform texture, where the vertices are spread over the texture's extent. The
+    /// kernels are specialized on it (`kFoveated`), so it says which of the two was dispatched.
+    public var foveated: UInt32
 
     public init(
         originFromEye: simd_float4x4,
@@ -42,7 +53,10 @@ public struct XRGridUnprojectUniforms {
         textureSize: SIMD2<UInt32>,
         farShell: Float,
         tearThreshold: Float,
-        skirtTexels: Float = 0
+        skirtTexels: Float = 0,
+        screenSize: SIMD2<Float> = .zero,
+        cellTexels: Float = 0,
+        foveated: Bool = false
     ) {
         self.originFromEye = originFromEye
         self.inverseProjection = inverseProjection
@@ -52,6 +66,9 @@ public struct XRGridUnprojectUniforms {
         self.tearThreshold = tearThreshold
         flags = 0
         self.skirtTexels = skirtTexels
+        self.screenSize = screenSize
+        self.cellTexels = cellTexels
+        self.foveated = foveated ? 1 : 0
     }
 }
 
@@ -88,6 +105,16 @@ public struct XRGridUnprojectUniforms {
 /// above zero, while a triangle of the object's own surface (x = 0) and one of the far surface
 /// (y = 0) are kept whole, up to the jump.
 ///
+/// Drawn through a rasterization rate map (`rateMapData`), the texture is the map's physical
+/// texels: a vertex sits every `cellTexels` (the cell divides the map's tile, so the vertices
+/// lie where the map's mapping of texels to the screen changes slope and the grid interpolates
+/// it exactly between them), and wherever a texel becomes a ray — the vertex's own, its
+/// neighbours', a cell's — the kernels map the texel's centre to the screen through the map's
+/// decoder (`rasterization_rate_map_decoder`, buffer 3), then to NDC by the screen size; the uv
+/// written is the texel's centre, so ray, uv and the depth read coincide. Without a map the
+/// arithmetic is as it was: the vertices spread over the texture's extent, a texel's uv over
+/// `size - 1`.
+///
 /// The kernels are compiled from source once per device: the engine's prebuilt metallibs stay
 /// as they are, and the tests run them on a Mac.
 public final class XRGridUnprojectPass: @unchecked Sendable {
@@ -103,6 +130,10 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     public static let source = """
     #include <metal_stdlib>
     using namespace metal;
+    // Whether the eye was drawn through a rasterization rate map: a function constant, so each
+    // kernel is compiled twice and the uniform one is the arithmetic it always was, with no map
+    // argument, while the foveated one carries no branch.
+    constant bool kFoveated [[function_constant(0)]];
     struct XRGridVertex {
         packed_float3 position;   // the origin's space
         packed_float2 uv;         // v = 0 at the texture's top row
@@ -117,11 +148,55 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         float tearThreshold;
         uint flags;
         float skirtTexels;
+        float2 screenSize;
+        float cellTexels;
+        uint foveated;
     };
-    // The eye-space point of a texture position at a reverse-Z depth; on the far shell when the
+    // The NDC of a texture position (v = 0 at the top row).
+    static float2 uvToNDC(float2 uv) {
+        return float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    }
+    // Where a grid vertex is centred, in texels. Through a rate map, the texture is the map's
+    // physical texels and a vertex sits every cellTexels, the last on the last texel: the cell
+    // divides the map's tile, so the vertices lie where the map's mapping of texels to the
+    // screen changes slope and the grid interpolates it exactly between them. Uniform, the
+    // vertices are spread over the texture's extent.
+    static float2 vertexCentre(uint2 gid, constant XRGridUnprojectUniforms &u) {
+        float2 size = float2(u.textureSize);
+        if (kFoveated) {
+            return min(float2(gid) * u.cellTexels, size - 1.0f);
+        }
+        return float2(gid) * (1.0f / float2(u.gridSize - 1)) * (size - 1.0f);
+    }
+    // Half a cell, in texels.
+    static float2 halfCellTexels(constant XRGridUnprojectUniforms &u) {
+        if (kFoveated) {
+            return float2(u.cellTexels * 0.5f);
+        }
+        return float2(u.textureSize) / float2(u.gridSize - 1) * 0.5f;
+    }
+    // The texture coordinate the material samples at a texel: the texel's centre through a
+    // rate map, the point its ray goes through; over the texture's extent otherwise.
+    static float2 texelToUV(float2 texel, constant XRGridUnprojectUniforms &u) {
+        float2 size = float2(u.textureSize);
+        if (kFoveated) {
+            return (texel + 0.5f) / size;
+        }
+        return texel * (1.0f / (size - 1.0f));
+    }
+    // The NDC of the ray through a texel: through the rate map's decoder when the eye was drawn
+    // through one (the texel's centre on the map's screen, over the screen), else from the
+    // texel's texture coordinate. The map's parameters are read only when foveated.
+    static float2 texelToNDC(float2 texel, constant XRGridUnprojectUniforms &u, constant rasterization_rate_map_data *rateMap) {
+        if (kFoveated) {
+            rasterization_rate_map_decoder decoder(*rateMap);
+            return uvToNDC(decoder.map_physical_to_screen_coordinates(texel + 0.5f) / u.screenSize);
+        }
+        return uvToNDC(texelToUV(texel, u));
+    }
+    // The eye-space point of a ray, as NDC, at a reverse-Z depth; on the far shell when the
     // depth is the far plane or the point lies beyond the shell.
-    static float3 eyePoint(float2 uv, float depth, constant XRGridUnprojectUniforms &u) {
-        float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    static float3 eyePoint(float2 ndc, float depth, constant XRGridUnprojectUniforms &u) {
         float4 eye = u.inverseProjection * float4(ndc, max(depth, 1e-6f), 1.0f);
         float3 p = eye.xyz / eye.w;
         float distance = length(p);
@@ -150,13 +225,14 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     // lands on a texel is the same texel whichever way the arithmetic rounds.
     kernel void xrGridNearestDepth(device float4 *depths [[buffer(0)]],
                                    constant XRGridUnprojectUniforms &u [[buffer(1)]],
+                                   constant rasterization_rate_map_data *rateMap [[buffer(3), function_constant(kFoveated)]],
                                    depth2d<float, access::read> depth [[texture(0)]],
                                    uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) { return; }
         float2 size = float2(u.textureSize);
-        float2 halfCell = size / float2(u.gridSize - 1) * 0.5f;
-        float2 centre = float2(gid) * (1.0f / float2(u.gridSize - 1)) * (size - 1.0f);
+        float2 halfCell = halfCellTexels(u);
+        float2 centre = vertexCentre(gid, u);
         // The margin is half a cell, so the footprint reaches a whole cell from the centre: the
         // first vertex outside an edge is within a cell of it and must reach it wherever the edge
         // falls among the cells, and the second must not, or it would leave the surface behind
@@ -170,8 +246,8 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
                 nearest = max(nearest, depth.read(uint2(x, y)));
             }
         }
-        float2 centreUV = centre / (size - 1.0f);
-        float2 ndc = float2(centreUV.x * 2.0f - 1.0f, 1.0f - centreUV.y * 2.0f);
+        // The vertex's own ray: through the map when foveated, else its texture position.
+        float2 ndc = kFoveated ? texelToNDC(centre, u, rateMap) : uvToNDC(centre / (size - 1.0f));
         float4 a = u.inverseProjection * float4(ndc, 0.0f, 1.0f);
         float4 b = u.inverseProjection * float4(0.0f, 0.0f, 1.0f, 0.0f);
         float nearSideLimit = zInFront(nearest, a, b) + u.tearThreshold;
@@ -233,16 +309,20 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     kernel void xrGridUnproject(device XRGridVertex *vertices [[buffer(0)]],
                                 constant XRGridUnprojectUniforms &u [[buffer(1)]],
                                 const device float4 *depths [[buffer(2)]],
+                                constant rasterization_rate_map_data *rateMap [[buffer(3), function_constant(kFoveated)]],
                                 uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) { return; }
         float2 size = float2(u.textureSize);
-        float2 texelToUV = 1.0f / (size - 1.0f);
-        float2 cellStep = 1.0f / float2(u.gridSize - 1);
+        float2 texelToUVScale = 1.0f / (size - 1.0f);
         float4 own = depths[gid.y * u.gridSize.x + gid.x];
-        float2 centre = float2(gid) * cellStep * (size - 1.0f);
-        float2 uv = placedTexel(own, centre, size, u.skirtTexels) * texelToUV;
-        float3 eye = eyePoint(uv, own.x, u);
+        float2 centre = vertexCentre(gid, u);
+        float2 placed = placedTexel(own, centre, size, u.skirtTexels);
+        // The uv the material samples and the ray: through the map when foveated (the texel's
+        // centre), else the texel over the texture's extent and the ray from that uv.
+        float2 uv = kFoveated ? (placed + 0.5f) / size : placed * texelToUVScale;
+        float2 ndc = kFoveated ? texelToNDC(placed, u, rateMap) : uvToNDC(uv);
+        float3 eye = eyePoint(ndc, own.x, u);
         float distance = length(eye);
         // The tear mask against the eight neighbours: x when this vertex is further from the eye
         // than a neighbour by more than the threshold, y when it is nearer by that much. The
@@ -255,7 +335,8 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             int2 n = int2(gid) + offsets[k];
             if (n.x < 0 || n.y < 0 || n.x >= int(u.gridSize.x) || n.y >= int(u.gridSize.y)) { continue; }
             float4 entry = depths[n.y * u.gridSize.x + n.x];
-            float neighbour = length(eyePoint(entry.yz * texelToUV, entry.x, u));
+            float2 neighbourNDC = kFoveated ? texelToNDC(entry.yz, u, rateMap) : uvToNDC(entry.yz * texelToUVScale);
+            float neighbour = length(eyePoint(neighbourNDC, entry.x, u));
             if (distance - neighbour > u.tearThreshold) { farSide = 1.0f; }
             if (neighbour - distance > u.tearThreshold) { nearSide = 1.0f; }
         }
@@ -273,6 +354,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     kernel void xrGridTriangulate(device uint *indices [[buffer(0)]],
                                   constant XRGridUnprojectUniforms &u [[buffer(1)]],
                                   const device float4 *depths [[buffer(2)]],
+                                  constant rasterization_rate_map_data *rateMap [[buffer(3), function_constant(kFoveated)]],
                                   uint2 gid [[thread_position_in_grid]])
     {
         uint2 cells = u.gridSize - 1;
@@ -281,8 +363,14 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         uint b = a + 1;
         uint c = a + u.gridSize.x;
         uint d = c + 1;
-        float2 centreUV = (float2(gid) + 0.5f) / float2(cells);
-        float2 ndc = float2(centreUV.x * 2.0f - 1.0f, 1.0f - centreUV.y * 2.0f);
+        // The cell's own ray: through its centre texel's place on the map when foveated.
+        float2 ndc;
+        if (kFoveated) {
+            float2 cellCentre = clamp((float2(gid) + 0.5f) * u.cellTexels - 0.5f, float2(0.0f), float2(u.textureSize) - 1.0f);
+            ndc = texelToNDC(cellCentre, u, rateMap);
+        } else {
+            ndc = uvToNDC((float2(gid) + 0.5f) / float2(cells));
+        }
         float4 ra = u.inverseProjection * float4(ndc, 0.0f, 1.0f);
         float4 rb = u.inverseProjection * float4(0.0f, 0.0f, 1.0f, 0.0f);
         float za = zInFront(depths[a].x, ra, rb);
@@ -302,30 +390,38 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     }
     """
 
-    public enum Error: Swift.Error, CustomStringConvertible {
-        case kernelMissing(String)
-
-        public var description: String {
-            switch self {
-            case let .kernelMissing(name): return "the kernel \(name) is not in the compiled library"
-            }
-        }
+    /// The three kernels, specialized for one value of `kFoveated`.
+    private struct Pipelines {
+        let nearestDepth: MTLComputePipelineState
+        let unproject: MTLComputePipelineState
+        let triangulate: MTLComputePipelineState
     }
 
-    private let nearestDepthPipeline: MTLComputePipelineState
-    private let pipeline: MTLComputePipelineState
-    private let triangulatePipeline: MTLComputePipelineState
+    /// The kernels for a uniform eye texture: the arithmetic as it always was.
+    private let uniformPipelines: Pipelines
+    /// The kernels for an eye drawn through a rate map: texels to rays through its decoder.
+    private let foveatedPipelines: Pipelines
 
-    /// Compiles the kernels for `device`; throws what the Metal compiler reports.
+    /// Compiles the kernels for `device`, in both specializations; throws what the Metal
+    /// compiler reports.
     public init(device: MTLDevice) throws {
         let library = try device.makeLibrary(source: Self.source, options: nil)
-        func makePipeline(_ name: String) throws -> MTLComputePipelineState {
-            guard let function = library.makeFunction(name: name) else { throw Error.kernelMissing(name) }
-            return try device.makeComputePipelineState(function: function)
+        func makePipelines(foveated: Bool) throws -> Pipelines {
+            var foveated = foveated
+            let constants = MTLFunctionConstantValues()
+            constants.setConstantValue(&foveated, type: .bool, index: 0)
+            func makePipeline(_ name: String) throws -> MTLComputePipelineState {
+                let function = try library.makeFunction(name: name, constantValues: constants)
+                return try device.makeComputePipelineState(function: function)
+            }
+            return try Pipelines(
+                nearestDepth: makePipeline(Self.nearestDepthKernelName),
+                unproject: makePipeline(Self.kernelName),
+                triangulate: makePipeline(Self.triangulateKernelName)
+            )
         }
-        nearestDepthPipeline = try makePipeline(Self.nearestDepthKernelName)
-        pipeline = try makePipeline(Self.kernelName)
-        triangulatePipeline = try makePipeline(Self.triangulateKernelName)
+        uniformPipelines = try makePipelines(foveated: false)
+        foveatedPipelines = try makePipelines(foveated: true)
     }
 
     /// The scratch buffer between the two dispatches for one eye's `grid`: one float4 per vertex
@@ -343,7 +439,9 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     /// Z), `nearestDepths` the eye's scratch buffer (`makeNearestDepthBuffer`), `vertices` the
     /// grid's vertex buffer for this frame, `originFromEye` the inverse of the view matrix the
     /// eye was drawn with and `projection` its projection. Both dispatches go into one compute
-    /// encoder, a memory barrier between them.
+    /// encoder, a memory barrier between them. `rateMapData` is the rasterization rate map the
+    /// eye was drawn through, with the grid's cell in physical texels (`grid` must then be the
+    /// map's: `XRPresenterFoveation.grid`); nil, and the eye is a uniform texture.
     public func encode(
         commandBuffer: MTLCommandBuffer,
         depth: MTLTexture,
@@ -357,10 +455,13 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         tearThreshold: Float,
         skirtTexels: Float = 0,
         adaptiveDiagonal: Bool = true,
+        rateMapData: XRRasterizationRateMapData? = nil,
+        cellTexels: Float = 0,
         label: String = "XR grid unproject"
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = label
+        let foveated = rateMapData != nil && cellTexels > 0
         var uniforms = XRGridUnprojectUniforms(
             originFromEye: originFromEye,
             inverseProjection: simd_inverse(projection),
@@ -368,28 +469,36 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             textureSize: SIMD2<UInt32>(UInt32(depth.width), UInt32(depth.height)),
             farShell: farShell,
             tearThreshold: tearThreshold,
-            skirtTexels: skirtTexels
+            skirtTexels: skirtTexels,
+            screenSize: foveated ? rateMapData?.screenSize ?? .zero : .zero,
+            cellTexels: foveated ? cellTexels : 0,
+            foveated: foveated
         )
         uniforms.flags = adaptiveDiagonal ? 0 : 1
         encoder.setBytes(&uniforms, length: MemoryLayout<XRGridUnprojectUniforms>.stride, index: 1)
+        // The kernels specialized for the eye, and the map's parameters for the foveated ones.
+        let pipelines = foveated ? foveatedPipelines : uniformPipelines
+        if foveated, let rateMapData {
+            encoder.setBuffer(rateMapData.buffer, offset: 0, index: 3)
+        }
 
-        encoder.setComputePipelineState(nearestDepthPipeline)
+        encoder.setComputePipelineState(pipelines.nearestDepth)
         encoder.setBuffer(nearestDepths, offset: 0, index: 0)
         encoder.setTexture(depth, index: 0)
-        dispatch(encoder, pipeline: nearestDepthPipeline, columns: grid.columns, rows: grid.rows)
+        dispatch(encoder, pipeline: pipelines.nearestDepth, columns: grid.columns, rows: grid.rows)
         encoder.memoryBarrier(scope: .buffers)
 
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(pipelines.unproject)
         encoder.setBuffer(vertices, offset: 0, index: 0)
         encoder.setBuffer(nearestDepths, offset: 0, index: 2)
-        dispatch(encoder, pipeline: pipeline, columns: grid.columns, rows: grid.rows)
+        dispatch(encoder, pipeline: pipelines.unproject, columns: grid.columns, rows: grid.rows)
         // The cells' triangles for this frame, when the presenter hands the index buffer in
         // (nil keeps the mesh's indices as they are: the fixed split).
         if let indices {
-            encoder.setComputePipelineState(triangulatePipeline)
+            encoder.setComputePipelineState(pipelines.triangulate)
             encoder.setBuffer(indices, offset: 0, index: 0)
             encoder.setBuffer(nearestDepths, offset: 0, index: 2)
-            dispatch(encoder, pipeline: triangulatePipeline, columns: grid.columns - 1, rows: grid.rows - 1)
+            dispatch(encoder, pipeline: pipelines.triangulate, columns: grid.columns - 1, rows: grid.rows - 1)
         }
         encoder.endEncoding()
     }

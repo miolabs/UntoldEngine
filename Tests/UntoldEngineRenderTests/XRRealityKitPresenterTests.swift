@@ -274,9 +274,13 @@ final class XRGridUnprojectTests: XCTestCase {
         commandBuffer.waitUntilCompleted()
     }
 
-    /// The kernel's `eyePoint`, in Swift.
+    /// The kernel's `eyePoint`, in Swift, of a texture position.
     private func referenceEyePoint(uv: SIMD2<Float>, depth: Float, inverseProjection: simd_float4x4, farShell: Float) -> SIMD3<Float> {
-        let ndc = SIMD2<Float>(uv.x * 2 - 1, 1 - uv.y * 2)
+        referenceEyePoint(ndc: SIMD2<Float>(uv.x * 2 - 1, 1 - uv.y * 2), depth: depth, inverseProjection: inverseProjection, farShell: farShell)
+    }
+
+    /// The kernel's `eyePoint`, in Swift, of a ray.
+    private func referenceEyePoint(ndc: SIMD2<Float>, depth: Float, inverseProjection: simd_float4x4, farShell: Float) -> SIMD3<Float> {
         let eye = inverseProjection * SIMD4<Float>(ndc.x, ndc.y, max(depth, 1e-6), 1)
         var point = SIMD3<Float>(eye.x, eye.y, eye.z) / eye.w
         let distance = simd_length(point)
@@ -286,13 +290,49 @@ final class XRGridUnprojectTests: XCTestCase {
         return point
     }
 
+    /// A rasterization rate map the kernel works through, for the references: the grid's cell in
+    /// physical texels, and the map's own mapping (Metal's, on the CPU) of a texel's centre to
+    /// its place on the screen, as NDC.
+    private struct ReferenceMap {
+        let rateMap: MTLRasterizationRateMap
+        let cellTexels: Float
+
+        var screenSize: SIMD2<Float> {
+            SIMD2<Float>(Float(rateMap.screenSize.width), Float(rateMap.screenSize.height))
+        }
+
+        func ndc(ofTexel texel: SIMD2<Float>) -> SIMD2<Float> {
+            let screen = rateMap.screenCoordinates(physicalCoordinates: MTLCoordinate2D(x: texel.x + 0.5, y: texel.y + 0.5), layer: 0)
+            let uv = SIMD2<Float>(screen.x, screen.y) / screenSize
+            return SIMD2<Float>(uv.x * 2 - 1, 1 - uv.y * 2)
+        }
+    }
+
+    /// Where the kernel centres a grid vertex, in texels: on the knots of the map's tiles when
+    /// there is one, else spread over the texture's extent.
+    private func referenceCentre(column: Int, row: Int, grid: XRPresenterGrid, textureSize: SIMD2<Int>, map: ReferenceMap?) -> SIMD2<Float> {
+        let size = SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
+        if let map {
+            return simd_min(SIMD2<Float>(Float(column), Float(row)) * map.cellTexels, size - 1)
+        }
+        let cells = SIMD2<Float>(Float(grid.columns - 1), Float(grid.rows - 1))
+        return SIMD2<Float>(Float(column), Float(row)) * (1 / cells) * (size - 1)
+    }
+
+    /// The kernel's ray of a texel, as NDC: through the map, or from its texture position.
+    private func referenceNDC(ofTexel texel: SIMD2<Float>, textureSize: SIMD2<Int>, map: ReferenceMap?) -> SIMD2<Float> {
+        if let map { return map.ndc(ofTexel: texel) }
+        let uv = texel / SIMD2<Float>(Float(textureSize.x - 1), Float(textureSize.y - 1))
+        return SIMD2<Float>(uv.x * 2 - 1, 1 - uv.y * 2)
+    }
+
     /// The kernel's footprint of a grid vertex, in Swift: the texels of the cell about the vertex
     /// plus a margin of half a cell, `lo ... hi` on each axis, clamped to the texture.
-    private func referenceFootprint(column: Int, row: Int, grid: XRPresenterGrid, textureSize: SIMD2<Int>) -> (lo: SIMD2<Int>, hi: SIMD2<Int>) {
+    private func referenceFootprint(column: Int, row: Int, grid: XRPresenterGrid, textureSize: SIMD2<Int>, map: ReferenceMap? = nil) -> (lo: SIMD2<Int>, hi: SIMD2<Int>) {
         let size = SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
         let cells = SIMD2<Float>(Float(grid.columns - 1), Float(grid.rows - 1))
-        let halfCell = size / cells * 0.5
-        let centre = SIMD2<Float>(Float(column), Float(row)) * (1 / cells) * (size - 1)
+        let halfCell = map.map { SIMD2<Float>(repeating: $0.cellTexels * 0.5) } ?? size / cells * 0.5
+        let centre = referenceCentre(column: column, row: row, grid: grid, textureSize: textureSize, map: map)
         let margin = SIMD2<Int>(Int(ceil(halfCell.x - 1e-3)), Int(ceil(halfCell.y - 1e-3)))
         let lo = SIMD2<Int>(Int(ceil(centre.x - halfCell.x - 1e-3)) - margin.x, Int(ceil(centre.y - halfCell.y - 1e-3)) - margin.y)
         let hi = SIMD2<Int>(Int(floor(centre.x + halfCell.x + 1e-3)) + margin.x, Int(floor(centre.y + halfCell.y + 1e-3)) + margin.y)
@@ -304,12 +344,12 @@ final class XRGridUnprojectTests: XCTestCase {
     /// vertex's centre among those on the near side of the footprint's depth jump (within the
     /// tear threshold of the nearest depth, in metres along the vertex's ray), with that texel's
     /// depth.
-    private func referenceNearestDepth(column: Int, row: Int, grid: XRPresenterGrid, textureSize: SIMD2<Int>, projection: simd_float4x4, tearThreshold: Float, line: Line = Line(), skirtTexels: Float = 0) -> (depth: Float, texel: SIMD2<Float>, rim: Bool, placed: SIMD2<Float>) {
-        let (lo, hi) = referenceFootprint(column: column, row: row, grid: grid, textureSize: textureSize)
+    private func referenceNearestDepth(column: Int, row: Int, grid: XRPresenterGrid, textureSize: SIMD2<Int>, projection: simd_float4x4, tearThreshold: Float, line: Line = Line(), skirtTexels: Float = 0, map: ReferenceMap? = nil, depthOfTexel: ((SIMD2<Int>) -> Float)? = nil) -> (depth: Float, texel: SIMD2<Float>, rim: Bool, placed: SIMD2<Float>) {
+        let (lo, hi) = referenceFootprint(column: column, row: row, grid: grid, textureSize: textureSize, map: map)
         let size = SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
-        let cells = SIMD2<Float>(Float(grid.columns - 1), Float(grid.rows - 1))
-        let centre = SIMD2<Float>(Float(column), Float(row)) * (1 / cells) * (size - 1)
+        let centre = referenceCentre(column: column, row: row, grid: grid, textureSize: textureSize, map: map)
         func depthAt(_ x: Int, _ y: Int) -> Float {
+            if let depthOfTexel { return depthOfTexel(SIMD2<Int>(x, y)) }
             if Int32(x) == line.column || Int32(y) == line.row { return line.depth }
             return syntheticDepth(texel: SIMD2<Int>(x, y), textureSize: textureSize, projection: projection)
         }
@@ -319,8 +359,7 @@ final class XRGridUnprojectTests: XCTestCase {
                 nearest = max(nearest, depthAt(x, y))
             }
         }
-        let centreUV = centre / (size - 1)
-        let ndc = SIMD2<Float>(centreUV.x * 2 - 1, 1 - centreUV.y * 2)
+        let ndc = referenceNDC(ofTexel: centre, textureSize: textureSize, map: map)
         let inverseProjection = simd_inverse(projection)
         let a = inverseProjection * SIMD4<Float>(ndc.x, ndc.y, 0, 1)
         let b = inverseProjection * SIMD4<Float>(0, 0, 1, 0)
@@ -360,9 +399,13 @@ final class XRGridUnprojectTests: XCTestCase {
         return (chosen, texel, rim, placed)
     }
 
-    /// The uv of a texel: v = 0 at the top row.
-    private func uvOfTexel(_ texel: SIMD2<Float>, textureSize: SIMD2<Int>) -> SIMD2<Float> {
-        texel / SIMD2<Float>(Float(textureSize.x - 1), Float(textureSize.y - 1))
+    /// The uv the kernel writes for a texel: v = 0 at the top row; the texel's centre over the
+    /// size through a map, the texel over the extent otherwise.
+    private func uvOfTexel(_ texel: SIMD2<Float>, textureSize: SIMD2<Int>, map: ReferenceMap? = nil) -> SIMD2<Float> {
+        if map != nil {
+            return (texel + 0.5) / SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
+        }
+        return texel / SIMD2<Float>(Float(textureSize.x - 1), Float(textureSize.y - 1))
     }
 
     private struct Vertex {
@@ -709,13 +752,288 @@ final class XRGridUnprojectTests: XCTestCase {
     }
 
     func test_theUniforms_haveTheKernelsLayout() {
-        XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.stride, 160)
+        XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.stride, 176)
         XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.inverseProjection), 64)
         XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.gridSize), 128)
         XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.textureSize), 136)
         XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.farShell), 144)
         XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.flags), 152)
         XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.skirtTexels), 156)
+        XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.screenSize), 160)
+        XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.cellTexels), 168)
+        XCTAssertEqual(MemoryLayout<XRGridUnprojectUniforms>.offset(of: \.foveated), 172)
+        let uniform = XRGridUnprojectUniforms(originFromEye: matrix_identity_float4x4, inverseProjection: matrix_identity_float4x4, gridSize: [2, 2], textureSize: [8, 8], farShell: 1, tearThreshold: 1)
+        XCTAssertEqual(uniform.foveated, 0, "no map by default")
+        XCTAssertEqual(uniform.cellTexels, 0)
+    }
+
+    // MARK: - Through a rasterization rate map
+
+    /// The presenter's map for `configuration`, or a skip where the GPU has none.
+    private func makeFoveation(_ configuration: XRRealityKitPresenterConfiguration) throws -> XRPresenterFoveation {
+        guard device.supportsRasterizationRateMap(layerCount: 1) else {
+            throw XCTSkip("this GPU has no rasterization rate maps")
+        }
+        return try XCTUnwrap(XRPresenterFoveation.make(device: device, configuration: configuration), "the device makes the presenter's map")
+    }
+
+    private var depthCopyPipeline: (pipeline: MTLRenderPipelineState, depthStencil: MTLDepthStencilState)?
+
+    /// A pass that writes a texture of depths, one per texel, into a depth texture: made once
+    /// per test.
+    private func makeDepthCopyPipeline() throws -> (pipeline: MTLRenderPipelineState, depthStencil: MTLDepthStencilState) {
+        if let depthCopyPipeline { return depthCopyPipeline }
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct V { float4 position [[position]]; };
+        vertex V fullscreen(uint id [[vertex_id]]) {
+            V out; out.position = float4((id == 2) ? 3.0f : -1.0f, (id == 1) ? 3.0f : -1.0f, 0, 1);
+            return out;
+        }
+        struct Out { float depth [[depth(any)]]; };
+        fragment Out copyDepth(V in [[stage_in]], texture2d<float, access::read> depths [[texture(0)]]) {
+            Out out; out.depth = depths.read(uint2(in.position.xy)).x;
+            return out;
+        }
+        """
+        let library = try device.makeLibrary(source: source, options: nil)
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+        pipelineDescriptor.vertexFunction = library.makeFunction(name: "fullscreen")
+        pipelineDescriptor.fragmentFunction = library.makeFunction(name: "copyDepth")
+        pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
+        let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        let depthStencilDescriptor = MTLDepthStencilDescriptor()
+        depthStencilDescriptor.depthCompareFunction = .always
+        depthStencilDescriptor.isDepthWriteEnabled = true
+        let depthStencil = try XCTUnwrap(device.makeDepthStencilState(descriptor: depthStencilDescriptor))
+        depthCopyPipeline = (pipeline, depthStencil)
+        return (pipeline, depthStencil)
+    }
+
+    /// Draws `depths`, one per texel row by row, into `texture`.
+    private func drawDepths(_ depths: [Float], into texture: MTLTexture) throws {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: texture.width, height: texture.height, mipmapped: false)
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .managed
+        let source = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+        depths.withUnsafeBytes { bytes in
+            source.replace(region: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0, withBytes: bytes.baseAddress!, bytesPerRow: texture.width * MemoryLayout<Float>.stride)
+        }
+        let (pipeline, depthStencil) = try makeDepthCopyPipeline()
+        let pass = MTLRenderPassDescriptor()
+        pass.depthAttachment.texture = texture
+        pass.depthAttachment.loadAction = .clear
+        pass.depthAttachment.storeAction = .store
+        pass.depthAttachment.clearDepth = 0
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeRenderCommandEncoder(descriptor: pass))
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setDepthStencilState(depthStencil)
+        encoder.setFragmentTexture(source, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+
+    /// The equi-angular profile: 1 at the centre of view, 1 / (1 + x²) at a tangent of x,
+    /// symmetric, the same number of samples whatever the tangents.
+    func test_theEquiAngularProfile_isOneAtTheCentre_andFallsWithTheTangent() {
+        let rates = XRPresenterFoveation.rates(of: .equiAngular, from: 1.3, to: 1.3, samples: 64)
+        XCTAssertEqual(rates.count, 64)
+        XCTAssertEqual(rates[31], rates[32], accuracy: 1e-6, "symmetric about the centre")
+        XCTAssertGreaterThan(rates[31], 0.999, "1 at the centre of view")
+        let edgeTangent: Float = -1.3 + 0.5 / 64 * 2.6
+        XCTAssertEqual(rates[0], 1 / (1 + edgeTangent * edgeTangent), accuracy: 1e-6, "the edge sample's rate is the profile at its centre")
+        XCTAssertEqual(rates[0], rates[63], accuracy: 1e-6)
+        XCTAssertTrue(zip(rates[0 ..< 31], rates[1 ..< 32]).allSatisfy { $0 < $1 }, "rising to the centre")
+        let asymmetric = XRPresenterFoveation.rates(of: .equiAngular, from: 1.15, to: 1.30, samples: 64)
+        XCTAssertGreaterThan(asymmetric[0], asymmetric[63], "the nearer edge is drawn denser")
+        XCTAssertEqual(XRPresenterFoveation.rates(of: .none, from: 1.3, to: 1.3, samples: 4), [1, 1, 1, 1])
+        XCTAssertEqual(XRPresenterFoveation.vertexCount(over: 1920, cell: 8), 241)
+        XCTAssertEqual(XRPresenterFoveation.vertexCount(over: 1823, cell: 8), 229, "a vertex on the last texel when the cells do not divide")
+    }
+
+    /// The shipped profile at the shipped budget: the physical size never exceeds the budget
+    /// (Metal rounds rates up; a profile edit can never silently cost GPU), the centre of view
+    /// is denser, the cell divides the map's tile, the map's edges are the screen's, and the
+    /// grid's linear interpolation of the map between two vertices meets the map at the cell's
+    /// midpoint, since the mapping changes slope only at the tile boundaries the vertices sit on.
+    func test_theShippedMap_fitsTheBudget_andTheGridInterpolatesItWithinACell() throws {
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.foveation = .equiAngular
+        let foveation = try makeFoveation(configuration)
+        let budget = configuration.textureSize
+        let physical = foveation.physicalSize
+        let screen = foveation.screenSize
+        print("XR presenter rate map on this Mac: \(foveation)")
+
+        XCTAssertEqual(foveation.budget, budget)
+        XCTAssertLessThanOrEqual(physical.x, budget.x, "the physical width is within the budget")
+        XCTAssertLessThanOrEqual(physical.y, budget.y, "the physical height is within the budget")
+        XCTAssertLessThanOrEqual(physical.x * physical.y, Int(1.05 * Double(budget.x * budget.y)), "no more pixels than the uniform frame")
+        XCTAssertGreaterThan(physical.x * physical.y, Int(0.9 * Double(budget.x * budget.y)), "and nearly all of them")
+        XCTAssertGreaterThanOrEqual(foveation.screenScale.x, 1.25, "the centre of view is denser than the uniform frame: \(foveation.screenScale)")
+        XCTAssertGreaterThanOrEqual(foveation.screenScale.y, 1.2)
+        XCTAssertEqual(foveation.granularity.x % foveation.cellTexels, 0, "the cell divides the tile")
+        XCTAssertEqual(foveation.granularity.y % foveation.cellTexels, 0)
+        XCTAssertEqual(foveation.cellTexels, configuration.foveatedCellTexels)
+        XCTAssertEqual(foveation.grid.columns, (physical.x + foveation.cellTexels - 1) / foveation.cellTexels + 1)
+        XCTAssertEqual(foveation.grid.rows, (physical.y + foveation.cellTexels - 1) / foveation.cellTexels + 1)
+        XCTAssertEqual(foveation.frame.viewport.width, Double(screen.x), "the eyes' viewport is the map's screen")
+        XCTAssertEqual(foveation.frame.viewport.height, Double(screen.y))
+        XCTAssertEqual(foveation.rateMapData.screenSize, SIMD2<Float>(Float(screen.x), Float(screen.y)))
+        XCTAssertEqual(foveation.rateMapData.physicalSize, SIMD2<Float>(Float(physical.x), Float(physical.y)))
+        XCTAssertTrue(foveation.rateMap.screenSize.width == screen.x && foveation.rateMap.physicalSize(layer: 0).width == physical.x)
+
+        let rateMap = foveation.rateMap
+        func screenOf(_ x: Float, _ y: Float) -> SIMD2<Float> {
+            let point = rateMap.screenCoordinates(physicalCoordinates: MTLCoordinate2D(x: x, y: y), layer: 0)
+            return SIMD2<Float>(point.x, point.y)
+        }
+        let origin = screenOf(0, 0)
+        let farCorner = screenOf(Float(physical.x), Float(physical.y))
+        XCTAssertEqual(origin.x, 0, accuracy: 0.05, "the map's origin is the screen's")
+        XCTAssertEqual(origin.y, 0, accuracy: 0.05)
+        XCTAssertEqual(farCorner.x, Float(screen.x), accuracy: 0.05, "the map's far corner is the screen's")
+        XCTAssertEqual(farCorner.y, Float(screen.y), accuracy: 0.05)
+        // The centre of view is drawn at the full rate: a texel there is a screen pixel.
+        let centre = screenOf(Float(physical.x / 2) + 0.5, Float(physical.y / 2) + 0.5)
+        let next = screenOf(Float(physical.x / 2) + 1.5, Float(physical.y / 2) + 1.5)
+        XCTAssertEqual(next.x - centre.x, 1, accuracy: 0.02, "one screen pixel per texel at the centre of view")
+        XCTAssertEqual(next.y - centre.y, 1, accuracy: 0.02)
+        let edge = screenOf(0.5, Float(physical.y / 2) + 0.5)
+        let nextEdge = screenOf(1.5, Float(physical.y / 2) + 0.5)
+        XCTAssertGreaterThan(nextEdge.x - edge.x, 2, "a texel at the edge covers more than two screen pixels")
+
+        // Between two vertices of a row or a column, the map at the cell's midpoint against the
+        // mean of the map at the vertices.
+        let cell = Float(foveation.cellTexels)
+        var worst: Float = 0
+        for row in [0, physical.y / 3, physical.y / 2, physical.y - 1] {
+            let y = Float(row) + 0.5
+            var x: Float = 0
+            while x + cell <= Float(physical.x - 1) {
+                let interpolated = (screenOf(x + 0.5, y).x + screenOf(x + cell + 0.5, y).x) / 2
+                worst = max(worst, abs(interpolated - screenOf(x + cell / 2 + 0.5, y).x))
+                x += cell
+            }
+        }
+        for column in [0, physical.x / 3, physical.x / 2, physical.x - 1] {
+            let x = Float(column) + 0.5
+            var y: Float = 0
+            while y + cell <= Float(physical.y - 1) {
+                let interpolated = (screenOf(x, y + 0.5).y + screenOf(x, y + cell + 0.5).y) / 2
+                worst = max(worst, abs(interpolated - screenOf(x, y + cell / 2 + 0.5).y))
+                y += cell
+            }
+        }
+        print("XR presenter rate map: the grid's worst interpolation error at a cell's midpoint is \(worst) screen px")
+        XCTAssertLessThan(worst, 0.3, "the grid interpolates the map within a cell to under a third of a screen pixel")
+    }
+
+    /// Through a map, every vertex lies on the ray Metal's own mapping gives its texel, at the
+    /// depth drawn there: the depth of a plane tilted in eye space, computed per texel through
+    /// that mapping on the CPU and drawn into the physical texture; the kernel, reading the map
+    /// through its decoder on the GPU, must put every vertex back on the plane, to a tenth of a
+    /// millimetre, with the uv of the texel's centre.
+    func test_withARateMap_theVerticesLieOnTheMapsRays_atTheTiltedPlanesDepth() throws {
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.textureSize = [256, 192]
+        configuration.foveation = .equiAngular
+        configuration.farShellMetres = 50
+        // The plane is continuous, so no cell may read as a tear; at the periphery it is seen
+        // at a grazing angle and a cell there spans the most depth, under a metre.
+        configuration.tearThresholdMetres = 3
+        configuration.skirtTexels = 0
+        let foveation = try makeFoveation(configuration)
+        let grid = foveation.grid
+        let textureSize = foveation.physicalSize
+        XCTAssertLessThanOrEqual(textureSize.x, 256)
+        XCTAssertLessThanOrEqual(textureSize.y, 192)
+        XCTAssertGreaterThan(foveation.screenSize.x, textureSize.x, "the screen is larger than the texture")
+        let map = ReferenceMap(rateMap: foveation.rateMap, cellTexels: Float(foveation.cellTexels))
+        let projection = configuration.projection
+        let inverseProjection = simd_inverse(projection)
+
+        // The plane: through (0, 0, -3) in eye space, tilted both ways. The depth at a texel is
+        // where the texel's ray, through the map, meets it.
+        let normal = simd_normalize(SIMD3<Float>(0.2, -0.12, 1))
+        let planeOffset = simd_dot(normal, SIMD3<Float>(0, 0, -3))
+        func depthOfTexel(_ texel: SIMD2<Int>) -> Float {
+            let ndc = map.ndc(ofTexel: SIMD2<Float>(Float(texel.x), Float(texel.y)))
+            let onNearPlane = inverseProjection * SIMD4<Float>(ndc.x, ndc.y, 1, 1)
+            let direction = SIMD3<Float>(onNearPlane.x, onNearPlane.y, onNearPlane.z) / onNearPlane.w
+            let point = direction * (planeOffset / simd_dot(normal, direction))
+            let clip = projection * SIMD4<Float>(point, 1)
+            return clip.z / clip.w
+        }
+        var depths = [Float](repeating: 0, count: textureSize.x * textureSize.y)
+        for y in 0 ..< textureSize.y {
+            for x in 0 ..< textureSize.x {
+                depths[y * textureSize.x + x] = depthOfTexel(SIMD2<Int>(x, y))
+            }
+        }
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        try drawDepths(depths, into: depthTexture)
+
+        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
+        let originFromEye = matrix4x4Translation(0.5, 1, 0)
+        let pass = try XRGridUnprojectPass(device: device)
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, grid: grid, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: 0, rateMapData: foveation.rateMapData, cellTexels: Float(foveation.cellTexels))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertEqual(commandBuffer.status, .completed)
+
+        let result = readVertices(vertices, grid: grid)
+        let nearest = readNearestDepths(nearestDepths, grid: grid)
+        let eyeFromOrigin = simd_inverse(originFromEye)
+        var worstOffPlane: Float = 0, worstOffReference: Float = 0
+        for row in 0 ..< grid.rows {
+            for column in 0 ..< grid.columns {
+                let index = row * grid.columns + column
+                let vertex = result[index]
+                let entry = nearest[index]
+                let centre = referenceCentre(column: column, row: row, grid: grid, textureSize: textureSize, map: map)
+                XCTAssertEqual(centre, simd_min(SIMD2<Float>(Float(column), Float(row)) * map.cellTexels, SIMD2<Float>(Float(textureSize.x - 1), Float(textureSize.y - 1))), "vertex \(column),\(row) sits every cell, the last on the last texel")
+                // A continuous surface: the vertex stays on its own texel, with that texel's depth,
+                // and the reference agrees.
+                let reference = referenceNearestDepth(column: column, row: row, grid: grid, textureSize: textureSize, projection: projection, tearThreshold: configuration.tearThresholdMetres, map: map, depthOfTexel: depthOfTexel)
+                XCTAssertEqual(entry.texel, centre, "vertex \(column),\(row) stays on its own texel over a continuous surface")
+                XCTAssertEqual(reference.texel, centre)
+                XCTAssertFalse(entry.rim, "no rim on a continuous surface (\(column),\(row))")
+                let expectedDepth = depthOfTexel(SIMD2<Int>(Int(centre.x), Int(centre.y)))
+                XCTAssertEqual(entry.depth, expectedDepth, accuracy: 1e-6, "the depth of vertex \(column),\(row) is its texel's")
+                XCTAssertEqual(reference.depth, expectedDepth, accuracy: 1e-6)
+                // The uv is the texel's centre over the size.
+                let uv = uvOfTexel(centre, textureSize: textureSize, map: map)
+                XCTAssertEqual(vertex.uv.x, uv.x, accuracy: 1e-6, "u of vertex \(column),\(row)")
+                XCTAssertEqual(vertex.uv.y, uv.y, accuracy: 1e-6, "v of vertex \(column),\(row)")
+                XCTAssertEqual(vertex.mask, 0, "no tear on a continuous surface (\(column),\(row))")
+                XCTAssertEqual(vertex.nearSide, 0)
+                // The position: on the ray Metal's mapping gives the texel, at the drawn depth, so
+                // on the plane; and where the reference puts it.
+                let expected = originFromEye * SIMD4<Float>(referenceEyePoint(ndc: map.ndc(ofTexel: centre), depth: expectedDepth, inverseProjection: inverseProjection, farShell: configuration.farShellMetres), 1)
+                let offReference = simd_length(vertex.position - SIMD3<Float>(expected.x, expected.y, expected.z))
+                worstOffReference = max(worstOffReference, offReference)
+                XCTAssertLessThan(offReference, 1e-4, "vertex \(column),\(row) lies where the map's ray meets the drawn depth: \(vertex.position) against \(expected)")
+                let inEye = eyeFromOrigin * SIMD4<Float>(vertex.position, 1)
+                let offPlane = abs(simd_dot(normal, SIMD3<Float>(inEye.x, inEye.y, inEye.z)) - planeOffset)
+                worstOffPlane = max(worstOffPlane, offPlane)
+                XCTAssertLessThan(offPlane, 1e-4, "vertex \(column),\(row) lies on the tilted plane (\(offPlane) m off)")
+            }
+        }
+        print("XR presenter rate map: the kernel's vertices lie within \(worstOffPlane) m of the plane and \(worstOffReference) m of the CPU's mapping")
+        /// The grid is uniform in texels, so it is dense on the screen where the texture is: the
+        /// first cell at the edge spans more of the screen than one at the centre.
+        func screenX(_ column: Int) -> Float {
+            let point = foveation.rateMap.screenCoordinates(physicalCoordinates: MTLCoordinate2D(x: Float(column) * map.cellTexels + 0.5, y: 0.5), layer: 0)
+            return point.x
+        }
+        XCTAssertGreaterThan(screenX(1) - screenX(0), (screenX(grid.columns / 2 + 1) - screenX(grid.columns / 2)) * 1.5, "an edge cell covers more screen than a centre cell")
     }
 }
 
@@ -793,6 +1111,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         renderInfo.isXRStereoMode = false
         renderInfo.currentEye = 0
         renderInfo.xrFoveation = nil
+        applyXRFoveationToSceneRenderPassDescriptors()
         renderInfo.viewPort = viewportBefore
         renderer.initSizeableResources()
         destroyAllEntities()
@@ -1081,5 +1400,109 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         try waitUntil { ticket.commandBuffer.status == .completed }
         XCTAssertEqual(ticket.commandBuffer.status, .completed)
         presenter.stop()
+    }
+
+    /// The chain through the presenter's rate map: the textures are the map's physical size
+    /// within the budget, the loop sizes the engine's targets to them and draws every eye through
+    /// the map, the grid is the map's (a vertex every cell of physical texels), and the vertices
+    /// land on the scene as before: the middle one on the cube ahead, a corner on the shell.
+    func test_theLoop_drawsTheEyesThroughThePresentersRateMap_andPlacesTheGrids() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        guard renderInfo.device.supportsRasterizationRateMap(layerCount: 1) else { throw XCTSkip("this GPU has no rasterization rate maps") }
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.textureSize = [320, 240]
+        configuration.foveation = .equiAngular
+        configuration.farShellMetres = 50
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        let foveation = try XCTUnwrap(presenter.foveation, "the presenter made its map")
+        let physical = foveation.physicalSize
+        XCTAssertLessThanOrEqual(physical.x, 320)
+        XCTAssertLessThanOrEqual(physical.y, 240)
+        XCTAssertGreaterThan(foveation.screenSize.x, 320, "the eyes' screen is larger than the budget")
+        XCTAssertEqual(presenter.textureSize, physical, "the textures are the map's physical size")
+        XCTAssertEqual(presenter.grid, foveation.grid, "the grid is the map's")
+        XCTAssertEqual(presenter.grid.columns, (physical.x + foveation.cellTexels - 1) / foveation.cellTexels + 1)
+        XCTAssertNotEqual(presenter.grid.columns, configuration.gridColumns, "not the configuration's")
+
+        let source = RealityKitFrameSource(presenter: presenter) { _ in matrix4x4Translation(0, 0, 5) }
+        XCTAssertEqual(source.eyeSize, simd_float2(Float(physical.x), Float(physical.y)), "the loop sizes the renderer's targets from the physical size")
+        let frame = try XCTUnwrap(source.nextFrameAfter(presenter: presenter, queue: renderInfo.commandQueue))
+        let eyes = try XCTUnwrap(frame.acquireEyes().first?.eyes)
+        XCTAssertEqual(eyes.count, 2)
+        for eye in eyes {
+            XCTAssertTrue(eye.foveation?.rateMap === foveation.rateMap, "each eye carries the presenter's map")
+            XCTAssertEqual(eye.viewport.width, Double(foveation.screenSize.x), "the eye's viewport is the map's screen")
+            XCTAssertEqual(eye.viewport.height, Double(foveation.screenSize.y))
+            XCTAssertEqual(eye.colorTexture.width, physical.x, "drawn into a physical-size texture")
+            XCTAssertEqual(eye.colorTexture.height, physical.y)
+            XCTAssertEqual(eye.depthTexture.width, physical.x)
+        }
+        _ = frame
+
+        let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
+        loop.start()
+        let thread = Thread { loop.run() }
+        thread.start()
+        try waitUntil {
+            presenter.update()
+            return loop.framesDrawn >= 6
+        }
+        let lastTicket = try XCTUnwrap(presenter.lastTicket)
+        try waitUntil { lastTicket.commandBuffer.status == .completed }
+        presenter.stop()
+        try waitUntil { thread.isFinished }
+
+        XCTAssertGreaterThanOrEqual(loop.framesDrawn, 6)
+        XCTAssertEqual(renderInfo.viewPort, simd_float2(Float(physical.x), Float(physical.y)), "the engine's targets took the physical size")
+        XCTAssertTrue(renderInfo.xrFoveation?.rateMap === foveation.rateMap, "the eyes were drawn through the presenter's map")
+        XCTAssertEqual(renderInfo.xrFoveation?.viewport.width, Double(foveation.screenSize.x))
+        XCTAssertTrue(renderInfo.offscreenRenderPassDescriptor.rasterizationRateMap === foveation.rateMap, "the scene passes carry the map")
+        XCTAssertEqual(lastTicket.colorTextures[0].width, physical.x)
+        XCTAssertEqual(presenter.statistics.snapshot().posesMissing, 0)
+
+        let halfDistance = configuration.interpupillaryDistance / 2
+        let grid = presenter.grid
+        for (eye, buffer) in lastTicket.gridBuffers.enumerated() {
+            let bytes = try bytes(of: buffer)
+            func vertex(column: Int, row: Int) -> (position: SIMD3<Float>, uv: SIMD2<Float>) {
+                bytes.withUnsafeBytes { raw in
+                    let base = (row * grid.columns + column) * XRPresenterGrid.vertexStride
+                    let position = SIMD3<Float>(
+                        raw.load(fromByteOffset: base, as: Float.self),
+                        raw.load(fromByteOffset: base + 4, as: Float.self),
+                        raw.load(fromByteOffset: base + 8, as: Float.self)
+                    )
+                    let uv = SIMD2<Float>(
+                        raw.load(fromByteOffset: base + XRPresenterGrid.uvOffset, as: Float.self),
+                        raw.load(fromByteOffset: base + XRPresenterGrid.uvOffset + 4, as: Float.self)
+                    )
+                    return (position, uv)
+                }
+            }
+            let middle = vertex(column: grid.columns / 2, row: grid.rows / 2)
+            let corner = vertex(column: 0, row: 0)
+            let eyePosition = SIMD3<Float>(eye == 0 ? -halfDistance : halfDistance, 0, 5)
+            XCTAssertEqual(middle.position.z, 0.5, accuracy: 0.1, "eye \(eye): the middle vertex lies on the near face of the cube at the origin: \(middle.position)")
+            XCTAssertEqual(abs(middle.position.x), 0, accuracy: 0.2, "eye \(eye): the middle vertex is in front of the headset: \(middle.position)")
+            XCTAssertEqual(simd_length(corner.position - eyePosition), configuration.farShellMetres, accuracy: 0.5, "eye \(eye): a corner sees nothing and lies on the shell: \(corner.position)")
+            // The uv is the texel's centre: the first vertex half a texel in, the middle one at
+            // the middle texel's centre.
+            XCTAssertEqual(corner.uv.x, 0.5 / Float(physical.x), accuracy: 1e-6, "eye \(eye): the corner's u is half a texel in")
+            XCTAssertEqual(corner.uv.y, 0.5 / Float(physical.y), accuracy: 1e-6)
+            let middleTexel = Float((grid.columns / 2) * foveation.cellTexels)
+            XCTAssertEqual(middle.uv.x, min(middleTexel, Float(physical.x - 1)) / Float(physical.x) + 0.5 / Float(physical.x), accuracy: 1e-6, "eye \(eye): the middle vertex's u is its texel's centre")
+        }
+    }
+}
+
+@available(macOS 15.0, *)
+private extension RealityKitFrameSource {
+    /// A frame of a ticket the presenter posts now, for a look at its eyes without the loop.
+    @MainActor
+    func nextFrameAfter(presenter: XRRealityKitPresenter, queue: MTLCommandQueue) -> XRFrame? {
+        presenter.start(commandQueue: queue)
+        presenter.update()
+        return nextFrame()
     }
 }
