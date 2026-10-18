@@ -28,6 +28,7 @@ public struct XRGridUnprojectUniforms {
     /// A difference in view distance to a neighbour above this, metres, is a depth jump: the
     /// vertex is marked as its far side, or its near side, in the tear mask.
     public var tearThreshold: Float
+    /// Bit 0: the cells keep the fixed diagonal (no per-frame split by depth).
     public var flags: UInt32
     /// How far, in texels, a rim vertex (one whose own centre lies off the near surface) is
     /// pushed outward past the edge texel it was placed on, so that the alpha test of the
@@ -291,7 +292,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         device uint *t = indices + (gid.y * cells.x + gid.x) * 6;
         // Only where the default diagonal crosses a depth jump and the other does not: every
         // continuous surface keeps one topology from frame to frame.
-        if (fabs(zb - zc) > u.tearThreshold && fabs(za - zd) <= u.tearThreshold) {
+        if ((u.flags & 1u) == 0u && fabs(zb - zc) > u.tearThreshold && fabs(za - zd) <= u.tearThreshold) {
             t[0] = a; t[1] = c; t[2] = d;
             t[3] = a; t[4] = d; t[5] = b;
         } else {
@@ -355,6 +356,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         farShell: Float,
         tearThreshold: Float,
         skirtTexels: Float = 0,
+        adaptiveDiagonal: Bool = true,
         label: String = "XR grid unproject"
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
@@ -368,6 +370,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             tearThreshold: tearThreshold,
             skirtTexels: skirtTexels
         )
+        uniforms.flags = adaptiveDiagonal ? 0 : 1
         encoder.setBytes(&uniforms, length: MemoryLayout<XRGridUnprojectUniforms>.stride, index: 1)
 
         encoder.setComputePipelineState(nearestDepthPipeline)

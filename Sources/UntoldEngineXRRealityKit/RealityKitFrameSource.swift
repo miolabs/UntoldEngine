@@ -55,7 +55,9 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
     // MARK: - XRFrameSource
 
     public var colorPixelFormat: MTLPixelFormat { .bgra8Unorm_srgb }
+
     public var depthPixelFormat: MTLPixelFormat { .depth32Float }
+
     public var eyeSize: simd_float2 { configuration.eyeSize }
 
     /// The next ticket as a frame, waiting for the presenter to post one; nil once the presenter
@@ -151,6 +153,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                         farShell: source.configuration.farShellMetres,
                         tearThreshold: source.configuration.tearThresholdMetres,
                         skirtTexels: source.configuration.skirtTexels,
+                        adaptiveDiagonal: source.configuration.adaptiveDiagonal,
                         label: "XR grid unproject eye \(index)"
                     )
                 }

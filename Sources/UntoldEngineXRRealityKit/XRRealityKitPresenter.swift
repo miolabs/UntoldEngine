@@ -47,6 +47,10 @@ public final class XRRealityKitPresenter {
     private let colorTextures: [LowLevelTexture]
     private let meshes: [LowLevelMesh]
     private let gridEntities: [ModelEntity]
+    /// The edge band's entities, one per eye, when the configuration asks for it and its graph loaded.
+    private let edgeEntities: [ModelEntity]
+    /// Whether the edge band is drawn.
+    public private(set) var drawsEdgeBand = false
     private var commandQueue: MTLCommandQueue?
     private var serial: UInt64 = 0
     private var lastReportTime = CACurrentMediaTime()
@@ -114,13 +118,36 @@ public final class XRRealityKitPresenter {
         }
 
         var entities: [ModelEntity] = []
+        var meshResources: [RealityKit.MeshResource] = []
         for eye in 0 ..< stereoEyeCount {
-            let entity = try await ModelEntity(mesh: MeshResource(from: meshes[eye]), materials: [materials[eye]])
+            let meshResource = try await RealityKit.MeshResource(from: meshes[eye])
+            meshResources.append(meshResource)
+            let entity = ModelEntity(mesh: meshResource, materials: [materials[eye]])
             entity.name = eye == 0 ? "Untold XR left eye" : "Untold XR right eye"
             root.addChild(entity)
             entities.append(entity)
         }
         gridEntities = entities
+
+        // The edge band: the same grids again, blended, over the opaque core.
+        var edges: [ModelEntity] = []
+        if configuration.edgeBlending, usesShaderGraphMaterial {
+            do {
+                let graph = try await XRPresenterMaterial.loadEdge()
+                for eye in 0 ..< stereoEyeCount {
+                    var material = graph
+                    try XRPresenterMaterial.configure(&material, eye: eye, texture: textureResources[eye])
+                    let entity = ModelEntity(mesh: meshResources[eye], materials: [material])
+                    entity.name = eye == 0 ? "Untold XR left eye edge" : "Untold XR right eye edge"
+                    root.addChild(entity)
+                    edges.append(entity)
+                }
+                drawsEdgeBand = true
+            } catch {
+                Logger.logWarning(message: "XR presenter: the edge band's material could not be loaded (\(error)); edges are alpha-tested only")
+            }
+        }
+        edgeEntities = edges
         root.name = "Untold XR presenter"
     }
 
@@ -158,7 +185,9 @@ public final class XRRealityKitPresenter {
         let replaceStart = CACurrentMediaTime()
         let textures = colorTextures.map { $0.replace(using: commandBuffer) }
         let buffers = meshes.map { $0.replace(bufferIndex: 0, using: commandBuffer) }
-        let indexBuffers = meshes.map { $0.replaceIndices(using: commandBuffer) }
+        // The cells' split per frame only when it is asked for; otherwise the mesh keeps its
+        // indices and the ticket carries none.
+        let indexBuffers = configuration.adaptiveDiagonal ? meshes.map { $0.replaceIndices(using: commandBuffer) } : []
         let posted = CACurrentMediaTime()
         statistics.noteTicketPosted(replaceSeconds: posted - replaceStart)
 

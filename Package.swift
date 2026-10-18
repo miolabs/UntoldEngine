@@ -189,6 +189,8 @@ let package = Package(
             resources: [
                 // The hand-written MaterialX graph of the eye material, loaded by URL.
                 .copy("Resources/XRPresenter.usda"),
+                // The edge band's graph: the same without the alpha test, blended.
+                .copy("Resources/XRPresenterEdge.usda"),
             ],
             swiftSettings: [
                 .define("ENGINE_STATS_ENABLED", .when(configuration: .debug)),

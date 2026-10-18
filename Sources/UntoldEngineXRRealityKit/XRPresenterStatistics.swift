@@ -40,6 +40,7 @@ public struct XRPresenterStatisticsSnapshot: Sendable, Equatable {
     public var ticketsDroppedTotal = 0
 
     public var updatesPerSecond: Double { seconds > 0 ? Double(updates) / seconds : 0 }
+
     public var framesPerSecond: Double { seconds > 0 ? Double(framesDrawn) / seconds : 0 }
 
     /// One line with the numbers, for a log.
@@ -68,6 +69,7 @@ public final class XRPresenterStatistics: @unchecked Sendable {
         }
 
         var averageMs: Double { count > 0 ? sum / Double(count) * 1000 : 0 }
+
         var maxMs: Double { max * 1000 }
     }
 

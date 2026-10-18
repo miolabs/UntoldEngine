@@ -33,6 +33,7 @@ public struct XRPresenterGrid: Sendable, Equatable {
     }
 
     public var vertexCount: Int { columns * rows }
+
     public var indexCount: Int { (columns - 1) * (rows - 1) * 6 }
 
     /// Two triangles per cell, counter-clockwise as seen from the eye: looking down -Z with the

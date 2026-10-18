@@ -699,7 +699,6 @@ final class XRGridUnprojectTests: XCTestCase {
         XCTAssertGreaterThan(rimOther, 2, "the rim uses the other split where the edge runs corner to corner that way")
         XCTAssertGreaterThan(rimFixed, 2, "and the fixed split where it runs the other way")
         func signedArea(_ p: UInt32, _ q: UInt32, _ r: UInt32) -> Float {
-            // Positive for a counter-clockwise triangle with y up and the first row at the top.
             func at(_ i: UInt32) -> SIMD2<Float> { SIMD2<Float>(Float(Int(i) % grid.columns), -Float(Int(i) / grid.columns)) }
             let u = at(q) - at(p), v = at(r) - at(p)
             return u.x * v.y - u.y * v.x
@@ -732,6 +731,12 @@ final class XRPresenterMaterialTests: XCTestCase {
 
         XCTAssertEqual(Set(material.parameterNames), [XRPresenterMaterial.colorTextureParameter, XRPresenterMaterial.eyeParameter])
         XCTAssertEqual(material.faceCulling, .none)
+    }
+
+    func test_theEdgeGraph_loadsWithTheSameParameters() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("shader graph materials need macOS 15") }
+        let material = try await XRPresenterMaterial.loadEdge()
+        XCTAssertEqual(Set(material.parameterNames), [XRPresenterMaterial.colorTextureParameter, XRPresenterMaterial.eyeParameter])
     }
 
     func test_theGraph_takesAnEyeAndATexture() async throws {
@@ -828,7 +833,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         configuration.farShellMetres = 50
         let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
         presenter.reportInterval = 0
-        XCTAssertEqual(presenter.root.children.count, 2, "one grid entity per eye")
+        XCTAssertEqual(presenter.root.children.count, presenter.drawsEdgeBand ? 4 : 2, "one grid entity per eye, and its edge band")
 
         // The headset five units back, looking at the cubes.
         let source = RealityKitFrameSource(presenter: presenter) { _ in matrix4x4Translation(0, 0, 5) }
@@ -847,17 +852,19 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
             return loop.framesDrawn >= 6
         }
         let lastTicket = try XCTUnwrap(presenter.lastTicket)
+        try waitUntil { lastTicket.commandBuffer.status == .completed }
+        // The numbers so far, before the probe below adds frames of its own.
+        let statistics = presenter.statistics.snapshot()
+        try probeAlpha(presenter: presenter, loop: loop)
         presenter.stop()
         try waitUntil { thread.isFinished }
-        try waitUntil { lastTicket.commandBuffer.status == .completed }
 
         XCTAssertGreaterThanOrEqual(loop.framesDrawn, 6)
         XCTAssertEqual(renderInfo.viewPort, simd_float2(320, 240), "the engine's targets took the presenter's size")
         XCTAssertEqual(lastTicket.commandBuffer.status, .completed, "the ticket's own command buffer carried the frame")
         XCTAssertEqual(lastTicket.colorTextures.count, 2)
         XCTAssertEqual(lastTicket.gridBuffers.count, 2)
-        XCTAssertEqual(lastTicket.indexBuffers.count, 2, "the cells' split follows the depth each frame")
-        let statistics = presenter.statistics.snapshot()
+        XCTAssertTrue(lastTicket.indexBuffers.isEmpty, "the mesh keeps its indices unless the adaptive diagonal is asked for")
         XCTAssertEqual(statistics.updates, updates)
         XCTAssertGreaterThanOrEqual(statistics.framesDrawn, 6)
         XCTAssertEqual(statistics.posesMissing, 0)
@@ -892,6 +899,48 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
             XCTAssertEqual(abs(middle.x), 0, accuracy: 0.2, "eye \(eye): the middle vertex is in front of the headset: \(middle)")
             XCTAssertEqual(simd_length(corner - eyePosition), configuration.farShellMetres, accuracy: 0.5, "eye \(eye): a corner sees nothing and lies on the shell: \(corner)")
         }
+    }
+
+    /// The engine's alpha at a silhouette, printed: see the probe's comment.
+    @available(macOS 15.0, *)
+    private func probeAlpha(presenter: XRRealityKitPresenter, loop: XRFrameLoop) throws {
+        // What the engine leaves at a silhouette in mixed immersion (alpha 0 where nothing is
+        // drawn): the alpha values of the left eye's texture along the row through the cubes'
+        // middle, read back through a blit. Coverage anti-aliasing leaves a ramp of partial
+        // alphas at each edge; a binary alpha has none, and the edge band has nothing to blend.
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        // Each anti-aliasing mode in turn: a few frames for it to take, then the row.
+        for mode in [AntiAliasingMode.fxaa, .smaa, .msaa, .msaaTaa] {
+            setRendering(.antiAliasing(mode))
+            let framesBefore = loop.framesDrawn
+            try waitUntil {
+                presenter.update()
+                return loop.framesDrawn >= framesBefore + 6
+            }
+            let mixedTicket = try XCTUnwrap(presenter.lastTicket)
+            try waitUntil { mixedTicket.commandBuffer.status == .completed }
+            let color = mixedTicket.colorTextures[0]
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: color.pixelFormat, width: color.width, height: color.height, mipmapped: false)
+            descriptor.usage = [.shaderRead]
+            descriptor.storageMode = .shared
+            let copy = try XCTUnwrap(renderInfo.device.makeTexture(descriptor: descriptor))
+            let commandBuffer = try XCTUnwrap(renderInfo.commandQueue.makeCommandBuffer())
+            let blit = try XCTUnwrap(commandBuffer.makeBlitCommandEncoder())
+            blit.copy(from: color, to: copy)
+            blit.endEncoding()
+            commandBuffer.commit()
+            try waitUntil { commandBuffer.status == .completed }
+            var row = [UInt8](repeating: 0, count: color.width * 4)
+            copy.getBytes(&row, bytesPerRow: color.width * 4, from: MTLRegionMake2D(0, color.height / 2, color.width, 1), mipmapLevel: 0)
+            let alphas = stride(from: 3, to: row.count, by: 4).map { Int(row[$0]) }
+            let partial = alphas.filter { $0 > 0 && $0 < 255 }.count
+            let covered = alphas.filter { $0 == 255 }.count
+            let transitions = zip(alphas, alphas.dropFirst()).filter { ($0 == 0) != ($1 == 0) }.count
+            print("XR presenter alpha along the middle row with \(mode): \(covered) covered, \(partial) partial, \(alphas.count - covered - partial) empty, \(transitions) edges; partial values: \(alphas.filter { $0 > 0 && $0 < 255 })")
+        }
+        setRendering(.antiAliasing(.fxaa))
     }
 
     func test_aFrameWithoutAPose_clearsTheEyes_andKeepsTheGrids() async throws {

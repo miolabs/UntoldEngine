@@ -17,12 +17,16 @@ private final class XRPresenterMaterialSentinel {}
 /// The material each eye's grid is shown with: the hand-written MaterialX graph
 /// `Resources/XRPresenter.usda`, whose Camera Index Switch keeps the grid for its own eye and
 /// discards it for the other (a mono view shows the left eye's), an Unlit Surface with the
-/// post-process tone map off, and an opacity of the frame's alpha under a threshold of 0.5,
-/// so that what the engine left transparent shows the passthrough.
+/// post-process tone map off, and an opacity of the frame's alpha under a threshold of 0.9,
+/// so that what the engine left transparent shows the passthrough and only a silhouette's fully
+/// covered texels are opaque: the partly covered ones are the edge band's to blend.
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 public enum XRPresenterMaterial {
     public static let primPath = "/Root/XRPresenterMaterial"
     public static let resourceName = "XRPresenter"
+    /// The edge band's graph: the same without the opacity threshold, blended (`XRPresenterEdge.usda`).
+    public static let edgePrimPath = "/Root/XRPresenterEdgeMaterial"
+    public static let edgeResourceName = "XRPresenterEdge"
     public static let resourceExtension = "usda"
     /// The SwiftPM resource bundle of this target.
     public static let bundleName = "UntoldEngine_UntoldEngineXRRealityKit.bundle"
@@ -39,17 +43,26 @@ public enum XRPresenterMaterial {
 
     /// Where the graph is: the target's resource bundle next to the running code (found without
     /// the crash risk of `Bundle.module`), else the main bundle.
-    public static func resourceURL() -> URL? {
+    public static func resourceURL(_ name: String = resourceName) -> URL? {
         Bundle.safeModuleResourceBundle(named: bundleName, anchor: XRPresenterMaterialSentinel.self)?
-            .url(forResource: resourceName, withExtension: resourceExtension)
-            ?? Bundle.main.url(forResource: resourceName, withExtension: resourceExtension)
+            .url(forResource: name, withExtension: resourceExtension)
+            ?? Bundle.main.url(forResource: name, withExtension: resourceExtension)
     }
 
     /// The graph as a material, drawn on both faces (the grid's winding is as seen from the eye,
     /// but a tear may fold a triangle).
     public static func load() async throws -> ShaderGraphMaterial {
-        guard let url = resourceURL() else { throw LoadError.resourceMissing }
-        var material = try await ShaderGraphMaterial(named: primPath, from: url)
+        try await load(resource: resourceName, prim: primPath)
+    }
+
+    /// The edge band's graph as a material.
+    public static func loadEdge() async throws -> ShaderGraphMaterial {
+        try await load(resource: edgeResourceName, prim: edgePrimPath)
+    }
+
+    private static func load(resource: String, prim: String) async throws -> ShaderGraphMaterial {
+        guard let url = resourceURL(resource) else { throw LoadError.resourceMissing }
+        var material = try await ShaderGraphMaterial(named: prim, from: url)
         material.faceCulling = .none
         return material
     }

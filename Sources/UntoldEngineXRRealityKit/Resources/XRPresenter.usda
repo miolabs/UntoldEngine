@@ -19,9 +19,13 @@
 # alpha threshold's crossing have alpha under 1, and undivided they would draw a dark line
 # along every edge. Opacity = texture alpha x that visibility, times 0 where
 # min(x, y) exceeds a small epsilon, through an Unlit Surface with the post-process tone map
-# off and an opacity threshold of 0.5: the other eye's grid is discarded, alpha below the
+# off and an opacity threshold of 0.9: the other eye's grid is discarded, alpha below the
 # threshold shows passthrough, and the stretched triangles go while the object and the surface
-# behind it keep their outlines. The cut is at an epsilon rather than at 0.5 because the mask
+# behind it keep their outlines. The threshold is high so that only a silhouette's fully
+# covered texels are opaque here: the partly covered ones (the anti-aliasing's coverage,
+# quarter steps under MSAA) are left to the edge band (XRPresenterEdge.usda), which blends
+# them over the room; at 0.5 the core took every texel covered by half or more and the band
+# had nothing but a quarter-strength fringe to add, invisible. The cut is at an epsilon rather than at 0.5 because the mask
 # is interpolated linearly in distance along the stretched triangle, whose midpoint lies far
 # behind the object: in a view shifted from the eye it was drawn for, the visible part of the
 # stretch is its first metre.
@@ -42,7 +46,7 @@ def Xform "Root"
             color3f inputs:color.connect = </Root/XRPresenterMaterial/StraightRGB.outputs:out>
             bool inputs:hasPremultipliedAlpha = 0
             float inputs:opacity.connect = </Root/XRPresenterMaterial/Opacity.outputs:out>
-            float inputs:opacityThreshold = 0.5
+            float inputs:opacityThreshold = 0.9
             token outputs:out
         }
 

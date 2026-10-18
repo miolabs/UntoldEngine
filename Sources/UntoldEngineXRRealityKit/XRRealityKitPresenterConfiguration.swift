@@ -46,6 +46,16 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// texture's alpha crosses the material's threshold rather than the mesh boundary through
     /// rim texels (which is quantised to the texel and flips with the predicted pose); 0 for none.
     public var skirtTexels: Float = 3
+    /// Whether each cell's diagonal follows the depth each frame (the fixed one unless it crosses
+    /// a depth jump and the other does not), with the index buffer rewritten per frame. Off by
+    /// default: with the skirt the fixed split draws silhouettes clean at any grid density, and
+    /// the flip was seen to add a staircase on edges that descend to the right and a spike at a
+    /// cube's corner (simulator, 2026-10-18); kept for comparisons.
+    public var adaptiveDiagonal = false
+    /// Whether a second entity per eye draws the grid again with the blended edge-band material
+    /// over the opaque core, so that a silhouette's partly covered texels blend over the room
+    /// instead of being cut by the alpha test at a texel boundary.
+    public var edgeBlending = true
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50
 
