@@ -1715,6 +1715,9 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         // is visionOS-only; its deferred part is the engine's own): the entities destroyed at
         // the start of a frame, the completion then clearing the camera and stopping the loop.
         let first = try await session("first") { presenter, loop, _ in
+            // The unlucky close: the last frame's completion has not asked for the finalization
+            // yet (a window of a few milliseconds per close); the presenter asks itself.
+            needsFinalizeDestroys = false
             presenter.stop(after: { done in
                 setSceneReady(false)
                 destroyAllEntities {

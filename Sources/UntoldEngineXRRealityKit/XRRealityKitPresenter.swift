@@ -275,8 +275,25 @@ public final class XRRealityKitPresenter {
             Task { @MainActor in self?.stop() }
         }
         shutdown(finish)
+        postUntilFinished(once: once, finish: finish, ticketsLeft: 90)
+    }
+
+    /// A ticket per refresh until the shutdown's completion fires (`once` claimed), or until
+    /// `ticketsLeft` are posted, then `finish` itself. The engine finalizes the destroys at the
+    /// start of a frame only when a frame's completion asked for it, so each ticket asks first;
+    /// a loop that skips a frame's update (assets loading) or drops a ticket gets the next one.
+    private func postUntilFinished(once: XRPresenterOnce, finish: @escaping @Sendable () -> Void, ticketsLeft: Int) {
+        guard !once.isClaimed else { return }
+        guard ticketsLeft > 0 else {
+            finish()
+            return
+        }
+        needsFinalizeDestroys = true
         update()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { finish() }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 11_000_000)
+            self?.postUntilFinished(once: once, finish: finish, ticketsLeft: ticketsLeft - 1)
+        }
     }
 
     /// Ends the exchange: the engine's loop, waiting on the mailbox, ends; a pending ticket is
@@ -299,6 +316,12 @@ public final class XRRealityKitPresenter {
 private final class XRPresenterOnce: @unchecked Sendable {
     private let lock = NSLock()
     private var claimed = false
+
+    var isClaimed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return claimed
+    }
 
     func claim() -> Bool {
         lock.lock()
