@@ -34,10 +34,44 @@ def Xform "Root"
             token outputs:out
         }
 
+        def Shader "ProjectiveCoord"
+        {
+            uniform token info:id = "ND_texcoord_vector4"
+            int inputs:index = 2
+            float4 outputs:out
+        }
+
+        def Shader "ProjectiveParts"
+        {
+            uniform token info:id = "ND_separate4_vector4"
+            float4 inputs:in.connect = </Root/XRPresenterEdgeMaterial/ProjectiveCoord.outputs:out>
+            float outputs:outx
+            float outputs:outy
+            float outputs:outz
+            float outputs:outw
+        }
+
+        def Shader "CoordU"
+        {
+            uniform token info:id = "ND_divide_float"
+            float inputs:in1.connect = </Root/XRPresenterEdgeMaterial/ProjectiveParts.outputs:outx>
+            float inputs:in2.connect = </Root/XRPresenterEdgeMaterial/ProjectiveParts.outputs:outz>
+            float outputs:out
+        }
+
+        def Shader "CoordV"
+        {
+            uniform token info:id = "ND_divide_float"
+            float inputs:in1.connect = </Root/XRPresenterEdgeMaterial/ProjectiveParts.outputs:outy>
+            float inputs:in2.connect = </Root/XRPresenterEdgeMaterial/ProjectiveParts.outputs:outz>
+            float outputs:out
+        }
+
         def Shader "TexCoord"
         {
-            uniform token info:id = "ND_texcoord_vector2"
-            int inputs:index = 0
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/XRPresenterEdgeMaterial/CoordU.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterEdgeMaterial/CoordV.outputs:out>
             float2 outputs:out
         }
 

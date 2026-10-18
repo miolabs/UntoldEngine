@@ -136,8 +136,9 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     constant bool kFoveated [[function_constant(0)]];
     struct XRGridVertex {
         packed_float3 position;   // the origin's space
-        packed_float2 uv;         // v = 0 at the texture's top row
+        packed_float2 uv;         // v = 0 at the texture's top row (affine; the fallback material's)
         half2 mask;               // x: 1 on the far side of a depth jump, y: 1 on the near side
+        packed_float4 uvw;        // (u, v) times the eye-space depth, that depth, 0: the material divides
     };
     struct XRGridUnprojectUniforms {
         float4x4 originFromEye;
@@ -344,6 +345,12 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         v.position = (u.originFromEye * float4(eye, 1.0f)).xyz;
         v.uv = uv;
         v.mask = half2(half(farSide), half(nearSide));
+        // uv is this vertex's own projection, so uv times its eye-space depth is an affine
+        // function of the point: interpolated perspective-correctly by RealityKit and divided per
+        // pixel, the texture is read where the engine drew it across every planar triangle,
+        // whatever RealityKit's own camera (an affine uv keystones across a tilted cell).
+        float ze = -eye.z;
+        v.uvw = packed_float4(uv.x * ze, uv.y * ze, ze, 0.0f);
     }
     // Pass 3: the cell's two triangles, split along the diagonal that does not cross a depth
     // jump when the other does (the depths read along the cell's own ray). A silhouette that
