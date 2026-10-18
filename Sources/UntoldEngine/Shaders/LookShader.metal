@@ -80,7 +80,14 @@ inline float3 sampleColorGradeLUT(
 }
 
 // The look pass's colour, the one the output transform presents: shared by the fragment
-// function that writes it alone and the one that presents it too.
+// function that writes it alone and the one that presents it too. `premultiplied` says the
+// frame is (mixed immersion: a texel's alpha is its coverage, its colour the scene's times
+// that), and the grade and the tone map then act on the colour behind the coverage. A
+// template argument rather than a function constant so that the opaque instantiation is the
+// code it always was, bit for bit: the front end folds it away before it optimizes, where a
+// function constant is folded after, and the compiler then contracts the graded arithmetic
+// differently (one half-float ULP on a few texels in ten thousand).
+template <bool premultiplied>
 static inline float4 lookColor(
   VertexCompositeOutput in,
   texture2d<float> sceneTexture,
@@ -137,6 +144,29 @@ static inline float4 lookColor(
       splatLinear = splatSRGBToLinear(layer.rgb / splat) * splat;
       color = max((sceneSample.rgb - splatLinear) / (1.0 - splat), 0.0);
   }
+  // A premultiplied frame: a mixed-immersion silhouette texel the multisample resolve partly
+  // covers holds the face's colour times its coverage. The grade and the tone map must see the
+  // face's colour, not the fraction — the tone map of a quarter of the colour is not a quarter
+  // of the tone-mapped colour, and a lit face's rim came out up to 1.3 times as bright as the
+  // face — so the coverage comes out here and goes back on after them. The coverage is the
+  // texel's alpha, or what is left of it once the splats are out. A texel the scene covers
+  // whole takes the arithmetic it always did; under the floor the texel is graded as it is: a
+  // transparent one stays (0, 0, 0, 0), and what a pass spilt onto one keeps its colour. An
+  // opaque frame (the pre-composite sets alpha 1 outside passthrough) takes the instantiation
+  // without any of this.
+  float coverage = 1.0;
+  bool partlyCovered = false;
+  if (premultiplied) {
+      coverage = sceneSample.a;
+      if (splat > kSplatLayerAlphaFloor) {
+          coverage = (sceneSample.a - splat) / (1.0 - splat);
+      }
+      coverage = saturate(coverage);
+      partlyCovered = coverage < 1.0 && coverage > kCoverageAlphaFloor;
+      if (partlyCovered) {
+          color /= coverage;
+      }
+  }
 
   if (enabled) {
       color *= exposure;
@@ -180,35 +210,56 @@ static inline float4 lookColor(
       color = max(p3ToSRGB * color, 0.0);
   }
 
+  // The coverage back on: the frame stays premultiplied, its alpha as it came.
+  if (premultiplied && partlyCovered) {
+      color *= coverage;
+  }
+
   return float4(splatLinear + color * (1.0 - splat), sceneSample.a);
 }
 
-fragment float4 fragmentLookShader(
-  VertexCompositeOutput in [[stage_in]],
-  texture2d<float> sceneTexture [[texture(0)]],
-  texture2d<float> colorLUTTexture [[texture(lookPassColorLUTTextureIndex)]],
-  texture3d<float> colorGradeLUTTexture [[texture(colorGradeLUTTextureIndex)]],
-  constant float &brightness [[buffer(colorGradingPassBrightnessIndex)]],
-  constant float &contrast [[buffer(colorGradingPassContrastIndex)]],
-  constant float &saturation [[buffer(colorGradingPassSaturationIndex)]],
-  constant float &exposure [[buffer(colorGradingPassExposureIndex)]],
-  constant float3 &whiteBalanceCoeffs [[buffer(colorGradingWhiteBalanceCoeffsIndex)]],
-  constant bool &enabled [[buffer(colorGradingPassEnabledIndex)]],
-  constant bool &colorLUTEnabled [[buffer(colorLUTEnabledIndex)]],
-  constant float &colorLUTShaperMinStops [[buffer(colorLUTShaperMinStopsIndex)]],
-  constant float &colorLUTShaperMaxStops [[buffer(colorLUTShaperMaxStopsIndex)]],
-  constant int &colorLUTSize [[buffer(colorLUTSizeIndex)]],
-  constant bool &colorGradeLUTEnabled [[buffer(colorGradeLUTEnabledIndex)]],
-  constant float3 &colorGradeLUTDomainMin [[buffer(colorGradeLUTDomainMinIndex)]],
-  constant float3 &colorGradeLUTDomainMax [[buffer(colorGradeLUTDomainMaxIndex)]],
-  constant int &tonemapOperator [[buffer(tonemapOperatorSelectIndex)]],
-  constant int &colorPrimaries [[buffer(lookPassColorPrimariesIndex)]],
-  texture2d<float> splatLayer [[texture(lookPassSplatCoverageTextureIndex)]],
-  constant int &splatMask [[buffer(lookPassSplatMaskIndex)]],
-  texture2d<float> gizmoTexture [[texture(lookPassGizmoTextureIndex)]],
+// The look fragment functions' inputs, the same for the four of them: the scene, the look's
+// settings, the splat and gizmo layers.
+#define LOOK_FRAGMENT_INPUTS \
+  VertexCompositeOutput in [[stage_in]], \
+  texture2d<float> sceneTexture [[texture(0)]], \
+  texture2d<float> colorLUTTexture [[texture(lookPassColorLUTTextureIndex)]], \
+  texture3d<float> colorGradeLUTTexture [[texture(colorGradeLUTTextureIndex)]], \
+  constant float &brightness [[buffer(colorGradingPassBrightnessIndex)]], \
+  constant float &contrast [[buffer(colorGradingPassContrastIndex)]], \
+  constant float &saturation [[buffer(colorGradingPassSaturationIndex)]], \
+  constant float &exposure [[buffer(colorGradingPassExposureIndex)]], \
+  constant float3 &whiteBalanceCoeffs [[buffer(colorGradingWhiteBalanceCoeffsIndex)]], \
+  constant bool &enabled [[buffer(colorGradingPassEnabledIndex)]], \
+  constant bool &colorLUTEnabled [[buffer(colorLUTEnabledIndex)]], \
+  constant float &colorLUTShaperMinStops [[buffer(colorLUTShaperMinStopsIndex)]], \
+  constant float &colorLUTShaperMaxStops [[buffer(colorLUTShaperMaxStopsIndex)]], \
+  constant int &colorLUTSize [[buffer(colorLUTSizeIndex)]], \
+  constant bool &colorGradeLUTEnabled [[buffer(colorGradeLUTEnabledIndex)]], \
+  constant float3 &colorGradeLUTDomainMin [[buffer(colorGradeLUTDomainMinIndex)]], \
+  constant float3 &colorGradeLUTDomainMax [[buffer(colorGradeLUTDomainMaxIndex)]], \
+  constant int &tonemapOperator [[buffer(tonemapOperatorSelectIndex)]], \
+  constant int &colorPrimaries [[buffer(lookPassColorPrimariesIndex)]], \
+  texture2d<float> splatLayer [[texture(lookPassSplatCoverageTextureIndex)]], \
+  constant int &splatMask [[buffer(lookPassSplatMaskIndex)]], \
+  texture2d<float> gizmoTexture [[texture(lookPassGizmoTextureIndex)]], \
   constant bool &gizmoOverrides [[buffer(lookPassGizmoOverrideIndex)]]
-) {
-  return lookColor(in, sceneTexture, colorLUTTexture, colorGradeLUTTexture, brightness, contrast, saturation, exposure, whiteBalanceCoeffs, enabled, colorLUTEnabled, colorLUTShaperMinStops, colorLUTShaperMaxStops, colorLUTSize, colorGradeLUTEnabled, colorGradeLUTDomainMin, colorGradeLUTDomainMax, tonemapOperator, colorPrimaries, splatLayer, splatMask, gizmoTexture, gizmoOverrides);
+
+// The same, handed on to lookColor.
+#define LOOK_FRAGMENT_ARGUMENTS \
+  in, sceneTexture, colorLUTTexture, colorGradeLUTTexture, brightness, contrast, saturation, exposure, \
+  whiteBalanceCoeffs, enabled, colorLUTEnabled, colorLUTShaperMinStops, colorLUTShaperMaxStops, colorLUTSize, \
+  colorGradeLUTEnabled, colorGradeLUTDomainMin, colorGradeLUTDomainMax, tonemapOperator, colorPrimaries, \
+  splatLayer, splatMask, gizmoTexture, gizmoOverrides
+
+fragment float4 fragmentLookShader(LOOK_FRAGMENT_INPUTS) {
+  return lookColor<false>(LOOK_FRAGMENT_ARGUMENTS);
+}
+
+// The look pass on a premultiplied frame (mixed immersion): the grade and the tone map act on
+// the colour behind each texel's coverage.
+fragment float4 fragmentLookPremultipliedShader(LOOK_FRAGMENT_INPUTS) {
+  return lookColor<true>(LOOK_FRAGMENT_ARGUMENTS);
 }
 
 static inline float3 lookLinearToSRGB(float3 x) {
@@ -226,36 +277,10 @@ struct LookPresentFragmentOut {
 // The look pass that presents as it grades, in place of the output transform pass: the look
 // output, the frame encoded for the display and the opaque depth (its clear value kept finite:
 // the compositor reprojects by view distance and drops a pixel at infinity).
-fragment LookPresentFragmentOut fragmentLookPresentShader(
-  VertexCompositeOutput in [[stage_in]],
-  texture2d<float> sceneTexture [[texture(0)]],
-  texture2d<float> colorLUTTexture [[texture(lookPassColorLUTTextureIndex)]],
-  texture3d<float> colorGradeLUTTexture [[texture(colorGradeLUTTextureIndex)]],
-  constant float &brightness [[buffer(colorGradingPassBrightnessIndex)]],
-  constant float &contrast [[buffer(colorGradingPassContrastIndex)]],
-  constant float &saturation [[buffer(colorGradingPassSaturationIndex)]],
-  constant float &exposure [[buffer(colorGradingPassExposureIndex)]],
-  constant float3 &whiteBalanceCoeffs [[buffer(colorGradingWhiteBalanceCoeffsIndex)]],
-  constant bool &enabled [[buffer(colorGradingPassEnabledIndex)]],
-  constant bool &colorLUTEnabled [[buffer(colorLUTEnabledIndex)]],
-  constant float &colorLUTShaperMinStops [[buffer(colorLUTShaperMinStopsIndex)]],
-  constant float &colorLUTShaperMaxStops [[buffer(colorLUTShaperMaxStopsIndex)]],
-  constant int &colorLUTSize [[buffer(colorLUTSizeIndex)]],
-  constant bool &colorGradeLUTEnabled [[buffer(colorGradeLUTEnabledIndex)]],
-  constant float3 &colorGradeLUTDomainMin [[buffer(colorGradeLUTDomainMinIndex)]],
-  constant float3 &colorGradeLUTDomainMax [[buffer(colorGradeLUTDomainMaxIndex)]],
-  constant int &tonemapOperator [[buffer(tonemapOperatorSelectIndex)]],
-  constant int &colorPrimaries [[buffer(lookPassColorPrimariesIndex)]],
-  texture2d<float> splatLayer [[texture(lookPassSplatCoverageTextureIndex)]],
-  constant int &splatMask [[buffer(lookPassSplatMaskIndex)]],
-  texture2d<float> gizmoTexture [[texture(lookPassGizmoTextureIndex)]],
-  constant bool &gizmoOverrides [[buffer(lookPassGizmoOverrideIndex)]],
-  depth2d<float> depthTexture [[texture(lookPassDepthTextureIndex)]],
-  constant int &encodingMode [[buffer(lookPassEncodingModeIndex)]]
-) {
+static inline LookPresentFragmentOut lookPresent(float4 color, VertexCompositeOutput in, depth2d<float> depthTexture, int encodingMode) {
   constexpr sampler depthSampler(min_filter::nearest, mag_filter::nearest, address::clamp_to_edge);
   LookPresentFragmentOut out;
-  out.color = lookColor(in, sceneTexture, colorLUTTexture, colorGradeLUTTexture, brightness, contrast, saturation, exposure, whiteBalanceCoeffs, enabled, colorLUTEnabled, colorLUTShaperMinStops, colorLUTShaperMaxStops, colorLUTSize, colorGradeLUTEnabled, colorGradeLUTDomainMin, colorGradeLUTDomainMax, tonemapOperator, colorPrimaries, splatLayer, splatMask, gizmoTexture, gizmoOverrides);
+  out.color = color;
   float3 c = max(out.color.rgb, 0.0);
   if (encodingMode == 1) {
       c = lookLinearToSRGB(c);
@@ -263,4 +288,21 @@ fragment LookPresentFragmentOut fragmentLookPresentShader(
   out.present = float4(c, out.color.a);
   out.depth = max(depthTexture.sample(depthSampler, in.uvCoords), 1e-4);
   return out;
+}
+
+fragment LookPresentFragmentOut fragmentLookPresentShader(
+  LOOK_FRAGMENT_INPUTS,
+  depth2d<float> depthTexture [[texture(lookPassDepthTextureIndex)]],
+  constant int &encodingMode [[buffer(lookPassEncodingModeIndex)]]
+) {
+  return lookPresent(lookColor<false>(LOOK_FRAGMENT_ARGUMENTS), in, depthTexture, encodingMode);
+}
+
+// The presenting look pass on a premultiplied frame.
+fragment LookPresentFragmentOut fragmentLookPresentPremultipliedShader(
+  LOOK_FRAGMENT_INPUTS,
+  depth2d<float> depthTexture [[texture(lookPassDepthTextureIndex)]],
+  constant int &encodingMode [[buffer(lookPassEncodingModeIndex)]]
+) {
+  return lookPresent(lookColor<true>(LOOK_FRAGMENT_ARGUMENTS), in, depthTexture, encodingMode);
 }
