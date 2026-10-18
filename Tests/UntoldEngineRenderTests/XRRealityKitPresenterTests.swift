@@ -833,7 +833,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         configuration.farShellMetres = 50
         let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
         presenter.reportInterval = 0
-        XCTAssertEqual(presenter.root.children.count, presenter.drawsEdgeBand ? 4 : 2, "one grid entity per eye, and its edge band")
+        XCTAssertEqual(presenter.root.children.count, presenter.hasEdgeBand ? 4 : 2, "one grid entity per eye, and its edge band")
 
         // The headset five units back, looking at the cubes.
         let source = RealityKitFrameSource(presenter: presenter) { _ in matrix4x4Translation(0, 0, 5) }
@@ -941,6 +941,93 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
             print("XR presenter alpha along the middle row with \(mode): \(covered) covered, \(partial) partial, \(alphas.count - covered - partial) empty, \(transitions) edges; partial values: \(alphas.filter { $0 > 0 && $0 < 255 })")
         }
         setRendering(.antiAliasing(.fxaa))
+    }
+
+    func test_settingsChangedWhileRunning_rideInTheTickets_andTheFixedSplitComesBack() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.textureSize = [64, 48]
+        configuration.gridColumns = 5
+        configuration.gridRows = 4
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        XCTAssertEqual(presenter.settings, XRPresenterSettings(configuration: configuration), "the settings start from the configuration")
+        XCTAssertEqual(presenter.drawsEdgeBand, presenter.hasEdgeBand, "the band is drawn when its graph loaded, the configuration asking for it")
+        presenter.start(commandQueue: renderInfo.commandQueue)
+
+        func nextTicket() throws -> XRPresenterTicket {
+            // No loop: the test takes the tickets itself and commits their command buffers.
+            presenter.update()
+            return try XCTUnwrap(presenter.mailbox.take())
+        }
+        func finish(_ ticket: XRPresenterTicket) throws {
+            ticket.commandBuffer.commit()
+            try waitUntil { ticket.commandBuffer.status == .completed }
+        }
+        func indices(of mesh: LowLevelMesh) -> [UInt32] {
+            var read: [UInt32] = []
+            mesh.withUnsafeIndices { read = Array($0.bindMemory(to: UInt32.self)) }
+            return read
+        }
+
+        // The cells' split per frame asked for: the ticket carries the index buffers and the
+        // settings; the test writes every cell's other diagonal, as the kernel might.
+        presenter.settings.adaptiveDiagonal = true
+        presenter.settings.skirtTexels = 0
+        presenter.settings.tearThresholdMetres = 0.9
+        presenter.settings.leadSeconds = 0.01
+        let split = try nextTicket()
+        XCTAssertEqual(split.indexBuffers.count, 2)
+        XCTAssertTrue(split.settings.adaptiveDiagonal)
+        XCTAssertEqual(split.settings.skirtTexels, 0)
+        XCTAssertEqual(split.settings.tearThresholdMetres, 0.9)
+        XCTAssertEqual(split.settings.leadSeconds, 0.01)
+        let fixed = presenter.grid.indices()
+        var flipped = fixed
+        for cell in stride(from: 0, to: fixed.count, by: 6) {
+            // a b c, b d c -> a b d, a d c: the other diagonal.
+            let (a, b, c, d) = (fixed[cell], fixed[cell + 1], fixed[cell + 2], fixed[cell + 4])
+            flipped[cell ... cell + 5] = [a, b, d, a, d, c]
+        }
+        let flippedBuffer = try XCTUnwrap(flipped.withUnsafeBytes { renderInfo.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) })
+        let blit = try XCTUnwrap(split.commandBuffer.makeBlitCommandEncoder())
+        for buffer in split.indexBuffers {
+            blit.copy(from: flippedBuffer, sourceOffset: 0, to: buffer, destinationOffset: 0, size: flippedBuffer.length)
+        }
+        blit.endEncoding()
+        try finish(split)
+        for mesh in presenter.meshes {
+            XCTAssertEqual(indices(of: mesh), flipped, "the cells were split the other way")
+        }
+
+        // Turned off: the next ticket carries no index buffers, and its command buffer writes
+        // the fixed split back; the one after leaves the indices alone.
+        presenter.settings.adaptiveDiagonal = false
+        let restore = try nextTicket()
+        XCTAssertTrue(restore.indexBuffers.isEmpty)
+        XCTAssertFalse(restore.settings.adaptiveDiagonal)
+        try finish(restore)
+        for mesh in presenter.meshes {
+            XCTAssertEqual(indices(of: mesh), fixed, "the fixed split is back")
+        }
+        let after = try nextTicket()
+        XCTAssertTrue(after.indexBuffers.isEmpty)
+        try finish(after)
+
+        // The band follows its setting: its entities are disabled, then enabled again.
+        if presenter.hasEdgeBand {
+            let bands = presenter.root.children.filter { $0.name.hasSuffix("edge") }
+            XCTAssertEqual(bands.count, 2)
+            presenter.settings.edgeBlending = false
+            XCTAssertFalse(presenter.drawsEdgeBand)
+            try finish(nextTicket())
+            XCTAssertTrue(bands.allSatisfy { !$0.isEnabled }, "the band's entities are off")
+            presenter.settings.edgeBlending = true
+            try finish(nextTicket())
+            XCTAssertTrue(bands.allSatisfy(\.isEnabled), "the band's entities are on again")
+            XCTAssertTrue(presenter.drawsEdgeBand)
+        }
+        presenter.stop()
     }
 
     func test_aFrameWithoutAPose_clearsTheEyes_andKeepsTheGrids() async throws {

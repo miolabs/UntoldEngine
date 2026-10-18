@@ -88,7 +88,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
             self.ticket = ticket
             self.takenAt = takenAt
             self.source = source
-            timing = XRFrameTiming(presentationTime: takenAt + source.configuration.leadSeconds)
+            timing = XRFrameTiming(presentationTime: takenAt + ticket.settings.leadSeconds)
         }
 
         deinit {
@@ -146,14 +146,14 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                         depth: eye.depthTexture,
                         nearestDepths: source.nearestDepthBuffers[index],
                         vertices: ticket.gridBuffers[index],
-                        indices: index < ticket.indexBuffers.count ? ticket.indexBuffers[index] : nil,
+                        indices: ticket.settings.adaptiveDiagonal && index < ticket.indexBuffers.count ? ticket.indexBuffers[index] : nil,
                         grid: source.grid,
                         originFromEye: simd_mul(originFromDevice, eye.deviceFromView),
                         projection: eye.projection,
                         farShell: source.configuration.farShellMetres,
-                        tearThreshold: source.configuration.tearThresholdMetres,
-                        skirtTexels: source.configuration.skirtTexels,
-                        adaptiveDiagonal: source.configuration.adaptiveDiagonal,
+                        tearThreshold: ticket.settings.tearThresholdMetres,
+                        skirtTexels: ticket.settings.skirtTexels,
+                        adaptiveDiagonal: ticket.settings.adaptiveDiagonal,
                         label: "XR grid unproject eye \(index)"
                     )
                 }

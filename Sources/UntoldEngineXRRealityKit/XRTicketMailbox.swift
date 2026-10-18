@@ -27,14 +27,17 @@ public struct XRPresenterTicket: @unchecked Sendable {
     public let indexBuffers: [MTLBuffer]
     /// `CACurrentMediaTime()` when the ticket was posted.
     public let postedAt: TimeInterval
+    /// The presenter's settings in force when the ticket was posted: the frame's rules.
+    public let settings: XRPresenterSettings
 
-    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], indexBuffers: [MTLBuffer] = [], postedAt: TimeInterval) {
+    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], indexBuffers: [MTLBuffer] = [], postedAt: TimeInterval, settings: XRPresenterSettings = .init()) {
         self.serial = serial
         self.commandBuffer = commandBuffer
         self.colorTextures = colorTextures
         self.gridBuffers = gridBuffers
         self.indexBuffers = indexBuffers
         self.postedAt = postedAt
+        self.settings = settings
     }
 }
 

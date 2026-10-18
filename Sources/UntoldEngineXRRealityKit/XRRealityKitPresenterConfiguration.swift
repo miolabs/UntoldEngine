@@ -48,13 +48,13 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     public var skirtTexels: Float = 3
     /// Whether each cell's diagonal follows the depth each frame (the fixed one unless it crosses
     /// a depth jump and the other does not), with the index buffer rewritten per frame. Off by
-    /// default: with the skirt the fixed split draws silhouettes clean at any grid density, and
-    /// the flip was seen to add a staircase on edges that descend to the right and a spike at a
-    /// cube's corner (simulator, 2026-10-18); kept for comparisons.
+    /// default until the headset has judged it against the fixed split with the skirt; both are
+    /// there at run time through `XRPresenterSettings`.
     public var adaptiveDiagonal = false
     /// Whether a second entity per eye draws the grid again with the blended edge-band material
     /// over the opaque core, so that a silhouette's partly covered texels blend over the room
-    /// instead of being cut by the alpha test at a texel boundary.
+    /// instead of being cut by the alpha test at a texel boundary. Needs coverage in the frame's
+    /// alpha: the engine's MSAA modes leave it, FXAA and SMAA do not.
     public var edgeBlending = true
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50

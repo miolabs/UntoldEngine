@@ -44,13 +44,23 @@ public final class XRRealityKitPresenter {
     /// material (both grids in both eyes).
     public private(set) var usesShaderGraphMaterial = false
 
+    /// The settings in force for the next frame: the configuration's to start with, changed
+    /// while running as a game likes; each ticket carries a copy.
+    public var settings: XRPresenterSettings
+
     private let colorTextures: [LowLevelTexture]
-    private let meshes: [LowLevelMesh]
+    let meshes: [LowLevelMesh]
+    /// The grids' fixed split, for writing it back when the adaptive diagonal is turned off.
+    private let fixedIndices: MTLBuffer?
     private let gridEntities: [ModelEntity]
-    /// The edge band's entities, one per eye, when the configuration asks for it and its graph loaded.
+    /// The edge band's entities, one per eye, when its graph loaded; enabled by the settings.
     private let edgeEntities: [ModelEntity]
-    /// Whether the edge band is drawn.
-    public private(set) var drawsEdgeBand = false
+    /// Whether the edge band's material loaded, so that the band can be drawn.
+    public private(set) var hasEdgeBand = false
+    /// Whether the edge band is drawn: it is there and the settings ask for it.
+    public var drawsEdgeBand: Bool { hasEdgeBand && settings.edgeBlending }
+    /// Whether the last ticket's cells were split by the depth (the adaptive diagonal).
+    private var splitByDepth = false
     private var commandQueue: MTLCommandQueue?
     private var serial: UInt64 = 0
     private var lastReportTime = CACurrentMediaTime()
@@ -66,8 +76,11 @@ public final class XRRealityKitPresenter {
     public init(device: MTLDevice, configuration: XRRealityKitPresenterConfiguration = .init()) async throws {
         self.device = device
         self.configuration = configuration
+        settings = XRPresenterSettings(configuration: configuration)
         let grid = XRPresenterGrid(columns: configuration.gridColumns, rows: configuration.gridRows)
         self.grid = grid
+        fixedIndices = grid.indices().withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
+        fixedIndices?.label = "XR presenter fixed split"
         unproject = try XRGridUnprojectPass(device: device)
 
         let width = configuration.textureSize.x
@@ -129,9 +142,10 @@ public final class XRRealityKitPresenter {
         }
         gridEntities = entities
 
-        // The edge band: the same grids again, blended, over the opaque core.
+        // The edge band: the same grids again, blended, over the opaque core; made whenever its
+        // graph loads, enabled when the settings ask for it.
         var edges: [ModelEntity] = []
-        if configuration.edgeBlending, usesShaderGraphMaterial {
+        if usesShaderGraphMaterial {
             do {
                 let graph = try await XRPresenterMaterial.loadEdge()
                 for eye in 0 ..< stereoEyeCount {
@@ -139,10 +153,11 @@ public final class XRRealityKitPresenter {
                     try XRPresenterMaterial.configure(&material, eye: eye, texture: textureResources[eye])
                     let entity = ModelEntity(mesh: meshResources[eye], materials: [material])
                     entity.name = eye == 0 ? "Untold XR left eye edge" : "Untold XR right eye edge"
+                    entity.isEnabled = configuration.edgeBlending
                     root.addChild(entity)
                     edges.append(entity)
                 }
-                drawsEdgeBand = true
+                hasEdgeBand = true
             } catch {
                 Logger.logWarning(message: "XR presenter: the edge band's material could not be loaded (\(error)); edges are alpha-tested only")
             }
@@ -174,6 +189,11 @@ public final class XRRealityKitPresenter {
     /// when the engine has not taken the previous ticket (a counted drop), or before `start`.
     public func update() {
         statistics.noteUpdate()
+        let settings = settings
+        // The band follows its setting on every update, whether or not a ticket goes out.
+        for entity in edgeEntities where entity.isEnabled != settings.edgeBlending {
+            entity.isEnabled = settings.edgeBlending
+        }
         guard let commandQueue, !mailbox.isClosed else { return }
         guard !mailbox.hasPending else {
             statistics.noteTicketDropped()
@@ -186,8 +206,24 @@ public final class XRRealityKitPresenter {
         let textures = colorTextures.map { $0.replace(using: commandBuffer) }
         let buffers = meshes.map { $0.replace(bufferIndex: 0, using: commandBuffer) }
         // The cells' split per frame only when it is asked for; otherwise the mesh keeps its
-        // indices and the ticket carries none.
-        let indexBuffers = configuration.adaptiveDiagonal ? meshes.map { $0.replaceIndices(using: commandBuffer) } : []
+        // indices and the ticket carries none. RealityKit hands the index buffers out with no
+        // content, so each starts from the fixed split, blitted here: the kernel splits the
+        // cells over it later in this command buffer, and a frame that draws nothing (no pose
+        // yet, the stop path) still completes with every cell whole. Just turned off, the same
+        // blit writes the fixed split back once, so no cell stays split as the depth last left it.
+        var indexBuffers: [MTLBuffer] = []
+        if settings.adaptiveDiagonal || splitByDepth {
+            let handed = meshes.map { $0.replaceIndices(using: commandBuffer) }
+            if let fixedIndices, let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "XR presenter fixed split"
+                for buffer in handed {
+                    blit.copy(from: fixedIndices, sourceOffset: 0, to: buffer, destinationOffset: 0, size: min(fixedIndices.length, buffer.length))
+                }
+                blit.endEncoding()
+            }
+            if settings.adaptiveDiagonal { indexBuffers = handed }
+        }
+        splitByDepth = settings.adaptiveDiagonal
         let posted = CACurrentMediaTime()
         statistics.noteTicketPosted(replaceSeconds: posted - replaceStart)
 
@@ -198,7 +234,8 @@ public final class XRRealityKitPresenter {
             colorTextures: textures,
             gridBuffers: buffers,
             indexBuffers: indexBuffers,
-            postedAt: posted
+            postedAt: posted,
+            settings: settings
         )
         lastTicket = ticket
         if !mailbox.post(ticket) {
