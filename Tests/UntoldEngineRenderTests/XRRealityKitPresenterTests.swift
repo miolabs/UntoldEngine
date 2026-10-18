@@ -1711,6 +1711,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
             (0 ..< 128 * 128).filter { index in (0 ..< 3).contains { pixels[index * 4 + $0] > 0.05 } }.count
         }
 
+        var ended = false
         // The first session, closed as the view closes it (the world reset of the XR shutdown
         // is visionOS-only; its deferred part is the engine's own): the entities destroyed at
         // the start of a frame, the completion then clearing the camera and stopping the loop.
@@ -1725,8 +1726,15 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
                     loop.stop()
                     done()
                 }
-            })
+            }, then: { ended = true })
         }
+        // The end is reported through the main queue, which a synchronous spin on the run loop
+        // does not service here: an asynchronous wait lets it through.
+        let deadline = Date().addingTimeInterval(5)
+        while !ended, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(ended, "the close says when the session has ended")
         XCTAssertGreaterThan(coloured(first), 100, "the first session drew the cubes")
         XCTAssertLessThan(coloured(first), 128 * 128 / 2, "over a transparent room")
 

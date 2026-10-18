@@ -84,6 +84,8 @@
             onReady: @MainActor (UntoldEngineXR, XRRealityKitPresenter) -> Void
         ) async {
             guard xr == nil else { return }
+            await Self.closing?.value
+            Self.closing = nil
             guard let device = MTLCreateSystemDefaultDevice() else {
                 Logger.logWarning(message: "XR presenter: no Metal device")
                 return
@@ -136,7 +138,12 @@
             subscription?.cancel()
             subscription = nil
             if let xr, let presenter {
-                presenter.stop(after: { done in shutdownUntoldEngineXR(xr, completion: done) })
+                // The next session waits for this one to have ended (a second at most).
+                Self.closing = Task { @MainActor in
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        presenter.stop(after: { done in shutdownUntoldEngineXR(xr, completion: done) }, then: { continuation.resume() })
+                    }
+                }
             } else {
                 presenter?.stop()
             }
@@ -145,5 +152,9 @@
             presenter = nil
             thread = nil
         }
+
+        /// The previous session's close, until its engine has shut down in its last frame; a
+        /// session opened before that would inherit the destroys and lose its camera.
+        private static var closing: Task<Void, Never>?
     }
 #endif

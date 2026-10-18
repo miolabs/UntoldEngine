@@ -268,11 +268,22 @@ public final class XRRealityKitPresenter {
     /// the ticket of that frame; the exchange ends when the completion fires, or after a second
     /// if no frame comes. Stopping first would leave the destroys and the completion to the next
     /// session's first frame, which would then lose its camera and draw nothing.
-    public func stop(after shutdown: (@escaping @Sendable () -> Void) -> Void) {
+    /// `then` runs on the main actor once the exchange has ended, so that whoever opens the
+    /// next session can wait for it. The presenter keeps itself alive until then.
+    public func stop(after shutdown: (@escaping @Sendable () -> Void) -> Void, then: (@MainActor () -> Void)? = nil) {
         let once = XRPresenterOnce()
-        let finish: @Sendable () -> Void = { [weak self] in
+        let finish: @Sendable () -> Void = {
             guard once.claim() else { return }
-            Task { @MainActor in self?.stop() }
+            // The completion comes on the engine's thread; the exchange ends on the main one.
+            let end: @MainActor () -> Void = {
+                self.stop()
+                then?()
+            }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { end() }
+            } else {
+                DispatchQueue.main.async { MainActor.assumeIsolated { end() } }
+            }
         }
         shutdown(finish)
         postUntilFinished(once: once, finish: finish, ticketsLeft: 90)
@@ -290,9 +301,10 @@ public final class XRRealityKitPresenter {
         }
         needsFinalizeDestroys = true
         update()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 11_000_000)
-            self?.postUntilFinished(once: once, finish: finish, ticketsLeft: ticketsLeft - 1)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.011) {
+            MainActor.assumeIsolated {
+                self.postUntilFinished(once: once, finish: finish, ticketsLeft: ticketsLeft - 1)
+            }
         }
     }
 
