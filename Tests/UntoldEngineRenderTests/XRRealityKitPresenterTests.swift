@@ -1758,6 +1758,36 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         let psnr = 10 * log10(1 / max(squared / Double(128 * 128 * 3), 1e-9))
         print("XR presenter second session against the first: PSNR \(psnr) dB")
         XCTAssertGreaterThan(psnr, 40, "the second session draws the first session's picture")
+
+        // A close that has to give up: the loop ended before it (a game stopped the engine
+        // itself), so no frame finishes the destroys and the exchange ends by the fallback with
+        // the reset still pending. The next open finishes it before making its camera.
+        var gaveUp = false
+        _ = try await session("third") { presenter, loop, thread in
+            loop.stop()
+            presenter.update()
+            try waitUntil { thread.isFinished }
+            presenter.stop(after: { done in
+                setSceneReady(false)
+                destroyAllEntities {
+                    CameraSystem.shared.activeCamera = nil
+                    done()
+                }
+            }, then: { gaveUp = true })
+        }
+        let fallbackDeadline = Date().addingTimeInterval(5)
+        while !gaveUp, Date() < fallbackDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(gaveUp, "the close ended by its fallback")
+        finalizeDestroysNow()
+        CameraSystem.shared.activeCamera = findGameCamera()
+        initializeAssets()
+        let fourth = try await session("fourth") { presenter, loop, _ in
+            presenter.stop()
+            loop.stop()
+        }
+        XCTAssertEqual(coloured(fourth), coloured(first), "the session after a close that gave up draws the picture too")
     }
 
     func test_aFrameWithoutAPose_clearsTheEyes_andKeepsTheGrids() async throws {

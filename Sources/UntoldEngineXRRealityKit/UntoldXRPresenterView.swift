@@ -86,6 +86,10 @@
             guard xr == nil else { return }
             await Self.closing?.value
             Self.closing = nil
+            // A close that gave up (its loop already ended, a scene still loading) left the
+            // old session's destroys and completion for the next frame: finished here, before
+            // the engine makes this session's camera.
+            finalizeDestroysNow()
             guard let device = MTLCreateSystemDefaultDevice() else {
                 Logger.logWarning(message: "XR presenter: no Metal device")
                 return
