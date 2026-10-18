@@ -128,13 +128,17 @@
             }
         }
 
-        /// Ends the exchange (the loop's thread ends with it), then shuts the engine down.
+        /// Shuts the engine down in one more frame of the loop, then ends the exchange (the
+        /// loop's thread ends with it). The engine destroys the world's entities at the start
+        /// of a frame and runs the shutdown's completion then; stopping the presenter first
+        /// would leave that to the next session's first frame, which would lose its camera.
         func close() {
             subscription?.cancel()
             subscription = nil
-            presenter?.stop()
-            if let xr {
-                shutdownUntoldEngineXR(xr)
+            if let xr, let presenter {
+                presenter.stop(after: { done in shutdownUntoldEngineXR(xr, completion: done) })
+            } else {
+                presenter?.stop()
             }
             xr = nil
             runtime = nil

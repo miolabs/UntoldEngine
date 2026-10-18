@@ -1666,6 +1666,89 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         return halves.map { Float($0) }
     }
 
+    /// A space closed and opened again: the second session draws. The presenter view closes a
+    /// session by stopping the presenter (the loop ends with the mailbox) and then resetting the
+    /// engine's world, whose entity destroys and completion (the active camera cleared, the
+    /// loop stopped) the engine defers to the start of a frame. With the old loop gone, that
+    /// frame is the new session's first, which then loses its camera and draws nothing. The
+    /// presenter's `stop(after:)` gives the old loop that frame instead.
+    func test_aSessionClosedAsTheViewClosesIt_leavesTheNextSessionDrawing() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.textureSize = [128, 128]
+        configuration.frustumTangents = [1, 1, 1, 1]
+        configuration.gridColumns = 17
+        configuration.gridRows = 17
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        let devicePose = matrix4x4Translation(0, 0, 5)
+
+        func session(_ name: String, close: (XRRealityKitPresenter, XRFrameLoop, Thread) throws -> Void) async throws -> [Float] {
+            let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+            presenter.reportInterval = 0
+            setSceneReady(true)
+            let source = RealityKitFrameSource(presenter: presenter) { _ in devicePose }
+            let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
+            loop.start()
+            let thread = Thread { loop.run() }
+            thread.start()
+            presenter.start(commandQueue: renderInfo.commandQueue)
+            try waitUntil {
+                presenter.update()
+                return loop.framesDrawn >= 8
+            }
+            let lastTicket = try XCTUnwrap(presenter.lastTicket)
+            try waitUntil { lastTicket.commandBuffer.status == .completed }
+            let pixels = try linearPixels(ofSRGB: lastTicket.colorTextures[0])
+            let coloured = (0 ..< 128 * 128).filter { index in (0 ..< 3).contains { pixels[index * 4 + $0] > 0.05 } }.count
+            print("XR presenter session \(name): \(coloured) coloured pixels in the eye")
+            try close(presenter, loop, thread)
+            try waitUntil { thread.isFinished }
+            return pixels
+        }
+        func coloured(_ pixels: [Float]) -> Int {
+            (0 ..< 128 * 128).filter { index in (0 ..< 3).contains { pixels[index * 4 + $0] > 0.05 } }.count
+        }
+
+        // The first session, closed as the view closes it (the world reset of the XR shutdown
+        // is visionOS-only; its deferred part is the engine's own): the entities destroyed at
+        // the start of a frame, the completion then clearing the camera and stopping the loop.
+        let first = try await session("first") { presenter, loop, _ in
+            presenter.stop(after: { done in
+                setSceneReady(false)
+                destroyAllEntities {
+                    CameraSystem.shared.activeCamera = nil
+                    loop.stop()
+                    done()
+                }
+            })
+        }
+        XCTAssertGreaterThan(coloured(first), 100, "the first session drew the cubes")
+        XCTAssertLessThan(coloured(first), 128 * 128 / 2, "over a transparent room")
+
+        // The engine made again, as the view's next session makes it (a camera, set active),
+        // the scene again as a game's onReady makes it, and the second session.
+        CameraSystem.shared.activeCamera = findGameCamera()
+        initializeAssets()
+        let second = try await session("second") { presenter, loop, _ in
+            presenter.stop()
+            loop.stop()
+        }
+        // The same picture as the first session's: the first session's destroys and completion
+        // did not run in the second session's frames.
+        var squared = 0.0
+        for index in 0 ..< 128 * 128 {
+            for channel in 0 ..< 3 {
+                let difference = Double(second[index * 4 + channel] - first[index * 4 + channel])
+                squared += difference * difference
+            }
+        }
+        let psnr = 10 * log10(1 / max(squared / Double(128 * 128 * 3), 1e-9))
+        print("XR presenter second session against the first: PSNR \(psnr) dB")
+        XCTAssertGreaterThan(psnr, 40, "the second session draws the first session's picture")
+    }
+
     func test_aFrameWithoutAPose_clearsTheEyes_andKeepsTheGrids() async throws {
         guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
         var configuration = XRRealityKitPresenterConfiguration()

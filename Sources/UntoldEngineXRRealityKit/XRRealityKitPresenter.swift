@@ -261,6 +261,24 @@ public final class XRRealityKitPresenter {
         report()
     }
 
+    /// Ends the exchange after one more frame, for a shutdown the engine finishes in a frame:
+    /// `shutdown` is handed a completion and asked to shut the engine down (the engine defers
+    /// destroying the world's entities to the start of a frame, and runs the shutdown's own
+    /// completion then: the loop stopped, the active camera cleared), and the presenter posts
+    /// the ticket of that frame; the exchange ends when the completion fires, or after a second
+    /// if no frame comes. Stopping first would leave the destroys and the completion to the next
+    /// session's first frame, which would then lose its camera and draw nothing.
+    public func stop(after shutdown: (@escaping @Sendable () -> Void) -> Void) {
+        let once = XRPresenterOnce()
+        let finish: @Sendable () -> Void = { [weak self] in
+            guard once.claim() else { return }
+            Task { @MainActor in self?.stop() }
+        }
+        shutdown(finish)
+        update()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { finish() }
+    }
+
     /// Ends the exchange: the engine's loop, waiting on the mailbox, ends; a pending ticket is
     /// committed empty. No ticket is posted after this.
     public func stop() {
@@ -274,5 +292,19 @@ public final class XRRealityKitPresenter {
         guard now - lastReportTime >= reportInterval else { return }
         lastReportTime = now
         print(statistics.snapshot().description)
+    }
+}
+
+/// A flag claimed once, from any thread.
+private final class XRPresenterOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
