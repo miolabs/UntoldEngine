@@ -12,9 +12,10 @@ import Foundation
 import Metal
 
 /// One frame the presenter asks the engine for: the command buffer RealityKit's replace calls
-/// were made on, the Metal textures and grid buffers they handed back for it, and when it was
-/// posted. The command buffer must be committed exactly once, by whoever holds the ticket
-/// last: the loop after the frame's drawing, or the mailbox when it closes on a pending one.
+/// were made on, the Metal textures, grid buffers and edge-band buffers they handed back for it,
+/// and when it was posted. The command buffer must be committed exactly once, by whoever holds
+/// the ticket last: the loop after the frame's drawing, or the mailbox when it closes on a
+/// pending one.
 public struct XRPresenterTicket: @unchecked Sendable {
     public let serial: UInt64
     public let commandBuffer: MTLCommandBuffer
@@ -25,17 +26,26 @@ public struct XRPresenterTicket: @unchecked Sendable {
     /// One per eye, left first: the grids' index buffers for this frame (the cells' split
     /// follows the depth); empty when the mesh keeps its indices.
     public let indexBuffers: [MTLBuffer]
+    /// One per eye, left first: the edge band's vertex buffers for this frame, which the kernel
+    /// fills with the grids' bytes; empty when the band is not drawn.
+    public let bandBuffers: [MTLBuffer]
+    /// One per eye, left first: the edge band's index buffers for this frame, which the kernel
+    /// fills with the cells along silhouettes, every other cell degenerate; empty with
+    /// `bandBuffers`.
+    public let bandIndexBuffers: [MTLBuffer]
     /// `CACurrentMediaTime()` when the ticket was posted.
     public let postedAt: TimeInterval
     /// The presenter's settings in force when the ticket was posted: the frame's rules.
     public let settings: XRPresenterSettings
 
-    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], indexBuffers: [MTLBuffer] = [], postedAt: TimeInterval, settings: XRPresenterSettings = .init()) {
+    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], indexBuffers: [MTLBuffer] = [], bandBuffers: [MTLBuffer] = [], bandIndexBuffers: [MTLBuffer] = [], postedAt: TimeInterval, settings: XRPresenterSettings = .init()) {
         self.serial = serial
         self.commandBuffer = commandBuffer
         self.colorTextures = colorTextures
         self.gridBuffers = gridBuffers
         self.indexBuffers = indexBuffers
+        self.bandBuffers = bandBuffers
+        self.bandIndexBuffers = bandIndexBuffers
         self.postedAt = postedAt
         self.settings = settings
     }

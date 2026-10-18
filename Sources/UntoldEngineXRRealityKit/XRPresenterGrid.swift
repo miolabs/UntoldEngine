@@ -13,11 +13,14 @@ import RealityKit
 import simd
 
 /// One eye's grid: `columns × rows` vertices the unprojection kernel places in the origin's
-/// space every frame, a static index buffer of two triangles per cell, one part bounded well
-/// past the far shell. The vertex layout (40 bytes) is the kernel's `XRGridVertex`: a packed
-/// position, a packed uv with v = 0 at the texture's top row (affine, the fallback material's),
-/// a half2 tear mask (x the far side of a depth jump, y the near side), and the projective uv
-/// (u, v times the eye-space depth, that depth, 0) the shader graph divides per pixel.
+/// space every frame, an index buffer of two triangles per cell (static, or rewritten per frame
+/// when the cells' split follows the depth), one part bounded well past the far shell. The
+/// vertex layout (40 bytes) is the kernel's `XRGridVertex`: a packed position, a packed uv with
+/// v = 0 at the texture's top row (affine, the fallback material's), a half2 tear mask (x the far
+/// side of a depth jump, y the near side), and the projective uv (u, v times the eye-space
+/// depth, that depth, 0) the shader graph divides per pixel. The edge band's mesh is a second
+/// grid of the same layout and capacity whose index buffer the kernel fills per frame with the
+/// cells along silhouettes alone, every other cell degenerate (`degenerateIndices`).
 public struct XRPresenterGrid: Sendable, Equatable {
     public static let vertexStride = 40
     public static let positionOffset = 0
@@ -55,6 +58,21 @@ public struct XRPresenterGrid: Sendable, Equatable {
         return indices
     }
 
+    /// Every cell degenerate: six copies of the cell's first vertex, a pair of triangles the
+    /// rasterizer draws nothing for. The edge band's mesh before its first frame, and what its
+    /// index buffer starts from each frame.
+    public func degenerateIndices() -> [UInt32] {
+        var indices: [UInt32] = []
+        indices.reserveCapacity(indexCount)
+        for row in 0 ..< rows - 1 {
+            for column in 0 ..< columns - 1 {
+                let a = UInt32(row * columns + column)
+                indices.append(contentsOf: [a, a, a, a, a, a])
+            }
+        }
+        return indices
+    }
+
     /// The vertices before the first frame: a 4 × 3 m plane 2 m ahead of the origin at head
     /// height, the uv unflipped, no tears. The kernel overwrites them on the first frame.
     public func initialVertexBytes() -> [UInt8] {
@@ -83,10 +101,12 @@ public struct XRPresenterGrid: Sendable, Equatable {
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 public extension XRPresenterGrid {
     /// The grid as RealityKit draws it: the vertex buffer the kernel rewrites every frame
-    /// through `replace(bufferIndex:using:)`, the static indices, one part whose bound takes
-    /// in the far shell wherever the eye is.
+    /// through `replace(bufferIndex:using:)`, the indices to start from (`indices()`, two
+    /// triangles per cell, unless given: the edge band starts from `degenerateIndices()`) with
+    /// the capacity of the whole grid, one part whose bound takes in the far shell wherever
+    /// the eye is.
     @MainActor
-    func makeMesh(farShell: Float) throws -> LowLevelMesh {
+    func makeMesh(farShell: Float, indices initialIndices: [UInt32]? = nil) throws -> LowLevelMesh {
         var descriptor = LowLevelMesh.Descriptor()
         descriptor.vertexCapacity = vertexCount
         descriptor.indexCapacity = indexCount
@@ -100,7 +120,8 @@ public extension XRPresenterGrid {
         descriptor.vertexLayouts = [.init(bufferIndex: 0, bufferOffset: 0, bufferStride: Self.vertexStride)]
         let mesh = try LowLevelMesh(descriptor: descriptor)
 
-        let indices = indices()
+        let indices = initialIndices ?? indices()
+        precondition(indices.count == indexCount, "a grid's index buffer holds six indices per cell")
         mesh.replaceUnsafeMutableIndices { raw in
             indices.withUnsafeBytes { source in
                 raw.copyMemory(from: UnsafeRawBufferPointer(rebasing: source.prefix(raw.count)))

@@ -146,10 +146,11 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
             return ticket.commandBuffer
         }
 
-        /// After the eyes: each grid placed from its eye's depth, in the same command buffer,
-        /// which the loop commits; RealityKit shows the frame when it completes. Without a pose
-        /// nothing was drawn, so the eyes' textures are cleared to transparent instead and the
-        /// grids keep their places.
+        /// After the eyes: each grid placed from its eye's depth, and the edge band's mesh with
+        /// it when the ticket carries one, in the same command buffer, which the loop commits;
+        /// RealityKit shows the frame when it completes. Without a pose nothing was drawn, so the
+        /// eyes' textures are cleared to transparent instead and the grids keep their places (the
+        /// band's indices, blitted degenerate when the ticket was posted, draw nothing).
         func present(_ target: XREyes, commandBuffer: MTLCommandBuffer) {
             if let originFromDevice = target.originFromDevice {
                 for (index, eye) in target.eyes.enumerated() where index < ticket.gridBuffers.count {
@@ -159,6 +160,8 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                         nearestDepths: source.nearestDepthBuffers[index],
                         vertices: ticket.gridBuffers[index],
                         indices: ticket.settings.adaptiveDiagonal && index < ticket.indexBuffers.count ? ticket.indexBuffers[index] : nil,
+                        bandVertices: index < ticket.bandBuffers.count ? ticket.bandBuffers[index] : nil,
+                        bandIndices: index < ticket.bandIndexBuffers.count ? ticket.bandIndexBuffers[index] : nil,
                         grid: source.grid,
                         originFromEye: simd_mul(originFromDevice, eye.deviceFromView),
                         projection: eye.projection,

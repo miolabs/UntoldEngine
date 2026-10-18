@@ -37,6 +37,13 @@ final class XRPresenterGridTests: XCTestCase {
         XCTAssertEqual(Array(indices[0 ..< 6]), [0, 5, 1, 1, 5, 6])
     }
 
+    func test_theDegenerateIndices_areSixCopiesOfEachCellsFirstVertex() {
+        let grid = XRPresenterGrid(columns: 4, rows: 3)
+        let indices = grid.degenerateIndices()
+        XCTAssertEqual(indices.count, grid.indexCount)
+        XCTAssertEqual(indices, [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6])
+    }
+
     func test_theInitialVertices_lieOnAPlaneAhead_withTheUVUnflipped() {
         let grid = XRPresenterGrid(columns: 3, rows: 3)
         let bytes = grid.initialVertexBytes()
@@ -464,6 +471,29 @@ final class XRGridUnprojectTests: XCTestCase {
         try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared))
     }
 
+    /// The third dispatch's rule, in Swift: whether a cell is split along the other diagonal
+    /// (top-left to bottom-right), from the first dispatch's entries read along the cell's own
+    /// ray: only where the default diagonal crosses a depth jump and the other does not.
+    private func referenceSplitsTheOtherWay(column: Int, row: Int, grid: XRPresenterGrid, entries: [(depth: Float, texel: SIMD2<Float>, rim: Bool)], projection: simd_float4x4, tearThreshold: Float) -> Bool {
+        let a = row * grid.columns + column, b = a + 1, c = a + grid.columns, d = c + 1
+        let centreUV = SIMD2<Float>((Float(column) + 0.5) / Float(grid.columns - 1), (Float(row) + 0.5) / Float(grid.rows - 1))
+        let ndc = SIMD2<Float>(centreUV.x * 2 - 1, 1 - centreUV.y * 2)
+        let inverseProjection = simd_inverse(projection)
+        let ra = inverseProjection * SIMD4<Float>(ndc.x, ndc.y, 0, 1)
+        let rb = inverseProjection * SIMD4<Float>(0, 0, 1, 0)
+        func z(_ index: Int) -> Float {
+            let dd = max(entries[index].depth, 1e-6)
+            return -(ra.z + dd * rb.z) / (ra.w + dd * rb.w)
+        }
+        return abs(z(b) - z(c)) > tearThreshold && abs(z(a) - z(d)) <= tearThreshold
+    }
+
+    /// An index buffer's contents.
+    private func readIndices(_ buffer: MTLBuffer, grid: XRPresenterGrid) -> [UInt32] {
+        let raw = UnsafeRawBufferPointer(start: buffer.contents(), count: buffer.length)
+        return (0 ..< grid.indexCount).map { raw.load(fromByteOffset: $0 * 4, as: UInt32.self) }
+    }
+
     func test_theKernel_placesTheVertices_asTheReferenceDoes() throws {
         let grid = XRPresenterGrid(columns: 33, rows: 25)
         let textureSize = SIMD2<Int>(256, 192)
@@ -729,23 +759,13 @@ final class XRGridUnprojectTests: XCTestCase {
         commandBuffer.waitUntilCompleted()
 
         let entries = readNearestDepths(nearestDepths, grid: grid)
-        let raw = UnsafeRawBufferPointer(start: indices.contents(), count: indices.length)
-        let written = (0 ..< grid.indexCount).map { raw.load(fromByteOffset: $0 * 4, as: UInt32.self) }
-        let inverseProjection = simd_inverse(projection)
+        let written = readIndices(indices, grid: grid)
         var fixedSplits = 0, otherSplits = 0, rimFixed = 0, rimOther = 0
         for row in 0 ..< grid.rows - 1 {
             for column in 0 ..< grid.columns - 1 {
                 let a = UInt32(row * grid.columns + column), b = a + 1, c = a + UInt32(grid.columns), d = c + 1
                 let centreUV = SIMD2<Float>((Float(column) + 0.5) / Float(grid.columns - 1), (Float(row) + 0.5) / Float(grid.rows - 1))
-                let ndc = SIMD2<Float>(centreUV.x * 2 - 1, 1 - centreUV.y * 2)
-                let ra = inverseProjection * SIMD4<Float>(ndc.x, ndc.y, 0, 1)
-                let rb = inverseProjection * SIMD4<Float>(0, 0, 1, 0)
-                func z(_ index: UInt32) -> Float {
-                    let dd = max(entries[Int(index)].depth, 1e-6)
-                    return -(ra.z + dd * rb.z) / (ra.w + dd * rb.w)
-                }
-                let threshold = configuration.tearThresholdMetres
-                let other = abs(z(b) - z(c)) > threshold && abs(z(a) - z(d)) <= threshold
+                let other = referenceSplitsTheOtherWay(column: column, row: row, grid: grid, entries: entries, projection: projection, tearThreshold: configuration.tearThresholdMetres)
                 let cell = (row * (grid.columns - 1) + column) * 6
                 let triangles = Array(written[cell ..< cell + 6])
                 let expected: [UInt32] = other ? [a, c, d, a, d, b] : [a, c, b, b, c, d]
@@ -770,6 +790,122 @@ final class XRGridUnprojectTests: XCTestCase {
         for cell in stride(from: 0, to: grid.indexCount, by: 3) {
             XCTAssertGreaterThan(signedArea(written[cell], written[cell + 1], written[cell + 2]), 0, "triangle at index \(cell) is counter-clockwise")
         }
+    }
+
+    /// The edge band's mesh on the two planes and the hole: its vertices are the core's bytes,
+    /// and its index buffer keeps a cell's two triangles, split as the core's are, when one of
+    /// the cell's four vertices is a rim vertex or carries a tear-mask channel, and makes the
+    /// cell six copies of one index otherwise. So the cells along the planes' seam and around
+    /// the hole's rim are kept, the cells inside the planes, inside the hole and on the shell
+    /// are degenerate, and the kept cells are a small part of the grid; with the fixed diagonal
+    /// the same cells are kept, each with the fixed split.
+    func test_theBand_keepsTheCellsAlongTheSeamAndTheHolesRim_andDropsTheRest() throws {
+        let grid = XRPresenterGrid(columns: 33, rows: 25)
+        let textureSize = SIMD2<Int>(256, 192)
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.farShellMetres = 50
+        configuration.tearThresholdMetres = 0.9
+        let projection = configuration.projection
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        try drawDepth(into: depthTexture, projection: projection)
+        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let vertexLength = grid.vertexCount * XRPresenterGrid.vertexStride
+        let indexLength = grid.indexCount * MemoryLayout<UInt32>.stride
+        let vertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModeShared))
+        let indices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModeShared))
+        let bandVertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModeShared))
+        let bandIndices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModeShared))
+        // Filled with ones first, so that a vertex or a cell the kernel left alone would show.
+        memset(bandVertices.contents(), 0xFF, vertexLength)
+        memset(bandIndices.contents(), 0xFF, indexLength)
+        let pass = try XRGridUnprojectPass(device: device)
+        func run(adaptiveDiagonal: Bool) throws {
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, indices: indices, bandVertices: bandVertices, bandIndices: bandIndices, grid: grid, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, adaptiveDiagonal: adaptiveDiagonal)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertEqual(commandBuffer.status, .completed)
+        }
+        try run(adaptiveDiagonal: true)
+
+        XCTAssertEqual(
+            Array(UnsafeRawBufferPointer(start: bandVertices.contents(), count: vertexLength)),
+            Array(UnsafeRawBufferPointer(start: vertices.contents(), count: vertexLength)),
+            "the band's vertices are the core's bytes"
+        )
+        let entries = readNearestDepths(nearestDepths, grid: grid)
+        let result = readVertices(vertices, grid: grid)
+        let core = readIndices(indices, grid: grid)
+        let band = readIndices(bandIndices, grid: grid)
+        func alongAnEdge(_ index: UInt32) -> Bool {
+            entries[Int(index)].rim || result[Int(index)].mask > 0 || result[Int(index)].nearSide > 0
+        }
+        func cellStart(_ column: Int, _ row: Int) -> Int { (row * (grid.columns - 1) + column) * 6 }
+        func isKept(_ column: Int, _ row: Int, in indices: [UInt32]) -> Bool {
+            let cell = cellStart(column, row)
+            return Set(indices[cell ..< cell + 6]).count > 1
+        }
+        var kept = 0
+        for row in 0 ..< grid.rows - 1 {
+            for column in 0 ..< grid.columns - 1 {
+                let a = UInt32(row * grid.columns + column), b = a + 1, c = a + UInt32(grid.columns), d = c + 1
+                let cell = cellStart(column, row)
+                let written = Array(band[cell ..< cell + 6])
+                if [a, b, c, d].contains(where: alongAnEdge) {
+                    kept += 1
+                    let other = referenceSplitsTheOtherWay(column: column, row: row, grid: grid, entries: entries, projection: projection, tearThreshold: configuration.tearThresholdMetres)
+                    let expected: [UInt32] = other ? [a, c, d, a, d, b] : [a, c, b, b, c, d]
+                    XCTAssertEqual(written, expected, "cell \(column),\(row), along an edge, keeps its two triangles split as the core's")
+                    XCTAssertEqual(written, Array(core[cell ..< cell + 6]), "the band's cell \(column),\(row) is the core's cell")
+                } else {
+                    XCTAssertEqual(written, [UInt32](repeating: a, count: 6), "cell \(column),\(row), away from every edge, is degenerate")
+                }
+            }
+        }
+        // Where the kept cells are: the three cell columns whose corners are the seam's two
+        // vertex columns (16 the near side, 17 the far side), on rows away from the hole, and
+        // no cell further out; all around the hole's rim; nothing deep inside a plane or the
+        // hole, nor at the grid's corners.
+        for row in [1, 2, 20, 22] {
+            for column in 15 ... 17 {
+                XCTAssertTrue(isKept(column, row, in: band), "cell \(column),\(row) at the seam is kept")
+            }
+            XCTAssertFalse(isKept(14, row, in: band), "cell 14,\(row), a cell before the seam, is degenerate")
+            XCTAssertFalse(isKept(18, row, in: band), "cell 18,\(row), a cell past the seam, is degenerate")
+        }
+        for step in 0 ..< 16 {
+            let angle = Float(step) / 16 * 2 * .pi
+            let rim = SIMD2<Float>(0.5 + Self.holeRadius * cos(angle), 0.5 + Self.holeRadius * sin(angle))
+            let column = min(Int(rim.x * Float(grid.columns - 1)), grid.columns - 2)
+            let row = min(Int(rim.y * Float(grid.rows - 1)), grid.rows - 2)
+            XCTAssertTrue(isKept(column, row, in: band), "cell \(column),\(row) on the hole's rim is kept")
+        }
+        for (column, row) in [(3, 12), (6, 3), (28, 5), (26, 20), (16, 12), (0, 0), (31, 23)] {
+            XCTAssertFalse(isKept(column, row, in: band), "cell \(column),\(row), inside a plane, inside the hole or at a corner, is degenerate")
+        }
+        let cells = (grid.columns - 1) * (grid.rows - 1)
+        print("XR presenter edge band: \(kept) of \(cells) cells kept on the two planes and the hole (\(String(format: "%.1f", Double(kept) / Double(cells) * 100)) %)")
+        XCTAssertGreaterThan(kept, 60, "the seam and the hole's rim keep cells")
+        XCTAssertLessThan(kept, cells / 3, "the band keeps a small part of the grid")
+
+        // The fixed diagonal: the same cells kept, each with the fixed split.
+        try run(adaptiveDiagonal: false)
+        let fixedBand = readIndices(bandIndices, grid: grid)
+        var keptAgain = 0
+        for row in 0 ..< grid.rows - 1 {
+            for column in 0 ..< grid.columns - 1 {
+                let a = UInt32(row * grid.columns + column), b = a + 1, c = a + UInt32(grid.columns), d = c + 1
+                let cell = cellStart(column, row)
+                let written = Array(fixedBand[cell ..< cell + 6])
+                if isKept(column, row, in: band) {
+                    keptAgain += 1
+                    XCTAssertEqual(written, [a, c, b, b, c, d], "cell \(column),\(row) is kept with the fixed split")
+                } else {
+                    XCTAssertEqual(written, [UInt32](repeating: a, count: 6), "cell \(column),\(row) is degenerate as before")
+                }
+            }
+        }
+        XCTAssertEqual(keptAgain, kept, "the fixed diagonal keeps the same cells")
     }
 
     func test_theUniforms_haveTheKernelsLayout() {
@@ -1205,6 +1341,9 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertEqual(lastTicket.colorTextures.count, 2)
         XCTAssertEqual(lastTicket.gridBuffers.count, 2)
         XCTAssertTrue(lastTicket.indexBuffers.isEmpty, "the mesh keeps its indices unless the adaptive diagonal is asked for")
+        XCTAssertEqual(lastTicket.bandBuffers.count, presenter.hasEdgeBand ? 2 : 0, "the band's vertex buffers ride in the ticket while it is drawn")
+        XCTAssertEqual(lastTicket.bandIndexBuffers.count, presenter.hasEdgeBand ? 2 : 0, "and its index buffers")
+        XCTAssertEqual(presenter.bandMeshes.count, presenter.hasEdgeBand ? 2 : 0, "the band has a mesh per eye")
         XCTAssertEqual(statistics.updates, updates)
         XCTAssertGreaterThanOrEqual(statistics.framesDrawn, 6)
         XCTAssertEqual(statistics.posesMissing, 0)
@@ -1354,18 +1493,32 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertTrue(after.indexBuffers.isEmpty)
         try finish(after)
 
-        // The band follows its setting: its entities are disabled, then enabled again.
+        // The band follows its setting: its entities are disabled and its buffers leave the
+        // tickets, then both come back. The band's meshes began with every cell degenerate, and
+        // a ticket committed without the kernel (every one here) leaves them so: its index
+        // buffers start from the degenerate cells each frame.
         if presenter.hasEdgeBand {
             let bands = presenter.root.children.filter { $0.name.hasSuffix("edge") }
             XCTAssertEqual(bands.count, 2)
+            XCTAssertEqual(split.bandBuffers.count, 2, "the band's buffers rode in the first ticket")
+            XCTAssertEqual(split.bandIndexBuffers.count, 2)
             presenter.settings.edgeBlending = false
             XCTAssertFalse(presenter.drawsEdgeBand)
-            try finish(nextTicket())
+            let off = try nextTicket()
+            XCTAssertTrue(off.bandBuffers.isEmpty, "no band buffers while the band is off")
+            XCTAssertTrue(off.bandIndexBuffers.isEmpty)
+            try finish(off)
             XCTAssertTrue(bands.allSatisfy { !$0.isEnabled }, "the band's entities are off")
             presenter.settings.edgeBlending = true
-            try finish(nextTicket())
+            let on = try nextTicket()
+            XCTAssertEqual(on.bandBuffers.count, 2, "the band's buffers ride in the tickets again")
+            XCTAssertEqual(on.bandIndexBuffers.count, 2)
+            try finish(on)
             XCTAssertTrue(bands.allSatisfy(\.isEnabled), "the band's entities are on again")
             XCTAssertTrue(presenter.drawsEdgeBand)
+            for mesh in presenter.bandMeshes {
+                XCTAssertEqual(indices(of: mesh), presenter.grid.degenerateIndices(), "a frame that draws nothing leaves the band empty")
+            }
         }
         presenter.stop()
     }
@@ -1608,6 +1761,131 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         try dumpPictures([("realitykit-rate-map.png", shown, screen), ("engine-uniform-screen.png", reference, screen)])
         XCTAssertTrue(psnr.isFinite)
         XCTAssertGreaterThan(psnr, 30, "RealityKit shows the engine's picture through the map, to the resampling of the periphery")
+    }
+
+    /// The edge band's vertex and index buffers as `[UInt32]` and the grid's bytes of one eye of
+    /// a ticket, with the eye's scratch entries' rim flags and the vertices' tear mask, read back
+    /// once the ticket's frame completed.
+    @available(macOS 15.0, *)
+    private func bandOfEye(_ eye: Int, ticket: XRPresenterTicket, presenter: XRRealityKitPresenter) throws -> (indices: [UInt32], core: [UInt8], band: [UInt8], rim: [Bool], masked: [Bool]) {
+        let core = try bytes(of: ticket.gridBuffers[eye])
+        let band = try bytes(of: ticket.bandBuffers[eye])
+        let indices = try bytes(of: ticket.bandIndexBuffers[eye]).withUnsafeBytes { Array($0.bindMemory(to: UInt32.self)) }
+        let entries = try bytes(of: presenter.nearestDepthBuffers[eye])
+        let grid = presenter.grid
+        let rim = entries.withUnsafeBytes { raw in
+            (0 ..< grid.vertexCount).map { raw.load(fromByteOffset: $0 * MemoryLayout<SIMD4<Float>>.stride + 12, as: Float.self) > 0.5 }
+        }
+        let masked = core.withUnsafeBytes { raw in
+            (0 ..< grid.vertexCount).map { index -> Bool in
+                let base = index * XRPresenterGrid.vertexStride + XRPresenterGrid.maskOffset
+                return Float(raw.load(fromByteOffset: base, as: Float16.self)) > 0 || Float(raw.load(fromByteOffset: base + 2, as: Float16.self)) > 0
+            }
+        }
+        return (indices, core, band, rim, masked)
+    }
+
+    /// The chain with the edge band: the band's buffers ride in the ticket while it is drawn,
+    /// the kernel fills its vertices with the grid's bytes and its index buffer with the cells
+    /// along the cubes' silhouettes alone (a rim vertex or a tear-mask channel at a corner, by
+    /// the scratch entries and the grid's vertices), every other cell degenerate: a few per cent
+    /// of the grid around the three cubes, none at the shell's corners, none inside a cube's
+    /// face; and the band's meshes hold what the kernel wrote once the frame completed.
+    func test_theLoop_fillsTheBandsMeshes_withTheCellsAlongTheCubes() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        let (presenter, _, _) = try await drawEngineEye(Self.pictureConfiguration)
+        guard presenter.hasEdgeBand else { throw XCTSkip("the band's graph did not load") }
+        let ticket = try XCTUnwrap(presenter.lastTicket)
+        XCTAssertEqual(ticket.bandBuffers.count, 2)
+        XCTAssertEqual(ticket.bandIndexBuffers.count, 2)
+        let grid = presenter.grid
+        let cells = (grid.columns - 1) * (grid.rows - 1)
+        for eye in 0 ..< 2 {
+            let read = try bandOfEye(eye, ticket: ticket, presenter: presenter)
+            XCTAssertEqual(read.band, read.core, "eye \(eye): the band's vertices are the grid's bytes")
+            XCTAssertEqual(read.indices.count, grid.indexCount)
+            var kept = 0
+            var keptCells = Set<Int>()
+            for row in 0 ..< grid.rows - 1 {
+                for column in 0 ..< grid.columns - 1 {
+                    let a = UInt32(row * grid.columns + column), b = a + 1, c = a + UInt32(grid.columns), d = c + 1
+                    let cell = (row * (grid.columns - 1) + column) * 6
+                    let written = Array(read.indices[cell ..< cell + 6])
+                    if [a, b, c, d].contains(where: { read.rim[Int($0)] || read.masked[Int($0)] }) {
+                        kept += 1
+                        keptCells.insert(row * (grid.columns - 1) + column)
+                        XCTAssertEqual(written, [a, c, b, b, c, d], "eye \(eye): cell \(column),\(row) at a silhouette keeps its triangles, the fixed split (the adaptive diagonal is off)")
+                    } else {
+                        XCTAssertEqual(written, [UInt32](repeating: a, count: 6), "eye \(eye): cell \(column),\(row) away from the cubes is degenerate")
+                    }
+                }
+            }
+            print("XR presenter edge band: eye \(eye) keeps \(kept) of \(cells) cells around the three cubes (\(String(format: "%.1f", Double(kept) / Double(cells) * 100)) %)")
+            XCTAssertGreaterThan(kept, 20, "eye \(eye): the cubes' silhouettes keep cells")
+            XCTAssertLessThan(kept, cells / 5, "eye \(eye): the shell and the cubes' faces, most of the grid, are degenerate")
+            XCTAssertFalse(keptCells.contains(0), "eye \(eye): the top-left corner, on the shell, is degenerate")
+            XCTAssertFalse(keptCells.contains(cells - 1), "eye \(eye): the bottom-right corner, on the shell, is degenerate")
+            // The middle cell lies on the near face of the cube at the origin, a cell in from its edges.
+            XCTAssertFalse(keptCells.contains((grid.rows / 2) * (grid.columns - 1) + grid.columns / 2), "eye \(eye): the middle cell, inside the cube's face, is degenerate")
+            // The band's mesh holds the frame's indices.
+            var meshIndices: [UInt32] = []
+            presenter.bandMeshes[eye].withUnsafeIndices { meshIndices = Array($0.bindMemory(to: UInt32.self)) }
+            XCTAssertEqual(meshIndices, read.indices, "eye \(eye): the band's mesh holds what the kernel wrote")
+        }
+    }
+
+    /// The band on meshes of its own, the cells along silhouettes alone, shows what the band
+    /// over the whole grid showed. Under MSAA, whose coverage the band blends: RealityKit's
+    /// picture with the band's meshes against the picture with the band's entities put back on
+    /// the grids' meshes (every cell, as the band was first drawn), and both against the
+    /// engine's eye. A silhouette's partly covered texel that the band's cells missed would show
+    /// as a cut pixel against a blended one, at about 55 dB for a single one.
+    func test_theBandsCells_showWhatTheWholeGridsBandShowed() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        let modeBefore = antiAliasingMode
+        setRendering(.antiAliasing(.msaa))
+        defer { setRendering(.antiAliasing(modeBefore)) }
+        try turnTheCubes()
+        let (presenter, engine, size) = try await drawEngineEye(Self.pictureConfiguration)
+        guard presenter.hasEdgeBand else { throw XCTSkip("the band's graph did not load") }
+        XCTAssertGreaterThan(coloured(engine, size: size), 1000, "the engine drew the cubes into the eye")
+        let partlyCovered = stride(from: 3, to: engine.count, by: 4).filter { engine[$0] > 0 && engine[$0] < 1 }.count
+        XCTAssertGreaterThan(partlyCovered, 50, "MSAA left partly covered texels along the cubes' silhouettes for the band to blend")
+
+        let withCells = try await realityKitPicture(of: presenter, size: size)
+        XCTAssertGreaterThan(coloured(withCells, size: size), 1000, "RealityKit drew the grids and the band")
+        let entities = presenter.root.children.compactMap { $0 as? ModelEntity }
+        let cores = entities.filter { !$0.name.hasSuffix("edge") }
+        let bands = entities.filter { $0.name.hasSuffix("edge") }
+        XCTAssertEqual(cores.count, 2)
+        XCTAssertEqual(bands.count, 2)
+        // Without the band: the core alone cuts the partly covered texels, a visible difference.
+        for band in bands { band.isEnabled = false }
+        let withoutBand = try await realityKitPicture(of: presenter, size: size)
+        for band in bands { band.isEnabled = true }
+        // The band's entities back on the grids' meshes: every cell blended, as before.
+        for (band, core) in zip(bands, cores) {
+            band.model?.mesh = try XCTUnwrap(core.model?.mesh)
+        }
+        let wholeGrid = try await realityKitPicture(of: presenter, size: size)
+        XCTAssertGreaterThan(coloured(wholeGrid, size: size), 1000)
+
+        let cellsAgainstWholeGrid = peakSignalToNoise(withCells, wholeGrid, size: size)
+        let cellsAgainstEngine = peakSignalToNoise(withCells, engine, size: size)
+        let wholeGridAgainstEngine = peakSignalToNoise(wholeGrid, engine, size: size)
+        let withoutBandAgainstCells = peakSignalToNoise(withoutBand, withCells, size: size)
+        print("RealityKit's picture with the band's cells against the band over the whole grid: PSNR \(cellsAgainstWholeGrid) dB; against the engine's MSAA eye \(cellsAgainstEngine) dB (the whole grid's band: \(wholeGridAgainstEngine) dB; no band: \(withoutBandAgainstCells) dB against the cells, \(partlyCovered) partly covered texels)")
+        try dumpPictures([("band-cells.png", withCells, size), ("band-whole-grid.png", wholeGrid, size), ("band-none.png", withoutBand, size), ("engine-msaa.png", engine, size)])
+        XCTAssertLessThan(withoutBandAgainstCells, 60, "the band blends what the core alone cuts")
+        XCTAssertTrue(cellsAgainstWholeGrid.isFinite)
+        XCTAssertGreaterThan(cellsAgainstWholeGrid, 70, "the band's cells blend every texel the whole grid's band blended")
+        XCTAssertGreaterThan(cellsAgainstEngine, 70, "RealityKit shows the engine's MSAA picture through the core and the band's cells")
     }
 
     private enum PictureError: Swift.Error { case stalled(String) }

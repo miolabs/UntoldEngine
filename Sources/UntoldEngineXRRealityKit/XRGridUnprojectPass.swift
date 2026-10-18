@@ -115,6 +115,16 @@ public struct XRGridUnprojectUniforms {
 /// arithmetic is as it was: the vertices spread over the texture's extent, a texel's uv over
 /// `size - 1`.
 ///
+/// The edge band, the blended second drawing of the grid over the opaque core, has a mesh of
+/// its own per eye: its vertices are the core's bytes, which the second dispatch writes into a
+/// second buffer when one is bound (`kEdgeBand`, a function constant, so the kernel without a
+/// band is what it always was), and its index buffer a fourth dispatch writes per frame, one
+/// thread per cell: the cell's two triangles, split as the core's are, when any of its four
+/// vertices is a rim vertex or carries a tear-mask channel (the cells along silhouettes and
+/// depth jumps, where the texture has partly covered texels to blend), else six copies of one
+/// index, a pair of degenerate triangles the rasterizer draws nothing for. RealityKit then
+/// shades the band's cells alone instead of the whole grid a second time.
+///
 /// The kernels are compiled from source once per device: the engine's prebuilt metallibs stay
 /// as they are, and the tests run them on a Mac.
 public final class XRGridUnprojectPass: @unchecked Sendable {
@@ -124,6 +134,8 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     public static let kernelName = "xrGridUnproject"
     /// The third: each cell's two triangles, split along the diagonal nearer in depth.
     public static let triangulateKernelName = "xrGridTriangulate"
+    /// The fourth: the edge band's index buffer, the cells along silhouettes and depth jumps.
+    public static let edgeBandKernelName = "xrGridEdgeBand"
 
     /// The kernels. Their `XRGridVertex` is the grid's vertex layout; their uniforms are
     /// `XRGridUnprojectUniforms`.
@@ -134,6 +146,9 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     // kernel is compiled twice and the uniform one is the arithmetic it always was, with no map
     // argument, while the foveated one carries no branch.
     constant bool kFoveated [[function_constant(0)]];
+    // Whether the second dispatch writes the edge band's vertex buffer too: a function
+    // constant, so the kernel without a band is what it always was.
+    constant bool kEdgeBand [[function_constant(1)]];
     struct XRGridVertex {
         packed_float3 position;   // the origin's space
         packed_float2 uv;         // v = 0 at the texture's top row (affine; the fallback material's)
@@ -311,6 +326,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
                                 constant XRGridUnprojectUniforms &u [[buffer(1)]],
                                 const device float4 *depths [[buffer(2)]],
                                 constant rasterization_rate_map_data *rateMap [[buffer(3), function_constant(kFoveated)]],
+                                device XRGridVertex *bandVertices [[buffer(4), function_constant(kEdgeBand)]],
                                 uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) { return; }
@@ -351,13 +367,48 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         // whatever RealityKit's own camera (an affine uv keystones across a tilted cell).
         float ze = -eye.z;
         v.uvw = packed_float4(uv.x * ze, uv.y * ze, ze, 0.0f);
+        // The edge band's mesh has the same vertices: the same bytes into its own buffer.
+        if (kEdgeBand) { bandVertices[gid.y * u.gridSize.x + gid.x] = v; }
     }
-    // Pass 3: the cell's two triangles, split along the diagonal that does not cross a depth
-    // jump when the other does (the depths read along the cell's own ray). A silhouette that
+    // Whether a cell's two triangles are split along the other diagonal (top-left to
+    // bottom-right): only where the default diagonal crosses a depth jump and the other does
+    // not (the depths read along the cell's own ray), and never under the fixed-diagonal flag,
+    // so every continuous surface keeps one topology from frame to frame. A silhouette that
     // crosses a cell corner to corner has its two on-edge vertices on one diagonal; with a
     // fixed split half of those cells lost both triangles to the far vertex and the boundary
-    // dipped to the next interior vertex. One thread per cell; a (top-left) = row r column c,
-    // b = a + 1, c = a + columns, d = c + 1; counter-clockwise as seen from the eye.
+    // dipped to the next interior vertex. a (top-left) = row r column c, b = a + 1,
+    // c = a + columns, d = c + 1. The cell's own ray goes through its centre texel's place on
+    // the map when foveated.
+    static bool splitsTheOtherWay(uint2 gid, uint a, uint b, uint c, uint d, constant XRGridUnprojectUniforms &u, const device float4 *depths, constant rasterization_rate_map_data *rateMap) {
+        if ((u.flags & 1u) != 0u) { return false; }
+        float2 ndc;
+        if (kFoveated) {
+            float2 cellCentre = clamp((float2(gid) + 0.5f) * u.cellTexels - 0.5f, float2(0.0f), float2(u.textureSize) - 1.0f);
+            ndc = texelToNDC(cellCentre, u, rateMap);
+        } else {
+            ndc = uvToNDC((float2(gid) + 0.5f) / float2(u.gridSize - 1));
+        }
+        float4 ra = u.inverseProjection * float4(ndc, 0.0f, 1.0f);
+        float4 rb = u.inverseProjection * float4(0.0f, 0.0f, 1.0f, 0.0f);
+        float za = zInFront(depths[a].x, ra, rb);
+        float zb = zInFront(depths[b].x, ra, rb);
+        float zc = zInFront(depths[c].x, ra, rb);
+        float zd = zInFront(depths[d].x, ra, rb);
+        return fabs(zb - zc) > u.tearThreshold && fabs(za - zd) <= u.tearThreshold;
+    }
+    // The cell's two triangles at t, counter-clockwise as seen from the eye, split one way or
+    // the other.
+    static void writeCell(device uint *t, bool otherWay, uint a, uint b, uint c, uint d) {
+        if (otherWay) {
+            t[0] = a; t[1] = c; t[2] = d;
+            t[3] = a; t[4] = d; t[5] = b;
+        } else {
+            t[0] = a; t[1] = c; t[2] = b;
+            t[3] = b; t[4] = c; t[5] = d;
+        }
+    }
+    // Pass 3: the cell's two triangles, split along the diagonal that does not cross a depth
+    // jump when the other does. One thread per cell.
     kernel void xrGridTriangulate(device uint *indices [[buffer(0)]],
                                   constant XRGridUnprojectUniforms &u [[buffer(1)]],
                                   const device float4 *depths [[buffer(2)]],
@@ -370,38 +421,55 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         uint b = a + 1;
         uint c = a + u.gridSize.x;
         uint d = c + 1;
-        // The cell's own ray: through its centre texel's place on the map when foveated.
-        float2 ndc;
-        if (kFoveated) {
-            float2 cellCentre = clamp((float2(gid) + 0.5f) * u.cellTexels - 0.5f, float2(0.0f), float2(u.textureSize) - 1.0f);
-            ndc = texelToNDC(cellCentre, u, rateMap);
-        } else {
-            ndc = uvToNDC((float2(gid) + 0.5f) / float2(cells));
-        }
-        float4 ra = u.inverseProjection * float4(ndc, 0.0f, 1.0f);
-        float4 rb = u.inverseProjection * float4(0.0f, 0.0f, 1.0f, 0.0f);
-        float za = zInFront(depths[a].x, ra, rb);
-        float zb = zInFront(depths[b].x, ra, rb);
-        float zc = zInFront(depths[c].x, ra, rb);
-        float zd = zInFront(depths[d].x, ra, rb);
         device uint *t = indices + (gid.y * cells.x + gid.x) * 6;
-        // Only where the default diagonal crosses a depth jump and the other does not: every
-        // continuous surface keeps one topology from frame to frame.
-        if ((u.flags & 1u) == 0u && fabs(zb - zc) > u.tearThreshold && fabs(za - zd) <= u.tearThreshold) {
-            t[0] = a; t[1] = c; t[2] = d;
-            t[3] = a; t[4] = d; t[5] = b;
-        } else {
-            t[0] = a; t[1] = c; t[2] = b;
-            t[3] = b; t[4] = c; t[5] = d;
+        writeCell(t, splitsTheOtherWay(gid, a, b, c, d, u, depths, rateMap), a, b, c, d);
+    }
+    // Whether a vertex lies along a silhouette or a depth jump: a rim vertex (the scratch
+    // entry's flag: its own centre lies off the near surface its footprint reached) or one
+    // carrying a tear-mask channel (the near or the far side of a jump).
+    static bool alongAnEdge(uint index, const device float4 *depths, const device XRGridVertex *vertices) {
+        float2 mask = float2(vertices[index].mask);
+        return depths[index].w > 0.5f || mask.x > 0.0f || mask.y > 0.0f;
+    }
+    // Pass 4: the edge band's index buffer, one thread per cell. The cell's two triangles, split
+    // as the core's are, when any of its four vertices lies along an edge: those cells hold
+    // every texel a silhouette partly covers (the rim vertex sits past the edge texel, the
+    // surface's own vertex next to it inside the surface) and the stretched triangles of a
+    // depth jump, which the material discards. Every other cell is six copies of its first
+    // index, a pair of degenerate triangles the rasterizer draws nothing for. The mask is read
+    // from the core's vertices, written by pass 2 (a barrier between).
+    kernel void xrGridEdgeBand(device uint *indices [[buffer(0)]],
+                               constant XRGridUnprojectUniforms &u [[buffer(1)]],
+                               const device float4 *depths [[buffer(2)]],
+                               constant rasterization_rate_map_data *rateMap [[buffer(3), function_constant(kFoveated)]],
+                               const device XRGridVertex *vertices [[buffer(4)]],
+                               uint2 gid [[thread_position_in_grid]])
+    {
+        uint2 cells = u.gridSize - 1;
+        if (gid.x >= cells.x || gid.y >= cells.y) { return; }
+        uint a = gid.y * u.gridSize.x + gid.x;
+        uint b = a + 1;
+        uint c = a + u.gridSize.x;
+        uint d = c + 1;
+        device uint *t = indices + (gid.y * cells.x + gid.x) * 6;
+        bool along = alongAnEdge(a, depths, vertices) || alongAnEdge(b, depths, vertices) || alongAnEdge(c, depths, vertices) || alongAnEdge(d, depths, vertices);
+        if (!along) {
+            t[0] = a; t[1] = a; t[2] = a;
+            t[3] = a; t[4] = a; t[5] = a;
+            return;
         }
+        writeCell(t, splitsTheOtherWay(gid, a, b, c, d, u, depths, rateMap), a, b, c, d);
     }
     """
 
-    /// The three kernels, specialized for one value of `kFoveated`.
+    /// The four kernels, specialized for one value of `kFoveated`; the second one twice, with
+    /// and without the edge band's vertex buffer (`kEdgeBand`).
     private struct Pipelines {
         let nearestDepth: MTLComputePipelineState
         let unproject: MTLComputePipelineState
+        let unprojectWithBand: MTLComputePipelineState
         let triangulate: MTLComputePipelineState
+        let edgeBand: MTLComputePipelineState
     }
 
     /// The kernels for a uniform eye texture: the arithmetic as it always was.
@@ -415,16 +483,25 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         let library = try device.makeLibrary(source: Self.source, options: nil)
         func makePipelines(foveated: Bool) throws -> Pipelines {
             var foveated = foveated
-            let constants = MTLFunctionConstantValues()
-            constants.setConstantValue(&foveated, type: .bool, index: 0)
-            func makePipeline(_ name: String) throws -> MTLComputePipelineState {
+            func makeConstants(edgeBand: Bool) -> MTLFunctionConstantValues {
+                var edgeBand = edgeBand
+                let constants = MTLFunctionConstantValues()
+                constants.setConstantValue(&foveated, type: .bool, index: 0)
+                constants.setConstantValue(&edgeBand, type: .bool, index: 1)
+                return constants
+            }
+            let constants = makeConstants(edgeBand: false)
+            let bandConstants = makeConstants(edgeBand: true)
+            func makePipeline(_ name: String, _ constants: MTLFunctionConstantValues) throws -> MTLComputePipelineState {
                 let function = try library.makeFunction(name: name, constantValues: constants)
                 return try device.makeComputePipelineState(function: function)
             }
             return try Pipelines(
-                nearestDepth: makePipeline(Self.nearestDepthKernelName),
-                unproject: makePipeline(Self.kernelName),
-                triangulate: makePipeline(Self.triangulateKernelName)
+                nearestDepth: makePipeline(Self.nearestDepthKernelName, constants),
+                unproject: makePipeline(Self.kernelName, constants),
+                unprojectWithBand: makePipeline(Self.kernelName, bandConstants),
+                triangulate: makePipeline(Self.triangulateKernelName, constants),
+                edgeBand: makePipeline(Self.edgeBandKernelName, constants)
             )
         }
         uniformPipelines = try makePipelines(foveated: false)
@@ -445,16 +522,22 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     /// Encodes one eye's unprojection: `depth` is the eye's depth as the engine left it (reverse
     /// Z), `nearestDepths` the eye's scratch buffer (`makeNearestDepthBuffer`), `vertices` the
     /// grid's vertex buffer for this frame, `originFromEye` the inverse of the view matrix the
-    /// eye was drawn with and `projection` its projection. Both dispatches go into one compute
-    /// encoder, a memory barrier between them. `rateMapData` is the rasterization rate map the
-    /// eye was drawn through, with the grid's cell in physical texels (`grid` must then be the
-    /// map's: `XRPresenterFoveation.grid`); nil, and the eye is a uniform texture.
+    /// eye was drawn with and `projection` its projection. The dispatches go into one compute
+    /// encoder, memory barriers between them. `indices` is the grid's index buffer for this
+    /// frame, split by the depth (nil keeps the mesh's). `bandVertices` and `bandIndices` are the
+    /// edge band's mesh for this frame: its vertices get the grid's bytes, its indices the cells
+    /// along silhouettes and depth jumps, every other cell degenerate (nil for no band).
+    /// `rateMapData` is the rasterization rate map the eye was drawn through, with the grid's
+    /// cell in physical texels (`grid` must then be the map's: `XRPresenterFoveation.grid`);
+    /// nil, and the eye is a uniform texture.
     public func encode(
         commandBuffer: MTLCommandBuffer,
         depth: MTLTexture,
         nearestDepths: MTLBuffer,
         vertices: MTLBuffer,
         indices: MTLBuffer? = nil,
+        bandVertices: MTLBuffer? = nil,
+        bandIndices: MTLBuffer? = nil,
         grid: XRPresenterGrid,
         originFromEye: simd_float4x4,
         projection: simd_float4x4,
@@ -495,10 +578,15 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         dispatch(encoder, pipeline: pipelines.nearestDepth, columns: grid.columns, rows: grid.rows)
         encoder.memoryBarrier(scope: .buffers)
 
-        encoder.setComputePipelineState(pipelines.unproject)
+        // The vertices, and the edge band's copy of them when its buffer is handed in.
+        let unproject = bandVertices == nil ? pipelines.unproject : pipelines.unprojectWithBand
+        encoder.setComputePipelineState(unproject)
         encoder.setBuffer(vertices, offset: 0, index: 0)
         encoder.setBuffer(nearestDepths, offset: 0, index: 2)
-        dispatch(encoder, pipeline: pipelines.unproject, columns: grid.columns, rows: grid.rows)
+        if let bandVertices {
+            encoder.setBuffer(bandVertices, offset: 0, index: 4)
+        }
+        dispatch(encoder, pipeline: unproject, columns: grid.columns, rows: grid.rows)
         // The cells' triangles for this frame, when the presenter hands the index buffer in
         // (nil keeps the mesh's indices as they are: the fixed split).
         if let indices {
@@ -506,6 +594,15 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             encoder.setBuffer(indices, offset: 0, index: 0)
             encoder.setBuffer(nearestDepths, offset: 0, index: 2)
             dispatch(encoder, pipeline: pipelines.triangulate, columns: grid.columns - 1, rows: grid.rows - 1)
+        }
+        // The band's cells, from the vertices' tear mask and the rim flags: after the vertices.
+        if let bandIndices {
+            encoder.memoryBarrier(scope: .buffers)
+            encoder.setComputePipelineState(pipelines.edgeBand)
+            encoder.setBuffer(bandIndices, offset: 0, index: 0)
+            encoder.setBuffer(nearestDepths, offset: 0, index: 2)
+            encoder.setBuffer(vertices, offset: 0, index: 4)
+            dispatch(encoder, pipeline: pipelines.edgeBand, columns: grid.columns - 1, rows: grid.rows - 1)
         }
         encoder.endEncoding()
     }
