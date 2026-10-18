@@ -1381,8 +1381,14 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         configuration.textureSize = [256, 256]
         configuration.frustumTangents = [1, 1, 1, 1]
         configuration.interpupillaryDistance = 0
-        configuration.gridColumns = 33
-        configuration.gridRows = 33
+        // Cells of four texels, and a tear threshold for this scale: a texel is 39 mm at the
+        // cubes, five metres off through this 90° frustum, and a turned cube's grazing side face
+        // changes its distance to the eye by half a metre between neighbouring vertices, which
+        // the headset's 2 mm texels never reach on such a face. The threshold stays well under
+        // the 45 m between a cube and the far shell.
+        configuration.gridColumns = 65
+        configuration.gridRows = 65
+        configuration.tearThresholdMetres = 1
         configuration.farShellMetres = 50
         let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
         presenter.reportInterval = 0
@@ -1393,6 +1399,21 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         let styleBefore = renderInfo.immersionStyle
         renderInfo.immersionStyle = .mixed
         defer { renderInfo.immersionStyle = styleBefore }
+        // The cubes turned, so that their faces run across cells at changing depth: an affine
+        // uv keystones there by a measurable fraction of a texel (64.6 dB against the engine's
+        // picture with the cubes square to the eye; the projective one is exact at 8 bits).
+        for index in 0 ..< 3 {
+            let cube = try XCTUnwrap(findEntity(name: "Cube\(index)"))
+            rotateTo(entityId: cube, angle: 35, axis: simd_float3(0, 1, 0))
+        }
+        func reach(_ what: String, _ condition: () -> Bool) throws {
+            // A stalled loop is a failure here, not an unavailable environment.
+            let deadline = Date().addingTimeInterval(10)
+            while !condition() {
+                guard Date() < deadline else { throw PictureError.stalled(what) }
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            }
+        }
         let devicePose = matrix4x4Translation(0, 0, 5)
         let source = RealityKitFrameSource(presenter: presenter) { _ in devicePose }
         let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
@@ -1400,18 +1421,23 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         let thread = Thread { loop.run() }
         thread.start()
         presenter.start(commandQueue: renderInfo.commandQueue)
-        try waitUntil {
+        try reach("six frames drawn") {
             presenter.update()
             return loop.framesDrawn >= 6
         }
         let lastTicket = try XCTUnwrap(presenter.lastTicket)
-        try waitUntil { lastTicket.commandBuffer.status == .completed }
+        try reach("the last ticket completed") { lastTicket.commandBuffer.status == .completed }
         presenter.stop()
-        try waitUntil { thread.isFinished }
+        try reach("the loop's thread finished") { thread.isFinished }
 
-        // The engine's left eye, linear.
+        // The engine's left eye, linear: the cubes over the transparent room.
         let eyeTexture = lastTicket.colorTextures[0]
         let engine = try linearPixels(ofSRGB: eyeTexture)
+        let width = configuration.textureSize.x, height = configuration.textureSize.y
+        func coloured(_ pixels: [Float]) -> Int {
+            (0 ..< width * height).filter { index in (0 ..< 3).contains { pixels[index * 4 + $0] > 0.05 } }.count
+        }
+        XCTAssertGreaterThan(coloured(engine), 1000, "the engine drew the cubes into the eye")
 
         // RealityKit's picture of the grids from the same point, through the same projection.
         let rkRenderer = try RealityRenderer()
@@ -1423,7 +1449,6 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         camera.transform = Transform(matrix: devicePose)
         rkRenderer.activeCamera = camera
         rkRenderer.entities.replaceAll([camera, presenter.root])
-        let width = configuration.textureSize.x, height = configuration.textureSize.y
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .shared
@@ -1441,10 +1466,11 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
             }
             try await Task.sleep(nanoseconds: 20_000_000)
             shown = halfPixels(of: output)
-            if shown == previous, shown.contains(where: { $0 > 0.05 }) { break }
+            if shown == previous, coloured(shown) > 0 { break }
             previous = shown
         }
-        XCTAssertTrue(shown.contains(where: { $0 > 0.05 }), "RealityKit drew the grids")
+        // The output's alpha is the opaque background's everywhere: colour says what was drawn.
+        XCTAssertGreaterThan(coloured(shown), 1000, "RealityKit drew the grids")
 
         // The two pictures agree: the mean squared difference over the colour channels of every
         // pixel, as a peak signal-to-noise ratio. The engine's cubes are lit over a transparent
@@ -1457,14 +1483,19 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
                 squared += difference * difference
             }
         }
-        let psnr = 10 * log10(1 / (squared / Double(width * height * 3)))
+        // A floor on the error keeps the ratio finite when the pictures are the same at 8 bits.
+        let meanSquared = max(squared / Double(width * height * 3), 1e-9)
+        let psnr = 10 * log10(1 / meanSquared)
         print("RealityKit's picture of the presenter's grids against the engine's eye: PSNR \(psnr) dB")
         if let folder = ProcessInfo.processInfo.environment["XR_PRESENTER_DUMP"] {
             try writePNG(shown, width: width, height: height, to: URL(fileURLWithPath: folder).appendingPathComponent("realitykit.png"))
             try writePNG(engine, width: width, height: height, to: URL(fileURLWithPath: folder).appendingPathComponent("engine.png"))
         }
-        XCTAssertGreaterThan(psnr, 30, "RealityKit shows the engine's picture from the engine's eye")
+        XCTAssertTrue(psnr.isFinite)
+        XCTAssertGreaterThan(psnr, 70, "RealityKit shows the engine's picture from the engine's eye (the affine uv scores under 65 dB)")
     }
+
+    private enum PictureError: Swift.Error { case stalled(String) }
 
     /// The texture's pixels, linear floats, rgba, row by row from the top.
     private func linearPixels(ofSRGB texture: MTLTexture) throws -> [Float] {
