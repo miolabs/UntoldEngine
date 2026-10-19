@@ -42,6 +42,7 @@ public final class XRFrameLoop: @unchecked Sendable {
     private let lock = NSLock()
     private var running = false
     private var drawnFrames = 0
+    private var letGoFrames = 0
 
     // Reuse render pass descriptors to avoid allocation churn (2 eyes × 90 FPS = 180 allocs/sec)
     private let passDescriptorLeft = MTLRenderPassDescriptor()
@@ -58,6 +59,13 @@ public final class XRFrameLoop: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return drawnFrames
+    }
+
+    /// Frames taken and let go undrawn (`letGo`), for the tests and the stats.
+    public var framesLetGo: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return letGoFrames
     }
 
     private var isRunning: Bool {
@@ -88,6 +96,13 @@ public final class XRFrameLoop: @unchecked Sendable {
             var shouldExit = false
             autoreleasepool {
                 guard isRunning, let frame = source.nextFrame() else {
+                    shouldExit = true
+                    return
+                }
+                // stop() may have landed while the source waited for this frame: it is let go,
+                // not drawn, and not left taken.
+                guard isRunning else {
+                    letGo(frame, reason: "stopped while the source waited")
                     shouldExit = true
                     return
                 }
@@ -159,8 +174,16 @@ public final class XRFrameLoop: @unchecked Sendable {
         #endif
 
         // The compositor or app state can transition while waiting. If not running anymore,
-        // skip submission entirely to avoid using an invalid frame.
-        guard isRunning, frame.beginDrawing() else { return }
+        // skip submission entirely to avoid using an invalid frame: the frame is let go, which
+        // ends it as its presenter requires.
+        guard isRunning else {
+            letGo(frame, reason: "stopped during the frame")
+            return
+        }
+        guard frame.beginDrawing() else {
+            letGo(frame, reason: "the presenter refused the drawing")
+            return
+        }
 
         // 8. The submission phase has begun
         #if ENGINE_STATS_ENABLED
@@ -184,8 +207,10 @@ public final class XRFrameLoop: @unchecked Sendable {
             #else
                 renderer.finalizeXRStatsAndMonitors(frameStartTime: 0.0)
             #endif
-            // No targets (shutdown/teardown, or the compositor cancelled the frame): the
-            // frame is already invalid and the drawing must not be ended.
+            // No targets: the compositor cancelled the frame (nothing to end), or gave only
+            // drawables the scene is not drawn into (presented cleared and ended by the
+            // release). The presenter tells the two apart.
+            letGo(frame, reason: "no targets")
             return
         }
 
@@ -211,6 +236,24 @@ public final class XRFrameLoop: @unchecked Sendable {
             renderer.finalizeXRStatsAndMonitors(frameStartTime: 0.0)
         #endif
         frame.endDrawing()
+    }
+
+    /// Lets a frame go that will not be drawn, through its presenter (`XRFrame.release`), and
+    /// says so: on Compositor Services a frame taken and never submitted stays taken, and three
+    /// of them abort the app, so each one is worth a line (the first ten, then one in a
+    /// hundred: a layer going away cancels frames in a row).
+    private func letGo(_ frame: any XRFrame, reason: String) {
+        frame.release()
+        lock.lock()
+        letGoFrames += 1
+        let count = letGoFrames
+        lock.unlock()
+        #if ENGINE_STATS_ENABLED
+            EngineStatsMonitor.shared.recordFrameLetGo()
+        #endif
+        if count <= 10 || count % 100 == 0 {
+            print("XR: a frame let go (\(reason)), \(count) so far")
+        }
     }
 
     /// One target's pass: the culling once, each eye, the depth pyramid, the presentation,

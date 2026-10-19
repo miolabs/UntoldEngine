@@ -170,9 +170,39 @@ final class XRFrameLoopTests: BaseRenderSetup {
 
         loop.run()
 
-        XCTAssertEqual(frame.phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire"], "the drawing is not ended: the frame is already invalid")
+        XCTAssertEqual(frame.phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "release"], "the frame is let go: its presenter ends it if there is anything to end")
         XCTAssertTrue(frame.presentedIn.isEmpty)
         XCTAssertEqual(loop.framesDrawn, 0)
+        XCTAssertEqual(loop.framesLetGo, 1)
+    }
+
+    /// A frame the source hands out after `stop()` landed while it waited is let go, not drawn
+    /// and not left taken, and the loop ends.
+    func test_aFrameHandedOutAfterTheStop_isLetGo() {
+        let frames = FakeFrames(device: renderInfo.device, eyeSize: (64, 48), count: 2)
+        let loop = makeLoop(frames)
+        frames.onHandOut = { loop.stop() }
+
+        loop.run()
+
+        XCTAssertEqual(frames.frames.count, 1, "no frame is taken once the loop has ended")
+        XCTAssertEqual(frames.frames[0].phases, ["release"], "let go before any phase")
+        XCTAssertEqual(loop.framesDrawn, 0)
+        XCTAssertEqual(loop.framesLetGo, 1)
+    }
+
+    /// A frame whose presenter refuses the drawing (its layer no longer running) is let go
+    /// after its update, and the loop goes on.
+    func test_aFrameWhoseDrawingIsRefused_isLetGo() {
+        let frames = FakeFrames(device: renderInfo.device, eyeSize: (64, 48), count: 1)
+        frames.refusesDrawing = true
+        let loop = makeLoop(frames)
+
+        loop.run()
+
+        XCTAssertEqual(frames.frames[0].phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "release"])
+        XCTAssertEqual(loop.framesDrawn, 0)
+        XCTAssertEqual(loop.framesLetGo, 1)
     }
 
     func test_aFrameWithoutAPose_isPresentedWithNoEyeDrawn() throws {
@@ -329,9 +359,12 @@ final class FakeFrames: XRFrameSource, @unchecked Sendable {
             record("wait")
         }
 
+        /// Whether the drawing is refused, as a presenter whose layer stopped running refuses it.
+        var refusesDrawing = false
+
         func beginDrawing() -> Bool {
             record("beginDrawing")
-            return true
+            return !refusesDrawing
         }
 
         func acquireEyes() -> [XREyes] {
@@ -356,6 +389,10 @@ final class FakeFrames: XRFrameSource, @unchecked Sendable {
         func endDrawing() {
             record("endDrawing")
         }
+
+        func release() {
+            record("release")
+        }
     }
 
     /// Half the distance between the eyes, as on a headset.
@@ -376,6 +413,11 @@ final class FakeFrames: XRFrameSource, @unchecked Sendable {
     /// Whether the frames carry the display's target, and a capture target after it.
     var displayTarget = true
     var captureTarget = false
+    /// Whether the frames refuse their drawing (`Frame.refusesDrawing`).
+    var refusesDrawing = false
+    /// Called as a frame is handed out, before the loop gets it: a test's stop() in the window
+    /// between the source's wait and the loop's check.
+    var onHandOut: (() -> Void)?
 
     private let lock = NSLock()
     private var handed: [Frame] = []
@@ -439,9 +481,11 @@ final class FakeFrames: XRFrameSource, @unchecked Sendable {
     }
 
     private func hand(_ frame: Frame) -> Frame {
+        frame.refusesDrawing = refusesDrawing
         lock.lock()
         handed.append(frame)
         lock.unlock()
+        onHandOut?()
         return frame
     }
 

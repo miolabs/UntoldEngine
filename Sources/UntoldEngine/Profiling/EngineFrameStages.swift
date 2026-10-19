@@ -112,6 +112,11 @@ public struct EngineFrameStageStats: Sendable, Equatable {
     /// presenter sets one (Compositor Services does): the presenter's own verdict on the
     /// frame being late, beside the one against the refresh period.
     public var pastDeadline = 0
+    /// Frames the loop took and let go undrawn (a stop, a refused drawing, nothing to draw
+    /// into): each is ended through its presenter so it does not stay taken, and each is
+    /// worth knowing about, since on Compositor Services three frames taken and never
+    /// submitted abort the app.
+    public var letGo = 0
     /// Each stage's maximum over the span, milliseconds; the frames behind them may differ.
     public var cpuMsMax = 0.0
     public var waitMsMax = 0.0
@@ -138,6 +143,9 @@ public struct EngineFrameStageStats: Sendable, Equatable {
         )
         if pastDeadline > 0 {
             line += " · \(pastDeadline) past the deadline"
+        }
+        if letGo > 0 {
+            line += " · \(letGo) let go"
         }
         return line
     }

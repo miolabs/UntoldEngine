@@ -118,12 +118,21 @@ public protocol XRFrame: AnyObject {
     /// still rides on the buffer). Nothing by default.
     func willCommit(_ commandBuffer: MTLCommandBuffer)
     func endDrawing()
+    /// Lets go of a frame the loop will not draw or will not finish: one taken after the loop
+    /// was stopped, one whose drawing could not begin, one with nothing to draw into, one
+    /// abandoned between its targets. The presenter ends it however its compositor requires
+    /// (Compositor Services: the phases it missed run, every drawable queried is presented
+    /// cleared and the submission is ended, so the frame does not stay taken; three frames
+    /// taken and never submitted abort the app). Nothing by default.
+    func release()
 }
 
 public extension XRFrame {
     func makeCommandBuffer(for _: XREyes) -> MTLCommandBuffer? { nil }
 
     func willCommit(_: MTLCommandBuffer) {}
+
+    func release() {}
 }
 
 /// Where the frames come from: the headset through Compositor Services, another presenter,

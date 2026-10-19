@@ -249,6 +249,15 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         #endif
     }
 
+    /// A frame the loop took and let go undrawn, into the open span's count.
+    public func recordFrameLetGo() {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            _spanStats.letGo += 1
+            lock.unlock()
+        #endif
+    }
+
     /// The span still open: its frames so far, as of the last frame begun. The snapshot
     /// carries the last span closed; this is for a reader that cannot wait for one.
     public func frameStagesInProgress() -> EngineFrameStageStats {

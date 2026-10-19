@@ -199,6 +199,9 @@
             // rendered land on every other refresh, evenly, when one refresh is not enough for
             // a frame's GPU work; the display shows the previous frame again meanwhile.
             paceForHalfRate()
+            // The layer may have paused or gone while the pacing waited: nextFrame() reads the
+            // state again rather than querying a layer that is not running.
+            guard layerRenderer.state == .running else { return nil }
 
             // 1. Call queryNextFrame() to fetch the next frame to use for drawing
             let queryStart = LayerRenderer.Clock().now
@@ -208,7 +211,12 @@
             lastFrameHandedAt = handedAt
 
             // 2. Call predictTiming to get the predicted render deadlines for code
-            guard let timing = frame.predictTiming() else { return nil }
+            guard let timing = frame.predictTiming() else {
+                // A frame the compositor gives no timing for is no longer valid (Apple's sample
+                // drops it the same way); said, so a run of them can be told from the stats.
+                print("XR: a frame without timing let go")
+                return nil
+            }
 
             // The instant the compositor predicts the frame will be shown, in the media-time
             // base: the game poses the frame for it in the update phase, and the head is posed
@@ -662,8 +670,15 @@
             private let compositorPresentationTime: TimeInterval
             private let source: CompositorFrameSource
             private var drawables: [LayerRenderer.Drawable] = []
-            /// Which drawables were handed to the loop as targets; the rest are presented cleared.
-            private var handedOut: [Bool] = []
+            /// Which drawables the loop presented; the rest are presented cleared at the end, so
+            /// that every drawable the compositor handed out is presented once.
+            private var presented: [Bool] = []
+            /// The phases run so far, for `release()` to run the ones a let-go frame missed.
+            private var updateBegun = false
+            private var updateEnded = false
+            private var submitting = false
+            private var queried = false
+            private var ended = false
 
             init(frame: LayerRenderer.Frame, prediction: LayerRenderer.Frame.Timing, compositorPresentationTime: TimeInterval, timing: XRFrameTiming, source: CompositorFrameSource) {
                 self.frame = frame
@@ -676,11 +691,13 @@
             func beginUpdate() {
                 // 3. Call startUpdate() to mark the start of the update phase
                 frame.startUpdate()
+                updateBegun = true
             }
 
             func endUpdate() {
                 // 6. Call endupdate() to mark the end of the update phase
                 frame.endUpdate()
+                updateEnded = true
             }
 
             func waitForDrawingTime() {
@@ -702,19 +719,27 @@
                 guard source.layerRenderer.state == .running else { return false }
                 // 8. Call startSubmission() to mark the start of submission phase
                 frame.startSubmission()
+                submitting = true
                 return true
             }
 
-            func acquireEyes() -> [XREyes] {
-                // 9. visionOS 26 hands a frame one drawable per target (the built-in display, and a
-                // capture target while the view is recorded or streamed); a layer with foveation
-                // or a render quality set aborts the app if the single-drawable query is used.
+            /// The frame's drawables, queried once: visionOS 26 hands a frame one drawable per
+            /// target (the built-in display, and a capture target while the view is recorded or
+            /// streamed); a layer with foveation or a render quality set aborts the app if the
+            /// single-drawable query is used.
+            private func queryDrawables() {
                 if #available(visionOS 26.0, *) {
                     drawables = frame.queryDrawables()
                 } else {
                     drawables = frame.queryDrawable().map { [$0] } ?? []
                 }
-                handedOut = Array(repeating: false, count: drawables.count)
+                presented = Array(repeating: false, count: drawables.count)
+                queried = true
+            }
+
+            func acquireEyes() -> [XREyes] {
+                // 9. The drawables, one target each.
+                queryDrawables()
                 // No drawables (shutdown/teardown, or the compositor cancelled the frame): the
                 // frame is already invalid and the loop must not end the drawing.
                 guard !drawables.isEmpty else { return [] }
@@ -742,7 +767,6 @@
 
                     // A drawable the scene is not drawn into is presented cleared at endDrawing.
                     guard source.drawsScene(into: drawable) else { continue }
-                    handedOut[index] = true
                     source.logDepthSetupOnce(drawable)
                     // A capture drawable (a recording or a stream of the view) is drawn from
                     // its own pose, so it must not advance the frame-to-frame state the
@@ -780,6 +804,7 @@
             func present(_ target: XREyes, commandBuffer: MTLCommandBuffer) {
                 let drawable = drawables[target.index]
                 drawable.encodePresent(commandBuffer: commandBuffer)
+                presented[target.index] = true
                 guard target.primary else { return }
 
                 // The instant the GPU must have finished by for the compositor to show this frame at
@@ -792,12 +817,45 @@
                 }
             }
 
+            /// Every drawable not presented is presented cleared, and the submission ended: the
+            /// compositor wants every drawable it handed out presented. A frame it gave no
+            /// drawables for was cancelled and must not be ended; a layer no longer running
+            /// reclaims its frames.
             func endDrawing() {
-                for (index, drawable) in drawables.enumerated() where !handedOut[index] {
+                guard !ended else { return }
+                ended = true
+                guard !drawables.isEmpty else { return }
+                for (index, drawable) in drawables.enumerated() where !presented[index] {
                     source.presentCleared(drawable)
                 }
                 guard source.layerRenderer.state == .running else { return }
                 frame.endSubmission()
+            }
+
+            /// A frame the loop lets go, ended so it does not stay taken (three taken and never
+            /// submitted abort the app): on a running layer the phases it missed are run, an
+            /// update of nothing and the submission, its drawables are queried if they were not,
+            /// and `endDrawing` presents them cleared and ends the submission. A layer that is
+            /// paused or gone reclaims its frames.
+            func release() {
+                guard !ended else { return }
+                guard source.layerRenderer.state == .running else {
+                    ended = true
+                    return
+                }
+                if !updateBegun {
+                    beginUpdate()
+                }
+                if !updateEnded {
+                    endUpdate()
+                }
+                if !submitting {
+                    _ = beginDrawing()
+                }
+                if !queried {
+                    queryDrawables()
+                }
+                endDrawing()
             }
         }
     }
