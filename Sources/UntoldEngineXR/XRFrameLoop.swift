@@ -160,22 +160,24 @@ public final class XRFrameLoop: @unchecked Sendable {
 
         // The compositor or app state can transition while waiting. If not running anymore,
         // skip submission entirely to avoid using an invalid frame.
-        #if ENGINE_STATS_ENABLED
-            let drawableWaitStart = CACurrentMediaTime()
-        #endif
         guard isRunning, frame.beginDrawing() else { return }
 
         // 8. The submission phase has begun
         #if ENGINE_STATS_ENABLED
             let xrSubmissionStart = CACurrentMediaTime()
-            // The frame's pacing, for its stages: the two waits on the presenter, for its
-            // drawing time and then for its drawables (Compositor Services hands both out at
-            // a fixed phase of the refresh), which are not the frame's work.
-            let xrPacingSeconds = xrWaitSeconds + (xrSubmissionStart - drawableWaitStart)
         #endif
 
         // 9. Encode any drawing commands that depend on the device position or orientation.
+        // The presenter may block here until its drawables are handed out (Compositor
+        // Services hands them out at a fixed phase of the refresh): with the wait for the
+        // drawing time above, that is the frame's pacing for its stages, not its work.
+        #if ENGINE_STATS_ENABLED
+            let drawableWaitStart = CACurrentMediaTime()
+        #endif
         let targets = frame.acquireEyes()
+        #if ENGINE_STATS_ENABLED
+            let xrPacingSeconds = xrWaitSeconds + (CACurrentMediaTime() - drawableWaitStart)
+        #endif
         guard !targets.isEmpty else {
             #if ENGINE_STATS_ENABLED
                 renderer.finalizeXRStatsAndMonitors(frameStartTime: xrFrameStartTime)
