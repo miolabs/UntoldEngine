@@ -715,8 +715,12 @@
                 #endif
             }
 
+            /// The submission begins whatever the layer's state, as in Apple's sample: a frame
+            /// taken from the compositor goes through its phases to the end, or the next query
+            /// asserts. A layer that pauses mid-frame (the Digital Crown, Control Center, a
+            /// system alert, the headset taken off) resumes with that frame still counted; a
+            /// layer that is gone gives no drawables, which ends the frame without a submission.
             func beginDrawing() -> Bool {
-                guard source.layerRenderer.state == .running else { return false }
                 // 8. Call startSubmission() to mark the start of submission phase
                 frame.startSubmission()
                 submitting = true
@@ -817,10 +821,12 @@
                 }
             }
 
-            /// Every drawable not presented is presented cleared, and the submission ended: the
-            /// compositor wants every drawable it handed out presented. A frame it gave no
-            /// drawables for was cancelled and must not be ended; a layer no longer running
-            /// reclaims its frames.
+            /// Every drawable not presented is presented cleared, and the submission ended,
+            /// whatever the layer's state (Apple's sample ends it unconditionally; a layer paused
+            /// mid-frame keeps the frame counted until it is ended, and the first query after
+            /// the resume asserted when the end was skipped): the compositor wants every
+            /// drawable it handed out presented. A frame it gave no drawables for was cancelled
+            /// and must not be ended.
             func endDrawing() {
                 guard !ended else { return }
                 ended = true
@@ -828,21 +834,16 @@
                 for (index, drawable) in drawables.enumerated() where !presented[index] {
                     source.presentCleared(drawable)
                 }
-                guard source.layerRenderer.state == .running else { return }
                 frame.endSubmission()
             }
 
-            /// A frame the loop lets go, ended so it does not stay taken (three taken and never
-            /// submitted abort the app): on a running layer the phases it missed are run, an
-            /// update of nothing and the submission, its drawables are queried if they were not,
-            /// and `endDrawing` presents them cleared and ends the submission. A layer that is
-            /// paused or gone reclaims its frames.
+            /// A frame the loop lets go, ended so it does not stay taken (a frame taken and never
+            /// ended makes the next query assert): the phases it missed are run, an update of
+            /// nothing and the submission, its drawables are queried if they were not (a layer
+            /// that is gone gives none, which is the end of a cancelled frame), and `endDrawing`
+            /// presents them cleared and ends the submission.
             func release() {
                 guard !ended else { return }
-                guard source.layerRenderer.state == .running else {
-                    ended = true
-                    return
-                }
                 if !updateBegun {
                     beginUpdate()
                 }
