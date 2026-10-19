@@ -50,9 +50,13 @@ public final class XRRealityKitPresenter {
     /// map's physical size within it.
     public let textureSize: SIMD2<Int>
     public let unproject: XRGridUnprojectPass
-    /// The unprojection's scratch per eye (each vertex's nearest depth, between its two
-    /// dispatches), kept across frames: the tickets' command buffers run in order on one queue.
-    public let nearestDepthBuffers: [MTLBuffer]
+    /// The unprojection's scratch per eye (each vertex's nearest depth between its dispatches,
+    /// the depth's block maxima, the scan list), kept across frames: the tickets' command
+    /// buffers run in order on one queue.
+    public let unprojectScratch: [XRGridUnprojectScratch]
+    /// Each eye's entries of the unprojection: one float4 per vertex, the chosen texel's depth,
+    /// the texel and the rim flag.
+    public var nearestDepthBuffers: [MTLBuffer] { unprojectScratch.map(\.nearestDepths) }
     /// Whether the grids show through the shader graph (each eye its own grid) or the fallback
     /// material (both grids in both eyes).
     public private(set) var usesShaderGraphMaterial = false
@@ -134,11 +138,11 @@ public final class XRRealityKitPresenter {
             return texture
         }
 
-        nearestDepthBuffers = try (0 ..< stereoEyeCount).map { eye in
-            guard let buffer = XRGridUnprojectPass.makeNearestDepthBuffer(device: device, grid: grid, label: "XR presenter nearest depth eye \(eye)") else {
+        unprojectScratch = try (0 ..< stereoEyeCount).map { eye in
+            guard let scratch = XRGridUnprojectScratch(device: device, grid: grid, textureSize: textureSize, label: "XR presenter eye \(eye)") else {
                 throw PresenterError.nearestDepthBuffer
             }
-            return buffer
+            return scratch
         }
 
         let meshes = try (0 ..< stereoEyeCount).map { _ in try grid.makeMesh(farShell: configuration.farShellMetres) }

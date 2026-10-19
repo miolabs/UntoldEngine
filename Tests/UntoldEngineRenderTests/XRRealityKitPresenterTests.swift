@@ -466,9 +466,16 @@ final class XRGridUnprojectTests: XCTestCase {
         }
     }
 
-    /// The scratch buffer of the two dispatches, readable by the test.
-    private func makeNearestDepthBuffer(grid: XRPresenterGrid) throws -> MTLBuffer {
-        try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared))
+    /// The scratch of the dispatches for `grid` and a depth of `textureSize`, readable by the test.
+    private func makeScratch(grid: XRPresenterGrid, textureSize: SIMD2<Int>) throws -> XRGridUnprojectScratch {
+        try XCTUnwrap(XRGridUnprojectScratch(device: device, grid: grid, textureSize: textureSize, options: .storageModeShared, label: "test"))
+    }
+
+    /// The block buffer's contents, row by row.
+    private func readBlockNearestDepths(_ buffer: MTLBuffer, textureSize: SIMD2<Int>) -> [Float] {
+        let count = XRGridUnprojectPass.blockCount(textureSize: textureSize)
+        let raw = UnsafeRawBufferPointer(start: buffer.contents(), count: buffer.length)
+        return (0 ..< count.x * count.y).map { raw.load(fromByteOffset: $0 * MemoryLayout<Float>.stride, as: Float.self) }
     }
 
     /// The third dispatch's rule, in Swift: whether a cell is split along the other diagonal
@@ -507,20 +514,20 @@ final class XRGridUnprojectTests: XCTestCase {
         let projection = configuration.projection
         let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
         try drawDepth(into: depthTexture, projection: projection)
-        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
         let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
         // The eye one metre up and half a metre to the right of the origin, looking straight ahead.
         let originFromEye = matrix4x4Translation(0.5, 1, 0)
 
         let pass = try XRGridUnprojectPass(device: device)
         let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
-        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, grid: grid, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels)
+        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         XCTAssertEqual(commandBuffer.status, .completed)
 
         let result = readVertices(vertices, grid: grid)
-        let nearest = readNearestDepths(nearestDepths, grid: grid)
+        let nearest = readNearestDepths(scratch.nearestDepths, grid: grid)
         let inverseProjection = simd_inverse(projection)
         // The projective uv of every vertex: its uv times its own eye-space depth, which is the
         // depth of its position seen from the eye (affine in the point, so RealityKit's
@@ -681,7 +688,7 @@ final class XRGridUnprojectTests: XCTestCase {
         XCTAssertFalse(rowCovered.contains(false), "every texel row is in some vertex's footprint")
 
         let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
-        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
         let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
         let pass = try XRGridUnprojectPass(device: device)
         let lineDistance: Float = 1
@@ -699,10 +706,10 @@ final class XRGridUnprojectTests: XCTestCase {
             let line = Line(column: texel < textureSize.x ? Int32(texel) : -1, row: texel < textureSize.y ? Int32(texel) : -1, depth: lineDepth)
             try drawDepth(into: depthTexture, projection: projection, line: line)
             let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
-            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, grid: grid, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
+            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
-            let nearest = readNearestDepths(nearestDepths, grid: grid)
+            let nearest = readNearestDepths(scratch.nearestDepths, grid: grid)
             let result = readVertices(vertices, grid: grid)
 
             for index in 0 ..< grid.vertexCount {
@@ -748,17 +755,17 @@ final class XRGridUnprojectTests: XCTestCase {
         let projection = configuration.projection
         let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
         try drawDepth(into: depthTexture, projection: projection)
-        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
         let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
         let indices = try XCTUnwrap(device.makeBuffer(length: grid.indexCount * MemoryLayout<UInt32>.stride, options: .storageModeShared))
 
         let pass = try XRGridUnprojectPass(device: device)
         let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
-        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, indices: indices, grid: grid, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
+        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, indices: indices, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        let entries = readNearestDepths(nearestDepths, grid: grid)
+        let entries = readNearestDepths(scratch.nearestDepths, grid: grid)
         let written = readIndices(indices, grid: grid)
         var fixedSplits = 0, otherSplits = 0, rimFixed = 0, rimOther = 0
         for row in 0 ..< grid.rows - 1 {
@@ -808,7 +815,7 @@ final class XRGridUnprojectTests: XCTestCase {
         let projection = configuration.projection
         let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
         try drawDepth(into: depthTexture, projection: projection)
-        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
         let vertexLength = grid.vertexCount * XRPresenterGrid.vertexStride
         let indexLength = grid.indexCount * MemoryLayout<UInt32>.stride
         let vertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModeShared))
@@ -821,7 +828,7 @@ final class XRGridUnprojectTests: XCTestCase {
         let pass = try XRGridUnprojectPass(device: device)
         func run(adaptiveDiagonal: Bool) throws {
             let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
-            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, indices: indices, bandVertices: bandVertices, bandIndices: bandIndices, grid: grid, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, adaptiveDiagonal: adaptiveDiagonal)
+            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, indices: indices, bandVertices: bandVertices, bandIndices: bandIndices, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, adaptiveDiagonal: adaptiveDiagonal)
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
             XCTAssertEqual(commandBuffer.status, .completed)
@@ -833,7 +840,7 @@ final class XRGridUnprojectTests: XCTestCase {
             Array(UnsafeRawBufferPointer(start: vertices.contents(), count: vertexLength)),
             "the band's vertices are the core's bytes"
         )
-        let entries = readNearestDepths(nearestDepths, grid: grid)
+        let entries = readNearestDepths(scratch.nearestDepths, grid: grid)
         let result = readVertices(vertices, grid: grid)
         let core = readIndices(indices, grid: grid)
         let band = readIndices(bandIndices, grid: grid)
@@ -906,6 +913,217 @@ final class XRGridUnprojectTests: XCTestCase {
             }
         }
         XCTAssertEqual(keptAgain, kept, "the fixed diagonal keeps the same cells")
+    }
+
+    /// The block dispatch on a depth whose size is no multiple of the block: a depth of 37 × 29
+    /// texels with a value of its own at every texel, so that a block's nearest depth is
+    /// exactly one texel's and a block read one texel wide of its bounds, or one short, shows.
+    /// Every block's entry is the largest depth of the texels it covers, the blocks of the last
+    /// column and row covering the texels left there alone.
+    func test_theBlockDispatch_writesEachBlocksNearestDepth_theEdgeBlocksCutToTheTexture() throws {
+        let textureSize = SIMD2<Int>(37, 29)
+        let grid = XRPresenterGrid(columns: 5, rows: 4)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
+        let count = XRGridUnprojectPass.blockCount(textureSize: textureSize)
+        XCTAssertEqual(count, SIMD2<Int>(5, 4), "five blocks of eight cover 37 texels, four cover 29")
+        XCTAssertEqual(XRGridUnprojectPass.blockCount(textureSize: [1920, 1824]), SIMD2<Int>(240, 228))
+        XCTAssertEqual(XRGridUnprojectPass.blockCount(textureSize: [256, 192]), SIMD2<Int>(32, 24))
+        XCTAssertEqual(scratch.blockNearestDepths.length, 20 * MemoryLayout<Float>.stride)
+        XCTAssertEqual(scratch.scanList.length, XRGridUnprojectPass.scanListHeaderLength + grid.vertexCount * MemoryLayout<UInt32>.stride)
+        func depthOf(_ x: Int, _ y: Int) -> Float {
+            // A depth of its own per texel, in (0.05, 0.95), scattered so neighbours differ.
+            0.05 + 0.9 * Float((x * 7919 + y * 104_729 + x * y * 31) % 1009) / 1008
+        }
+        var depths = [Float](repeating: 0, count: textureSize.x * textureSize.y)
+        for y in 0 ..< textureSize.y {
+            for x in 0 ..< textureSize.x {
+                depths[y * textureSize.x + x] = depthOf(x, y)
+            }
+        }
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        try drawDepths(depths, into: depthTexture)
+        let configuration = XRRealityKitPresenterConfiguration()
+        memset(scratch.blockNearestDepths.contents(), 0xFF, scratch.blockNearestDepths.length)
+        let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
+        let pass = try XRGridUnprojectPass(device: device)
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, originFromEye: matrix_identity_float4x4, projection: configuration.projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres)
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertEqual(commandBuffer.status, .completed)
+
+        let blocks = readBlockNearestDepths(scratch.blockNearestDepths, textureSize: textureSize)
+        for blockRow in 0 ..< count.y {
+            for blockColumn in 0 ..< count.x {
+                var expected: Float = 0
+                for y in blockRow * 8 ..< min(blockRow * 8 + 8, textureSize.y) {
+                    for x in blockColumn * 8 ..< min(blockColumn * 8 + 8, textureSize.x) {
+                        expected = max(expected, depthOf(x, y))
+                    }
+                }
+                XCTAssertEqual(blocks[blockRow * count.x + blockColumn], expected, "block \(blockColumn),\(blockRow) holds the nearest depth of its texels")
+            }
+        }
+        // The last column of blocks covers five texels, the last row five: cut, not read past.
+        XCTAssertEqual(blocks[4], (0 ..< 8).flatMap { y in (32 ..< 37).map { x in depthOf(x, y) } }.max())
+        XCTAssertEqual(blocks[3 * count.x], (24 ..< 29).flatMap { y in (0 ..< 8).map { x in depthOf(x, y) } }.max())
+    }
+
+    /// The fast path of the nearest-depth dispatch against the scan, on the two planes and the
+    /// hole: two frames, the first with a one-texel line a texel off a vertex column (which
+    /// pulls that column's vertices onto the line), the second without it (where the hysteresis
+    /// keeps them on the line's texel), each run twice from the same previous entries, once
+    /// with the fast path and once with every vertex scanned (flag bit 1). The entries, the
+    /// vertices, the core's indices and the band's are the same bytes either way, the
+    /// hysteresis included; and on the second frame most vertices, those on a plane or deep in
+    /// the hole, take the fast path, while the ones within two blocks of the seam and the hole's
+    /// rim scan.
+    func test_theFastPath_settlesMostVerticesOnThePlanes_andWritesTheScansBytes() throws {
+        let grid = XRPresenterGrid(columns: 33, rows: 25)
+        let textureSize = SIMD2<Int>(256, 192)
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.farShellMetres = 50
+        configuration.tearThresholdMetres = 0.9
+        let projection = configuration.projection
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
+        let vertexLength = grid.vertexCount * XRPresenterGrid.vertexStride
+        let indexLength = grid.indexCount * MemoryLayout<UInt32>.stride
+        let vertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModeShared))
+        let indices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModeShared))
+        let bandVertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModeShared))
+        let bandIndices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModeShared))
+        let pass = try XRGridUnprojectPass(device: device)
+        struct Frame {
+            var entries: [UInt8]
+            var vertices: [UInt8]
+            var indices: [UInt8]
+            var band: [UInt8]
+            var fast: Int
+            var scanned: Int
+        }
+        func run(fastPath: Bool, previousEntries: [UInt8]) throws -> Frame {
+            let nearestDepths = scratch.nearestDepths
+            previousEntries.withUnsafeBytes { nearestDepths.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            // The list filled with ones first, so that a frame that left it alone would show.
+            memset(scratch.scanList.contents(), 0xFF, scratch.scanList.length)
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, indices: indices, bandVertices: bandVertices, bandIndices: bandIndices, originFromEye: matrix4x4Translation(0.5, 1, 0), projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, fastPath: fastPath)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertEqual(commandBuffer.status, .completed)
+            let scanned = scratch.scannedVertexCount
+            // The listed vertices are distinct and within the grid.
+            let list = UnsafeRawBufferPointer(start: scratch.scanList.contents() + XRGridUnprojectPass.scanListHeaderLength, count: grid.vertexCount * MemoryLayout<UInt32>.stride)
+            let listed = (0 ..< min(scanned, grid.vertexCount)).map { Int(list.load(fromByteOffset: $0 * MemoryLayout<UInt32>.stride, as: UInt32.self)) }
+            XCTAssertEqual(Set(listed).count, listed.count, "each listed vertex once")
+            XCTAssertNil(listed.first { $0 >= grid.vertexCount }, "every listed vertex is in the grid")
+            return Frame(
+                entries: Array(UnsafeRawBufferPointer(start: nearestDepths.contents(), count: nearestDepths.length)),
+                vertices: Array(UnsafeRawBufferPointer(start: vertices.contents(), count: vertexLength)),
+                indices: Array(UnsafeRawBufferPointer(start: indices.contents(), count: indexLength)),
+                band: Array(UnsafeRawBufferPointer(start: bandIndices.contents(), count: indexLength)),
+                fast: grid.vertexCount - scanned,
+                scanned: scanned
+            )
+        }
+        func assertSameBytes(_ fast: Frame, _ scan: Frame, _ frame: String) {
+            XCTAssertEqual(fast.entries, scan.entries, "\(frame): the fast path writes the scan's entries, byte for byte")
+            XCTAssertEqual(fast.vertices, scan.vertices, "\(frame): the vertices")
+            XCTAssertEqual(fast.indices, scan.indices, "\(frame): the core's indices")
+            XCTAssertEqual(fast.band, scan.band, "\(frame): the band's indices")
+            XCTAssertEqual(scan.fast, 0, "\(frame): the flag sends every vertex to the scan")
+            XCTAssertEqual(scan.scanned, grid.vertexCount)
+        }
+
+        // Frame one: a vertical line a metre ahead at texel column 97, a texel past the centre
+        // texel (96) of vertex column 12, whose vertices land on it. The entries start as
+        // zeros: no previous frame.
+        let lineDistance: Float = 1
+        try drawDepth(into: depthTexture, projection: projection, line: Line(column: 97, depth: depth(ofDistance: lineDistance, projection: projection)))
+        let none = [UInt8](repeating: 0, count: scratch.nearestDepths.length)
+        let fastFirst = try run(fastPath: true, previousEntries: none)
+        let scanFirst = try run(fastPath: false, previousEntries: none)
+        assertSameBytes(fastFirst, scanFirst, "the frame with the line")
+        let firstEntries = readNearestDepths(scratch.nearestDepths, grid: grid)
+        for row in 0 ..< grid.rows {
+            XCTAssertEqual(firstEntries[row * grid.columns + 12].texel.x, 97, "vertex 12,\(row) lands on the line")
+        }
+
+        // Frame two: the line gone, the previous entries frame one's. The hysteresis keeps
+        // vertex column 12 on texel 97 (within a texel of its centre texel, and on the near
+        // plane now), through the fast path as through the scan.
+        try drawDepth(into: depthTexture, projection: projection)
+        let fastSecond = try run(fastPath: true, previousEntries: fastFirst.entries)
+        let scanSecond = try run(fastPath: false, previousEntries: fastFirst.entries)
+        assertSameBytes(fastSecond, scanSecond, "the frame after the line")
+        let secondEntries = readNearestDepths(scratch.nearestDepths, grid: grid)
+        let nearDepth = depth(ofDistance: Self.nearPlaneDistance, projection: projection)
+        var keptOnTheLinesTexel = 0
+        for row in 0 ..< grid.rows {
+            let entry = secondEntries[row * grid.columns + 12]
+            if entry.texel.x == 97, abs(entry.depth - nearDepth) < 1e-6 { keptOnTheLinesTexel += 1 }
+        }
+        XCTAssertGreaterThan(keptOnTheLinesTexel, 15, "the hysteresis keeps vertex column 12 on the line's texel, at the near plane's depth, away from the hole")
+        // A third frame from the second's entries: the same bytes still, and the same count.
+        let fastThird = try run(fastPath: true, previousEntries: fastSecond.entries)
+        let scanThird = try run(fastPath: false, previousEntries: fastSecond.entries)
+        assertSameBytes(fastThird, scanThird, "a steady frame")
+        XCTAssertEqual(fastThird.fast, fastSecond.fast)
+
+        // Most vertices take the fast path: the planes and the hole's middle. The scan is kept
+        // for the vertices whose blocks reach across the seam or the hole's rim: with blocks of
+        // 8 texels, those within about two blocks of either.
+        let fraction = Double(fastSecond.fast) / Double(grid.vertexCount)
+        print("XR presenter fast path: \(fastSecond.fast) of \(grid.vertexCount) vertices settled from the blocks on the two planes and the hole (\(String(format: "%.1f", fraction * 100)) %), \(fastSecond.scanned) scanned")
+        XCTAssertGreaterThan(fraction, 0.6, "most vertices sit on a plane or deep in the hole")
+        XCTAssertGreaterThan(fastSecond.scanned, 50, "the seam's and the rim's vertices scan")
+    }
+
+    /// The kernels' GPU time at the headset's size: the two planes and the hole drawn at
+    /// 1920 × 1824, the 256 × 240 grid, the edge band on and the fixed diagonal, as the headset
+    /// runs them; each frame a command buffer of its own holding the unprojection alone, timed by
+    /// the command buffer's GPU timestamps over 60 frames after four of warm-up, with the fast
+    /// path and with every vertex scanned (the dispatches as they were before the blocks, plus
+    /// the block dispatch). A measurement, printed: it asserts only that the frames complete and
+    /// that the fast path settles most of this scene's vertices. The Mac's milliseconds are not
+    /// the headset's, but a change's ratio carries over.
+    func test_theKernels_atTheHeadsetsSize_timedByGPUTimestamps() throws {
+        let configuration = XRRealityKitPresenterConfiguration()
+        let grid = XRPresenterGrid(columns: configuration.gridColumns, rows: configuration.gridRows)
+        let textureSize = configuration.textureSize
+        let projection = configuration.projection
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        try drawDepth(into: depthTexture, projection: projection)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
+        let vertexLength = grid.vertexCount * XRPresenterGrid.vertexStride
+        let indexLength = grid.indexCount * MemoryLayout<UInt32>.stride
+        let vertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModePrivate))
+        let bandVertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModePrivate))
+        let bandIndices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModePrivate))
+        let pass = try XRGridUnprojectPass(device: device)
+        func time(fastPath: Bool) throws -> (median: Double, mean: Double, min: Double) {
+            var milliseconds: [Double] = []
+            for frame in 0 ..< 64 {
+                let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+                pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, bandVertices: bandVertices, bandIndices: bandIndices, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, adaptiveDiagonal: false, fastPath: fastPath)
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                XCTAssertEqual(commandBuffer.status, .completed)
+                if frame >= 4 { milliseconds.append((commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1000) }
+            }
+            milliseconds.sort()
+            return (milliseconds[milliseconds.count / 2], milliseconds.reduce(0, +) / Double(milliseconds.count), milliseconds[0])
+        }
+        let scanned = try time(fastPath: false)
+        let fast = try time(fastPath: true)
+        // How many of the headset-sized grid's vertices the blocks settled on the last frame.
+        let settled = grid.vertexCount - scratch.scannedVertexCount
+        func format(_ t: (median: Double, mean: Double, min: Double)) -> String {
+            String(format: "median %.3f ms, mean %.3f ms, min %.3f ms", t.median, t.mean, t.min)
+        }
+        print("XR presenter kernels at \(textureSize.x)×\(textureSize.y), grid \(grid.columns)×\(grid.rows), 60 frames on \(device.name): every vertex scanned \(format(scanned)); fast path \(format(fast)); \(settled) of \(grid.vertexCount) vertices settled from the blocks (\(String(format: "%.1f", Double(settled) / Double(grid.vertexCount) * 100)) %)")
+        XCTAssertGreaterThan(Double(settled) / Double(grid.vertexCount), 0.8, "at the headset's size most of the two planes' vertices are settled from the blocks")
     }
 
     func test_theUniforms_haveTheKernelsLayout() {
@@ -1135,18 +1353,18 @@ final class XRGridUnprojectTests: XCTestCase {
         let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
         try drawDepths(depths, into: depthTexture)
 
-        let nearestDepths = try makeNearestDepthBuffer(grid: grid)
+        let scratch = try makeScratch(grid: grid, textureSize: textureSize)
         let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
         let originFromEye = matrix4x4Translation(0.5, 1, 0)
         let pass = try XRGridUnprojectPass(device: device)
         let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
-        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, nearestDepths: nearestDepths, vertices: vertices, grid: grid, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: 0, rateMapData: foveation.rateMapData, cellTexels: Float(foveation.cellTexels))
+        pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: 0, rateMapData: foveation.rateMapData, cellTexels: Float(foveation.cellTexels))
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         XCTAssertEqual(commandBuffer.status, .completed)
 
         let result = readVertices(vertices, grid: grid)
-        let nearest = readNearestDepths(nearestDepths, grid: grid)
+        let nearest = readNearestDepths(scratch.nearestDepths, grid: grid)
         let eyeFromOrigin = simd_inverse(originFromEye)
         var worstOffPlane: Float = 0, worstOffReference: Float = 0
         for row in 0 ..< grid.rows {

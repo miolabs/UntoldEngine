@@ -31,7 +31,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
 
     let mailbox: XRTicketMailbox
     let depthTextures: [MTLTexture]
-    let nearestDepthBuffers: [MTLBuffer]
+    let unprojectScratch: [XRGridUnprojectScratch]
     let unproject: XRGridUnprojectPass
     let grid: XRPresenterGrid
     let foveation: XRPresenterFoveation?
@@ -46,7 +46,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
     public init(presenter: XRRealityKitPresenter, pose: @escaping PoseProvider) {
         mailbox = presenter.mailbox
         depthTextures = presenter.depthTextures
-        nearestDepthBuffers = presenter.nearestDepthBuffers
+        unprojectScratch = presenter.unprojectScratch
         unproject = presenter.unproject
         grid = presenter.grid
         foveation = presenter.foveation
@@ -157,12 +157,11 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                     source.unproject.encode(
                         commandBuffer: commandBuffer,
                         depth: eye.depthTexture,
-                        nearestDepths: source.nearestDepthBuffers[index],
+                        scratch: source.unprojectScratch[index],
                         vertices: ticket.gridBuffers[index],
                         indices: ticket.settings.adaptiveDiagonal && index < ticket.indexBuffers.count ? ticket.indexBuffers[index] : nil,
                         bandVertices: index < ticket.bandBuffers.count ? ticket.bandBuffers[index] : nil,
                         bandIndices: index < ticket.bandIndexBuffers.count ? ticket.bandIndexBuffers[index] : nil,
-                        grid: source.grid,
                         originFromEye: simd_mul(originFromDevice, eye.deviceFromView),
                         projection: eye.projection,
                         farShell: source.configuration.farShellMetres,
