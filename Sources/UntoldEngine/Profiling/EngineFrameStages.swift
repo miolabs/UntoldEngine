@@ -117,6 +117,8 @@ public struct EngineFrameStageStats: Sendable, Equatable {
     /// worth knowing about, since on Compositor Services three frames taken and never
     /// submitted abort the app.
     public var letGo = 0
+    /// The same count since the stats began, so a frame let go a while ago still shows.
+    public var letGoTotal = 0
     /// Each stage's maximum over the span, milliseconds; the frames behind them may differ.
     public var cpuMsMax = 0.0
     public var waitMsMax = 0.0
@@ -144,8 +146,8 @@ public struct EngineFrameStageStats: Sendable, Equatable {
         if pastDeadline > 0 {
             line += " · \(pastDeadline) past the deadline"
         }
-        if letGo > 0 {
-            line += " · \(letGo) let go"
+        if letGoTotal > 0 {
+            line += " · \(letGo) let go (\(letGoTotal) in all)"
         }
         return line
     }

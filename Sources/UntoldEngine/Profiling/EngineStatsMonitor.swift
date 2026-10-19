@@ -61,6 +61,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         private var _spanStats = EngineFrameStageStats()
         private var _spanCompletions: [TimeInterval] = []
         private var _latestFrameStages = EngineFrameStageStats()
+        private var _letGoTotal = 0
     #endif
 
     /// The most completions kept for a span's late count (eleven minutes at 100 frames/s):
@@ -202,6 +203,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         /// the late count against it. Under the lock.
         private func frameStageSpanStats(endingAt end: Double) -> EngineFrameStageStats {
             var stats = _spanStats
+            stats.letGoTotal = _letGoTotal
             stats.seconds = max(0, end - (_spanStart ?? end))
             stats.framesBegun = _spanFramesBegun
             if _spanFramesBegun > 0, stats.seconds > 0 {
@@ -254,6 +256,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         #if ENGINE_STATS_ENABLED
             lock.lock()
             _spanStats.letGo += 1
+            _letGoTotal += 1
             lock.unlock()
         #endif
     }
@@ -365,6 +368,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             _spanStats = EngineFrameStageStats()
             _spanCompletions.removeAll(keepingCapacity: true)
             _latestFrameStages = EngineFrameStageStats()
+            _letGoTotal = 0
             lock.unlock()
         #endif
     }

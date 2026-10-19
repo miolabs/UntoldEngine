@@ -364,10 +364,11 @@ final class EngineStatsMonitorTests: XCTestCase {
         XCTAssertEqual(stages.worstFrame, EngineFrameStages(cpu: 0.0031, wait: 0.0092, gpu: 0.0043, pacing: 0.002), "the longest frame, with its own stages and its pacing")
         XCTAssertEqual(stages.pastDeadline, 1)
         XCTAssertEqual(stages.letGo, 1)
+        XCTAssertEqual(stages.letGoTotal, 1)
         XCTAssertEqual(stages.framesBegun, 1, "one frame begun in the span: a refresh of a second, nothing late against it")
         XCTAssertEqual(stages.refreshMs, 1000, accuracy: 1e-9)
         XCTAssertEqual(stages.lateFrames, 0)
-        XCTAssertEqual(stages.description, "gpu span max 6.0 ms · late 0 of 3 (refresh 1000.0 ms) · worst 16.6 = cpu 3.1 + wait 9.2 + gpu 4.3 · 1 past the deadline · 1 let go")
+        XCTAssertEqual(stages.description, "gpu span max 6.0 ms · late 0 of 3 (refresh 1000.0 ms) · worst 16.6 = cpu 3.1 + wait 9.2 + gpu 4.3 · 1 past the deadline · 1 let go (1 in all)")
 
         let compact = formatEngineStatsCompact(getEngineStatsSnapshot())
         XCTAssertTrue(compact.hasSuffix(" | " + stages.description), compact)
