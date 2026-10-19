@@ -16,8 +16,12 @@ import QuartzCore
 /// counter sample buffer the frame's command buffer carries: a render pass at the start and
 /// end of its vertex stage and of its fragment stage, a compute or blit pass at its bounds.
 /// The buffer is resolved when the command buffer completes, and each pass's time is averaged
-/// over the recent frames (the same label twice in a frame, one per eye, is summed). Off by
-/// default: `setRendering(.gpuPassTiming(.enabled))`. Nothing is measured on a GPU without
+/// over the recent frames (the same label twice in a frame, one per eye, is summed). The
+/// frame's busy time (`busy()`) is the union of its stages' spans: the GPU's time on the
+/// frame's own passes, which leaves out the gaps inside the command buffer's span where the
+/// GPU ran something else (another process's work: on a headset, the compositor's and the
+/// system's), where the span (`gpuEndTime - gpuStartTime`) counts them. Off by default:
+/// `setRendering(.gpuPassTiming(.enabled))`. Nothing is measured on a GPU without
 /// stage-boundary sampling, and `averages()` stays empty.
 public final class GPUPassTiming: @unchecked Sendable {
     public static let shared = GPUPassTiming()
@@ -63,6 +67,8 @@ public final class GPUPassTiming: @unchecked Sendable {
     private var averageTimes: [String: (vertex: Double, fragment: Double)] = [:]
     private var lastFrameTimes: [String: (vertex: Double, fragment: Double)] = [:]
     private var lastFrameIndex = 0
+    private var lastFrameBusyMs = 0.0
+    private var averageBusyMs: Double?
     private var warnedUnsupported = false
 
     // GPU ticks to seconds, from two readings of the device's clocks far enough apart.
@@ -84,9 +90,44 @@ public final class GPUPassTiming: @unchecked Sendable {
         if !enabled {
             averageTimes = [:]
             lastFrameTimes = [:]
+            lastFrameBusyMs = 0
+            averageBusyMs = nil
             encoding = nil
         }
         lock.unlock()
+    }
+
+    /// The GPU's time on the frame's own passes, in milliseconds: the union of the timed
+    /// stages' spans, for the last resolved frame and averaged over the recent frames. Zero
+    /// when off, or until a frame has been resolved.
+    public func busy() -> (lastFrameMs: Double, averageMs: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (lastFrameBusyMs, averageBusyMs ?? 0)
+    }
+
+    /// The union of `intervals` (each a start and an end in GPU ticks, end not before start),
+    /// in milliseconds: overlapping and touching intervals count once, as the stages of
+    /// consecutive passes overlap on the GPU.
+    static func unionMilliseconds(of intervals: [(start: UInt64, end: UInt64)], msPerTick: Double) -> Double {
+        var total: UInt64 = 0
+        var current: (start: UInt64, end: UInt64)?
+        for interval in intervals.sorted(by: { $0.start < $1.start }) where interval.end >= interval.start {
+            guard let open = current else {
+                current = interval
+                continue
+            }
+            if interval.start > open.end {
+                total += open.end - open.start
+                current = interval
+            } else if interval.end > open.end {
+                current = (open.start, interval.end)
+            }
+        }
+        if let open = current {
+            total += open.end - open.start
+        }
+        return Double(total) * msPerTick
     }
 
     /// The last resolved frame's passes, heaviest first, with a number that changes with each
@@ -276,12 +317,17 @@ public final class GPUPassTiming: @unchecked Sendable {
         guard let first = valid.min(), let last = valid.max(), last > first else { return }
         let msPerTick = (secondsPerTick ?? (gpuSeconds / Double(last - first))) * 1000.0
 
-        func span(_ start: Int, _ end: Int) -> Double {
+        func interval(_ start: Int, _ end: Int) -> (start: UInt64, end: UInt64)? {
             let a = stamps[start], b = stamps[end]
-            guard a != MTLCounterErrorValue, b != MTLCounterErrorValue, a != 0, b != 0, b >= a else { return 0 }
-            return Double(b - a) * msPerTick
+            guard a != MTLCounterErrorValue, b != MTLCounterErrorValue, a != 0, b != 0, b >= a else { return nil }
+            return (a, b)
+        }
+        func span(_ start: Int, _ end: Int) -> Double {
+            guard let interval = interval(start, end) else { return 0 }
+            return Double(interval.end - interval.start) * msPerTick
         }
         var frameTimes: [String: (vertex: Double, fragment: Double)] = [:]
+        var intervals: [(start: UInt64, end: UInt64)] = []
         for pass in frame.passes {
             let vertex = pass.isRenderPass ? span(pass.firstSample, pass.firstSample + 1) : 0
             let fragment = pass.isRenderPass
@@ -289,7 +335,18 @@ public final class GPUPassTiming: @unchecked Sendable {
                 : span(pass.firstSample, pass.firstSample + 1)
             let before = frameTimes[pass.label] ?? (0, 0)
             frameTimes[pass.label] = (before.vertex + vertex, before.fragment + fragment)
+            if pass.isRenderPass {
+                if let vertex = interval(pass.firstSample, pass.firstSample + 1) {
+                    intervals.append(vertex)
+                }
+                if let fragment = interval(pass.firstSample + 2, pass.firstSample + 3) {
+                    intervals.append(fragment)
+                }
+            } else if let whole = interval(pass.firstSample, pass.firstSample + 1) {
+                intervals.append(whole)
+            }
         }
+        let busyMs = Self.unionMilliseconds(of: intervals, msPerTick: msPerTick)
 
         lock.lock()
         guard enabledFlag else {
@@ -298,7 +355,9 @@ public final class GPUPassTiming: @unchecked Sendable {
         }
         lastFrameTimes = frameTimes
         lastFrameIndex &+= 1
+        lastFrameBusyMs = busyMs
         let weight = Self.smoothing
+        averageBusyMs = averageBusyMs.map { $0 + (busyMs - $0) * weight } ?? busyMs
         for label in Set(averageTimes.keys).union(frameTimes.keys) {
             let now = frameTimes[label] ?? (0, 0)
             guard let old = averageTimes[label] else {

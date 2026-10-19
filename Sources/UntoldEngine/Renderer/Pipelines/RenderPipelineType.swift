@@ -74,6 +74,11 @@ public extension RenderPipelineType {
     static let taaPresent: RenderPipelineType = "taaPresent"
     /// The look pass that also presents the frame (look output, display colour, depth).
     static let lookPresent: RenderPipelineType = "lookPresent"
+    /// The look pass on a premultiplied frame (mixed immersion): a texel's alpha is its
+    /// coverage, and the grade and the tone map act on the colour behind it.
+    static let lookPremultiplied: RenderPipelineType = "lookPremultiplied"
+    /// `lookPresent` on a premultiplied frame.
+    static let lookPresentPremultiplied: RenderPipelineType = "lookPresentPremultiplied"
     static let smaaEdges: RenderPipelineType = "smaaEdges"
     static let smaaBlendWeights: RenderPipelineType = "smaaBlendWeights"
     static let smaaNeighborhood: RenderPipelineType = "smaaNeighborhood"

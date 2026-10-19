@@ -20,6 +20,12 @@ using namespace metal;
 // the layer holds nothing worth decoding and the divide would only amplify noise.
 constant float kSplatLayerAlphaFloor = 1e-4f;
 
+// The lowest coverage the look pass divides by to grade and tone-map the colour behind a
+// premultiplied texel's alpha (a mixed-immersion silhouette the multisample resolve partly
+// covers): below it the texel is as good as transparent and is left as it is, so a transparent
+// texel stays (0, 0, 0, 0) and no divide amplifies what is not there.
+constant float kCoverageAlphaFloor = 1e-3f;
+
 inline float3 splatSRGBToLinear(float3 color)
 {
     color = max(color, float3(0.0f));

@@ -333,6 +333,20 @@ func releaseQuarantinedComponents() {
     withExtendedLifetime(released) {}
 }
 
+/// Finishes the deferred destroys now, with their completions, for a caller that begins a new
+/// session after the loop that would have finished them at the start of a frame has ended (an
+/// XR space closed and opened again: the old session's reset must not run in the new one's
+/// first frame, where it would clear the new camera). Main thread, nothing rendering.
+public func finalizeDestroysNow() {
+    enforceRegistrationMainActor()
+    guard hasPendingDestroys else { return }
+    lockWorldAccessGate()
+    defer { unlockWorldAccessGate() }
+    finalizePendingDestroys()
+    hasPendingDestroys = false
+    needsFinalizeDestroys = false
+}
+
 func finalizePendingDestroys() {
     enforceRegistrationMainActor()
     ensureComponentCleanupHandlersRegistered()
