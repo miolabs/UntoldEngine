@@ -30,7 +30,10 @@ import UntoldEngine
 /// the configured pixel budget, and the grids a vertex every cell of physical texels. Under a
 /// render scale (`XRRealityKitPresenterConfiguration.renderScale`) the textures, the depth and
 /// the map's budget are the configured size times it, for more texels per degree than the
-/// display's pixels; the grids keep their vertex counts.
+/// display's pixels; the grids keep their vertex counts. Under the blended core
+/// (`XRRealityKitPresenterConfiguration.silhouette`) the grids take the band's blended graph
+/// with its depth write kept, and no band meshes or entities are made: the ticket carries no
+/// band buffers and the kernel's band pass is not encoded.
 ///
 /// With the pipeline two refreshes deep (`XRRealityKitPresenterConfiguration.pipelineDepth`),
 /// the textures, grids, band and entities above are made twice, as two sets the tickets
@@ -86,6 +89,9 @@ public final class XRRealityKitPresenter {
     /// Whether the grids show through the shader graph (each eye its own grid) or the fallback
     /// material (both grids in both eyes).
     public private(set) var usesShaderGraphMaterial = false
+    /// The silhouette in force: the configuration's, unless the blended core's graph could not
+    /// be loaded, when the shipped cut and band stand in.
+    public private(set) var silhouette: XRPresenterSilhouette = .cutAndBand
 
     /// The settings in force for the next frame: the configuration's to start with, changed
     /// while running as a game likes; each ticket carries a copy.
@@ -138,7 +144,8 @@ public final class XRRealityKitPresenter {
     /// Every cell degenerate: what the band's index buffers start from each frame, so that a
     /// frame that draws nothing (no pose, the stop path) leaves the band empty.
     private let degenerateIndices: MTLBuffer?
-    /// Whether the edge band's material loaded, so that the band can be drawn.
+    /// Whether the edge band's material loaded and its meshes were made, so that the band can
+    /// be drawn; never under the blended core, which has no band.
     public private(set) var hasEdgeBand = false
     /// Whether the edge band is drawn: it is there and the settings ask for it.
     public var drawsEdgeBand: Bool { hasEdgeBand && settings.edgeBlending }
@@ -210,18 +217,33 @@ public final class XRRealityKitPresenter {
             return scratch
         }
 
-        // The eye material once, for every set.
+        // The eye material once, for every set: the blended core's graph when the
+        // configuration asks for it (writing depth, no band), else the shipped core's; the
+        // blended core falls back to the shipped chain when its graph cannot be loaded.
         var graph: ShaderGraphMaterial?
-        do {
-            graph = try await XRPresenterMaterial.load()
-            usesShaderGraphMaterial = true
-        } catch {
-            Logger.logWarning(message: "XR presenter: the eye material could not be loaded (\(error)); both eyes see both grids")
+        var silhouette = configuration.silhouette
+        if silhouette == .blendedCore {
+            do {
+                graph = try await XRPresenterMaterial.loadBlended()
+                usesShaderGraphMaterial = true
+            } catch {
+                silhouette = .cutAndBand
+                Logger.logWarning(message: "XR presenter: the blended core's material could not be loaded (\(error)); the cut and band stand in")
+            }
         }
-        // The edge band's graph once, when the eye material loaded: a set whose band cannot
-        // be made has none, and the band is unavailable.
+        if graph == nil {
+            do {
+                graph = try await XRPresenterMaterial.load()
+                usesShaderGraphMaterial = true
+            } catch {
+                Logger.logWarning(message: "XR presenter: the eye material could not be loaded (\(error)); both eyes see both grids")
+            }
+        }
+        self.silhouette = silhouette
+        // The edge band's graph once, when the eye material loaded and the silhouette has a
+        // band: a set whose band cannot be made has none, and the band is unavailable.
         var edgeGraph: ShaderGraphMaterial?
-        if usesShaderGraphMaterial {
+        if usesShaderGraphMaterial, silhouette == .cutAndBand {
             do {
                 edgeGraph = try await XRPresenterMaterial.loadEdge()
             } catch {
@@ -267,8 +289,9 @@ public final class XRRealityKitPresenter {
 
             // The edge band: the grids' vertices again on meshes of its own, whose cells the
             // kernel keeps along silhouettes alone, blended over the opaque core; made whenever
-            // its graph loaded, enabled when the settings ask for it. Its meshes start with
-            // every cell degenerate, so the band draws nothing before its first frame.
+            // its graph loaded (never under the blended core), enabled when the settings ask
+            // for it. Its meshes start with every cell degenerate, so the band draws nothing
+            // before its first frame.
             var edges: [ModelEntity] = []
             var bands: [LowLevelMesh] = []
             if let edgeGraph {

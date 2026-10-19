@@ -191,6 +191,9 @@ let package = Package(
                 .copy("Resources/XRPresenter.usda"),
                 // The edge band's graph: the same without the alpha test, blended.
                 .copy("Resources/XRPresenterEdge.usda"),
+                // The blended core's graph: the band's, writing depth, the other eye's grid
+                // collapsed in the vertex stage.
+                .copy("Resources/XRPresenterBlended.usda"),
             ],
             swiftSettings: [
                 .define("ENGINE_STATS_ENABLED", .when(configuration: .debug)),

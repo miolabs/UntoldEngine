@@ -25,7 +25,8 @@ public struct XRPresenterSettings: Sendable, Equatable {
     /// next frame writes the fixed split back once.
     public var adaptiveDiagonal: Bool
     /// See `XRRealityKitPresenterConfiguration.edgeBlending`. Only when the band's material
-    /// loaded (`XRRealityKitPresenter.hasEdgeBand`).
+    /// loaded (`XRRealityKitPresenter.hasEdgeBand`), so never under the blended core, which
+    /// has no band (`XRRealityKitPresenterConfiguration.silhouette`).
     public var edgeBlending: Bool
     /// See `XRRealityKitPresenterConfiguration.leadSeconds`: the fixed lead.
     public var leadSeconds: TimeInterval

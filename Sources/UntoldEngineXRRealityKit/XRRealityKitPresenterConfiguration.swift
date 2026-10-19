@@ -122,8 +122,17 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// Whether a second entity per eye draws the grid again with the blended edge-band material
     /// over the opaque core, so that a silhouette's partly covered texels blend over the room
     /// instead of being cut by the alpha test at a texel boundary. Needs coverage in the frame's
-    /// alpha: the engine's MSAA modes leave it, FXAA and SMAA do not.
+    /// alpha: the engine's MSAA modes leave it, FXAA and SMAA do not. Under the `.cutAndBand`
+    /// silhouette only: the blended core has no band to turn on.
     public var edgeBlending = true
+    /// How a silhouette reaches the room: the shipped core cut by its alpha test with the edge
+    /// band blended over the cells along silhouettes (`.cutAndBand`, the default), or the
+    /// whole core blended with its depth still written and no band (`.blendedCore`), an
+    /// experiment for the headset (see the cases). Fixed when the presenter is made: the
+    /// grids' materials and the band's entities are made for it. The presenter's `silhouette`
+    /// says which is in force (the blended core falls back to the shipped one when its graph
+    /// cannot be loaded).
+    public var silhouette: XRPresenterSilhouette = .cutAndBand
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50
     /// An offset of both eyes' viewpoints on the device, metres, zero in use: a deliberate
@@ -210,6 +219,47 @@ public enum XRPresenterProjection {
             SIMD4<Float>((tangents.y - tangents.x) / width, (tangents.z - tangents.w) / height, zs, -1),
             SIMD4<Float>(0, 0, zs * far, 0)
         ))
+    }
+}
+
+/// How the RealityKit presenter draws a silhouette against the room
+/// (`XRRealityKitPresenterConfiguration.silhouette`).
+public enum XRPresenterSilhouette: String, Sendable, Equatable, CaseIterable {
+    /// The shipped chain: each eye's grid drawn opaque through an alpha test at 0.9 (a texel
+    /// shows only where its alpha is at least that), its depth written, with the edge band's
+    /// blended graph drawn on meshes of its own over the cells along silhouettes and depth
+    /// jumps (`edgeBlending`), so that a silhouette's partly covered texels blend over the room
+    /// where the cut would step texel by texel. On the Mac the band covers the cut to the
+    /// resampled texture's own floor (2026-10-19); on the headset the engine's cubes shimmer
+    /// beside a plain RealityKit cube that does not, through the same device render.
+    case cutAndBand
+    /// The experiment that answers it: each eye's grid drawn through the band's blended graph
+    /// itself (`XRPresenterBlended.usda`), with no alpha test anywhere along a silhouette, the
+    /// material's depth write kept on (`ShaderGraphMaterial.writesDepth`) so the grid still
+    /// occludes what RealityKit draws after it and what the system composites by the layer's
+    /// depth (Spatial Personas), and no band meshes made (`hasEdgeBand` is false). The whole
+    /// grid goes through RealityKit's transparent pass, which shades every cell at the
+    /// display's resolution once (the shipped core does too, under its alpha test); the band's
+    /// second pass is gone with the band. What the device renders differently from the Mac is
+    /// the suspect: the shipped cut rasterized without anti-aliasing under its foveated
+    /// render, and the texel staircase marching as the texture changes every frame; the
+    /// blended core removes the first and leaves the second. Its depth footprint is the
+    /// shipped chain's: the far shell, the skirt's texels and the triangles stretched across
+    /// a depth jump write depth at an opacity near 0 (the alpha test discarded them, a blend
+    /// cannot), so a RealityKit entity standing in the sliver beside a silhouette, between
+    /// the object and what lies behind it, is occluded there; the shipped band's cells blend
+    /// over the same texels and write the same depth (a shader graph material writes depth
+    /// unless told not to), the same 921 texels of a box behind the test's cubes hidden by
+    /// either chain on the Mac. The other eye's grid is collapsed in the vertex stage and
+    /// writes nothing.
+    case blendedCore
+
+    /// For a settings line.
+    public var label: String {
+        switch self {
+        case .cutAndBand: return "cut and band"
+        case .blendedCore: return "blended core"
+        }
     }
 }
 

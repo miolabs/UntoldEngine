@@ -19,7 +19,9 @@ private final class XRPresenterMaterialSentinel {}
 /// discards it for the other (a mono view shows the left eye's), an Unlit Surface with the
 /// post-process tone map off, and an opacity of the frame's alpha under a threshold of 0.9,
 /// so that what the engine left transparent shows the passthrough and only a silhouette's fully
-/// covered texels are opaque: the partly covered ones are the edge band's to blend.
+/// covered texels are opaque: the partly covered ones are the edge band's to blend. Under the
+/// blended core (`XRPresenterSilhouette.blendedCore`) the grid is shown with the band's
+/// blended graph itself, its depth write kept on, and no band (`XRPresenterBlended.usda`).
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 public enum XRPresenterMaterial {
     public static let primPath = "/Root/XRPresenterMaterial"
@@ -27,6 +29,11 @@ public enum XRPresenterMaterial {
     /// The edge band's graph: the same without the opacity threshold, blended (`XRPresenterEdge.usda`).
     public static let edgePrimPath = "/Root/XRPresenterEdgeMaterial"
     public static let edgeResourceName = "XRPresenterEdge"
+    /// The blended core's graph: the band's, with a geometry modifier that collapses the other
+    /// eye's grid so that it writes no depth (`XRPresenterBlended.usda`); loaded with
+    /// `writesDepth` on.
+    public static let blendedPrimPath = "/Root/XRPresenterBlendedMaterial"
+    public static let blendedResourceName = "XRPresenterBlended"
     public static let resourceExtension = "usda"
     /// The SwiftPM resource bundle of this target.
     public static let bundleName = "UntoldEngine_UntoldEngineXRRealityKit.bundle"
@@ -58,6 +65,15 @@ public enum XRPresenterMaterial {
     /// The edge band's graph as a material.
     public static func loadEdge() async throws -> ShaderGraphMaterial {
         try await load(resource: edgeResourceName, prim: edgePrimPath)
+    }
+
+    /// The blended core's graph as a material, writing depth: RealityKit leaves the depth
+    /// write off for a material that blends, and the grid must keep occluding what is drawn
+    /// after it and what the system composites by the layer's depth.
+    public static func loadBlended() async throws -> ShaderGraphMaterial {
+        var material = try await load(resource: blendedResourceName, prim: blendedPrimPath)
+        material.writesDepth = true
+        return material
     }
 
     private static func load(resource: String, prim: String) async throws -> ShaderGraphMaterial {

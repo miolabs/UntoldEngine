@@ -151,6 +151,21 @@ final class XRPresenterRenderScaleTests: XCTestCase {
     }
 }
 
+// MARK: - The silhouette
+
+/// The configuration's silhouette choice, without Metal: the shipped cut and band by default.
+final class XRPresenterSilhouetteTests: XCTestCase {
+    func test_theCutAndBand_isTheDefault_andTheCasesHaveLabels() {
+        let configuration = XRRealityKitPresenterConfiguration()
+        XCTAssertEqual(configuration.silhouette, .cutAndBand, "the shipped chain by default")
+        XCTAssertTrue(configuration.edgeBlending, "with its band on")
+        XCTAssertEqual(XRPresenterSilhouette.allCases, [.cutAndBand, .blendedCore])
+        XCTAssertEqual(XRPresenterSilhouette.cutAndBand.label, "cut and band")
+        XCTAssertEqual(XRPresenterSilhouette.blendedCore.label, "blended core")
+        XCTAssertEqual(XRPresenterSilhouette(rawValue: "blendedCore"), .blendedCore, "a launch argument's name")
+    }
+}
+
 // MARK: - The mailbox
 
 final class XRTicketMailboxTests: XCTestCase {
@@ -1555,6 +1570,24 @@ final class XRPresenterMaterialTests: XCTestCase {
         XCTAssertEqual(Set(material.parameterNames), [XRPresenterMaterial.colorTextureParameter, XRPresenterMaterial.eyeParameter])
     }
 
+    /// The blended core's graph: the band's parameters, its depth write on, both faces drawn.
+    /// (`writesDepth` reads true on every shader graph material as loaded, the band's too; the
+    /// blended core sets it all the same, and the box test below says what the depth does.)
+    func test_theBlendedGraph_loadsWithTheSameParameters_andWritesDepth() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("shader graph materials need macOS 15") }
+        let url = try XCTUnwrap(XRPresenterMaterial.resourceURL(XRPresenterMaterial.blendedResourceName), "the graph is in the target's resource bundle")
+        XCTAssertEqual(url.lastPathComponent, "XRPresenterBlended.usda")
+
+        let material = try await XRPresenterMaterial.loadBlended()
+        XCTAssertEqual(Set(material.parameterNames), [XRPresenterMaterial.colorTextureParameter, XRPresenterMaterial.eyeParameter])
+        XCTAssertTrue(material.writesDepth, "the blended core keeps the depth write on")
+        XCTAssertTrue(material.readsDepth)
+        XCTAssertEqual(material.faceCulling, .none)
+
+        let edge = try await XRPresenterMaterial.loadEdge()
+        print("XR presenter materials: the band's graph as loaded reads writesDepth \(edge.writesDepth); the blended core's \(material.writesDepth)")
+    }
+
     func test_theGraph_takesAnEyeAndATexture() async throws {
         guard #available(macOS 15.0, *) else { throw XCTSkip("shader graph materials need macOS 15") }
         var material = try await XRPresenterMaterial.load()
@@ -2087,11 +2120,11 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
     }
 
     /// RealityKit's picture of `presenter`'s grids from the picture pose through a 90° camera,
-    /// `size` pixels, linear rgba over an opaque black background. The materials load
-    /// asynchronously, with a placeholder in the meantime: the picture is read back when it stops
-    /// changing and shows something.
+    /// `size` pixels, linear rgba over an opaque black background, with `extras` in the scene
+    /// beside them. The materials load asynchronously, with a placeholder in the meantime: the
+    /// picture is read back when it stops changing and shows something.
     @available(macOS 15.0, *)
-    private func realityKitPicture(of presenter: XRRealityKitPresenter, size: SIMD2<Int>) async throws -> [Float] {
+    private func realityKitPicture(of presenter: XRRealityKitPresenter, size: SIMD2<Int>, extras: [Entity] = []) async throws -> [Float] {
         let configuration = presenter.configuration
         let rkRenderer = try RealityRenderer()
         rkRenderer.cameraSettings.isToneMappingEnabled = false
@@ -2101,7 +2134,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         camera.components.set(PerspectiveCameraComponent(near: configuration.nearPlane, far: configuration.farPlane, fieldOfViewInDegrees: 90))
         camera.transform = Transform(matrix: Self.picturePose)
         rkRenderer.activeCamera = camera
-        rkRenderer.entities.replaceAll([camera, presenter.root])
+        rkRenderer.entities.replaceAll([camera, presenter.root] + extras)
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: size.x, height: size.y, mipmapped: false)
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .shared
@@ -2526,6 +2559,194 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertTrue(cellsAgainstWholeGrid.isFinite)
         XCTAssertGreaterThan(cellsAgainstWholeGrid, 70, "the band's cells blend every texel the whole grid's band blended")
         XCTAssertGreaterThan(cellsAgainstEngine, 70, "RealityKit shows the engine's MSAA picture through the core and the band's cells")
+    }
+
+    /// The blended core (`silhouette = .blendedCore`): the grids take the blended graph with
+    /// its depth write on, no band is made (no band entities, no band buffers in the ticket,
+    /// `hasEdgeBand` false whatever the band setting says), and RealityKit's picture through
+    /// it is the engine's eye at the e2e threshold; under MSAA it is the shipped chain's
+    /// picture (the cut covered by the band equals the band alone on the Mac, as the straightness
+    /// measurements found), so what changes on the device is the device's rasterization of the
+    /// cut, not the Mac's picture.
+    func test_theBlendedCore_showsTheEnginesPicture_withNoBand_andItsGridsWriteDepth() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = Self.pictureConfiguration
+        configuration.silhouette = .blendedCore
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        let modeBefore = antiAliasingMode
+        setRendering(.antiAliasing(.msaa))
+        defer { setRendering(.antiAliasing(modeBefore)) }
+        try turnTheCubes()
+
+        let (presenter, engine, size) = try await drawEngineEye(configuration)
+        XCTAssertEqual(presenter.silhouette, .blendedCore, "the blended core's graph loaded")
+        XCTAssertFalse(presenter.hasEdgeBand, "no band under the blended core")
+        XCTAssertFalse(presenter.drawsEdgeBand)
+        presenter.settings.edgeBlending = true
+        XCTAssertFalse(presenter.drawsEdgeBand, "the band setting has nothing to turn on")
+        XCTAssertEqual(presenter.root.children.count, 2, "one grid entity per eye and nothing else")
+        XCTAssertTrue(presenter.bandMeshes.isEmpty)
+        let ticket = try XCTUnwrap(presenter.lastTicket)
+        XCTAssertTrue(ticket.bandBuffers.isEmpty, "the ticket carries no band buffers, so the kernel's band pass is not encoded")
+        XCTAssertTrue(ticket.bandIndexBuffers.isEmpty)
+        for entity in presenter.root.children.compactMap({ $0 as? ModelEntity }) {
+            let material = try XCTUnwrap(entity.model?.materials.first as? ShaderGraphMaterial, "\(entity.name) shows through the shader graph")
+            XCTAssertTrue(material.writesDepth, "\(entity.name) writes depth")
+            XCTAssertEqual(material.faceCulling, .none)
+        }
+        XCTAssertGreaterThan(coloured(engine, size: size), 1000, "the engine drew the cubes into the eye")
+        let partlyCovered = stride(from: 3, to: engine.count, by: 4).filter { engine[$0] > 0 && engine[$0] < 1 }.count
+        XCTAssertGreaterThan(partlyCovered, 50, "MSAA left partly covered texels along the cubes' silhouettes")
+
+        let blended = try await realityKitPicture(of: presenter, size: size)
+        XCTAssertGreaterThan(coloured(blended, size: size), 1000, "RealityKit drew the grids")
+        let againstEngine = peakSignalToNoise(blended, engine, size: size)
+
+        // The shipped chain's picture of the same frame's scene, for the comparison.
+        let (shipped, _, _) = try await drawEngineEye(Self.pictureConfiguration)
+        XCTAssertEqual(shipped.silhouette, .cutAndBand)
+        guard shipped.hasEdgeBand else { throw XCTSkip("the band's graph did not load") }
+        let cutAndBand = try await realityKitPicture(of: shipped, size: size)
+        let againstShipped = peakSignalToNoise(blended, cutAndBand, size: size)
+        print("RealityKit's picture through the blended core against the engine's MSAA eye: PSNR \(againstEngine) dB; against the shipped cut and band \(againstShipped) dB (\(partlyCovered) partly covered texels)")
+        try dumpPictures([("blended-core.png", blended, size), ("blended-core-shipped.png", cutAndBand, size), ("blended-core-engine.png", engine, size)])
+        XCTAssertTrue(againstEngine.isFinite)
+        XCTAssertGreaterThan(againstEngine, 70, "RealityKit shows the engine's picture through the blended core")
+        XCTAssertGreaterThan(againstShipped, 70, "the blended core is the shipped chain's picture on the Mac")
+    }
+
+    /// A box of one colour the size of the view, with no light on it, in RealityKit's
+    /// transparent pass (so that it is drawn where a sort group puts it, not first with the
+    /// opaque geometry), `behind` metres behind the cubes.
+    @available(macOS 15.0, *)
+    private func boxBehindTheCubes(order: Int32, group: ModelSortGroup) -> ModelEntity {
+        var material = UnlitMaterial(color: .init(red: 0, green: 1, blue: 0, alpha: 1))
+        material.blending = .transparent(opacity: 1.0)
+        let box = ModelEntity(mesh: .generateBox(width: 40, height: 40, depth: 0.1), materials: [material])
+        box.name = "Box behind the cubes"
+        box.position = [0, 0, -3]
+        box.components.set(ModelSortGroupComponent(group: group, order: order))
+        return box
+    }
+
+    /// Whether a pixel is the box's colour: the picture's top-left pixel's, where nothing but
+    /// the far shell, behind the box, lies (RealityKit maps the material's green into its
+    /// working colour space, so the picture's own reading of it is the reference).
+    private func isBox(_ pixels: [Float], _ index: Int) -> Bool {
+        (0 ..< 3).allSatisfy { abs(pixels[index * 4 + $0] - pixels[$0]) < 0.05 }
+    }
+
+    /// The texels where the eye's alpha is 0 and so is every texel within `margin`: the room
+    /// away from the cubes' silhouettes and their skirts.
+    private func roomTexels(_ engine: [Float], size: SIMD2<Int>, margin: Int) -> [Int] {
+        (0 ..< size.x * size.y).filter { index in
+            let x = index % size.x, y = index / size.x
+            for dy in -margin ... margin {
+                for dx in -margin ... margin {
+                    let sx = x + dx, sy = y + dy
+                    guard sx >= 0, sy >= 0, sx < size.x, sy < size.y else { continue }
+                    if engine[(sy * size.x + sx) * 4 + 3] > 0 { return false }
+                }
+            }
+            return true
+        }
+    }
+
+    /// The blended core writes depth: a RealityKit box behind the cubes, drawn after the grids
+    /// in the transparent pass (a sort group orders them), is hidden where the grid is opaque
+    /// (the cubes' fully covered texels: the grid's depth, written, rejects the box's
+    /// fragments there) and shows where the grid is transparent (the room: the far shell lies
+    /// behind the box). With the grids' depth write turned off the same box covers the cubes,
+    /// and with the left eye's grid gone the right eye's, collapsed in the vertex stage for a
+    /// mono camera, hides nothing: an invisible grid writes no depth. Around each cube the
+    /// box is hidden under a halo too: the skirt's texels and the near part of the triangles
+    /// stretched to the far shell write their depth at an opacity near 0 (the alpha test
+    /// discarded them; a blend cannot), so a RealityKit entity drawn after the grid, or
+    /// composited by the layer's depth, loses that sliver beside every silhouette; the halo
+    /// is counted and printed, with the shipped chain's own (its band blends too).
+    func test_theBlendedCore_writesDepth_aBoxBehindTheCubesIsHiddenWhereTheGridIsOpaque_andShowsWhereItIsTransparent() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = Self.pictureConfiguration
+        configuration.silhouette = .blendedCore
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        try turnTheCubes()
+        let (presenter, engine, size) = try await drawEngineEye(configuration)
+        guard presenter.silhouette == .blendedCore else { throw XCTSkip("the blended core's graph did not load") }
+        let pixels = size.x * size.y
+        let opaque = (0 ..< pixels).filter { engine[$0 * 4 + 3] >= 1 }
+        let transparent = (0 ..< pixels).filter { engine[$0 * 4 + 3] <= 0 }
+        // The room six texels and more from any covered texel: past the skirt (three texels)
+        // and the near part of a stretched cell (four texels here).
+        let room = roomTexels(engine, size: size, margin: 6)
+        XCTAssertGreaterThan(opaque.count, 1000, "the cubes cover texels fully")
+        XCTAssertGreaterThan(room.count, 10000, "the room is most of the eye")
+
+        let grids = presenter.root.children.compactMap { $0 as? ModelEntity }
+        XCTAssertEqual(grids.count, 2)
+        let group = ModelSortGroup()
+        for grid in grids {
+            grid.components.set(ModelSortGroupComponent(group: group, order: 0))
+        }
+        let box = boxBehindTheCubes(order: 1, group: group)
+
+        // The box drawn after the grids, which write depth.
+        let withDepth = try await realityKitPicture(of: presenter, size: size, extras: [box])
+        XCTAssertTrue(isBox(withDepth, 0) && withDepth[1] > 0.5, "the top-left pixel is the box's green, through the far shell behind it")
+        let boxOverOpaque = opaque.filter { isBox(withDepth, $0) }.count
+        let boxOverRoom = room.filter { isBox(withDepth, $0) }.count
+        let halo = transparent.filter { !isBox(withDepth, $0) }.count
+        var opaqueError = 0.0
+        for index in opaque {
+            for channel in 0 ..< 3 {
+                opaqueError = max(opaqueError, Double(abs(withDepth[index * 4 + channel] - engine[index * 4 + channel])))
+            }
+        }
+
+        // The same box over grids that write no depth: it covers the cubes.
+        for grid in grids {
+            guard var material = grid.model?.materials.first as? ShaderGraphMaterial else { continue }
+            material.writesDepth = false
+            grid.model?.materials = [material]
+        }
+        let withoutDepth = try await realityKitPicture(of: presenter, size: size, extras: [box])
+        let boxOverOpaqueWithoutDepth = opaque.filter { isBox(withoutDepth, $0) }.count
+        for grid in grids {
+            guard var material = grid.model?.materials.first as? ShaderGraphMaterial else { continue }
+            material.writesDepth = true
+            grid.model?.materials = [material]
+        }
+
+        // The right eye's grid alone (the left disabled): collapsed for the mono camera, it
+        // draws nothing and writes no depth, so the box shows whole.
+        let left = try XCTUnwrap(grids.first { !$0.name.contains("right") })
+        left.isEnabled = false
+        let otherEyeOnly = try await realityKitPicture(of: presenter, size: size, extras: [box])
+        left.isEnabled = true
+        let boxEverywhereOtherEye = (0 ..< pixels).filter { isBox(otherEyeOnly, $0) }.count
+
+        // The shipped chain's halo, for the comparison: its core's alpha test discards what
+        // the blend writes, and its band blends over the same texels.
+        let (shipped, _, _) = try await drawEngineEye(Self.pictureConfiguration)
+        let shippedGrids = shipped.root.children.compactMap { $0 as? ModelEntity }
+        for grid in shippedGrids {
+            grid.components.set(ModelSortGroupComponent(group: group, order: 0))
+        }
+        let shippedWithBox = try await realityKitPicture(of: shipped, size: size, extras: [box])
+        let shippedHalo = transparent.filter { !isBox(shippedWithBox, $0) }.count
+        let shippedBoxOverOpaque = opaque.filter { isBox(shippedWithBox, $0) }.count
+
+        print("XR presenter blended core, depth write: the box behind the cubes shows over \(boxOverOpaque) of \(opaque.count) opaque texels and \(boxOverRoom) of \(room.count) room texels six or more from the cubes (the opaque texels differ from the engine's by at most \(opaqueError)); hidden under a halo of \(halo) of the \(transparent.count) transparent texels (the shipped chain, band \(shipped.drawsEdgeBand ? "on" : "off"): \(shippedHalo), the box over \(shippedBoxOverOpaque) opaque texels); with the depth write off it covers \(boxOverOpaqueWithoutDepth) of the opaque texels; with the other eye's grid alone it fills \(boxEverywhereOtherEye) of \(pixels) pixels")
+        try dumpPictures([("blended-core-depth-box.png", withDepth, size), ("blended-core-depth-box-no-write.png", withoutDepth, size), ("blended-core-depth-box-other-eye.png", otherEyeOnly, size), ("blended-core-depth-box-shipped.png", shippedWithBox, size)])
+        XCTAssertEqual(boxOverOpaque, 0, "the grid's depth hides the box where the cubes are opaque")
+        XCTAssertLessThan(opaqueError, 0.02, "the cubes show over the hidden box as the engine drew them")
+        XCTAssertGreaterThan(boxOverRoom, room.count * 99 / 100, "the box shows through the room, where the grid is the far shell behind it")
+        XCTAssertGreaterThan(boxOverOpaqueWithoutDepth, opaque.count * 99 / 100, "without the depth write the box, drawn after, covers the cubes")
+        XCTAssertEqual(boxEverywhereOtherEye, pixels, "the other eye's grid, collapsed, writes no depth")
+        XCTAssertEqual(shippedBoxOverOpaque, 0, "the shipped core's depth hides the box under the cubes too")
     }
 
     private enum PictureError: Swift.Error { case stalled(String) }
