@@ -25,7 +25,15 @@
 # covered texels are opaque here: the partly covered ones (the anti-aliasing's coverage,
 # quarter steps under MSAA) are left to the edge band (XRPresenterEdge.usda), which blends
 # them over the room; at 0.5 the core took every texel covered by half or more and the band
-# had nothing but a quarter-strength fringe to add, invisible. The cut is at an epsilon rather than at 0.5 because the mask
+# had nothing but a quarter-strength fringe to add, invisible. Measured on a Mac
+# (XRPresenterEdgeStraightnessTests: a top face seen as a sliver, its far edge crossing the
+# rows at a shallow slope, RealityKit's picture magnified), the edge through this cut and the
+# band deviates 0.066 texel rms about a line, the texture's own coverage 0.074 (the quarter
+# steps of 4x MSAA) and its staircase read as a hard edge 0.29; the cut alone, without the
+# band, 0.22. Cuts of 0.5, 0.25 and 0.1 read 0.09, 0.13 and 0.22 and grow the object over the
+# room by 0.2 to 0.6 texel; the band at twice the coverage 0.12, at full weight 0.30 with a
+# 0.9-texel halo. So the cut stays at 0.9 and the band at the coverage.
+# The stretch cut is at an epsilon rather than at 0.5 because the mask
 # is interpolated linearly in distance along the stretched triangle, whose midpoint lies far
 # behind the object: in a view shifted from the eye it was drawn for, the visible part of the
 # stretch is its first metre.
