@@ -51,6 +51,14 @@
             runtime.currentDevicePose
         }
 
+        /// The headset's pose predicted for `presentationTime`: the instant the frame being
+        /// updated is posed for (`frameTime.presentationTime` inside the game's update), so
+        /// that something a game places on the head sits where the frame's eyes look. The
+        /// most recent pose while the prediction has no answer; nil before tracking runs.
+        public func devicePose(forPresentationAt presentationTime: TimeInterval) -> simd_float4x4? {
+            runtime.devicePose(predictedFor: presentationTime)
+        }
+
         /// Frames whose drawable's presentation time differed from the one predicted at the
         /// update: the game posed those frames for a slightly different instant than the head.
         public var presentationTimeRevisions: Int { compositor?.presentationTimeRevisions ?? 0 }

@@ -42,8 +42,24 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// eyes' places, so they sit a nominal half distance to each side of the device.
     public var interpupillaryDistance: Float = 0.063
     /// Seconds the frame is posed ahead of the moment its ticket is taken: an estimate of when
-    /// RealityKit shows it (two refresh periods at 90 Hz to start; stage 3 makes it adaptive).
+    /// RealityKit shows it (two refresh periods at 90 Hz), the fixed lead. With `adaptiveLead`
+    /// the lead is measured instead and this is what it falls back on until a frame has
+    /// completed (`XRPresenterLead`).
     public var leadSeconds: TimeInterval = 2.0 / 90.0
+    /// Whether the frame's lead follows the measured latency instead of `leadSeconds`: the
+    /// ticket's age at pickup, plus the engine's frame (from the pickup to the ticket's command
+    /// buffer completing on the GPU, averaged over the last frames), plus
+    /// `displayLatencySeconds`. Off by default until the headset has judged it against the
+    /// fixed lead; both are there at run time through `XRPresenterSettings`.
+    public var adaptiveLead = false
+    /// Seconds from a frame's command buffer completing to its display, the part of the
+    /// adaptive lead only the headset can calibrate: RealityKit noticing the replace, its own
+    /// frame and the compositor's. 16 ms to start: the fixed lead (22.2 ms) less the frame's
+    /// measured latency on the headset in Release (2026-10-19: age 0.03 ms, CPU 2.8 ms, GPU
+    /// 3.6 ms), rounded, so that the two leads agree at those numbers. Calibrate on the
+    /// headset with the adaptive lead on: a head-locked marker that lags a head turn wants a
+    /// longer latency, one that leads wants a shorter.
+    public var displayLatencySeconds: TimeInterval = 0.016
     /// The near plane of the eyes' projection, metres.
     public var nearPlane: Float = 0.05
     /// The far plane of the eyes' projection, metres: depth 0 under reverse Z.
