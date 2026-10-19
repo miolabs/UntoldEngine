@@ -11,7 +11,7 @@
 import Foundation
 
 /// The presenter's settings a game may change while it runs: the grids' depth rules, the edge
-/// band and the frame's lead. The presenter starts from its configuration's values; each ticket
+/// band and the frame's lead (fixed or measured). The presenter starts from its configuration's values; each ticket
 /// carries the values in force when it was posted, so the engine's thread reads a frame's
 /// settings from its ticket and never from the presenter. What needs the grids or textures made
 /// again (their sizes) stays in the configuration.
@@ -26,8 +26,12 @@ public struct XRPresenterSettings: Sendable, Equatable {
     /// See `XRRealityKitPresenterConfiguration.edgeBlending`. Only when the band's material
     /// loaded (`XRRealityKitPresenter.hasEdgeBand`).
     public var edgeBlending: Bool
-    /// See `XRRealityKitPresenterConfiguration.leadSeconds`.
+    /// See `XRRealityKitPresenterConfiguration.leadSeconds`: the fixed lead.
     public var leadSeconds: TimeInterval
+    /// See `XRRealityKitPresenterConfiguration.adaptiveLead`.
+    public var adaptiveLead: Bool
+    /// See `XRRealityKitPresenterConfiguration.displayLatencySeconds`.
+    public var displayLatencySeconds: TimeInterval
 
     public init(configuration: XRRealityKitPresenterConfiguration = .init()) {
         skirtTexels = configuration.skirtTexels
@@ -35,5 +39,7 @@ public struct XRPresenterSettings: Sendable, Equatable {
         adaptiveDiagonal = configuration.adaptiveDiagonal
         edgeBlending = configuration.edgeBlending
         leadSeconds = configuration.leadSeconds
+        adaptiveLead = configuration.adaptiveLead
+        displayLatencySeconds = configuration.displayLatencySeconds
     }
 }

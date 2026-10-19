@@ -1566,6 +1566,10 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertGreaterThanOrEqual(statistics.framesDrawn, 6)
         XCTAssertEqual(statistics.posesMissing, 0)
         XCTAssertGreaterThan(statistics.gpuMsMax, 0, "the frames' GPU spans were noted")
+        XCTAssertGreaterThan(statistics.leadMsAverage, 0, "each frame's lead was noted")
+        XCTAssertGreaterThan(statistics.completionMsMax, 0, "the frames' times to completion were noted on the GPU's completion")
+        XCTAssertGreaterThan(source.lead.framesNoted, 0, "and entered the adaptive lead's average")
+        XCTAssertGreaterThan(try XCTUnwrap(source.lead.frameSecondsAverage), 0)
 
         // The eyes were drawn with the presenter's eyes: a half eye distance to each side.
         let halfDistance = configuration.interpupillaryDistance / 2
@@ -1673,12 +1677,16 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         presenter.settings.skirtTexels = 0
         presenter.settings.tearThresholdMetres = 0.9
         presenter.settings.leadSeconds = 0.01
+        presenter.settings.adaptiveLead = true
+        presenter.settings.displayLatencySeconds = 0.012
         let split = try nextTicket()
         XCTAssertEqual(split.indexBuffers.count, 2)
         XCTAssertTrue(split.settings.adaptiveDiagonal)
         XCTAssertEqual(split.settings.skirtTexels, 0)
         XCTAssertEqual(split.settings.tearThresholdMetres, 0.9)
         XCTAssertEqual(split.settings.leadSeconds, 0.01)
+        XCTAssertTrue(split.settings.adaptiveLead)
+        XCTAssertEqual(split.settings.displayLatencySeconds, 0.012)
         let fixed = presenter.grid.indices()
         var flipped = fixed
         for cell in stride(from: 0, to: fixed.count, by: 6) {
@@ -1738,6 +1746,67 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
                 XCTAssertEqual(indices(of: mesh), presenter.grid.degenerateIndices(), "a frame that draws nothing leaves the band empty")
             }
         }
+        presenter.stop()
+    }
+
+    /// Each frame is posed for its ticket's posting plus the lead: the fixed lead past the
+    /// pickup, or, when the ticket's settings ask for it and frames have completed, the
+    /// measured one; the leads in force reach the statistics.
+    func test_theFrame_isPosedForItsTicketsPostingPlusTheLead_fixedOrMeasured() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.textureSize = [64, 48]
+        configuration.gridColumns = 5
+        configuration.gridRows = 4
+        configuration.leadSeconds = 0.02
+        configuration.displayLatencySeconds = 0.012
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        let source = RealityKitFrameSource(presenter: presenter) { _ in matrix4x4Translation(0, 0, 5) }
+        presenter.start(commandQueue: renderInfo.commandQueue)
+
+        func nextFrameLead() throws -> TimeInterval {
+            // No loop: the test takes the frames itself; a frame let go commits its command buffer.
+            presenter.update()
+            let ticket = try XCTUnwrap(presenter.lastTicket)
+            let frame = try XCTUnwrap(source.nextFrame())
+            let lead = frame.timing.presentationTime - ticket.postedAt
+            XCTAssertLessThan(lead, 0.1, "no frame is posed further ahead than the lead's range")
+            return lead
+        }
+
+        // Fixed: `leadSeconds` past the pickup, which comes after the posting.
+        let fixed = try nextFrameLead()
+        XCTAssertGreaterThanOrEqual(fixed, 0.02)
+        XCTAssertNil(source.lead.frameSecondsAverage, "nothing was drawn: no frame completed")
+
+        // Adaptive with no frame completed: the fixed lead still.
+        presenter.settings.adaptiveLead = true
+        let early = try nextFrameLead()
+        XCTAssertGreaterThanOrEqual(early, 0.02)
+        XCTAssertLessThan(early, 0.02 + 0.01, "the fixed lead plus the ticket's age at pickup, microseconds here")
+
+        // Frames completed, as the GPU's completion notes them: the lead follows the average
+        // frame plus the display latency, past the ticket's age.
+        source.noteFrameCompleted(seconds: 0.006)
+        source.noteFrameCompleted(seconds: 0.006)
+        XCTAssertEqual(try XCTUnwrap(source.lead.frameSecondsAverage), 0.006, accuracy: 1e-9)
+        XCTAssertEqual(source.lead.framesNoted, 2)
+        let measured = try nextFrameLead()
+        XCTAssertGreaterThanOrEqual(measured, 0.018)
+        XCTAssertLessThan(measured, 0.018 + 0.01)
+
+        // Back to the fixed lead on the next ticket; the frames seen stay for the next time.
+        presenter.settings.adaptiveLead = false
+        let fixedAgain = try nextFrameLead()
+        XCTAssertGreaterThanOrEqual(fixedAgain, 0.02)
+        XCTAssertEqual(source.lead.framesNoted, 2)
+
+        let numbers = presenter.statistics.snapshot()
+        XCTAssertEqual(numbers.framesDrawn, 4, "four tickets taken")
+        XCTAssertEqual(numbers.leadMsMax, max(fixed, early, measured, fixedAgain) * 1000, accuracy: 1e-6, "the leads in force reached the statistics")
+        XCTAssertEqual(numbers.leadMsAverage, (fixed + early + measured + fixedAgain) / 4 * 1000, accuracy: 1e-6)
+        XCTAssertEqual(numbers.completionMsAverage, 6, accuracy: 1e-9, "and the frames' times to completion")
         presenter.stop()
     }
 

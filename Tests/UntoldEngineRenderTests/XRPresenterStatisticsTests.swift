@@ -14,7 +14,8 @@ import UntoldEngineXRRealityKit
 import XCTest
 
 /// The presenter's numbers line names what makes its GPU span mean something: the engine's
-/// own busy time beside the span, and the device's thermal state.
+/// own busy time beside the span, and the device's thermal state; and it carries the lead in
+/// force and the frames' time to completion, which the adaptive lead is built from.
 final class XRPresenterStatisticsTests: XCTestCase {
     override func tearDown() {
         setRendering(.gpuPassTiming(.disabled))
@@ -34,11 +35,31 @@ final class XRPresenterStatisticsTests: XCTestCase {
         XCTAssertTrue(off.description.contains("engine GPU 0.00 ms"), off.description)
         XCTAssertTrue(off.description.contains("thermal \(off.thermalStateName)"), off.description)
         XCTAssertTrue(["nominal", "fair", "serious", "critical", "unknown"].contains(off.thermalStateName))
+        XCTAssertEqual(off.leadMsAverage, 0, "no lead noted yet")
+        XCTAssertEqual(off.completionMsAverage, 0)
 
         // On, with no frame resolved yet: the busy time is still zero, and the span resets.
         setRendering(.gpuPassTiming(.enabled))
         let on = statistics.snapshot()
         XCTAssertEqual(on.engineGPUMsAverage, GPUPassTiming.shared.busy().averageMs, accuracy: 1e-9)
         XCTAssertEqual(on.gpuMsAverage, 0, "a snapshot starts a new span")
+    }
+
+    func testTheSnapshotCarriesTheLeadInForce_andTheFramesTimeToCompletion() {
+        let statistics = XRPresenterStatistics()
+        statistics.noteLead(seconds: 0.022)
+        statistics.noteLead(seconds: 0.024)
+        statistics.noteFrameCompleted(seconds: 0.006)
+        statistics.noteFrameCompleted(seconds: 0.008)
+        let numbers = statistics.snapshot()
+        XCTAssertEqual(numbers.leadMsAverage, 23, accuracy: 1e-9, "the lead in force, averaged")
+        XCTAssertEqual(numbers.leadMsMax, 24, accuracy: 1e-9)
+        XCTAssertEqual(numbers.completionMsAverage, 7, accuracy: 1e-9, "from pickup to the GPU's completion, averaged")
+        XCTAssertEqual(numbers.completionMsMax, 8, accuracy: 1e-9)
+        XCTAssertTrue(numbers.description.contains("to completion 7.00 ms (max 8.00)"), numbers.description)
+        XCTAssertTrue(numbers.description.contains("lead 23.00 ms (max 24.00)"), numbers.description)
+        let next = statistics.snapshot()
+        XCTAssertEqual(next.leadMsAverage, 0, "a snapshot starts a new span")
+        XCTAssertEqual(next.completionMsMax, 0)
     }
 }

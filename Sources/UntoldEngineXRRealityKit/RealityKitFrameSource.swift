@@ -16,7 +16,8 @@ import UntoldEngine
 import UntoldEngineXR
 
 /// The engine's frames from a `XRRealityKitPresenter`: each ticket the presenter posts is one
-/// frame, posed for a lead past the moment it is taken; its eyes are the ticket's textures with
+/// frame, posed for a lead past its posting (`XRPresenterLead`: the fixed lead past the moment
+/// it is taken, or the measured one); its eyes are the ticket's textures with
 /// the presenter's depth, placed a nominal eye distance apart on the headset's pose for that
 /// instant; the frame is drawn in the ticket's own command buffer, which after the eyes carries
 /// the grids' unprojection and, committed by the loop, hands RealityKit the frame. No wait and
@@ -40,6 +41,10 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
     let statistics: XRPresenterStatistics
     let pose: PoseProvider
     let projection: simd_float4x4
+    /// The frames' measured latency, for the adaptive lead: written by the GPU's completion
+    /// thread, read by the engine's thread as each ticket is taken.
+    private let leadLock = NSLock()
+    private var leadEstimate = XRPresenterLead()
 
     /// The frames of `presenter`, posed by `pose`.
     @MainActor
@@ -80,6 +85,27 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         mailbox.close()
     }
 
+    // MARK: - The lead
+
+    /// The frames' average time from pickup to completion and the count behind it, as the
+    /// adaptive lead sees them.
+    public var lead: XRPresenterLead {
+        leadLock.withLock { leadEstimate }
+    }
+
+    /// The lead of a ticket taken `ageSeconds` after its posting, under its settings.
+    func leadSeconds(settings: XRPresenterSettings, ageSeconds: TimeInterval) -> TimeInterval {
+        leadLock.withLock { leadEstimate.seconds(settings: settings, ageSeconds: ageSeconds) }
+    }
+
+    /// A frame's time from its ticket's pickup to its command buffer completing on the GPU,
+    /// into the average the adaptive lead reads; noted whether or not the lead is adaptive,
+    /// so that turning it on finds the history there.
+    public func noteFrameCompleted(seconds: TimeInterval) {
+        leadLock.withLock { leadEstimate.noteFrame(seconds: seconds) }
+        statistics.noteFrameCompleted(seconds: seconds)
+    }
+
     // MARK: - A frame
 
     /// One ticket's frame. Its command buffer is committed exactly once: by the loop after the
@@ -91,11 +117,15 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         private let source: RealityKitFrameSource
         private var handedOut = false
 
+        /// Posed for the ticket's posting plus its lead: the fixed lead past the pickup, or the
+        /// measured latency when the ticket's settings ask for it.
         init(ticket: XRPresenterTicket, takenAt: TimeInterval, source: RealityKitFrameSource) {
             self.ticket = ticket
             self.takenAt = takenAt
             self.source = source
-            timing = XRFrameTiming(presentationTime: takenAt + ticket.settings.leadSeconds)
+            let lead = source.leadSeconds(settings: ticket.settings, ageSeconds: takenAt - ticket.postedAt)
+            source.statistics.noteLead(seconds: lead)
+            timing = XRFrameTiming(presentationTime: ticket.postedAt + lead)
         }
 
         deinit {
@@ -185,8 +215,17 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
             }
             let statistics = source.statistics
             statistics.noteFrameEncoded(seconds: CACurrentMediaTime() - takenAt)
+            // A frame that drew counts for the adaptive lead: from its pickup to the GPU's end
+            // of its command buffer (the GPU's host time, in CACurrentMediaTime's base; the
+            // handler's own time when the GPU reports none).
+            let drawn = target.originFromDevice != nil
+            let pickup = takenAt
+            let frameSource = source
             commandBuffer.addCompletedHandler { buffer in
                 statistics.noteGPU(seconds: max(0, buffer.gpuEndTime - buffer.gpuStartTime))
+                guard drawn else { return }
+                let end = buffer.gpuEndTime > pickup ? buffer.gpuEndTime : CACurrentMediaTime()
+                frameSource.noteFrameCompleted(seconds: end - pickup)
             }
         }
 

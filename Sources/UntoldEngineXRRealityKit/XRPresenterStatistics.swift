@@ -34,6 +34,15 @@ public struct XRPresenterStatisticsSnapshot: Sendable, Equatable {
     /// From a ticket's pickup to its frame being encoded, milliseconds: the engine's CPU frame.
     public var frameMsAverage = 0.0
     public var frameMsMax = 0.0
+    /// From a ticket's pickup to its command buffer completing on the GPU, milliseconds: the
+    /// CPU frame, the GPU's, and whatever waited in between; the frame's time the adaptive
+    /// lead averages (`XRPresenterLead`).
+    public var completionMsAverage = 0.0
+    public var completionMsMax = 0.0
+    /// The lead in force, milliseconds: from a ticket's posting to the instant its frame was
+    /// posed for, the fixed lead past the pickup or the measured one (`XRPresenterLead`).
+    public var leadMsAverage = 0.0
+    public var leadMsMax = 0.0
     /// The frame's GPU span, milliseconds: from the ticket's command buffer starting on the GPU
     /// to its ending. On a headset the GPU is shared with the compositor and RealityKit's own
     /// drawing, whose work inside that span counts too, and the span stretches when the GPU
@@ -70,16 +79,18 @@ public struct XRPresenterStatisticsSnapshot: Sendable, Equatable {
     /// One line with the numbers, for a log.
     public var description: String {
         String(
-            format: "XR presenter: %.0f updates/s, %.0f frames/s, %d tickets dropped (%d in all), %d frames without a pose; replace %.2f ms (max %.2f), pickup age %.2f ms (max %.2f), frame %.2f ms (max %.2f), GPU span %.2f ms (max %.2f), engine GPU %.2f ms, thermal %@",
+            format: "XR presenter: %.0f updates/s, %.0f frames/s, %d tickets dropped (%d in all), %d frames without a pose; replace %.2f ms (max %.2f), pickup age %.2f ms (max %.2f), frame %.2f ms (max %.2f), to completion %.2f ms (max %.2f), GPU span %.2f ms (max %.2f), engine GPU %.2f ms, lead %.2f ms (max %.2f), thermal %@",
             updatesPerSecond, framesPerSecond, ticketsDropped, ticketsDroppedTotal, posesMissing,
             replaceMsAverage, replaceMsMax, pickupAgeMsAverage, pickupAgeMsMax,
-            frameMsAverage, frameMsMax, gpuMsAverage, gpuMsMax, engineGPUMsAverage, thermalStateName
+            frameMsAverage, frameMsMax, completionMsAverage, completionMsMax, gpuMsAverage, gpuMsMax, engineGPUMsAverage,
+            leadMsAverage, leadMsMax, thermalStateName
         )
     }
 }
 
 /// Counters written from the main thread (updates, replace calls, drops), the engine's thread
-/// (pickups, poses, frames) and the GPU's completion thread (GPU spans), read as a snapshot.
+/// (pickups, poses, frames, leads) and the GPU's completion thread (GPU spans, completions),
+/// read as a snapshot.
 public final class XRPresenterStatistics: @unchecked Sendable {
     private struct Span {
         var sum = 0.0
@@ -108,7 +119,9 @@ public final class XRPresenterStatistics: @unchecked Sendable {
     private var replace = Span()
     private var pickupAge = Span()
     private var frame = Span()
+    private var completion = Span()
     private var gpu = Span()
+    private var lead = Span()
 
     public init() {}
 
@@ -149,6 +162,14 @@ public final class XRPresenterStatistics: @unchecked Sendable {
         lock.withLock { gpu.add(seconds) }
     }
 
+    public func noteFrameCompleted(seconds: Double) {
+        lock.withLock { completion.add(seconds) }
+    }
+
+    public func noteLead(seconds: Double) {
+        lock.withLock { lead.add(seconds) }
+    }
+
     /// The numbers since the last snapshot, which starts a new span.
     public func snapshot() -> XRPresenterStatisticsSnapshot {
         lock.withLock {
@@ -167,8 +188,12 @@ public final class XRPresenterStatistics: @unchecked Sendable {
             snapshot.pickupAgeMsMax = pickupAge.maxMs
             snapshot.frameMsAverage = frame.averageMs
             snapshot.frameMsMax = frame.maxMs
+            snapshot.completionMsAverage = completion.averageMs
+            snapshot.completionMsMax = completion.maxMs
             snapshot.gpuMsAverage = gpu.averageMs
             snapshot.gpuMsMax = gpu.maxMs
+            snapshot.leadMsAverage = lead.averageMs
+            snapshot.leadMsMax = lead.maxMs
             snapshot.engineGPUMsAverage = GPUPassTiming.shared.isEnabled ? GPUPassTiming.shared.busy().averageMs : 0
             snapshot.thermalState = ProcessInfo.processInfo.thermalState
             since = now
@@ -180,7 +205,9 @@ public final class XRPresenterStatistics: @unchecked Sendable {
             replace = Span()
             pickupAge = Span()
             frame = Span()
+            completion = Span()
             gpu = Span()
+            lead = Span()
             return snapshot
         }
     }

@@ -288,6 +288,19 @@
 
         // MARK: - Device anchor
 
+        /// The headset's pose predicted for `presentationTime` (origin from device), the most
+        /// recent one while the prediction has no answer, nil before tracking runs. A read that
+        /// changes nothing: for a game that places something on the head for the frame it is
+        /// updating, whose eyes `deviceAnchor(forPresentationAt:)` poses by the same prediction.
+        public func devicePose(predictedFor presentationTime: TimeInterval) -> simd_float4x4? {
+            #if canImport(ARKit)
+                if let anchor = queryDeviceAnchorIfTrackingRunning(atTimestamp: presentationTime) {
+                    return anchor.originFromAnchorTransform
+                }
+            #endif
+            return currentDevicePose
+        }
+
         /// The headset's pose for a frame's presentation instant, which the frame source poses
         /// its eyes by and the compositor's drawables take: the predicted anchor, else one
         /// predicted for now, else the last valid one (with the diagnostics of the gap), else nil.
