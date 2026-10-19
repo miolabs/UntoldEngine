@@ -842,7 +842,8 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             assertionFailure("the unprojection's scratch was made for a depth of \(scratch.textureSize), not \(textureSize)")
             return
         }
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        // Timed with the engine's passes when the GPU pass timing is on.
+        guard let encoder = GPUPassTiming.shared.makeComputeEncoder(commandBuffer, label) else { return }
         encoder.label = label
         let grid = scratch.grid
         let foveated = rateMapData != nil && cellTexels > 0

@@ -10,6 +10,7 @@
 
 import Foundation
 import QuartzCore
+import UntoldEngine
 
 /// The presenter's numbers over the span since the last snapshot: how RealityKit's cadence and
 /// the engine's frames meet.
@@ -33,9 +34,21 @@ public struct XRPresenterStatisticsSnapshot: Sendable, Equatable {
     /// From a ticket's pickup to its frame being encoded, milliseconds: the engine's CPU frame.
     public var frameMsAverage = 0.0
     public var frameMsMax = 0.0
-    /// The frame's GPU span, milliseconds.
+    /// The frame's GPU span, milliseconds: from the ticket's command buffer starting on the GPU
+    /// to its ending. On a headset the GPU is shared with the compositor and RealityKit's own
+    /// drawing, whose work inside that span counts too, and the span stretches when the GPU
+    /// runs at a lower clock (a warm device, a lighter load): a number to read with the
+    /// thermal state and the engine's own busy time beside it.
     public var gpuMsAverage = 0.0
     public var gpuMsMax = 0.0
+    /// The GPU's time on the engine's own passes, milliseconds: the union of the passes'
+    /// stage spans, read from the engine's GPU pass timing when it is on
+    /// (`setRendering(.gpuPassTiming(.enabled))`); 0 when it is off. The part of the span that
+    /// is the frame's own cost, whatever else the GPU ran in between.
+    public var engineGPUMsAverage = 0.0
+    /// The device's thermal state at the snapshot: under pressure, the GPU runs slower and
+    /// every GPU number above grows.
+    public var thermalState: ProcessInfo.ThermalState = .nominal
     /// Tickets dropped since the presenter started.
     public var ticketsDroppedTotal = 0
 
@@ -43,13 +56,24 @@ public struct XRPresenterStatisticsSnapshot: Sendable, Equatable {
 
     public var framesPerSecond: Double { seconds > 0 ? Double(framesDrawn) / seconds : 0 }
 
+    /// The thermal state as a word.
+    public var thermalStateName: String {
+        switch thermalState {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
+    }
+
     /// One line with the numbers, for a log.
     public var description: String {
         String(
-            format: "XR presenter: %.0f updates/s, %.0f frames/s, %d tickets dropped (%d in all), %d frames without a pose; replace %.2f ms (max %.2f), pickup age %.2f ms (max %.2f), frame %.2f ms (max %.2f), GPU %.2f ms (max %.2f)",
+            format: "XR presenter: %.0f updates/s, %.0f frames/s, %d tickets dropped (%d in all), %d frames without a pose; replace %.2f ms (max %.2f), pickup age %.2f ms (max %.2f), frame %.2f ms (max %.2f), GPU span %.2f ms (max %.2f), engine GPU %.2f ms, thermal %@",
             updatesPerSecond, framesPerSecond, ticketsDropped, ticketsDroppedTotal, posesMissing,
             replaceMsAverage, replaceMsMax, pickupAgeMsAverage, pickupAgeMsMax,
-            frameMsAverage, frameMsMax, gpuMsAverage, gpuMsMax
+            frameMsAverage, frameMsMax, gpuMsAverage, gpuMsMax, engineGPUMsAverage, thermalStateName
         )
     }
 }
@@ -145,6 +169,8 @@ public final class XRPresenterStatistics: @unchecked Sendable {
             snapshot.frameMsMax = frame.maxMs
             snapshot.gpuMsAverage = gpu.averageMs
             snapshot.gpuMsMax = gpu.maxMs
+            snapshot.engineGPUMsAverage = GPUPassTiming.shared.isEnabled ? GPUPassTiming.shared.busy().averageMs : 0
+            snapshot.thermalState = ProcessInfo.processInfo.thermalState
             since = now
             updates = 0
             posted = 0
