@@ -151,7 +151,8 @@ public final class XRFrameLoop: @unchecked Sendable {
         #endif
         frame.waitForDrawingTime()
         #if ENGINE_STATS_ENABLED
-            let xrWaitMs = (CACurrentMediaTime() - xrWaitStart) * 1000.0
+            let xrWaitSeconds = CACurrentMediaTime() - xrWaitStart
+            let xrWaitMs = xrWaitSeconds * 1000.0
             EngineStatsMonitor.shared.update { snapshot in
                 snapshot.timing.xrWaitMs = xrWaitMs
             }
@@ -185,7 +186,11 @@ public final class XRFrameLoop: @unchecked Sendable {
         let effectiveLoading = loading || loadingNow
 
         for target in targets {
-            submit(target, frame: frame, loading: effectiveLoading)
+            #if ENGINE_STATS_ENABLED
+                submit(target, frame: frame, loading: effectiveLoading, frameBegin: xrFrameStartTime, pacing: xrWaitSeconds)
+            #else
+                submit(target, frame: frame, loading: effectiveLoading, frameBegin: 0, pacing: 0)
+            #endif
         }
         #if ENGINE_STATS_ENABLED
             let xrEncodeMs = (CACurrentMediaTime() - xrSubmissionStart) * 1000.0
@@ -200,8 +205,10 @@ public final class XRFrameLoop: @unchecked Sendable {
     }
 
     /// One target's pass: the culling once, each eye, the depth pyramid, the presentation,
-    /// in one command buffer under the engine's in-flight semaphore.
-    private func submit(_ target: XREyes, frame: any XRFrame, loading: Bool) {
+    /// in one command buffer under the engine's in-flight semaphore. `frameBegin` is the
+    /// instant the loop began the frame and `pacing` the seconds it then waited for the
+    /// presenter's drawing time, for the frame's stages (zeros without stats).
+    private func submit(_ target: XREyes, frame: any XRFrame, loading: Bool, frameBegin: CFTimeInterval, pacing: CFTimeInterval) {
         // A capture target (a recording or a stream of the view) is drawn from its own pose, so
         // it must not advance the frame-to-frame state the built-in display relies on: the
         // temporal history and the depth pyramid.
@@ -357,6 +364,27 @@ public final class XRFrameLoop: @unchecked Sendable {
         frame.willCommit(commandBuffer)
         #if ENGINE_STATS_ENABLED
             let submitStart = CACurrentMediaTime()
+            if target.primary {
+                // The display's frame split into its stages, as the RealityKit presenter
+                // splits its own: the CPU frame from the loop's beginning of the frame (the
+                // pacing left out) to this commit, the wait to the GPU's start, the GPU's raw
+                // span. The handler, added after the commit instant is stamped, carries it by
+                // value; whether the GPU ended past the presenter's rendering deadline is the
+                // presenter's own verdict on the frame being late.
+                let deadline = frame.timing.renderingDeadline
+                commandBuffer.addCompletedHandler { cb in
+                    let now = CACurrentMediaTime()
+                    let stages = EngineFrameStages(
+                        begin: frameBegin, pacing: pacing, committed: submitStart,
+                        gpuStart: cb.gpuStartTime, gpuEnd: cb.gpuEndTime, now: now
+                    )
+                    let ended = cb.gpuEndTime > 0 ? cb.gpuEndTime : now
+                    EngineStatsMonitor.shared.recordFrameCompletion(stages, pastDeadline: deadline.map { ended > $0 } ?? false)
+                }
+            }
+        #else
+            _ = frameBegin
+            _ = pacing
         #endif
         commandBuffer.commit()
         #if ENGINE_STATS_ENABLED

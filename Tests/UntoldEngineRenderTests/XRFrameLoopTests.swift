@@ -230,6 +230,34 @@ final class XRFrameLoopTests: BaseRenderSetup {
         XCTAssertEqual(loop.framesDrawn, 0)
     }
 
+    /// Each display frame's command buffer enters the engine's frame stages from the loop's
+    /// own instants (the frame's beginning, the pacing, the commit) and the buffer's GPU
+    /// times; a capture target's buffer is not a frame of the display and enters nothing.
+    func test_theDisplaysFrames_enterTheFrameStages_aCaptureTargetsDoesNot() throws {
+        EngineStatsMonitor.shared.reset()
+        let frames = FakeFrames(device: renderInfo.device, eyeSize: (64, 48), count: 4)
+        frames.captureTarget = true
+        let loop = makeLoop(frames)
+
+        loop.run()
+        for frame in frames.frames {
+            for buffer in frame.presentedIn {
+                buffer.waitUntilCompleted()
+            }
+        }
+        try waitUntil { EngineStatsMonitor.shared.frameStagesInProgress().framesCompleted >= 4 }
+
+        let stages = EngineStatsMonitor.shared.frameStagesInProgress()
+        XCTAssertEqual(stages.framesBegun, 4)
+        XCTAssertEqual(stages.framesCompleted, 4, "one per display command buffer, none for the capture's")
+        XCTAssertGreaterThan(stages.gpuMsMax, 0, "the buffer's GPU span")
+        XCTAssertGreaterThan(stages.worstFrame.cpu, 0, "the loop's CPU frame")
+        XCTAssertEqual(stages.worstFrame.completion, stages.worstFrame.cpu + stages.worstFrame.wait + stages.worstFrame.gpu, accuracy: 1e-12)
+        XCTAssertEqual(stages.worstFrame.pacing, 0, accuracy: 0.002, "the fake frames wait for nothing")
+        XCTAssertEqual(stages.pastDeadline, 0, "the fake frames set no deadline")
+        EngineStatsMonitor.shared.reset()
+    }
+
     // MARK: - Sources of the test's own
 
     /// One frame, then none.

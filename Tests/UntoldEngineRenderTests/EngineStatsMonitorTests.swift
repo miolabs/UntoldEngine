@@ -240,4 +240,165 @@ final class EngineStatsMonitorTests: XCTestCase {
         XCTAssertFalse(overlay.contains("nan"), "Output should not contain NaN")
         XCTAssertFalse(compact.contains("nan"), "Output should not contain NaN")
     }
+
+    // MARK: - The frames' stages
+
+    /// The stages from a frame's instants, the pacing left out: the GPU's times split the
+    /// time past the commit into the wait and the span; a GPU that reports none leaves it all
+    /// in the wait, ending at the handler's time. Either way the three sum to the completion.
+    func testFrameStages_fromTheInstants_sumToTheCompletion_withThePacingLeftOut() {
+        // Begun at 100 s; 2 ms asleep for the drawing time; committed 6 ms after the
+        // beginning; the GPU starts 0.1 ms after the commit and runs 20 ms.
+        let reported = EngineFrameStages(begin: 100, pacing: 0.002, committed: 100.006, gpuStart: 100.0061, gpuEnd: 100.0261, now: 100.0265)
+        XCTAssertEqual(reported.cpu, 0.004, accuracy: 1e-9, "the CPU frame, the pacing left out")
+        XCTAssertEqual(reported.wait, 0.0001, accuracy: 1e-9)
+        XCTAssertEqual(reported.gpu, 0.020, accuracy: 1e-9)
+        XCTAssertEqual(reported.pacing, 0.002, accuracy: 1e-9)
+        XCTAssertEqual(reported.completion, 0.0241, accuracy: 1e-9, "the GPU's end, not the handler's time, from the beginning less the pacing")
+        XCTAssertEqual(reported.splitDescription, "24.1 = cpu 4.0 + wait 0.1 + gpu 20.0")
+
+        // No GPU times: the completion is the handler's time, the wait the rest.
+        let unreported = EngineFrameStages(begin: 100, committed: 100.003, gpuStart: 0, gpuEnd: 0, now: 100.008)
+        XCTAssertEqual(unreported.cpu, 0.003, accuracy: 1e-9)
+        XCTAssertEqual(unreported.gpu, 0)
+        XCTAssertEqual(unreported.wait, 0.005, accuracy: 1e-9)
+        XCTAssertEqual(unreported.completion, 0.008, accuracy: 1e-9)
+
+        // A GPU span said to start before the commit (clocks apart): the span is cut to what
+        // follows the CPU frame, and the sum holds.
+        let skewed = EngineFrameStages(begin: 100, committed: 100.003, gpuStart: 100.001, gpuEnd: 100.006, now: 100.0061)
+        XCTAssertEqual(skewed.cpu, 0.003, accuracy: 1e-9)
+        XCTAssertEqual(skewed.gpu, 0.003, accuracy: 1e-9)
+        XCTAssertEqual(skewed.wait, 0, accuracy: 1e-9)
+        XCTAssertEqual(skewed.completion, 0.006, accuracy: 1e-9)
+
+        XCTAssertEqual(EngineFrameStages().completion, 0)
+    }
+
+    /// Begins `frames` frames evenly over a second from `start`, three of them completing
+    /// at 9.0, 10.5 and 16.6 ms.
+    private func second(from start: Double, frames: Int) {
+        for index in 0 ..< frames {
+            EngineStatsMonitor.shared.beginFrame(timestampSeconds: start + Double(index) / Double(frames))
+            EngineStatsMonitor.shared.completeFrame()
+        }
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.003, wait: 0.001, gpu: 0.005)) // 9.0 ms
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.003, wait: 0.0025, gpu: 0.005)) // 10.5 ms
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.0031, wait: 0.0092, gpu: 0.0043)) // 16.6 ms
+    }
+
+    /// A span is the loop's frames from one timestamp to the first at least a span later,
+    /// which opens the next; the snapshot carries the last span closed. The refresh period
+    /// is measured from the frames begun in the span, not assumed: the same frames are late
+    /// against 100 frames in a second and not against 90.
+    func testFrameStages_areTheLastSpansClosed_withTheRefreshFromTheCadence() {
+        XCTAssertEqual(EngineStatsMonitor.shared.frameStageSpanSeconds, 1.0)
+
+        // 100 frames in the second: a 10 ms refresh, and two frames over it.
+        second(from: 1000, frames: 100)
+        XCTAssertEqual(getEngineStatsSnapshot().frameStages, EngineFrameStageStats(), "no span closed yet")
+        let open = EngineStatsMonitor.shared.frameStagesInProgress()
+        XCTAssertEqual(open.framesBegun, 100)
+        XCTAssertEqual(open.framesCompleted, 3)
+        XCTAssertEqual(open.completionMsMax, 16.6, accuracy: 1e-9)
+
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1001) // a second on: closes the span
+        EngineStatsMonitor.shared.completeFrame()
+        let hundred = getEngineStatsSnapshot().frameStages
+        XCTAssertEqual(hundred.seconds, 1, accuracy: 1e-9)
+        XCTAssertEqual(hundred.framesBegun, 100)
+        XCTAssertEqual(hundred.framesCompleted, 3)
+        XCTAssertEqual(hundred.framesPerSecond, 3, accuracy: 1e-9)
+        XCTAssertEqual(hundred.refreshMs, 10, accuracy: 1e-9)
+        XCTAssertEqual(hundred.lateFrames, 2)
+        XCTAssertEqual(hundred.gpuMsMax, 5, accuracy: 1e-9)
+        XCTAssertEqual(hundred.worstFrame, EngineFrameStages(cpu: 0.0031, wait: 0.0092, gpu: 0.0043))
+        XCTAssertEqual(hundred.description, "gpu span max 5.0 ms · late 2 of 3 (refresh 10.0 ms) · worst 16.6 = cpu 3.1 + wait 9.2 + gpu 4.3")
+        XCTAssertEqual(EngineStatsMonitor.shared.frameStagesInProgress().framesBegun, 1, "the closing frame opened the next span")
+
+        // 90 frames: 11.1 ms, and only the 16.6 ms frame is over it. The closed span stays
+        // in the snapshot meanwhile.
+        second(from: 1001 + 1.0 / 90, frames: 89)
+        XCTAssertEqual(getEngineStatsSnapshot().frameStages, hundred, "the last span closed, while the next is open")
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1002)
+        EngineStatsMonitor.shared.completeFrame()
+        let ninety = getEngineStatsSnapshot().frameStages
+        XCTAssertEqual(ninety.framesBegun, 90)
+        XCTAssertEqual(ninety.refreshMs, 11.111111, accuracy: 1e-5)
+        XCTAssertEqual(ninety.lateFrames, 1)
+        XCTAssertTrue(ninety.description.contains("late 1 of 3 (refresh 11.1 ms)"), ninety.description)
+
+        // A shorter span, set by the reader.
+        EngineStatsMonitor.shared.frameStageSpanSeconds = 0.25
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1002.1)
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.001))
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 1002.26)
+        EngineStatsMonitor.shared.completeFrame()
+        let quarter = getEngineStatsSnapshot().frameStages
+        XCTAssertEqual(quarter.seconds, 0.26, accuracy: 1e-9, "from the first frame at 1002 to the first a quarter later")
+        XCTAssertEqual(quarter.framesBegun, 2)
+        XCTAssertEqual(quarter.framesCompleted, 1)
+        EngineStatsMonitor.shared.frameStageSpanSeconds = 0
+        XCTAssertEqual(EngineStatsMonitor.shared.frameStageSpanSeconds, 0.1, "at least a tenth of a second")
+        EngineStatsMonitor.shared.frameStageSpanSeconds = 1.0
+    }
+
+    /// Each stage's maximum is its own (the longest wait and the longest GPU span may be
+    /// different frames'); the worst frame is the one with the longest completion, kept whole
+    /// with its pacing; the frames past the presenter's deadline are counted apart, and
+    /// printed only when there are any.
+    func testFrameStages_carryEachStagesMaximum_theWorstFrameWhole_andTheDeadlineCount() {
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 10)
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.0028, wait: 0.0005, gpu: 0.0036)) // 6.9: a usual frame
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.0040, wait: 0.0002, gpu: 0.0060), pastDeadline: true) // 10.2: the longest GPU span
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.0031, wait: 0.0092, gpu: 0.0043, pacing: 0.002)) // 16.6: the longest wait, the worst
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 11)
+        EngineStatsMonitor.shared.completeFrame()
+
+        let stages = getEngineStatsSnapshot().frameStages
+        XCTAssertEqual(stages.cpuMsMax, 4.0, accuracy: 1e-9, "the CPU frame's maximum")
+        XCTAssertEqual(stages.waitMsMax, 9.2, accuracy: 1e-9, "the wait's")
+        XCTAssertEqual(stages.gpuMsMax, 6.0, accuracy: 1e-9, "the GPU span's")
+        XCTAssertEqual(stages.completionMsMax, 16.6, accuracy: 1e-9, "the completion's")
+        XCTAssertEqual(stages.worstFrame, EngineFrameStages(cpu: 0.0031, wait: 0.0092, gpu: 0.0043, pacing: 0.002), "the longest frame, with its own stages and its pacing")
+        XCTAssertEqual(stages.pastDeadline, 1)
+        XCTAssertEqual(stages.framesBegun, 1, "one frame begun in the span: a refresh of a second, nothing late against it")
+        XCTAssertEqual(stages.refreshMs, 1000, accuracy: 1e-9)
+        XCTAssertEqual(stages.lateFrames, 0)
+        XCTAssertEqual(stages.description, "gpu span max 6.0 ms · late 0 of 3 (refresh 1000.0 ms) · worst 16.6 = cpu 3.1 + wait 9.2 + gpu 4.3 · 1 past the deadline")
+
+        let compact = formatEngineStatsCompact(getEngineStatsSnapshot())
+        XCTAssertTrue(compact.hasSuffix(" | " + stages.description), compact)
+        let overlay = formatEngineStatsOverlay(getEngineStatsSnapshot())
+        XCTAssertTrue(overlay.contains("Stages: " + stages.description + " | cpu max 4.00ms | wait max 9.20ms | completion max 16.60ms | worst's pacing 2.00ms | 3 frames in 1.00s"), overlay)
+        XCTAssertEqual(formatEngineFrameStages(getEngineStatsSnapshot()), stages.description)
+    }
+
+    /// The late count keeps a bounded list of completions in a span: past the bound the
+    /// frames still enter the maxima and the worst frame.
+    func testFrameStages_theLateCountIsBounded_theMaximaAreNot() {
+        for index in 0 ..< 100 {
+            EngineStatsMonitor.shared.beginFrame(timestampSeconds: 50 + Double(index) / 100)
+        }
+        for _ in 0 ..< EngineStatsMonitor.completionsKept {
+            EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.02))
+        }
+        EngineStatsMonitor.shared.recordFrameCompletion(EngineFrameStages(cpu: 0.03))
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 51)
+        EngineStatsMonitor.shared.completeFrame()
+
+        let stages = getEngineStatsSnapshot().frameStages
+        XCTAssertEqual(stages.refreshMs, 10, accuracy: 1e-9)
+        XCTAssertEqual(stages.framesCompleted, EngineStatsMonitor.completionsKept + 1)
+        XCTAssertEqual(stages.lateFrames, EngineStatsMonitor.completionsKept, "the frame past the bound is not counted")
+        XCTAssertEqual(stages.completionMsMax, 30, accuracy: 1e-9, "but it is the worst")
+        XCTAssertEqual(stages.worstFrame.cpuMs, 30, accuracy: 1e-9)
+    }
+
+    /// Nothing recorded: the stages print as zeros, with no deadline count.
+    func testFrameStages_withoutFrames_printZeros() {
+        let compact = formatEngineStatsCompact(EngineStatsSnapshot())
+        XCTAssertTrue(compact.hasSuffix(" | gpu span max 0.0 ms · late 0 of 0 (refresh 0.0 ms) · worst 0.0 = cpu 0.0 + wait 0.0 + gpu 0.0"), compact)
+        XCTAssertFalse(compact.contains("deadline"))
+    }
 }

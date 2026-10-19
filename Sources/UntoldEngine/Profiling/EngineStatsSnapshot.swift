@@ -372,6 +372,11 @@ public struct EngineStatsSnapshot {
     public var streaming: EngineStreamingStats = .init()
     public var batching: EngineBatchingStats = .init()
     public var memory: EngineMemoryStats = .init()
+    /// The frames' stages over the last span closed (a second of the loop's frames by
+    /// default, `EngineStatsMonitor.frameStageSpanSeconds`): the GPU span's maximum, the
+    /// frames late against the refresh measured from the cadence, the worst frame's split.
+    /// Filled by the XR loop; zeros elsewhere.
+    public var frameStages: EngineFrameStageStats = .init()
 
     public init(
         frameIndex: UInt64 = 0,
@@ -381,7 +386,8 @@ public struct EngineStatsSnapshot {
         culling: EngineCullingStats = .init(),
         streaming: EngineStreamingStats = .init(),
         batching: EngineBatchingStats = .init(),
-        memory: EngineMemoryStats = .init()
+        memory: EngineMemoryStats = .init(),
+        frameStages: EngineFrameStageStats = .init()
     ) {
         self.frameIndex = frameIndex
         self.timestampSeconds = timestampSeconds
@@ -391,5 +397,6 @@ public struct EngineStatsSnapshot {
         self.streaming = streaming
         self.batching = batching
         self.memory = memory
+        self.frameStages = frameStages
     }
 }
