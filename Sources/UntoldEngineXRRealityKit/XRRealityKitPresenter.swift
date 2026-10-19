@@ -27,7 +27,10 @@ import UntoldEngine
 /// completion RealityKit shows the new content. With a foveation
 /// profile in the configuration, both eyes are drawn through the presenter's own fixed
 /// rasterization rate map (`XRPresenterFoveation`): the textures are its physical size, within
-/// the configured pixel budget, and the grids a vertex every cell of physical texels.
+/// the configured pixel budget, and the grids a vertex every cell of physical texels. Under a
+/// render scale (`XRRealityKitPresenterConfiguration.renderScale`) the textures, the depth and
+/// the map's budget are the configured size times it, for more texels per degree than the
+/// display's pixels; the grids keep their vertex counts.
 ///
 /// With the pipeline two refreshes deep (`XRRealityKitPresenterConfiguration.pipelineDepth`),
 /// the textures, grids, band and entities above are made twice, as two sets the tickets
@@ -58,9 +61,20 @@ public final class XRRealityKitPresenter {
     /// The rate map both eyes are drawn through, when the configuration asks for one and the
     /// device has them; nil, and the eyes are drawn uniformly.
     public let foveation: XRPresenterFoveation?
-    /// The size of each eye's textures in pixels: the configuration's `textureSize`, or the rate
-    /// map's physical size within it.
+    /// The size of each eye's textures in pixels: the configuration's `renderedTextureSize`
+    /// (its `textureSize` times its render scale), or the rate map's physical size within it.
     public let textureSize: SIMD2<Int>
+    /// The render scale in force: the configuration's, clamped.
+    public var renderScale: Float { configuration.clampedRenderScale }
+
+    /// Texels per degree at the centre of view, horizontally: the uniform texture's, or the
+    /// rate map's screen's (the centre is drawn at the screen's density). 12.9 for the default
+    /// configuration, 17.6 through its map; against the headset's some 34 display pixels per
+    /// degree.
+    public var centreTexelsPerDegree: Float {
+        foveation?.centreTexelsPerDegree(tangents: configuration.frustumTangents) ?? configuration.centreTexelsPerDegree
+    }
+
     public let unproject: XRGridUnprojectPass
     /// The unprojection's scratch per eye (each vertex's nearest depth between its dispatches,
     /// the depth's block maxima, the scan list), kept across frames: the tickets' command
@@ -162,10 +176,11 @@ public final class XRRealityKitPresenter {
         self.device = device
         self.configuration = configuration
         settings = XRPresenterSettings(configuration: configuration)
-        // The rate map first: the textures and the grid take their sizes from it.
+        // The rate map first: the textures and the grid take their sizes from it; without
+        // one, the configured size at its render scale.
         let foveation = XRPresenterFoveation.make(device: device, configuration: configuration)
         self.foveation = foveation
-        let textureSize = foveation?.physicalSize ?? configuration.textureSize
+        let textureSize = foveation?.physicalSize ?? configuration.renderedTextureSize
         self.textureSize = textureSize
         let grid = foveation?.grid ?? XRPresenterGrid(columns: configuration.gridColumns, rows: configuration.gridRows)
         self.grid = grid

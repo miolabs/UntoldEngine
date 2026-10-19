@@ -12,12 +12,30 @@ import Foundation
 import simd
 
 /// How the RealityKit presenter renders and shows the engine's frame: the size of each eye's
-/// textures, the grids each eye is shown on, the eyes' frustum and distance, the lead the frame
-/// is posed ahead of its ticket, how many refreshes the engine has for a frame, and the depth
-/// rules of the grids.
+/// textures and the scale they are rendered at, the grids each eye is shown on, the eyes'
+/// frustum and distance, the lead the frame is posed ahead of its ticket, how many refreshes
+/// the engine has for a frame, and the depth rules of the grids.
 public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
-    /// Pixels per eye: the headset's per-eye drawable size by default (the plan's D5).
+    /// Pixels per eye: the headset's per-eye drawable size by default (the plan's D5). What
+    /// the eyes are rendered at is this times `renderScale` (`renderedTextureSize`).
     public var textureSize = SIMD2<Int>(1920, 1824)
+    /// How many times `textureSize` each eye is rendered at, along each axis: 1 by default,
+    /// the drawable size; 1.5 renders 2880 × 2736 per eye, 2.25 times the pixels. What it
+    /// buys is texels per degree: RealityKit shows the eye's texture through its bilinear
+    /// sampler at the display's resolution (some 34 pixels per degree), and the uniform
+    /// 1920-pixel frame gives 12.9 texels per degree at the centre of view (17.6 through the
+    /// rate map), so each texel is shown 2.6 display pixels wide and the engine's own one-texel
+    /// steps along edges (MSAA's quarter steps, the staircase of a shallow edge) are magnified
+    /// with it; at 1.5 the texture gives 19.4 (26.4 through the map), under a display pixel
+    /// per texel step at the centre. The price is the engine's GPU frame, which grows with the
+    /// pixels (the whole frame, not only the shading), affordable with the pipeline two
+    /// refreshes deep. Through the rate map `textureSize` × the scale is the physical pixel
+    /// budget, and the map's screen grows with it, so the centre of view gains the same
+    /// factor. The grids keep their vertex counts: a uniform grid is `gridColumns` ×
+    /// `gridRows` whatever the scale (its cell grows with the texels), and a foveated grid's
+    /// cell is `foveatedCellTexels` scaled with it, snapped to the map's tile (see there).
+    /// Clamped to `renderScaleRange`; 1 exactly leaves every size as it was.
+    public var renderScale: Float = 1
     /// Vertices per row, and rows, of each eye's grid (uniform; a foveated grid is the map's).
     public var gridColumns = 256
     public var gridRows = 240
@@ -29,11 +47,16 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// `gridRows` are not used). None by default, until the headset has judged it against the
     /// uniform frame.
     public var foveation: XRPresenterFoveationProfile = .none
-    /// The side of a grid cell in physical texels when foveated. The map's mapping of texels to
-    /// the screen changes slope at its tile boundaries (`physicalGranularity`, 32 on Apple
-    /// GPUs), so a cell that divides the tile puts a vertex on every boundary and the grid
-    /// interpolates the map exactly within each cell; the presenter halves this once if it does
-    /// not divide, and draws uniformly if that does not either.
+    /// The side of a grid cell in physical texels when foveated, at a render scale of 1. The
+    /// map's mapping of texels to the screen changes slope at its tile boundaries
+    /// (`physicalGranularity`, 32 on Apple GPUs), so a cell that divides the tile puts a vertex
+    /// on every boundary and the grid interpolates the map exactly within each cell. The cell
+    /// in force is this times `renderScale`, snapped to the divisor of the tile nearest to it
+    /// in ratio (so the grid's vertices stay about as many as at scale 1, rather than growing
+    /// with the texels: at 1.5 a cell of 8 becomes 12, which the 32-texel tile has no divisor
+    /// for, and snaps to 16, the grid 181 × 172 for the default budget against 241 × 229 at
+    /// scale 1; 4 would snap to 8 and keep the denser grid). A value that divides the tile is
+    /// taken as it is.
     public var foveatedCellTexels = 8
     /// Tangents of the half angles of each eye's frustum: left, right, up, down, all positive. A
     /// few degrees wider than the headset's view, so that a head turn between the frame's pose
@@ -111,9 +134,52 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
 
     public init() {}
 
-    /// `textureSize` as floats: the uniform eye's size, or the foveated eye's pixel budget (the
-    /// presenter's `textureSize` is the size its textures were made at).
-    public var eyeSize: simd_float2 { simd_float2(Float(textureSize.x), Float(textureSize.y)) }
+    /// The render scales accepted: 0.5 to 2 along each axis (a quarter to four times the
+    /// pixels); a value outside is clamped, one that is not a number is 1.
+    public static let renderScaleRange: ClosedRange<Float> = 0.5 ... 2
+
+    /// `renderScale` within `renderScaleRange`: what the presenter applies.
+    public var clampedRenderScale: Float {
+        guard renderScale.isFinite else { return 1 }
+        return min(max(renderScale, Self.renderScaleRange.lowerBound), Self.renderScaleRange.upperBound)
+    }
+
+    /// The size each eye is rendered at: `textureSize` times the render scale along each axis,
+    /// rounded to whole pixels, at least one; `textureSize` itself at a scale of 1. The uniform
+    /// eye's texture size, or the foveated eye's pixel budget (the presenter's `textureSize`
+    /// is the size its textures were made at).
+    public var renderedTextureSize: SIMD2<Int> {
+        let scale = clampedRenderScale
+        guard scale != 1 else { return textureSize }
+        return SIMD2<Int>(
+            max(1, Int((Float(textureSize.x) * scale).rounded())),
+            max(1, Int((Float(textureSize.y) * scale).rounded()))
+        )
+    }
+
+    /// `renderedTextureSize` as floats.
+    public var eyeSize: simd_float2 {
+        let size = renderedTextureSize
+        return simd_float2(Float(size.x), Float(size.y))
+    }
+
+    /// Texels per degree at the centre of view of a uniform eye of `renderedTextureSize` through
+    /// the configured frustum, horizontally: the texture's width over the frustum's width in
+    /// tangent is the texels per unit tangent, which at the centre of view (where a degree is
+    /// π / 180 of tangent) is the texels per radian. 12.9 for the default; what the display's
+    /// pixels per degree (some 34 on the headset) compare with. Through the rate map the centre
+    /// is drawn at the map's screen size instead (`XRPresenterFoveation.centreTexelsPerDegree`).
+    public var centreTexelsPerDegree: Float {
+        Self.centreTexelsPerDegree(width: renderedTextureSize.x, tangents: frustumTangents)
+    }
+
+    /// Texels per degree at the centre of view of `width` texels spread evenly over a frustum of
+    /// `tangents` (left and right), the texels per unit tangent as texels per radian.
+    public static func centreTexelsPerDegree(width: Int, tangents: SIMD4<Float>) -> Float {
+        let span = tangents.x + tangents.y
+        guard span > 0 else { return 0 }
+        return Float(width) / span * .pi / 180
+    }
 
     /// The eyes' projection for the configured frustum: right-handed, reverse Z (the near plane
     /// at depth 1, the far plane at 0), asymmetric when the tangents differ.

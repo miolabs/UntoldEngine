@@ -95,6 +95,62 @@ final class XRPresenterGridTests: XCTestCase {
     }
 }
 
+// MARK: - The render scale
+
+/// The configuration's render scale: its clamp, the size it renders at, and the texels per
+/// degree it gives, without Metal.
+final class XRPresenterRenderScaleTests: XCTestCase {
+    func test_theRenderScale_isClamped_andOneLeavesTheSizeAsItIs() {
+        var configuration = XRRealityKitPresenterConfiguration()
+        XCTAssertEqual(configuration.renderScale, 1, "the drawable size by default")
+        XCTAssertEqual(configuration.clampedRenderScale, 1)
+        XCTAssertEqual(configuration.renderedTextureSize, configuration.textureSize, "at 1 the rendered size is the texture size itself")
+        XCTAssertEqual(configuration.eyeSize, simd_float2(1920, 1824))
+
+        configuration.renderScale = 1.5
+        XCTAssertEqual(configuration.clampedRenderScale, 1.5)
+        XCTAssertEqual(configuration.renderedTextureSize, SIMD2<Int>(2880, 2736), "1.5 times the drawable size")
+        XCTAssertEqual(configuration.eyeSize, simd_float2(2880, 2736))
+
+        configuration.renderScale = 0
+        XCTAssertEqual(configuration.clampedRenderScale, 0.5, "clamped below")
+        XCTAssertEqual(configuration.renderedTextureSize, SIMD2<Int>(960, 912))
+        configuration.renderScale = 10
+        XCTAssertEqual(configuration.clampedRenderScale, 2, "clamped above")
+        XCTAssertEqual(configuration.renderedTextureSize, SIMD2<Int>(3840, 3648))
+        configuration.renderScale = -3
+        XCTAssertEqual(configuration.clampedRenderScale, 0.5)
+        configuration.renderScale = .nan
+        XCTAssertEqual(configuration.clampedRenderScale, 1, "not a number is 1")
+        XCTAssertEqual(configuration.renderedTextureSize, configuration.textureSize)
+        configuration.renderScale = .infinity
+        XCTAssertEqual(configuration.clampedRenderScale, 1)
+
+        // Odd sizes round to whole pixels (halves away from zero), never below one.
+        configuration.renderScale = 1.5
+        configuration.textureSize = [321, 1]
+        XCTAssertEqual(configuration.renderedTextureSize, SIMD2<Int>(482, 2))
+        configuration.renderScale = 0.5
+        XCTAssertEqual(configuration.renderedTextureSize, SIMD2<Int>(161, 1), "160.5 rounds up; at least one pixel")
+    }
+
+    func test_theTexelsPerDegreeAtTheCentre_areTheTexelsPerUnitTangentPerRadian_andGrowWithTheScale() {
+        var configuration = XRRealityKitPresenterConfiguration()
+        // 1920 texels over 2.6 of tangent: 738 per unit tangent, 12.9 per degree at the centre.
+        XCTAssertEqual(configuration.centreTexelsPerDegree, 1920 / 2.6 * .pi / 180, accuracy: 1e-4)
+        XCTAssertEqual(configuration.centreTexelsPerDegree, 12.89, accuracy: 0.01)
+        configuration.renderScale = 1.5
+        XCTAssertEqual(configuration.centreTexelsPerDegree, 2880 / 2.6 * .pi / 180, accuracy: 1e-4)
+        XCTAssertEqual(configuration.centreTexelsPerDegree, 19.33, accuracy: 0.01, "1.5 times the texels per degree")
+        // A 90° symmetric frustum of 256 texels: 128 per unit tangent, 2.23 per degree at the centre.
+        configuration.renderScale = 1
+        configuration.textureSize = [256, 256]
+        configuration.frustumTangents = [1, 1, 1, 1]
+        XCTAssertEqual(configuration.centreTexelsPerDegree, 128 * .pi / 180, accuracy: 1e-5)
+        XCTAssertEqual(XRRealityKitPresenterConfiguration.centreTexelsPerDegree(width: 100, tangents: [0, 0, 1, 1]), 0, "no frustum, no density")
+    }
+}
+
 // MARK: - The mailbox
 
 final class XRTicketMailboxTests: XCTestCase {
@@ -1308,6 +1364,73 @@ final class XRGridUnprojectTests: XCTestCase {
         XCTAssertLessThan(worst, 0.3, "the grid interpolates the map within a cell to under a third of a screen pixel")
     }
 
+    /// The grid's cell under a render scale: the configured cell times the scale when that
+    /// divides the tile, else the tile's divisor nearest in ratio; what divides is taken as it
+    /// is, so scale 1 keeps today's cell.
+    func test_theFoveatedCell_scalesWithTheRenderScale_andSnapsToTheTilesDivisors() {
+        func cell(_ texels: Int, scale: Float, granularity: Int = 32) -> Int? {
+            var configuration = XRRealityKitPresenterConfiguration()
+            configuration.foveatedCellTexels = texels
+            configuration.renderScale = scale
+            return XRPresenterFoveation.cellTexels(for: configuration, granularity: [granularity, granularity])
+        }
+        XCTAssertEqual(cell(8, scale: 1), 8, "the shipped cell at scale 1")
+        XCTAssertEqual(cell(4, scale: 1), 4)
+        XCTAssertEqual(cell(16, scale: 1), 16)
+        XCTAssertEqual(cell(8, scale: 2), 16, "twice the texels, twice the cell: the grid's count stays")
+        XCTAssertEqual(cell(8, scale: 0.5), 4)
+        XCTAssertEqual(cell(8, scale: 1.5), 16, "12 texels divide no 32-texel tile: 16 is nearer in ratio (1.33) than 8 (1.5)")
+        XCTAssertEqual(cell(4, scale: 1.5), 8, "6 snaps to 8 (1.33) rather than 4 (1.5): the denser grid at 1.5 is a cell of 4")
+        XCTAssertEqual(cell(8, scale: 1.25), 8, "10 snaps to 8 (1.25) rather than 16 (1.6)")
+        XCTAssertEqual(cell(6, scale: 1), 8, "a configured cell that does not divide snaps too")
+        XCTAssertEqual(cell(1, scale: 1), 2, "two texels at least")
+        XCTAssertEqual(cell(8, scale: 1, granularity: 4), 4, "a tile of 4: the cell within it")
+        XCTAssertEqual(cell(8, scale: 1, granularity: 16), 8)
+        XCTAssertNil(cell(8, scale: 1, granularity: 1), "a tile of one texel has no cell")
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.renderScale = 1.5
+        XCTAssertEqual(XRPresenterFoveation.cellTexels(for: configuration, granularity: [32, 16]), 16, "along both axes")
+        XCTAssertEqual(XRPresenterFoveation.cellTexels(for: configuration, granularity: [32, 8]), 8)
+    }
+
+    /// The shipped map at a render scale of 1.5: the budget is the scaled size, the screen
+    /// grows with it (so the centre of view gains the scale), the texels per degree at the
+    /// centre are 1.5 times the map's at scale 1, and the grid keeps about its vertex count
+    /// instead of growing with the texels (the cell snapped to the tile).
+    func test_theShippedMap_atARenderScale_growsItsScreenWithTheBudget_andKeepsTheGridsCount() throws {
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.foveation = .equiAngular
+        let plain = try makeFoveation(configuration)
+        configuration.renderScale = 1.5
+        let scaled = try makeFoveation(configuration)
+        print("XR presenter rate map at a render scale of 1.5 on this Mac: \(scaled)")
+
+        XCTAssertEqual(scaled.budget, SIMD2<Int>(2880, 2736), "the budget is the scaled size")
+        XCTAssertEqual(configuration.renderedTextureSize, scaled.budget)
+        XCTAssertLessThanOrEqual(scaled.physicalSize.x, 2880, "within the budget")
+        XCTAssertLessThanOrEqual(scaled.physicalSize.y, 2736)
+        XCTAssertGreaterThan(scaled.physicalSize.x * scaled.physicalSize.y, Int(0.9 * 2880.0 * 2736.0), "and nearly all of it")
+        XCTAssertEqual(Float(scaled.screenSize.x) / Float(plain.screenSize.x), 1.5, accuracy: 0.03, "the screen grows with the budget: \(scaled.screenSize) against \(plain.screenSize)")
+        XCTAssertEqual(Float(scaled.screenSize.y) / Float(plain.screenSize.y), 1.5, accuracy: 0.03)
+        XCTAssertEqual(scaled.screenScale.x, plain.screenScale.x, accuracy: 0.03, "the same profile over the budget")
+        let tangents = configuration.frustumTangents
+        XCTAssertEqual(scaled.centreTexelsPerDegree(tangents: tangents) / plain.centreTexelsPerDegree(tangents: tangents), 1.5, accuracy: 0.03, "1.5 times the texels per degree at the centre of view")
+        XCTAssertGreaterThan(plain.centreTexelsPerDegree(tangents: tangents), configuration.centreTexelsPerDegree / 1.5 * 1.25, "the map's centre is denser than the uniform frame's")
+        XCTAssertEqual(scaled.frame.viewport.width, Double(scaled.screenSize.x), "the eyes' viewport is the scaled screen")
+        XCTAssertEqual(scaled.rateMapData.physicalSize, SIMD2<Float>(Float(scaled.physicalSize.x), Float(scaled.physicalSize.y)))
+
+        XCTAssertEqual(scaled.granularity, plain.granularity, "the tile is the GPU's")
+        XCTAssertEqual(scaled.cellTexels, try XCTUnwrap(XRPresenterFoveation.cellTexels(for: configuration, granularity: scaled.granularity)))
+        XCTAssertEqual(scaled.granularity.x % scaled.cellTexels, 0, "the cell divides the tile")
+        if scaled.granularity == [32, 32] {
+            XCTAssertEqual(plain.cellTexels, 8)
+            XCTAssertEqual(scaled.cellTexels, 16, "8 × 1.5 snapped to the tile's divisor nearest in ratio")
+        }
+        XCTAssertEqual(scaled.grid.columns, (scaled.physicalSize.x + scaled.cellTexels - 1) / scaled.cellTexels + 1)
+        XCTAssertLessThanOrEqual(scaled.grid.vertexCount, plain.grid.vertexCount, "the grid does not grow with the texels: \(scaled.grid) against \(plain.grid)")
+        XCTAssertGreaterThan(scaled.grid.vertexCount, plain.grid.vertexCount / 3, "nor does it collapse")
+    }
+
     /// Through a map, every vertex lies on the ray Metal's own mapping gives its texel, at the
     /// depth drawn there: the depth of a plane tilted in eye space, computed per texel through
     /// that mapping on the CPU and drawn into the physical texture; the kernel, reading the map
@@ -1823,6 +1946,75 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         presenter.stop()
     }
 
+    /// The chain at a render scale of 1.5 without a map: the presenter's textures, its depth,
+    /// the kernel's scratch and the loop's targets take the scaled size, the grid keeps the
+    /// configured vertex count, the frame source reports the scaled eye size, and the loop
+    /// draws into it.
+    func test_atARenderScale_thePresenterSizesItsTexturesDepthAndKernelToTheScaledSize_andKeepsTheGrid() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.pipelineDepth = 1
+        configuration.textureSize = [320, 240]
+        configuration.renderScale = 1.5
+        configuration.gridColumns = 17
+        configuration.gridRows = 13
+        configuration.farShellMetres = 50
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        XCTAssertEqual(presenter.renderScale, 1.5)
+        XCTAssertEqual(presenter.textureSize, SIMD2<Int>(480, 360), "the textures are the scaled size")
+        XCTAssertNil(presenter.foveation)
+        XCTAssertEqual(presenter.grid, XRPresenterGrid(columns: 17, rows: 13), "the grid keeps its vertices; its cell grows with the texels")
+        for eye in 0 ..< 2 {
+            XCTAssertEqual(presenter.depthTextures[eye].width, 480, "the depth is the scaled size")
+            XCTAssertEqual(presenter.depthTextures[eye].height, 360)
+            XCTAssertEqual(presenter.unprojectScratch[eye].textureSize, SIMD2<Int>(480, 360), "the kernel's scratch was made for the scaled depth")
+            XCTAssertEqual(presenter.unprojectScratch[eye].grid, presenter.grid)
+            XCTAssertEqual(presenter.unprojectScratch[eye].blockNearestDepths.length, 60 * 45 * MemoryLayout<Float>.stride, "the block dispatch covers the scaled depth")
+        }
+        XCTAssertEqual(presenter.centreTexelsPerDegree, configuration.centreTexelsPerDegree)
+        XCTAssertEqual(presenter.centreTexelsPerDegree, 480 / 2.6 * .pi / 180, accuracy: 1e-4)
+
+        let source = RealityKitFrameSource(presenter: presenter) { _ in matrix4x4Translation(0, 0, 5) }
+        XCTAssertEqual(source.eyeSize, simd_float2(480, 360), "the loop sizes the renderer's targets from the scaled size")
+        let frame = try XCTUnwrap(source.nextFrameAfter(presenter: presenter, queue: renderInfo.commandQueue))
+        let eyes = try XCTUnwrap(frame.acquireEyes().first?.eyes)
+        for eye in eyes {
+            XCTAssertEqual(eye.colorTexture.width, 480, "RealityKit's texture is the scaled size")
+            XCTAssertEqual(eye.colorTexture.height, 360)
+            XCTAssertEqual(eye.viewport.width, 480, "the viewport is the texture's")
+            XCTAssertEqual(eye.viewport.height, 360)
+            XCTAssertNil(eye.foveation)
+        }
+        _ = frame
+
+        let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
+        loop.start()
+        let thread = Thread { loop.run() }
+        thread.start()
+        try waitUntil {
+            presenter.update()
+            return loop.framesDrawn >= 6
+        }
+        let lastTicket = try XCTUnwrap(presenter.lastTicket)
+        try waitUntil { lastTicket.commandBuffer.status == .completed }
+        presenter.stop()
+        try waitUntil { thread.isFinished }
+        XCTAssertEqual(renderInfo.viewPort, simd_float2(480, 360), "the engine's targets took the scaled size")
+        XCTAssertEqual(lastTicket.colorTextures[0].width, 480)
+        XCTAssertEqual(presenter.statistics.snapshot().posesMissing, 0)
+
+        // The middle vertex lies on the cube ahead, as at scale 1: the grid's placement does
+        // not depend on the texel size.
+        let grid = presenter.grid
+        let bytes = try bytes(of: lastTicket.gridBuffers[0])
+        let base = ((grid.rows / 2) * grid.columns + grid.columns / 2) * XRPresenterGrid.vertexStride
+        let middle = bytes.withUnsafeBytes { raw in
+            SIMD3<Float>(raw.load(fromByteOffset: base, as: Float.self), raw.load(fromByteOffset: base + 4, as: Float.self), raw.load(fromByteOffset: base + 8, as: Float.self))
+        }
+        XCTAssertEqual(middle.z, 0.5, accuracy: 0.1, "the middle vertex lies on the near face of the cube at the origin: \(middle)")
+    }
+
     /// The configuration of the picture tests: a symmetric 90° frustum, so that RealityKit's
     /// perspective camera matches the engine's projection exactly; the eyes at the device's point
     /// (no eye distance), so that the left eye's grid is what a mono camera there sees through
@@ -2035,6 +2227,122 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         try dumpPictures([("realitykit-two-deep.png", shown, size), ("engine-two-deep.png", engine, size)])
         XCTAssertTrue(psnr.isFinite)
         XCTAssertGreaterThan(psnr, 70, "the set shown holds a frame the engine drew from the same pose")
+    }
+
+    /// At a render scale of 1.5, RealityKit's picture of the grids is still the engine's: the
+    /// eye is drawn at the scaled size and the grid (the configured vertex count, a cell of six
+    /// texels now) puts every texel back where the engine drew it, against the engine's own
+    /// frame of that size. At 8 bits the two are the same, as at scale 1.
+    func test_realityKitShowsTheEnginesPicture_atARenderScale() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = Self.pictureConfiguration
+        configuration.renderScale = 1.5
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        try turnTheCubes()
+
+        let (presenter, engine, size) = try await drawEngineEye(configuration)
+        XCTAssertEqual(size, SIMD2<Int>(384, 384), "the eye was drawn at 1.5 times the configured size")
+        XCTAssertEqual(presenter.textureSize, size)
+        XCTAssertEqual(presenter.grid, XRPresenterGrid(columns: 65, rows: 65), "the grid is the configured one")
+        XCTAssertGreaterThan(coloured(engine, size: size), 2250, "the engine drew the cubes into the scaled eye (2.25 times the pixels of the scale-1 picture)")
+
+        let shown = try await realityKitPicture(of: presenter, size: size)
+        XCTAssertGreaterThan(coloured(shown, size: size), 2250, "RealityKit drew the grids")
+        let psnr = peakSignalToNoise(shown, engine, size: size)
+        print("RealityKit's picture of the presenter's grids at a render scale of 1.5 (\(size.x)×\(size.y)) against the engine's eye of that size: PSNR \(psnr) dB")
+        try dumpPictures([("realitykit-scale-1.5.png", shown, size), ("engine-scale-1.5.png", engine, size)])
+        XCTAssertTrue(psnr.isFinite)
+        XCTAssertGreaterThan(psnr, 70, "RealityKit shows the engine's scaled picture from the engine's eye")
+    }
+
+    /// The engine's frames through the presenter at the headset's configuration (1920 × 1824
+    /// per eye, the 256 × 240 grid, the band, the pipeline two refreshes deep) for `frames`
+    /// frames of the test scene from the picture pose: each ticket's command buffer's GPU span
+    /// in milliseconds after `warmUp` frames, the engine's busy time averaged by the pass
+    /// timing, and the textures' memory. The command buffer is the frame's whole: the eyes,
+    /// the unprojection, the band.
+    @available(macOS 15.0, *)
+    private func timeEngineFrames(_ configuration: XRRealityKitPresenterConfiguration, frames: Int, warmUp: Int) async throws -> (spansMs: [Double], busyMs: Double, colourBytesPerSet: Int, depthBytes: Int, textureSize: SIMD2<Int>) {
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        guard presenter.usesShaderGraphMaterial else { throw XCTSkip("the eye material did not load") }
+        let pose = Self.picturePose
+        let source = RealityKitFrameSource(presenter: presenter) { _ in pose }
+        let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
+        loop.start()
+        let thread = Thread { loop.run() }
+        thread.start()
+        presenter.start(commandQueue: renderInfo.commandQueue)
+        var tickets: [XRPresenterTicket] = []
+        try reach("\(frames) frames drawn") {
+            presenter.update()
+            if let ticket = presenter.lastTicket, ticket.serial != tickets.last?.serial { tickets.append(ticket) }
+            return loop.framesDrawn >= frames
+        }
+        let lastTicket = try XCTUnwrap(presenter.lastTicket)
+        try reach("the last ticket completed") { lastTicket.commandBuffer.status == .completed }
+        let busy = GPUPassTiming.shared.busy().averageMs
+        // Every frame posted has completed, so the stop commits the presentations left at once.
+        presenter.stop()
+        try reach("the loop's thread finished") { thread.isFinished }
+        try reach("the presentations committed") { presenter.pendingPresentations == 0 }
+        let completed = tickets.filter { $0.commandBuffer.status == .completed && $0.commandBuffer.gpuEndTime > $0.commandBuffer.gpuStartTime }
+        let spans = completed.dropFirst(warmUp).map { ($0.commandBuffer.gpuEndTime - $0.commandBuffer.gpuStartTime) * 1000 }
+        let colour = lastTicket.colorTextures.reduce(0) { $0 + $1.allocatedSize }
+        let depth = presenter.depthTextures.reduce(0) { $0 + $1.allocatedSize }
+        return (spans, busy, colour, depth, presenter.textureSize)
+    }
+
+    /// The engine's GPU frame through the presenter at the headset's configuration, at a render
+    /// scale of 1 and of 1.5, on this Mac: the command buffers' GPU spans (median and mean)
+    /// and the engine's own busy time, with the memory of each set's two eye textures and of
+    /// the depth pair. A measurement, printed; it asserts that the frames complete, that the
+    /// scaled run's textures are 2880 × 2736 (so RealityKit takes a `LowLevelTexture` of that
+    /// size), and that the scaled frame costs more than the plain one and less than four times
+    /// it. The Mac's milliseconds are not the headset's; the ratio is what carries over.
+    func test_theEnginesGPUFrame_throughThePresenter_atARenderScaleOfOneAndOneAndAHalf_timed() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        setRendering(.gpuPassTiming(.enabled))
+        defer { setRendering(.gpuPassTiming(.disabled)) }
+        try turnTheCubes()
+
+        func summary(_ spans: [Double]) -> (median: Double, mean: Double) {
+            let sorted = spans.sorted()
+            return (sorted[sorted.count / 2], sorted.reduce(0, +) / Double(sorted.count))
+        }
+        func megabytes(_ bytes: Int) -> String { String(format: "%.1f MB", Double(bytes) / 1_048_576) }
+
+        var results: [(scale: Float, median: Double, mean: Double, busy: Double, size: SIMD2<Int>, colour: Int, depth: Int)] = []
+        for scale: Float in [1, 1.5] {
+            var configuration = XRRealityKitPresenterConfiguration()
+            configuration.renderScale = scale
+            // The busy average starts afresh for each scale.
+            setRendering(.gpuPassTiming(.disabled))
+            setRendering(.gpuPassTiming(.enabled))
+            let timed = try await timeEngineFrames(configuration, frames: 50, warmUp: 10)
+            XCTAssertGreaterThanOrEqual(timed.spansMs.count, 20, "enough frames timed at scale \(scale)")
+            let (median, mean) = summary(timed.spansMs)
+            results.append((scale, median, mean, timed.busyMs, timed.textureSize, timed.colourBytesPerSet, timed.depthBytes))
+            let line = String(
+                format: "XR presenter at a render scale of %.1f on %@: %d×%d per eye, grid 256×240, two sets; GPU span per frame median %.3f ms, mean %.3f ms over %d frames; engine busy (pass timing) %.3f ms; eye textures %@ per set (%@ for the two sets), depth %@ shared",
+                scale, renderInfo.device.name, timed.textureSize.x, timed.textureSize.y, median, mean, timed.spansMs.count, timed.busyMs,
+                megabytes(timed.colourBytesPerSet), megabytes(timed.colourBytesPerSet * 2), megabytes(timed.depthBytes)
+            )
+            print(line)
+        }
+        XCTAssertEqual(results[0].size, SIMD2<Int>(1920, 1824))
+        XCTAssertEqual(results[1].size, SIMD2<Int>(2880, 2736), "RealityKit made the scaled textures")
+        XCTAssertGreaterThanOrEqual(results[1].colour, 2 * 2880 * 2736 * 4, "two bgra eyes per set")
+        XCTAssertGreaterThanOrEqual(results[1].depth, 2 * 2880 * 2736 * 4, "two depth32 eyes")
+        let ratio = results[1].median / results[0].median
+        print(String(format: "XR presenter render scale 1.5 against 1: the GPU span's median grows %.2f× (2.25× the pixels)", ratio))
+        XCTAssertGreaterThan(ratio, 1, "the scaled frame costs more")
+        XCTAssertLessThan(ratio, 4, "and not more than the pixels would explain")
     }
 
     /// Through the presenter's rate map, RealityKit's picture of the grids is the engine's

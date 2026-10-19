@@ -128,7 +128,8 @@
                 self.thread = thread
                 thread.start()
                 let foveated = presenter.foveation.map { " through its \($0.profile.rawValue) rate map (screen \($0.screenSize.x)×\($0.screenSize.y))" } ?? ""
-                print("XR presenter: running, \(presenter.textureSize.x)×\(presenter.textureSize.y) per eye\(foveated), grids \(presenter.grid.columns)×\(presenter.grid.rows), \(presenter.usesShaderGraphMaterial ? "eye material" : "fallback material")")
+                let scaled = presenter.renderScale == 1 ? "" : String(format: " at a render scale of %.2f", presenter.renderScale)
+                print("XR presenter: running, \(presenter.textureSize.x)×\(presenter.textureSize.y) per eye\(foveated)\(scaled), \(String(format: "%.1f", presenter.centreTexelsPerDegree)) texels per degree at the centre of view, grids \(presenter.grid.columns)×\(presenter.grid.rows), \(presenter.usesShaderGraphMaterial ? "eye material" : "fallback material")")
             } catch {
                 Logger.logWarning(message: "XR presenter: could not be created: \(error)")
             }

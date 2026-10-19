@@ -36,6 +36,11 @@ import UntoldEngine
 /// Metal rounds rates UP toward quality and pads to its tiles, so a screen scaled by the
 /// profile's ideal ratio would come out with more physical pixels than the budget; the screen
 /// is scaled down, axis by axis, until the physical size fits.
+///
+/// Under a render scale (`XRRealityKitPresenterConfiguration.renderScale`) the budget is the
+/// scaled texture size, so the screen grows with it and the centre of view gains the same
+/// factor; the grid's cell scales with it too, snapped to a divisor of the tile, so that the
+/// grid keeps about its vertex count instead of growing with the texels.
 public final class XRPresenterFoveation: @unchecked Sendable, CustomStringConvertible {
     public let profile: XRPresenterFoveationProfile
     /// The map, its viewport (the whole screen) and its parameters: what each eye carries into
@@ -45,7 +50,8 @@ public final class XRPresenterFoveation: @unchecked Sendable, CustomStringConver
     public let screenSize: SIMD2<Int>
     /// The size of the textures drawn through the map: the pixel budget, or less.
     public let physicalSize: SIMD2<Int>
-    /// The pixel budget the map was fitted to (the configuration's `textureSize`).
+    /// The pixel budget the map was fitted to (the configuration's `renderedTextureSize`:
+    /// its `textureSize` times its render scale).
     public let budget: SIMD2<Int>
     /// The map's tile in physical pixels, at whose boundaries its rate changes.
     public let granularity: SIMD2<Int>
@@ -62,6 +68,14 @@ public final class XRPresenterFoveation: @unchecked Sendable, CustomStringConver
     /// the uniform frame of the same pixel count (the rate there is 1).
     public var screenScale: SIMD2<Float> {
         SIMD2<Float>(Float(screenSize.x) / Float(budget.x), Float(screenSize.y) / Float(budget.y))
+    }
+
+    /// Texels per degree at the centre of view, horizontally: the centre is drawn at the
+    /// screen's density (a texel there is a screen pixel), so the screen's width over the
+    /// frustum's width in tangent, as texels per radian. 17.6 for the default budget on an
+    /// Apple GPU, against 12.9 uniform.
+    public func centreTexelsPerDegree(tangents: SIMD4<Float>) -> Float {
+        XRRealityKitPresenterConfiguration.centreTexelsPerDegree(width: screenSize.x, tangents: tangents)
     }
 
     /// The grid for the physical size: a vertex every `cellTexels` along each axis, the last on
@@ -111,10 +125,27 @@ public final class XRPresenterFoveation: @unchecked Sendable, CustomStringConver
         }
     }
 
+    /// The grid's cell in physical texels for `configuration` on a map whose tile is
+    /// `granularity`: `foveatedCellTexels` times the render scale, rounded, taken as it is when
+    /// it divides the tile along both axes, else the divisor of the tile nearest to it in ratio
+    /// (2 at least: the granularity's divisors are a short list, powers of two on Apple GPUs).
+    /// Nil when the tile has no divisor of 2 or more.
+    public static func cellTexels(for configuration: XRRealityKitPresenterConfiguration, granularity: SIMD2<Int>) -> Int? {
+        guard granularity.x > 0, granularity.y > 0 else { return nil }
+        let preferred = max(1, Int((Float(max(1, configuration.foveatedCellTexels)) * configuration.clampedRenderScale).rounded()))
+        if preferred >= 2, granularity.x % preferred == 0, granularity.y % preferred == 0 { return preferred }
+        let divisors = (2 ... max(2, min(granularity.x, granularity.y))).filter { granularity.x % $0 == 0 && granularity.y % $0 == 0 }
+        return divisors.min { a, b in
+            let ratioA = abs(log(Float(a)) - log(Float(preferred)))
+            let ratioB = abs(log(Float(b)) - log(Float(preferred)))
+            return ratioA == ratioB ? a > b : ratioA < ratioB
+        }
+    }
+
     /// The map for `configuration` on `device`, or nil when the configuration asks for none,
-    /// the device has no rasterization rate maps, Metal refuses the map, or no cell of
-    /// `foveatedCellTexels` or half of it divides the map's granularity: the presenter then
-    /// draws uniformly, as it did before, and says so.
+    /// the device has no rasterization rate maps, Metal refuses the map, or no cell of two
+    /// texels or more divides the map's granularity: the presenter then draws uniformly, as it
+    /// did before, and says so. The budget is the configuration's rendered texture size.
     public static func make(device: MTLDevice, configuration: XRRealityKitPresenterConfiguration) -> XRPresenterFoveation? {
         let profile = configuration.foveation
         guard profile != .none else { return nil }
@@ -122,7 +153,7 @@ public final class XRPresenterFoveation: @unchecked Sendable, CustomStringConver
             Logger.logWarning(message: "XR presenter: this GPU has no rasterization rate maps; the eyes are drawn uniformly")
             return nil
         }
-        let budget = configuration.textureSize
+        let budget = configuration.renderedTextureSize
         let tangents = configuration.frustumTangents
         guard budget.x > 0, budget.y > 0, tangents.min() > 0 else { return nil }
 
@@ -170,13 +201,11 @@ public final class XRPresenterFoveation: @unchecked Sendable, CustomStringConver
             return nil
         }
 
-        // The grid's cell: the configured one, or half of it, dividing the tile.
+        // The grid's cell: the configured one at the render scale, or the tile's divisor
+        // nearest to it.
         let granularity = SIMD2<Int>(rateMap.physicalGranularity.width, rateMap.physicalGranularity.height)
-        let preferred = max(1, configuration.foveatedCellTexels)
-        guard granularity.x > 0, granularity.y > 0,
-              let cell = [preferred, preferred / 2].first(where: { $0 >= 2 && granularity.x % $0 == 0 && granularity.y % $0 == 0 })
-        else {
-            Logger.logWarning(message: "XR presenter: no grid cell of \(preferred) or \(preferred / 2) texels divides the rate map's granularity \(granularity.x)×\(granularity.y); the eyes are drawn uniformly")
+        guard let cell = cellTexels(for: configuration, granularity: granularity) else {
+            Logger.logWarning(message: "XR presenter: no grid cell of two texels or more divides the rate map's granularity \(granularity.x)×\(granularity.y); the eyes are drawn uniformly")
             return nil
         }
 
