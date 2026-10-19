@@ -13,7 +13,8 @@ import simd
 
 /// How the RealityKit presenter renders and shows the engine's frame: the size of each eye's
 /// textures, the grids each eye is shown on, the eyes' frustum and distance, the lead the frame
-/// is posed ahead of its ticket, and the depth rules of the grids.
+/// is posed ahead of its ticket, how many refreshes the engine has for a frame, and the depth
+/// rules of the grids.
 public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// Pixels per eye: the headset's per-eye drawable size by default (the plan's D5).
     public var textureSize = SIMD2<Int>(1920, 1824)
@@ -60,6 +61,18 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// headset with the adaptive lead on: a head-locked marker that lags a head turn wants a
     /// longer latency, one that leads wants a shorter.
     public var displayLatencySeconds: TimeInterval = 0.016
+    /// How many refreshes the engine has for a frame, 1 or 2. At 1 a ticket posted at a
+    /// RealityKit update shows at the next render when its command buffer completed in time,
+    /// else at the one after (a late frame). At 2 the ticket is planned for the render after
+    /// the next: the presenter is made with a second set of textures and grids and alternates
+    /// the sets between its tickets, RealityKit's replace calls go on a presentation buffer the
+    /// presenter commits at the next update (after the engine committed the frame's own), and
+    /// a set is shown once its ticket of two updates ago completed. A frame whose GPU span is
+    /// stretched by up to a refresh then still lands on time, at the price of one refresh of
+    /// lead: the frame is posed a refresh further ahead (`XRPresenterLead`). 1 by default;
+    /// the sets are made here, and `XRPresenterSettings.pipelineDepth` chooses at run time
+    /// between the depths the sets allow.
+    public var pipelineDepth = 1
     /// The near plane of the eyes' projection, metres.
     public var nearPlane: Float = 0.05
     /// The far plane of the eyes' projection, metres: depth 0 under reverse Z.

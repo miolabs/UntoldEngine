@@ -28,17 +28,29 @@ import UntoldEngine
 /// profile in the configuration, both eyes are drawn through the presenter's own fixed
 /// rasterization rate map (`XRPresenterFoveation`): the textures are its physical size, within
 /// the configured pixel budget, and the grids a vertex every cell of physical texels.
+///
+/// With the pipeline two refreshes deep (`XRRealityKitPresenterConfiguration.pipelineDepth`),
+/// the textures, grids, band and entities above are made twice, as two sets the tickets
+/// alternate between by update; the replace calls of a ticket go on a presentation buffer of
+/// their own, which the presenter commits at the update after the engine committed the
+/// frame's buffer (ordered behind it on the engine's queue, so RealityKit takes the frame
+/// only once it is drawn); and at each update the set shown is the one whose ticket of two
+/// updates ago has its presentation completed, the other hidden: a frame posted at an update
+/// shows at the render two updates on, whether its drawing took one refresh or nearly two,
+/// and a frame later than that is held back (the set shown keeps showing) and skipped. The
+/// engine's thread poses each frame a refresh further ahead for it (`XRPresenterLead`).
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 @MainActor
 public final class XRRealityKitPresenter {
     public let configuration: XRRealityKitPresenterConfiguration
     public let device: MTLDevice
-    /// The entity to add to the `RealityView`: the two grids are its children.
+    /// The entity to add to the `RealityView`: the grids are its children.
     public let root = Entity()
     public let statistics = XRPresenterStatistics()
     public let mailbox = XRTicketMailbox()
     /// The engine's depth per eye (`depth32Float`, reverse Z), the presenter's own: drawn into
-    /// with the eye, read by the unprojection kernel after it.
+    /// with the eye, read by the unprojection kernel after it. One pair, shared by the sets:
+    /// the tickets' command buffers run in order on one queue.
     public let depthTextures: [MTLTexture]
     /// Each eye's grid: the configuration's, or, through a rate map, the map's physical texels
     /// in cells.
@@ -65,27 +77,75 @@ public final class XRRealityKitPresenter {
     /// while running as a game likes; each ticket carries a copy.
     public var settings: XRPresenterSettings
 
-    private let colorTextures: [LowLevelTexture]
-    let meshes: [LowLevelMesh]
+    /// One set of what RealityKit shows: the eyes' textures, the grids and their entities, the
+    /// edge band's meshes and entities. One set with the pipeline one refresh deep; two,
+    /// alternated between tickets, two refreshes deep.
+    struct PresentationSet {
+        let colorTextures: [LowLevelTexture]
+        let meshes: [LowLevelMesh]
+        let gridEntities: [ModelEntity]
+        let bandMeshes: [LowLevelMesh]
+        let edgeEntities: [ModelEntity]
+    }
+
+    /// The latest ticket of a set: at which update it was posted and the buffer on whose
+    /// completion RealityKit shows it, for choosing the set to show.
+    private struct SetContent {
+        var update: UInt64 = 0
+        var presentation: MTLCommandBuffer?
+    }
+
+    /// A ticket's replace calls two refreshes deep, waiting to be committed at the update after
+    /// the frame's own buffer was.
+    private struct DeferredPresentation {
+        let frame: MTLCommandBuffer
+        let presentation: MTLCommandBuffer
+    }
+
+    let sets: [PresentationSet]
+    /// How many sets of textures and grids the presenter was made with: 1, or 2 for the
+    /// pipeline two refreshes deep (`XRRealityKitPresenterConfiguration.pipelineDepth`).
+    public var presentationSets: Int {
+        sets.count
+    }
+
+    /// The first set's grids, one per eye.
+    var meshes: [LowLevelMesh] {
+        sets[0].meshes
+    }
+
+    /// The first set's edge band meshes, one per eye, when its graph loaded.
+    var bandMeshes: [LowLevelMesh] {
+        sets[0].bandMeshes
+    }
+
     /// The grids' fixed split, for writing it back when the adaptive diagonal is turned off.
     private let fixedIndices: MTLBuffer?
     /// Every cell degenerate: what the band's index buffers start from each frame, so that a
     /// frame that draws nothing (no pose, the stop path) leaves the band empty.
     private let degenerateIndices: MTLBuffer?
-    private let gridEntities: [ModelEntity]
-    /// The edge band's meshes, one per eye, when its graph loaded: the grid's vertices again
-    /// (the kernel writes the same bytes into them), an index buffer of the cells along
-    /// silhouettes the kernel writes per frame, every other cell degenerate.
-    let bandMeshes: [LowLevelMesh]
-    /// The edge band's entities, one per eye, on the band's meshes, when its graph loaded;
-    /// enabled by the settings.
-    private let edgeEntities: [ModelEntity]
     /// Whether the edge band's material loaded, so that the band can be drawn.
     public private(set) var hasEdgeBand = false
     /// Whether the edge band is drawn: it is there and the settings ask for it.
     public var drawsEdgeBand: Bool { hasEdgeBand && settings.edgeBlending }
-    /// Whether the last ticket's cells were split by the depth (the adaptive diagonal).
-    private var splitByDepth = false
+    /// Whether each set's last ticket's cells were split by the depth (the adaptive diagonal).
+    private var splitByDepth: [Bool]
+    /// Each set's latest ticket.
+    private var contents: [SetContent]
+    /// The set whose entities show; the others are hidden.
+    public private(set) var shownSet = 0
+    /// The presentation buffers waiting for their frames' buffers to be committed, oldest first.
+    private var deferred: [DeferredPresentation] = []
+    /// How many tickets' replace calls wait to be committed (two refreshes deep).
+    public var pendingPresentations: Int {
+        deferred.count
+    }
+
+    /// The display's refresh period measured from the updates, for the deeper pipeline's lead.
+    public private(set) var refresh = XRPresenterRefresh()
+    /// Updates so far: the tickets alternate sets by it, and a set is shown for the update two
+    /// before.
+    private var updates: UInt64 = 0
     private var commandQueue: MTLCommandQueue?
     private var serial: UInt64 = 0
     private var lastReportTime = CACurrentMediaTime()
@@ -117,16 +177,6 @@ public final class XRRealityKitPresenter {
 
         let width = textureSize.x
         let height = textureSize.y
-        var colorDescriptor = LowLevelTexture.Descriptor()
-        colorDescriptor.textureType = .type2D
-        colorDescriptor.pixelFormat = .bgra8Unorm_srgb
-        colorDescriptor.width = width
-        colorDescriptor.height = height
-        colorDescriptor.textureUsage = [.renderTarget, .shaderRead]
-        let colorTextures = try (0 ..< stereoEyeCount).map { _ in try LowLevelTexture(descriptor: colorDescriptor) }
-        self.colorTextures = colorTextures
-        let textureResources = try colorTextures.map { try TextureResource(from: $0) }
-
         let depthDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float, width: width, height: height, mipmapped: false
         )
@@ -145,63 +195,88 @@ public final class XRRealityKitPresenter {
             return scratch
         }
 
-        let meshes = try (0 ..< stereoEyeCount).map { _ in try grid.makeMesh(farShell: configuration.farShellMetres) }
-        self.meshes = meshes
-
-        var materials: [any RealityKit.Material] = []
+        // The eye material once, for every set.
+        var graph: ShaderGraphMaterial?
         do {
-            let graph = try await XRPresenterMaterial.load()
-            for eye in 0 ..< stereoEyeCount {
-                var material = graph
-                try XRPresenterMaterial.configure(&material, eye: eye, texture: textureResources[eye])
-                materials.append(material)
-            }
+            graph = try await XRPresenterMaterial.load()
             usesShaderGraphMaterial = true
         } catch {
             Logger.logWarning(message: "XR presenter: the eye material could not be loaded (\(error)); both eyes see both grids")
-            materials = textureResources.map { XRPresenterMaterial.fallback(texture: $0) }
         }
-
-        var entities: [ModelEntity] = []
-        for eye in 0 ..< stereoEyeCount {
-            let entity = try await ModelEntity(mesh: RealityKit.MeshResource(from: meshes[eye]), materials: [materials[eye]])
-            entity.name = eye == 0 ? "Untold XR left eye" : "Untold XR right eye"
-            root.addChild(entity)
-            entities.append(entity)
-        }
-        gridEntities = entities
-
-        // The edge band: the grids' vertices again on meshes of its own, whose cells the kernel
-        // keeps along silhouettes alone, blended over the opaque core; made whenever its graph
-        // loads, enabled when the settings ask for it. Its meshes start with every cell
-        // degenerate, so the band draws nothing before its first frame.
-        var edges: [ModelEntity] = []
-        var bands: [LowLevelMesh] = []
+        // The edge band's graph once, when the eye material loaded: a set whose band cannot
+        // be made has none, and the band is unavailable.
+        var edgeGraph: ShaderGraphMaterial?
         if usesShaderGraphMaterial {
             do {
-                let graph = try await XRPresenterMaterial.loadEdge()
+                edgeGraph = try await XRPresenterMaterial.loadEdge()
+            } catch {
+                Logger.logWarning(message: "XR presenter: the edge band's material could not be loaded (\(error)); edges are alpha-tested only")
+            }
+        }
+
+        // One set, or two for the pipeline two refreshes deep: the second starts hidden, and
+        // shows once a ticket drawn into it is due.
+        let setCount = min(max(configuration.pipelineDepth, 1), 2)
+        var sets: [PresentationSet] = []
+        for set in 0 ..< setCount {
+            var colorDescriptor = LowLevelTexture.Descriptor()
+            colorDescriptor.textureType = .type2D
+            colorDescriptor.pixelFormat = .bgra8Unorm_srgb
+            colorDescriptor.width = width
+            colorDescriptor.height = height
+            colorDescriptor.textureUsage = [.renderTarget, .shaderRead]
+            let colorTextures = try (0 ..< stereoEyeCount).map { _ in try LowLevelTexture(descriptor: colorDescriptor) }
+            let textureResources = try colorTextures.map { try TextureResource(from: $0) }
+            let meshes = try (0 ..< stereoEyeCount).map { _ in try grid.makeMesh(farShell: configuration.farShellMetres) }
+            let prefix = set == 0 ? "Untold XR " : "Untold XR second set, "
+
+            var materials: [any RealityKit.Material] = []
+            if let graph {
                 for eye in 0 ..< stereoEyeCount {
                     var material = graph
                     try XRPresenterMaterial.configure(&material, eye: eye, texture: textureResources[eye])
+                    materials.append(material)
+                }
+            } else {
+                materials = textureResources.map { XRPresenterMaterial.fallback(texture: $0) }
+            }
+
+            var entities: [ModelEntity] = []
+            for eye in 0 ..< stereoEyeCount {
+                let entity = try await ModelEntity(mesh: RealityKit.MeshResource(from: meshes[eye]), materials: [materials[eye]])
+                entity.name = prefix + (eye == 0 ? "left eye" : "right eye")
+                entity.isEnabled = set == 0
+                root.addChild(entity)
+                entities.append(entity)
+            }
+
+            // The edge band: the grids' vertices again on meshes of its own, whose cells the
+            // kernel keeps along silhouettes alone, blended over the opaque core; made whenever
+            // its graph loaded, enabled when the settings ask for it. Its meshes start with
+            // every cell degenerate, so the band draws nothing before its first frame.
+            var edges: [ModelEntity] = []
+            var bands: [LowLevelMesh] = []
+            if let edgeGraph {
+                for eye in 0 ..< stereoEyeCount {
+                    var material = edgeGraph
+                    try XRPresenterMaterial.configure(&material, eye: eye, texture: textureResources[eye])
                     let mesh = try grid.makeMesh(farShell: configuration.farShellMetres, indices: grid.degenerateIndices())
                     let entity = try await ModelEntity(mesh: RealityKit.MeshResource(from: mesh), materials: [material])
-                    entity.name = eye == 0 ? "Untold XR left eye edge" : "Untold XR right eye edge"
-                    entity.isEnabled = configuration.edgeBlending
+                    entity.name = prefix + (eye == 0 ? "left eye edge" : "right eye edge")
+                    entity.isEnabled = set == 0 && configuration.edgeBlending
                     bands.append(mesh)
                     edges.append(entity)
                 }
                 for entity in edges {
                     root.addChild(entity)
                 }
-                hasEdgeBand = true
-            } catch {
-                Logger.logWarning(message: "XR presenter: the edge band's material could not be loaded (\(error)); edges are alpha-tested only")
-                edges = []
-                bands = []
             }
+            sets.append(PresentationSet(colorTextures: colorTextures, meshes: meshes, gridEntities: entities, bandMeshes: bands, edgeEntities: edges))
         }
-        edgeEntities = edges
-        bandMeshes = bands
+        hasEdgeBand = edgeGraph != nil
+        self.sets = sets
+        splitByDepth = Array(repeating: false, count: sets.count)
+        contents = Array(repeating: SetContent(), count: sets.count)
         root.name = "Untold XR presenter"
     }
 
@@ -223,16 +298,32 @@ public final class XRRealityKitPresenter {
         self.commandQueue = commandQueue
     }
 
-    /// Once per RealityKit frame, on the main thread (`SceneEvents.Update`): a command buffer,
-    /// the replace calls for both eyes' textures, both grids and, when it is drawn, the edge
-    /// band's meshes, a ticket for the engine. None when the engine has not taken the previous
-    /// ticket (a counted drop), or before `start`.
+    /// The pipeline's depth in force for the next ticket: the settings', within the sets made.
+    public var pipelineDepth: Int {
+        min(max(settings.pipelineDepth, 1), sets.count)
+    }
+
+    /// Once per RealityKit frame, on the main thread (`SceneEvents.Update`): the presentation
+    /// buffers now due, the set to show for this render, then a command buffer, the replace
+    /// calls for both eyes' textures, both grids and, when it is drawn, the edge band's meshes,
+    /// a ticket for the engine. None when the engine has not taken the previous ticket (a
+    /// counted drop), or before `start`.
     public func update() {
         statistics.noteUpdate()
-        let settings = settings
-        // The band follows its setting on every update, whether or not a ticket goes out.
-        for entity in edgeEntities where entity.isEnabled != settings.edgeBlending {
-            entity.isEnabled = settings.edgeBlending
+        refresh.noteUpdate(at: CACurrentMediaTime())
+        updates += 1
+        let depth = pipelineDepth
+        var settings = settings
+        settings.pipelineDepth = depth
+        commitDuePresentations()
+        showSet(forUpdate: updates, depth: depth)
+        // The band follows its setting on every update, whether or not a ticket goes out, on
+        // the set shown; a hidden set's band is hidden with it.
+        for (index, set) in sets.enumerated() {
+            let wanted = settings.edgeBlending && index == shownSet
+            for entity in set.edgeEntities where entity.isEnabled != wanted {
+                entity.isEnabled = wanted
+            }
         }
         guard let commandQueue, !mailbox.isClosed else { return }
         guard !mailbox.hasPending else {
@@ -241,33 +332,48 @@ public final class XRRealityKitPresenter {
             return
         }
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        // Two refreshes deep: the replace calls on a buffer of their own, committed at the
+        // update after the frame's; one deep, on the frame's own buffer, as RealityKit expects
+        // the frame to show once it is drawn.
+        let presentation: MTLCommandBuffer
+        if depth > 1 {
+            guard let deferredBuffer = commandQueue.makeCommandBuffer() else { return }
+            deferredBuffer.label = "XR presenter presentation"
+            presentation = deferredBuffer
+        } else {
+            presentation = commandBuffer
+        }
+        let setIndex = depth > 1 ? Int(updates % 2) : 0
+        let set = sets[setIndex]
 
         let replaceStart = CACurrentMediaTime()
-        let textures = colorTextures.map { $0.replace(using: commandBuffer) }
-        let buffers = meshes.map { $0.replace(bufferIndex: 0, using: commandBuffer) }
+        let textures = set.colorTextures.map { $0.replace(using: presentation) }
+        let buffers = set.meshes.map { $0.replace(bufferIndex: 0, using: presentation) }
         // The cells' split per frame only when it is asked for; otherwise the mesh keeps its
         // indices and the ticket carries none. RealityKit hands the index buffers out with no
-        // content, so each starts from the fixed split, blitted here: the kernel splits the
-        // cells over it later in this command buffer, and a frame that draws nothing (no pose
-        // yet, the stop path) still completes with every cell whole. Just turned off, the same
-        // blit writes the fixed split back once, so no cell stays split as the depth last left it.
+        // content, so each starts from the fixed split, blitted here on the frame's buffer:
+        // the kernel splits the cells over it later in that command buffer, and a frame that
+        // draws nothing (no pose yet, the stop path) still completes with every cell whole.
+        // Just turned off, the same blit writes the fixed split back once, so no cell stays
+        // split as the depth last left it.
         var indexBuffers: [MTLBuffer] = []
         var fixedSplitInto: [MTLBuffer] = []
-        if settings.adaptiveDiagonal || splitByDepth {
-            fixedSplitInto = meshes.map { $0.replaceIndices(using: commandBuffer) }
+        if settings.adaptiveDiagonal || splitByDepth[setIndex] {
+            fixedSplitInto = set.meshes.map { $0.replaceIndices(using: presentation) }
             if settings.adaptiveDiagonal { indexBuffers = fixedSplitInto }
         }
-        splitByDepth = settings.adaptiveDiagonal
+        splitByDepth[setIndex] = settings.adaptiveDiagonal
         // The edge band's buffers while it is drawn: its vertices, which the kernel fills with
         // the grids' bytes, and its indices, handed out with no content like the grids' and
         // blitted degenerate here, so that a frame that draws nothing leaves the band empty;
-        // the kernel's band pass writes the cells along silhouettes over them later in this
-        // command buffer. Off, the band's entities are disabled and its meshes are left alone.
+        // the kernel's band pass writes the cells along silhouettes over them later in the
+        // frame's command buffer. Off, the band's entities are disabled and its meshes are
+        // left alone.
         var bandBuffers: [MTLBuffer] = []
         var bandIndexBuffers: [MTLBuffer] = []
         if hasEdgeBand, settings.edgeBlending {
-            bandBuffers = bandMeshes.map { $0.replace(bufferIndex: 0, using: commandBuffer) }
-            bandIndexBuffers = bandMeshes.map { $0.replaceIndices(using: commandBuffer) }
+            bandBuffers = set.bandMeshes.map { $0.replace(bufferIndex: 0, using: presentation) }
+            bandIndexBuffers = set.bandMeshes.map { $0.replaceIndices(using: presentation) }
         }
         if !fixedSplitInto.isEmpty || !bandIndexBuffers.isEmpty, let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.label = "XR presenter index buffers' start"
@@ -290,20 +396,67 @@ public final class XRRealityKitPresenter {
         let ticket = XRPresenterTicket(
             serial: serial,
             commandBuffer: commandBuffer,
+            presentationBuffer: presentation,
+            set: setIndex,
             colorTextures: textures,
             gridBuffers: buffers,
             indexBuffers: indexBuffers,
             bandBuffers: bandBuffers,
             bandIndexBuffers: bandIndexBuffers,
             postedAt: posted,
+            refreshSeconds: refresh.seconds,
             settings: settings
         )
         lastTicket = ticket
+        contents[setIndex] = SetContent(update: updates, presentation: presentation)
+        if depth > 1 {
+            deferred.append(DeferredPresentation(frame: commandBuffer, presentation: presentation))
+        }
         if !mailbox.post(ticket) {
             // Closed, or raced by a frame: a replaced texture never waits on an uncommitted buffer.
             commandBuffer.commit()
         }
         report()
+    }
+
+    /// Commits the presentation buffers whose frames' buffers the engine has committed, in
+    /// order, so that each is ordered behind its frame on the queue and RealityKit takes the
+    /// frame drawn; a frame not yet committed keeps its presentation and the later ones waiting.
+    private func commitDuePresentations() {
+        while let next = deferred.first {
+            guard next.frame.status != .notEnqueued else { break }
+            next.presentation.commit()
+            deferred.removeFirst()
+        }
+    }
+
+    /// The set to show for this update's render, two refreshes deep: the one whose latest
+    /// ticket was posted two updates ago and has its presentation completed, so that a frame
+    /// shows at the render it was planned for; otherwise the set shown stays (a frame later
+    /// than its plan, or an update that posted no ticket, holds the previous frame on screen,
+    /// and the late frame is skipped when the next one is on time). One deep, the first set
+    /// shows always.
+    private func showSet(forUpdate update: UInt64, depth: Int) {
+        var shown = shownSet
+        if depth > 1 {
+            if update > 2 {
+                let planned = update - 2
+                let candidate = Int(planned % 2)
+                let content = contents[candidate]
+                if content.update == planned, content.presentation?.status == .completed {
+                    shown = candidate
+                }
+            }
+        } else {
+            shown = 0
+        }
+        guard shown != shownSet else { return }
+        shownSet = shown
+        for (index, set) in sets.enumerated() {
+            for entity in set.gridEntities where entity.isEnabled != (index == shown) {
+                entity.isEnabled = index == shown
+            }
+        }
     }
 
     /// Ends the exchange after one more frame, for a shutdown the engine finishes in a frame:
@@ -354,10 +507,25 @@ public final class XRRealityKitPresenter {
     }
 
     /// Ends the exchange: the engine's loop, waiting on the mailbox, ends; a pending ticket is
-    /// committed empty. No ticket is posted after this.
+    /// committed empty; the presentation buffers still waiting are committed as their frames'
+    /// buffers are (a frame the engine is drawing commits in a moment). No ticket is posted
+    /// after this.
     public func stop() {
         mailbox.close()
         commandQueue = nil
+        commitRemainingPresentations()
+    }
+
+    /// The presentation buffers left after the stop, each committed once its frame's buffer is:
+    /// RealityKit's bookkeeping of the replace calls wants every one of them completed.
+    private func commitRemainingPresentations() {
+        commitDuePresentations()
+        guard !deferred.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+            MainActor.assumeIsolated {
+                self.commitRemainingPresentations()
+            }
+        }
     }
 
     private func report() {

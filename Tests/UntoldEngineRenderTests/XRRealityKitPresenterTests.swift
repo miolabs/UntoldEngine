@@ -2003,6 +2003,37 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertGreaterThan(psnr, 70, "RealityKit shows the engine's picture from the engine's eye (the affine uv scores under 65 dB)")
     }
 
+    /// Two refreshes deep, RealityKit's picture is still the engine's: the set shown is the one
+    /// whose ticket of two updates ago completed, drawn into through a presentation buffer
+    /// committed behind the frame's, so what RealityKit draws is a frame the engine finished.
+    func test_realityKitShowsTheEnginesPicture_twoRefreshesDeep() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = Self.pictureConfiguration
+        configuration.pipelineDepth = 2
+        let styleBefore = renderInfo.immersionStyle
+        renderInfo.immersionStyle = .mixed
+        defer { renderInfo.immersionStyle = styleBefore }
+        try turnTheCubes()
+
+        let (presenter, engine, size) = try await drawEngineEye(configuration)
+        XCTAssertEqual(presenter.presentationSets, 2)
+        XCTAssertGreaterThan(coloured(engine, size: size), 1000, "the engine drew the cubes into the eye")
+        try reach("the presentations committed") { presenter.pendingPresentations == 0 }
+        let lastTicket = try XCTUnwrap(presenter.lastTicket)
+        XCTAssertEqual(lastTicket.settings.pipelineDepth, 2)
+        try reach("the last presentation completed") { lastTicket.presentationBuffer.status == .completed }
+        let statistics = presenter.statistics.snapshot()
+        XCTAssertEqual(statistics.plannedRefreshes, 2, "the frames were planned two refreshes")
+
+        let shown = try await realityKitPicture(of: presenter, size: size)
+        XCTAssertGreaterThan(coloured(shown, size: size), 1000, "RealityKit drew the set shown")
+        let psnr = peakSignalToNoise(shown, engine, size: size)
+        print("RealityKit's picture two refreshes deep against the engine's eye: PSNR \(psnr) dB")
+        try dumpPictures([("realitykit-two-deep.png", shown, size), ("engine-two-deep.png", engine, size)])
+        XCTAssertTrue(psnr.isFinite)
+        XCTAssertGreaterThan(psnr, 70, "the set shown holds a frame the engine drew from the same pose")
+    }
+
     /// Through the presenter's rate map, RealityKit's picture of the grids is the engine's
     /// picture unwarped: the eye is drawn into the map's physical texels, dense at the centre of
     /// view and sparse at the edges, and the grid, a vertex every cell of those texels, puts each

@@ -17,13 +17,13 @@ import UntoldEngineXR
 
 /// The engine's frames from a `XRRealityKitPresenter`: each ticket the presenter posts is one
 /// frame, posed for a lead past its posting (`XRPresenterLead`: the fixed lead past the moment
-/// it is taken, or the measured one); its eyes are the ticket's textures with
+/// it is taken, or the measured one, plus a refresh under the deeper pipeline); its eyes are the ticket's textures with
 /// the presenter's depth, placed a nominal eye distance apart on the headset's pose for that
 /// instant; the frame is drawn in the ticket's own command buffer, which after the eyes carries
 /// the grids' unprojection and, committed by the loop, hands RealityKit the frame. No wait and
-/// no deadline: RealityKit shows the previous frame again while a frame takes longer than its
-/// refresh; the statistics split each frame into its CPU frame, its wait for the GPU and its
-/// GPU span, and count the frames that overran the refresh. With the presenter's rate map, every eye carries it (`XREye.foveation`) with the
+/// no deadline: RealityKit shows the previous frame again while a frame takes longer than the
+/// refreshes planned for it; the statistics split each frame into its CPU frame, its wait for
+/// the GPU and its GPU span, and count the frames that overran their plan. With the presenter's rate map, every eye carries it (`XREye.foveation`) with the
 /// map's screen as its viewport, and the grids are unprojected through it.
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
@@ -94,20 +94,22 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         leadLock.withLock { leadEstimate }
     }
 
-    /// The lead of a ticket taken `ageSeconds` after its posting, under its settings.
-    func leadSeconds(settings: XRPresenterSettings, ageSeconds: TimeInterval) -> TimeInterval {
-        leadLock.withLock { leadEstimate.seconds(settings: settings, ageSeconds: ageSeconds) }
+    /// The lead of a ticket taken `ageSeconds` after its posting, under its settings, with the
+    /// refresh period it measured.
+    func leadSeconds(settings: XRPresenterSettings, ageSeconds: TimeInterval, refreshSeconds: TimeInterval = 0) -> TimeInterval {
+        leadLock.withLock { leadEstimate.seconds(settings: settings, ageSeconds: ageSeconds, refreshSeconds: refreshSeconds) }
     }
 
     /// A frame's stages from its ticket's pickup to its command buffer completing on the GPU,
-    /// into the statistics; a frame that drew enters the average the adaptive lead reads with
-    /// its completion, whether or not the lead is adaptive, so that turning it on finds the
-    /// history there (a frame cleared for want of a pose says nothing about the engine's frame).
-    public func noteFrameCompleted(_ stages: XRPresenterFrameStages, drawn: Bool = true) {
+    /// into the statistics (late against the refreshes its ticket planned); a frame that drew
+    /// enters the average the adaptive lead reads with its completion, whether or not the
+    /// lead is adaptive, so that turning it on finds the history there (a frame cleared for
+    /// want of a pose says nothing about the engine's frame).
+    public func noteFrameCompleted(_ stages: XRPresenterFrameStages, drawn: Bool = true, plannedRefreshes: Int = 1) {
         if drawn {
             leadLock.withLock { leadEstimate.noteFrame(seconds: stages.completion) }
         }
-        statistics.noteFrameCompleted(stages)
+        statistics.noteFrameCompleted(stages, plannedRefreshes: plannedRefreshes)
     }
 
     // MARK: - A frame
@@ -124,12 +126,13 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         private var drawn = false
 
         /// Posed for the ticket's posting plus its lead: the fixed lead past the pickup, or the
-        /// measured latency when the ticket's settings ask for it.
+        /// measured latency when the ticket's settings ask for it, plus one refresh period as
+        /// the ticket measured it for each refresh its pipeline plans past the first.
         init(ticket: XRPresenterTicket, takenAt: TimeInterval, source: RealityKitFrameSource) {
             self.ticket = ticket
             self.takenAt = takenAt
             self.source = source
-            let lead = source.leadSeconds(settings: ticket.settings, ageSeconds: takenAt - ticket.postedAt)
+            let lead = source.leadSeconds(settings: ticket.settings, ageSeconds: takenAt - ticket.postedAt, refreshSeconds: ticket.refreshSeconds)
             source.statistics.noteLead(seconds: lead)
             timing = XRFrameTiming(presentationTime: ticket.postedAt + lead)
         }
@@ -233,13 +236,14 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
             let committed = CACurrentMediaTime()
             let wasDrawn = drawn
             let frameSource = source
+            let plannedRefreshes = ticket.settings.pipelineDepth
             commandBuffer.addCompletedHandler { buffer in
                 let stages = XRPresenterFrameStages(
                     pickup: pickup, committed: committed,
                     gpuStart: buffer.gpuStartTime, gpuEnd: buffer.gpuEndTime,
                     now: CACurrentMediaTime()
                 )
-                frameSource.noteFrameCompleted(stages, drawn: wasDrawn)
+                frameSource.noteFrameCompleted(stages, drawn: wasDrawn, plannedRefreshes: plannedRefreshes)
             }
         }
 

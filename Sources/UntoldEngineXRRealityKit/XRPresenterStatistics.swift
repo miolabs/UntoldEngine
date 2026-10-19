@@ -120,9 +120,14 @@ public struct XRPresenterStatisticsSnapshot: Sendable, Equatable {
     /// updates once a refresh, so 100 updates/s says 10 ms and 90 updates/s 11.1 ms. Zero
     /// without updates.
     public var refreshMs = 0.0
-    /// Frames whose completion exceeded the refresh period: each lands a refresh late, and
-    /// RealityKit shows the previous frame again meanwhile. Zero without updates.
+    /// Frames whose completion exceeded the refreshes planned for them (`plannedRefreshes`
+    /// times the refresh period): each lands a refresh later than planned, and RealityKit
+    /// shows the previous frame again meanwhile. Zero without updates.
     public var lateFrames = 0
+    /// The refreshes the frames of the span were planned to complete within: the pipeline's
+    /// depth in force (`XRPresenterSettings.pipelineDepth`), the deepest of the span; 1 without
+    /// frames.
+    public var plannedRefreshes = 1
     /// The frame with the longest completion in the span, split into its stages; zeros
     /// without a frame.
     public var worstFrame = XRPresenterFrameStages()
@@ -152,11 +157,16 @@ public struct XRPresenterStatisticsSnapshot: Sendable, Equatable {
         }
     }
 
+    /// The late count's plan as the lines print it: nothing one refresh deep, the plan beyond.
+    public var plannedRefreshesDescription: String {
+        plannedRefreshes > 1 ? " (plan \(plannedRefreshes) refreshes)" : ""
+    }
+
     /// One line with the numbers, for a log.
     public var description: String {
         String(
-            format: "XR presenter: %.0f updates/s (refresh %.1f ms), %.0f frames/s, %d tickets dropped (%d in all), %d frames without a pose, %d late; replace %.2f ms (max %.2f), pickup age %.2f ms (max %.2f), CPU frame %.2f ms (max %.2f), wait %.2f ms (max %.2f), GPU span %.2f ms (max %.2f), to completion %.2f ms (max %.2f), worst %@, engine GPU %.2f ms, lead %.2f ms (max %.2f), thermal %@",
-            updatesPerSecond, refreshMs, framesPerSecond, ticketsDropped, ticketsDroppedTotal, posesMissing, lateFrames,
+            format: "XR presenter: %.0f updates/s (refresh %.1f ms), %.0f frames/s, %d tickets dropped (%d in all), %d frames without a pose, %d late%@; replace %.2f ms (max %.2f), pickup age %.2f ms (max %.2f), CPU frame %.2f ms (max %.2f), wait %.2f ms (max %.2f), GPU span %.2f ms (max %.2f), to completion %.2f ms (max %.2f), worst %@, engine GPU %.2f ms, lead %.2f ms (max %.2f), thermal %@",
+            updatesPerSecond, refreshMs, framesPerSecond, ticketsDropped, ticketsDroppedTotal, posesMissing, lateFrames, plannedRefreshesDescription,
             replaceMsAverage, replaceMsMax, pickupAgeMsAverage, pickupAgeMsMax,
             frameMsAverage, frameMsMax, waitMsAverage, waitMsMax, gpuMsAverage, gpuMsMax,
             completionMsAverage, completionMsMax, worstFrame.splitDescription, engineGPUMsAverage,
@@ -204,7 +214,9 @@ public final class XRPresenterStatistics: @unchecked Sendable {
     private var wait = Span()
     private var gpu = Span()
     private var completion = Span()
-    private var completions: [TimeInterval] = []
+    /// Each frame's completion with the refreshes it was planned within, for the late count.
+    private var completions: [(seconds: TimeInterval, refreshes: Int)] = []
+    private var plannedRefreshes = 1
     private var worst = XRPresenterFrameStages()
     private var lead = Span()
 
@@ -244,15 +256,18 @@ public final class XRPresenterStatistics: @unchecked Sendable {
     }
 
     /// A frame's stages, as its command buffer's completion resolves them: into each stage's
-    /// average and maximum, the late count and the worst frame of the span.
-    public func noteFrameCompleted(_ stages: XRPresenterFrameStages) {
+    /// average and maximum, the late count (against the refreshes the frame was planned
+    /// within: the pipeline's depth) and the worst frame of the span.
+    public func noteFrameCompleted(_ stages: XRPresenterFrameStages, plannedRefreshes: Int = 1) {
         lock.withLock {
             frame.add(stages.cpu)
             wait.add(stages.wait)
             gpu.add(stages.gpu)
             completion.add(stages.completion)
+            let refreshes = max(1, plannedRefreshes)
+            self.plannedRefreshes = max(self.plannedRefreshes, refreshes)
             if completions.count < Self.completionsKept {
-                completions.append(stages.completion)
+                completions.append((stages.completion, refreshes))
             }
             if stages.completion > worst.completion {
                 worst = stages
@@ -292,8 +307,9 @@ public final class XRPresenterStatistics: @unchecked Sendable {
             if updates > 0, snapshot.seconds > 0 {
                 let period = snapshot.seconds / Double(updates)
                 snapshot.refreshMs = period * 1000
-                snapshot.lateFrames = completions.reduce(0) { $0 + ($1 > period ? 1 : 0) }
+                snapshot.lateFrames = completions.reduce(0) { $0 + ($1.seconds > Double($1.refreshes) * period ? 1 : 0) }
             }
+            snapshot.plannedRefreshes = plannedRefreshes
             snapshot.leadMsAverage = lead.averageMs
             snapshot.leadMsMax = lead.maxMs
             snapshot.engineGPUMsAverage = GPUPassTiming.shared.isEnabled ? GPUPassTiming.shared.busy().averageMs : 0
@@ -311,6 +327,7 @@ public final class XRPresenterStatistics: @unchecked Sendable {
             gpu = Span()
             completion = Span()
             completions.removeAll(keepingCapacity: true)
+            plannedRefreshes = 1
             worst = XRPresenterFrameStages()
             lead = Span()
             return snapshot

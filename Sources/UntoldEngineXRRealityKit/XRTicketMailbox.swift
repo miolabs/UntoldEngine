@@ -11,14 +11,24 @@
 import Foundation
 import Metal
 
-/// One frame the presenter asks the engine for: the command buffer RealityKit's replace calls
-/// were made on, the Metal textures, grid buffers and edge-band buffers they handed back for it,
-/// and when it was posted. The command buffer must be committed exactly once, by whoever holds
-/// the ticket last: the loop after the frame's drawing, or the mailbox when it closes on a
-/// pending one.
+/// One frame the presenter asks the engine for: the command buffer the frame is drawn in, the
+/// Metal textures, grid buffers and edge-band buffers RealityKit's replace calls handed back
+/// for it, and when it was posted. The command buffer must be committed exactly once, by
+/// whoever holds the ticket last: the loop after the frame's drawing, or the mailbox when it
+/// closes on a pending one. The replace calls were made on `presentationBuffer`: the same
+/// buffer with the pipeline one refresh deep, or, two refreshes deep, a buffer of the
+/// presenter's that it commits at the update after the frame's own was committed, so that
+/// RealityKit takes the frame one refresh later than it would.
 public struct XRPresenterTicket: @unchecked Sendable {
     public let serial: UInt64
     public let commandBuffer: MTLCommandBuffer
+    /// The command buffer RealityKit's replace calls were made on, on whose completion
+    /// RealityKit shows the frame: `commandBuffer` itself one refresh deep, the presenter's
+    /// deferred buffer two refreshes deep. Never the engine's to commit.
+    public let presentationBuffer: MTLCommandBuffer
+    /// Which of the presenter's sets of textures and grids the frame is drawn into: 0, or 1
+    /// for the deeper pipeline's second set.
+    public let set: Int
     /// One per eye, left first: the textures to draw the frame into.
     public let colorTextures: [MTLTexture]
     /// One per eye, left first: the grids' vertex buffers for this frame.
@@ -35,18 +45,26 @@ public struct XRPresenterTicket: @unchecked Sendable {
     public let bandIndexBuffers: [MTLBuffer]
     /// `CACurrentMediaTime()` when the ticket was posted.
     public let postedAt: TimeInterval
-    /// The presenter's settings in force when the ticket was posted: the frame's rules.
+    /// The display's refresh period as the presenter had measured it from RealityKit's
+    /// updates when the ticket was posted, seconds; 0 before two updates
+    /// (`XRPresenterRefresh`). The deeper pipeline's extra lead.
+    public let refreshSeconds: TimeInterval
+    /// The presenter's settings in force when the ticket was posted: the frame's rules. Its
+    /// `pipelineDepth` is the depth in force, within the presenter's sets.
     public let settings: XRPresenterSettings
 
-    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], indexBuffers: [MTLBuffer] = [], bandBuffers: [MTLBuffer] = [], bandIndexBuffers: [MTLBuffer] = [], postedAt: TimeInterval, settings: XRPresenterSettings = .init()) {
+    public init(serial: UInt64, commandBuffer: MTLCommandBuffer, presentationBuffer: MTLCommandBuffer? = nil, set: Int = 0, colorTextures: [MTLTexture], gridBuffers: [MTLBuffer], indexBuffers: [MTLBuffer] = [], bandBuffers: [MTLBuffer] = [], bandIndexBuffers: [MTLBuffer] = [], postedAt: TimeInterval, refreshSeconds: TimeInterval = 0, settings: XRPresenterSettings = .init()) {
         self.serial = serial
         self.commandBuffer = commandBuffer
+        self.presentationBuffer = presentationBuffer ?? commandBuffer
+        self.set = set
         self.colorTextures = colorTextures
         self.gridBuffers = gridBuffers
         self.indexBuffers = indexBuffers
         self.bandBuffers = bandBuffers
         self.bandIndexBuffers = bandIndexBuffers
         self.postedAt = postedAt
+        self.refreshSeconds = refreshSeconds
         self.settings = settings
     }
 }

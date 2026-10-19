@@ -28,6 +28,10 @@ import Foundation
 /// absorbs one, so that the fixed and the adaptive lead agree at the numbers the constant was
 /// chosen from. A frame's time is clamped to `maximumSeconds` before it enters the average, so
 /// a stall is forgotten in a few frames, and the adaptive lead is clamped to the same range.
+///
+/// Under the deeper pipeline (`XRPresenterSettings.pipelineDepth` 2) the frame shows a refresh
+/// later than it would, so either lead gains one refresh period as the ticket measured it
+/// (`XRPresenterRefresh`), past the clamp: the plan's refresh, not a measured frame.
 public struct XRPresenterLead: Sendable, Equatable {
     /// The most a frame may be posed ahead of its ticket with the adaptive lead, and the most
     /// a frame's time counts for in the average: nine refreshes at 90 Hz.
@@ -59,19 +63,23 @@ public struct XRPresenterLead: Sendable, Equatable {
         framesNoted = 0
     }
 
-    /// The lead for a ticket taken `ageSeconds` after its posting, under `settings`.
-    public func seconds(settings: XRPresenterSettings, ageSeconds: TimeInterval) -> TimeInterval {
-        Self.seconds(settings: settings, ageSeconds: ageSeconds, frameSecondsAverage: frameSecondsAverage)
+    /// The lead for a ticket taken `ageSeconds` after its posting, under `settings`, with the
+    /// refresh period the ticket measured (0 when not yet measured).
+    public func seconds(settings: XRPresenterSettings, ageSeconds: TimeInterval, refreshSeconds: TimeInterval = 0) -> TimeInterval {
+        Self.seconds(settings: settings, ageSeconds: ageSeconds, refreshSeconds: refreshSeconds, frameSecondsAverage: frameSecondsAverage)
     }
 
     /// The lead for a ticket taken `ageSeconds` after its posting, under `settings`, with the
     /// frames' average time at hand (nil before any frame): the fixed lead unless the settings
-    /// ask for the adaptive one and the average exists.
-    public static func seconds(settings: XRPresenterSettings, ageSeconds: TimeInterval, frameSecondsAverage: TimeInterval?) -> TimeInterval {
+    /// ask for the adaptive one and the average exists; plus one refresh period
+    /// (`refreshSeconds`, as the ticket measured it) for each refresh the pipeline plans past
+    /// the first.
+    public static func seconds(settings: XRPresenterSettings, ageSeconds: TimeInterval, refreshSeconds: TimeInterval = 0, frameSecondsAverage: TimeInterval?) -> TimeInterval {
         let age = max(0, ageSeconds)
+        let plan = Double(max(0, settings.pipelineDepth - 1)) * max(0, refreshSeconds)
         guard settings.adaptiveLead, let frame = frameSecondsAverage else {
-            return age + settings.leadSeconds
+            return age + settings.leadSeconds + plan
         }
-        return min(max(0, age + frame + settings.displayLatencySeconds), maximumSeconds)
+        return min(max(0, age + frame + settings.displayLatencySeconds), maximumSeconds) + plan
     }
 }
