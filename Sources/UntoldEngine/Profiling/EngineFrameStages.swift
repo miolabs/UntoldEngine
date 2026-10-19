@@ -24,9 +24,11 @@ public struct EngineFrameStages: Sendable, Equatable {
     public var cpu: TimeInterval = 0
     public var wait: TimeInterval = 0
     public var gpu: TimeInterval = 0
-    /// Seconds the loop slept inside the frame for the presenter's drawing time (Compositor
-    /// Services' optimal input time): the frame's pacing, not its work, so it is outside the
-    /// CPU frame and the completion. Zero for a presenter that paces nothing.
+    /// Seconds the loop waited inside the frame on the presenter: for its drawing time
+    /// (Compositor Services' optimal input time) and then for its drawables, which the
+    /// compositor hands out at a fixed phase of the refresh: the frame's pacing, not its
+    /// work, so it is outside the CPU frame and the completion. Zero for a presenter that
+    /// paces nothing.
     public var pacing: TimeInterval = 0
 
     public init(cpu: TimeInterval = 0, wait: TimeInterval = 0, gpu: TimeInterval = 0, pacing: TimeInterval = 0) {

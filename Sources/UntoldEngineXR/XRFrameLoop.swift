@@ -160,11 +160,18 @@ public final class XRFrameLoop: @unchecked Sendable {
 
         // The compositor or app state can transition while waiting. If not running anymore,
         // skip submission entirely to avoid using an invalid frame.
+        #if ENGINE_STATS_ENABLED
+            let drawableWaitStart = CACurrentMediaTime()
+        #endif
         guard isRunning, frame.beginDrawing() else { return }
 
         // 8. The submission phase has begun
         #if ENGINE_STATS_ENABLED
             let xrSubmissionStart = CACurrentMediaTime()
+            // The frame's pacing, for its stages: the two waits on the presenter, for its
+            // drawing time and then for its drawables (Compositor Services hands both out at
+            // a fixed phase of the refresh), which are not the frame's work.
+            let xrPacingSeconds = xrWaitSeconds + (xrSubmissionStart - drawableWaitStart)
         #endif
 
         // 9. Encode any drawing commands that depend on the device position or orientation.
@@ -187,7 +194,7 @@ public final class XRFrameLoop: @unchecked Sendable {
 
         for target in targets {
             #if ENGINE_STATS_ENABLED
-                submit(target, frame: frame, loading: effectiveLoading, frameBegin: xrFrameStartTime, pacing: xrWaitSeconds)
+                submit(target, frame: frame, loading: effectiveLoading, frameBegin: xrFrameStartTime, pacing: xrPacingSeconds)
             #else
                 submit(target, frame: frame, loading: effectiveLoading, frameBegin: 0, pacing: 0)
             #endif
@@ -206,8 +213,9 @@ public final class XRFrameLoop: @unchecked Sendable {
 
     /// One target's pass: the culling once, each eye, the depth pyramid, the presentation,
     /// in one command buffer under the engine's in-flight semaphore. `frameBegin` is the
-    /// instant the loop began the frame and `pacing` the seconds it then waited for the
-    /// presenter's drawing time, for the frame's stages (zeros without stats).
+    /// instant the loop began the frame and `pacing` the seconds it then waited on the
+    /// presenter, for its drawing time and for its drawables, for the frame's stages (zeros
+    /// without stats).
     private func submit(_ target: XREyes, frame: any XRFrame, loading: Bool, frameBegin: CFTimeInterval, pacing: CFTimeInterval) {
         // A capture target (a recording or a stream of the view) is drawn from its own pose, so
         // it must not advance the frame-to-frame state the built-in display relies on: the
