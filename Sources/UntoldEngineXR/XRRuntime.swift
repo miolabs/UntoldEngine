@@ -63,8 +63,11 @@
         private let xrStallDiagnosticsLogIntervalSeconds: CFTimeInterval = 1.0
 
         /// What the presenter says of its state, for the diagnostics: the compositor source
-        /// sets it to its layer's state; "nil" without a presenter.
-        var presenterStateDescription: () -> String = { "nil" }
+        /// sets it to its layer's state; "nil" without a presenter. Called from the session
+        /// event monitor's task and the frame loop's thread, so the closure must not inherit
+        /// the isolation of the context that forms it (a `@MainActor` init): `@Sendable` keeps
+        /// it nonisolated.
+        var presenterStateDescription: @Sendable () -> String = { "nil" }
 
         private let spatialGestureRecognizer = XRSpatialGestureRecognizer()
         private let xrEnvironmentLightingSystem = XREnvironmentLightingSystem()

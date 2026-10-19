@@ -127,9 +127,9 @@
         public init(layerRenderer: LayerRenderer, runtime: XRRuntime) {
             self.layerRenderer = layerRenderer
             self.runtime = runtime
-            runtime.presenterStateDescription = { [weak layerRenderer] in
-                layerRenderer.map { String(describing: $0.state) } ?? "nil"
-            }
+            // Through the source, which is Sendable, and not the layer: the closure is called
+            // off the main actor (the runtime's session monitor, the loop's thread).
+            runtime.presenterStateDescription = { [weak self] in self?.layerStateDescription ?? "nil" }
             configureSpatialEventBridge()
         }
 
@@ -139,6 +139,12 @@
             layerRenderer.onSpatialEvent = { [weak runtime] events in
                 runtime?.enqueueSpatialEvents(events)
             }
+        }
+
+        /// The layer's state as a word, for the runtime's diagnostics; read from any thread,
+        /// as the loop reads the state.
+        var layerStateDescription: String {
+            String(describing: layerRenderer.state)
         }
 
         // MARK: - XRFrameSource
