@@ -1521,6 +1521,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
     func test_theLoop_drawsTheEyesIntoThePresenter_andPlacesTheGrids() async throws {
         guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
         var configuration = XRRealityKitPresenterConfiguration()
+        configuration.pipelineDepth = 1 // one set: the test counts the entities
         configuration.textureSize = [320, 240]
         configuration.gridColumns = 17
         configuration.gridRows = 13
@@ -1655,6 +1656,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
     func test_settingsChangedWhileRunning_rideInTheTickets_andTheFixedSplitComesBack() async throws {
         guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
         var configuration = XRRealityKitPresenterConfiguration()
+        configuration.pipelineDepth = 1 // one set: the test counts the entities
         configuration.textureSize = [64, 48]
         configuration.gridColumns = 5
         configuration.gridRows = 4
@@ -1831,6 +1833,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
     /// 45 m between a cube and the far shell.
     private static var pictureConfiguration: XRRealityKitPresenterConfiguration {
         var configuration = XRRealityKitPresenterConfiguration()
+        configuration.pipelineDepth = 1 // one set: the pictures are read at the first render, and the band test counts the entities
         configuration.textureSize = [256, 256]
         configuration.frustumTangents = [1, 1, 1, 1]
         configuration.interpupillaryDistance = 0

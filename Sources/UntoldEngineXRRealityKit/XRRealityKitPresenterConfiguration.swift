@@ -69,10 +69,12 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// presenter commits at the next update (after the engine committed the frame's own), and
     /// a set is shown once its ticket of two updates ago completed. A frame whose GPU span is
     /// stretched by up to a refresh then still lands on time, at the price of one refresh of
-    /// lead: the frame is posed a refresh further ahead (`XRPresenterLead`). 1 by default;
-    /// the sets are made here, and `XRPresenterSettings.pipelineDepth` chooses at run time
-    /// between the depths the sets allow.
-    public var pipelineDepth = 1
+    /// lead: the frame is posed a refresh further ahead (`XRPresenterLead`). 2 by default: on
+    /// the headset (2026-10-19, Release) it took the late frames of quick head turns from one
+    /// to five in a hundred to none, and the swim probe's dot held still with the longer lead;
+    /// 1 is the pipeline as it was, one set. The sets are made here, and
+    /// `XRPresenterSettings.pipelineDepth` chooses at run time between the depths the sets allow.
+    public var pipelineDepth = 2
     /// The near plane of the eyes' projection, metres.
     public var nearPlane: Float = 0.05
     /// The far plane of the eyes' projection, metres: depth 0 under reverse Z.

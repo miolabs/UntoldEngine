@@ -69,7 +69,8 @@ final class XRPresenterPipelineDepthTests: XCTestCase {
         var settings = XRPresenterSettings()
         settings.leadSeconds = 0.0222
         settings.displayLatencySeconds = 0.016
-        XCTAssertEqual(settings.pipelineDepth, 1, "one refresh deep by default")
+        XCTAssertEqual(settings.pipelineDepth, 2, "two refreshes deep by default, as the configuration")
+        settings.pipelineDepth = 1
         XCTAssertEqual(XRPresenterLead.seconds(settings: settings, ageSeconds: 0.001, refreshSeconds: 0.010, frameSecondsAverage: nil), 0.0232, accuracy: 1e-12, "one deep, the refresh changes nothing")
         XCTAssertEqual(XRPresenterLead.seconds(settings: settings, ageSeconds: 0.001, frameSecondsAverage: nil), 0.0232, accuracy: 1e-12, "and the lead is what it was")
 
@@ -84,9 +85,9 @@ final class XRPresenterPipelineDepthTests: XCTestCase {
         XCTAssertEqual(XRPresenterLead.seconds(settings: settings, ageSeconds: 0.001, refreshSeconds: 0.010, frameSecondsAverage: nil), 0.0332, accuracy: 1e-12, "before a frame completed, the fixed lead plus the refresh")
 
         var configuration = XRRealityKitPresenterConfiguration()
-        XCTAssertEqual(configuration.pipelineDepth, 1)
-        configuration.pipelineDepth = 2
-        XCTAssertEqual(XRPresenterSettings(configuration: configuration).pipelineDepth, 2, "the configuration's depth reaches the settings")
+        XCTAssertEqual(configuration.pipelineDepth, 2, "two refreshes deep by default")
+        configuration.pipelineDepth = 1
+        XCTAssertEqual(XRPresenterSettings(configuration: configuration).pipelineDepth, 1, "the configuration's depth reaches the settings")
     }
 
     func test_theLateCount_isAgainstTheRefreshesPlanned() {
