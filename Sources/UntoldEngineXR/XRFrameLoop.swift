@@ -354,6 +354,7 @@ public final class XRFrameLoop: @unchecked Sendable {
         }
 
         GPUPassTiming.shared.endFrame(commandBuffer)
+        frame.willCommit(commandBuffer)
         #if ENGINE_STATS_ENABLED
             let submitStart = CACurrentMediaTime()
         #endif

@@ -22,7 +22,8 @@ import UntoldEngineXR
 /// instant; the frame is drawn in the ticket's own command buffer, which after the eyes carries
 /// the grids' unprojection and, committed by the loop, hands RealityKit the frame. No wait and
 /// no deadline: RealityKit shows the previous frame again while a frame takes longer than its
-/// refresh. With the presenter's rate map, every eye carries it (`XREye.foveation`) with the
+/// refresh; the statistics split each frame into its CPU frame, its wait for the GPU and its
+/// GPU span, and count the frames that overran the refresh. With the presenter's rate map, every eye carries it (`XREye.foveation`) with the
 /// map's screen as its viewport, and the grids are unprojected through it.
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
@@ -98,12 +99,15 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         leadLock.withLock { leadEstimate.seconds(settings: settings, ageSeconds: ageSeconds) }
     }
 
-    /// A frame's time from its ticket's pickup to its command buffer completing on the GPU,
-    /// into the average the adaptive lead reads; noted whether or not the lead is adaptive,
-    /// so that turning it on finds the history there.
-    public func noteFrameCompleted(seconds: TimeInterval) {
-        leadLock.withLock { leadEstimate.noteFrame(seconds: seconds) }
-        statistics.noteFrameCompleted(seconds: seconds)
+    /// A frame's stages from its ticket's pickup to its command buffer completing on the GPU,
+    /// into the statistics; a frame that drew enters the average the adaptive lead reads with
+    /// its completion, whether or not the lead is adaptive, so that turning it on finds the
+    /// history there (a frame cleared for want of a pose says nothing about the engine's frame).
+    public func noteFrameCompleted(_ stages: XRPresenterFrameStages, drawn: Bool = true) {
+        if drawn {
+            leadLock.withLock { leadEstimate.noteFrame(seconds: stages.completion) }
+        }
+        statistics.noteFrameCompleted(stages)
     }
 
     // MARK: - A frame
@@ -116,6 +120,8 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         private let takenAt: TimeInterval
         private let source: RealityKitFrameSource
         private var handedOut = false
+        /// Whether the eyes were drawn at the presentation (a pose was there), for the lead.
+        private var drawn = false
 
         /// Posed for the ticket's posting plus its lead: the fixed lead past the pickup, or the
         /// measured latency when the ticket's settings ask for it.
@@ -177,11 +183,13 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
         }
 
         /// After the eyes: each grid placed from its eye's depth, and the edge band's mesh with
-        /// it when the ticket carries one, in the same command buffer, which the loop commits;
-        /// RealityKit shows the frame when it completes. Without a pose nothing was drawn, so the
-        /// eyes' textures are cleared to transparent instead and the grids keep their places (the
-        /// band's indices, blitted degenerate when the ticket was posted, draw nothing).
+        /// it when the ticket carries one, in the same command buffer, which the loop commits
+        /// (`willCommit`); RealityKit shows the frame when it completes. Without a pose nothing
+        /// was drawn, so the eyes' textures are cleared to transparent instead and the grids
+        /// keep their places (the band's indices, blitted degenerate when the ticket was
+        /// posted, draw nothing).
         func present(_ target: XREyes, commandBuffer: MTLCommandBuffer) {
+            drawn = target.originFromDevice != nil
             if let originFromDevice = target.originFromDevice {
                 for (index, eye) in target.eyes.enumerated() where index < ticket.gridBuffers.count {
                     source.unproject.encode(
@@ -213,19 +221,25 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                     commandBuffer.makeRenderCommandEncoder(descriptor: descriptor)?.endEncoding()
                 }
             }
-            let statistics = source.statistics
-            statistics.noteFrameEncoded(seconds: CACurrentMediaTime() - takenAt)
-            // A frame that drew counts for the adaptive lead: from its pickup to the GPU's end
-            // of its command buffer (the GPU's host time, in CACurrentMediaTime's base; the
-            // handler's own time when the GPU reports none).
-            let drawn = target.originFromDevice != nil
+        }
+
+        /// The commit's instant ends the CPU frame; the completed handler, added here so that
+        /// it carries that instant, splits the frame into its stages from the command buffer's
+        /// GPU times (the GPU's host times, in CACurrentMediaTime's base; the handler's own
+        /// time when the GPU reports none) and notes them, the completion entering the
+        /// adaptive lead when the frame drew.
+        func willCommit(_ commandBuffer: MTLCommandBuffer) {
             let pickup = takenAt
+            let committed = CACurrentMediaTime()
+            let wasDrawn = drawn
             let frameSource = source
             commandBuffer.addCompletedHandler { buffer in
-                statistics.noteGPU(seconds: max(0, buffer.gpuEndTime - buffer.gpuStartTime))
-                guard drawn else { return }
-                let end = buffer.gpuEndTime > pickup ? buffer.gpuEndTime : CACurrentMediaTime()
-                frameSource.noteFrameCompleted(seconds: end - pickup)
+                let stages = XRPresenterFrameStages(
+                    pickup: pickup, committed: committed,
+                    gpuStart: buffer.gpuStartTime, gpuEnd: buffer.gpuEndTime,
+                    now: CACurrentMediaTime()
+                )
+                frameSource.noteFrameCompleted(stages, drawn: wasDrawn)
             }
         }
 

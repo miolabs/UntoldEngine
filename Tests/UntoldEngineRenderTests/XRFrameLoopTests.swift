@@ -108,7 +108,7 @@ final class XRFrameLoopTests: BaseRenderSetup {
             assertShowsTheCubes(eye, "eye \(index)")
         }
         for frame in frames.frames {
-            XCTAssertEqual(frame.phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "endDrawing"])
+            XCTAssertEqual(frame.phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "willCommit", "endDrawing"])
             XCTAssertEqual(frame.presentedIn.count, 1, "one command buffer a frame: the culling, both eyes, the pyramid and the presentation")
         }
         // Each eye was drawn with its own view, the right eye after the left: what the renderer
@@ -142,7 +142,7 @@ final class XRFrameLoopTests: BaseRenderSetup {
         try XCTUnwrap(frames.frames.last?.presentedIn.last).waitUntilCompleted()
         XCTAssertEqual(loop.framesDrawn, 3)
         for frame in frames.frames {
-            XCTAssertEqual(frame.phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "present 1", "endDrawing"])
+            XCTAssertEqual(frame.phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "willCommit", "present 1", "willCommit", "endDrawing"])
             XCTAssertEqual(frame.presentedIn.count, 2, "each target has a command buffer of its own")
         }
         XCTAssertTrue(renderInfo.hzbIsValid)
@@ -156,7 +156,7 @@ final class XRFrameLoopTests: BaseRenderSetup {
         try XCTUnwrap(capture.frames.last?.presentedIn.last).waitUntilCompleted()
 
         XCTAssertEqual(captureLoop.framesDrawn, 0, "a capture target is not a frame of the display")
-        XCTAssertEqual(capture.frames[0].phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "endDrawing"])
+        XCTAssertEqual(capture.frames[0].phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "willCommit", "endDrawing"])
         for (index, eye) in capture.captureColorTextures.enumerated() {
             assertShowsTheCubes(eye, "capture eye \(index)")
         }
@@ -183,7 +183,7 @@ final class XRFrameLoopTests: BaseRenderSetup {
         loop.run()
         try XCTUnwrap(frames.frames.last?.presentedIn.last).waitUntilCompleted()
 
-        XCTAssertEqual(frames.frames[0].phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "endDrawing"], "the presenter wants every target it handed out presented")
+        XCTAssertEqual(frames.frames[0].phases, ["beginUpdate", "endUpdate", "wait", "beginDrawing", "acquire", "present 0", "willCommit", "endDrawing"], "the presenter wants every target it handed out presented")
         XCTAssertEqual(loop.framesDrawn, 0)
         for (index, eye) in frames.colorTextures.enumerated() {
             let middle = FakeFrames.pixel(of: eye, x: 32, y: 24)
@@ -316,6 +316,13 @@ final class FakeFrames: XRFrameSource, @unchecked Sendable {
             recordedPhases.append("present \(target.index)")
             buffers.append(commandBuffer)
             lock.unlock()
+        }
+
+        /// Recorded as "willCommit" while the buffer is still the loop's to commit; a hook
+        /// called after the commit would record it late.
+        func willCommit(_ commandBuffer: MTLCommandBuffer) {
+            let late = commandBuffer.status.rawValue >= MTLCommandBufferStatus.committed.rawValue
+            record(late ? "willCommit after the commit" : "willCommit")
         }
 
         func endDrawing() {

@@ -1568,6 +1568,14 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertGreaterThan(statistics.gpuMsMax, 0, "the frames' GPU spans were noted")
         XCTAssertGreaterThan(statistics.leadMsAverage, 0, "each frame's lead was noted")
         XCTAssertGreaterThan(statistics.completionMsMax, 0, "the frames' times to completion were noted on the GPU's completion")
+        XCTAssertGreaterThan(statistics.frameMsMax, 0, "the CPU frame, to the loop's commit, was noted")
+        XCTAssertGreaterThan(statistics.worstFrame.completionMs, 0, "the longest frame of the span is kept with its split")
+        XCTAssertEqual(statistics.worstFrame.completionMs, statistics.completionMsMax, accuracy: 1e-6)
+        XCTAssertEqual(statistics.worstFrame.cpu + statistics.worstFrame.wait + statistics.worstFrame.gpu, statistics.worstFrame.completion, accuracy: 1e-12, "its stages sum to its completion")
+        XCTAssertLessThanOrEqual(statistics.worstFrame.gpuMs, statistics.gpuMsMax + 1e-6)
+        XCTAssertLessThanOrEqual(statistics.worstFrame.waitMs, statistics.waitMsMax + 1e-6)
+        XCTAssertGreaterThan(statistics.refreshMs, 0, "the refresh period follows the updates the test drove")
+        XCTAssertLessThanOrEqual(statistics.lateFrames, statistics.framesDrawn)
         XCTAssertGreaterThan(source.lead.framesNoted, 0, "and entered the adaptive lead's average")
         XCTAssertGreaterThan(try XCTUnwrap(source.lead.frameSecondsAverage), 0)
 
@@ -1788,8 +1796,8 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
 
         // Frames completed, as the GPU's completion notes them: the lead follows the average
         // frame plus the display latency, past the ticket's age.
-        source.noteFrameCompleted(seconds: 0.006)
-        source.noteFrameCompleted(seconds: 0.006)
+        source.noteFrameCompleted(XRPresenterFrameStages(cpu: 0.003, wait: 0.001, gpu: 0.002))
+        source.noteFrameCompleted(XRPresenterFrameStages(cpu: 0.003, wait: 0.001, gpu: 0.002))
         XCTAssertEqual(try XCTUnwrap(source.lead.frameSecondsAverage), 0.006, accuracy: 1e-9)
         XCTAssertEqual(source.lead.framesNoted, 2)
         let measured = try nextFrameLead()
@@ -1807,6 +1815,9 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertEqual(numbers.leadMsMax, max(fixed, early, measured, fixedAgain) * 1000, accuracy: 1e-6, "the leads in force reached the statistics")
         XCTAssertEqual(numbers.leadMsAverage, (fixed + early + measured + fixedAgain) / 4 * 1000, accuracy: 1e-6)
         XCTAssertEqual(numbers.completionMsAverage, 6, accuracy: 1e-9, "and the frames' times to completion")
+        XCTAssertEqual(numbers.frameMsAverage, 3, accuracy: 1e-9, "split into their stages")
+        XCTAssertEqual(numbers.waitMsMax, 1, accuracy: 1e-9)
+        XCTAssertEqual(numbers.gpuMsMax, 2, accuracy: 1e-9)
         presenter.stop()
     }
 

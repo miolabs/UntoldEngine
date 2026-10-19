@@ -113,11 +113,17 @@ public protocol XRFrame: AnyObject {
     func makeCommandBuffer(for target: XREyes) -> MTLCommandBuffer?
     /// Hands a target to the presenter, encoded after its eyes.
     func present(_ target: XREyes, commandBuffer: MTLCommandBuffer)
+    /// The loop is about to commit the command buffer a target was presented in: the frame's
+    /// last moment on the CPU, for a presenter that times its frames (a handler added here
+    /// still rides on the buffer). Nothing by default.
+    func willCommit(_ commandBuffer: MTLCommandBuffer)
     func endDrawing()
 }
 
 public extension XRFrame {
     func makeCommandBuffer(for _: XREyes) -> MTLCommandBuffer? { nil }
+
+    func willCommit(_: MTLCommandBuffer) {}
 }
 
 /// Where the frames come from: the headset through Compositor Services, another presenter,
