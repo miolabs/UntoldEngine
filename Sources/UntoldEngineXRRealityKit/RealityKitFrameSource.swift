@@ -211,6 +211,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                         adaptiveDiagonal: ticket.settings.adaptiveDiagonal,
                         rateMapData: source.foveation?.rateMapData,
                         cellTexels: Float(source.foveation?.cellTexels ?? 0),
+                        tears: ticket.settings.tears,
                         label: "XR grid unproject eye \(index)"
                     )
                 }

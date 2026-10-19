@@ -21,6 +21,8 @@ public struct XRPresenterSettings: Sendable, Equatable {
     public var skirtTexels: Float
     /// See `XRRealityKitPresenterConfiguration.tearThresholdMetres`.
     public var tearThresholdMetres: Float
+    /// See `XRRealityKitPresenterConfiguration.tears`.
+    public var tears: Bool
     /// See `XRRealityKitPresenterConfiguration.adaptiveDiagonal`. Turned off while running, the
     /// next frame writes the fixed split back once.
     public var adaptiveDiagonal: Bool
@@ -44,6 +46,7 @@ public struct XRPresenterSettings: Sendable, Equatable {
     public init(configuration: XRRealityKitPresenterConfiguration = .init()) {
         skirtTexels = configuration.skirtTexels
         tearThresholdMetres = configuration.tearThresholdMetres
+        tears = configuration.tears
         adaptiveDiagonal = configuration.adaptiveDiagonal
         edgeBlending = configuration.edgeBlending
         leadSeconds = configuration.leadSeconds

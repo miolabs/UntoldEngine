@@ -30,7 +30,8 @@ public struct XRGridUnprojectUniforms {
     /// vertex is marked as its far side, or its near side, in the tear mask.
     public var tearThreshold: Float
     /// Bit 0: the cells keep the fixed diagonal (no per-frame split by depth). Bit 1: the
-    /// nearest-depth dispatch scans every vertex's footprint, taking no block fast path.
+    /// nearest-depth dispatch scans every vertex's footprint, taking no block fast path. Bit 2:
+    /// no tear mask (every vertex's mask is zero; the placement is unchanged).
     public var flags: UInt32
     /// How far, in texels, a rim vertex (one whose own centre lies off the near surface) is
     /// pushed outward past the edge texel it was placed on, so that the alpha test of the
@@ -612,11 +613,12 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         // The tear mask against the eight neighbours: x when this vertex is further from the eye
         // than a neighbour by more than the threshold, y when it is nearer by that much. The
         // diagonals count too: a cell's triangles share its diagonal, and a jump along that
-        // diagonal alone would otherwise leave a stretched edge unmarked.
+        // diagonal alone would otherwise leave a stretched edge unmarked. Flag bit 2 leaves the
+        // mask zero: no cell is discarded for a depth jump.
         float farSide = 0.0f;
         float nearSide = 0.0f;
         const int2 offsets[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(1, -1), int2(-1, 1), int2(-1, -1) };
-        for (int k = 0; k < 8; ++k) {
+        for (int k = 0; k < ((u.flags & 4u) == 0u ? 8 : 0); ++k) {
             int2 n = int2(gid) + offsets[k];
             if (n.x < 0 || n.y < 0 || n.x >= int(u.gridSize.x) || n.y >= int(u.gridSize.y)) { continue; }
             float4 entry = depths[n.y * u.gridSize.x + n.x];
@@ -835,6 +837,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         rateMapData: XRRasterizationRateMapData? = nil,
         cellTexels: Float = 0,
         fastPath: Bool = true,
+        tears: Bool = true,
         label: String = "XR grid unproject"
     ) {
         let textureSize = SIMD2<Int>(depth.width, depth.height)
@@ -860,7 +863,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             cellTexels: foveated ? cellTexels : 0,
             foveated: foveated
         )
-        uniforms.flags = (adaptiveDiagonal ? 0 : 1) | (fastPath ? 0 : 2)
+        uniforms.flags = (adaptiveDiagonal ? 0 : 1) | (fastPath ? 0 : 2) | (tears ? 0 : 4)
         encoder.setBytes(&uniforms, length: MemoryLayout<XRGridUnprojectUniforms>.stride, index: 1)
         // The kernels specialized for the eye, and the map's parameters for the foveated ones.
         let pipelines = foveated ? foveatedPipelines : uniformPipelines

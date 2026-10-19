@@ -725,6 +725,45 @@ final class XRGridUnprojectTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(nearSideAtTheSeam, 10, "the near plane's seam column is the near side: its ten rows away from the hole")
     }
 
+    /// With the tears off (`XRRealityKitPresenterConfiguration.tears`), the kernel writes a zero
+    /// mask for every vertex and places the vertices exactly as it does with them on: the switch
+    /// isolates the tear decision, with the placement and the rims the same.
+    func test_withTheTearsOff_theMaskIsZero_andThePlacementIsTheSame() throws {
+        let grid = XRPresenterGrid(columns: 33, rows: 25)
+        let textureSize = SIMD2<Int>(256, 192)
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.farShellMetres = 50
+        configuration.tearThresholdMetres = 0.9
+        let projection = configuration.projection
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        try drawDepth(into: depthTexture, projection: projection)
+        let pass = try XRGridUnprojectPass(device: device)
+        func run(tears: Bool) throws -> (vertices: [Vertex], nearest: [(depth: Float, texel: SIMD2<Float>, rim: Bool)]) {
+            // A scratch of its own per run: the placement's hysteresis reads the previous entries.
+            let scratch = try makeScratch(grid: grid, textureSize: textureSize)
+            let vertices = try XCTUnwrap(device.makeBuffer(length: grid.vertexCount * XRPresenterGrid.vertexStride, options: .storageModeShared))
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, tears: tears)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            return (readVertices(vertices, grid: grid), readNearestDepths(scratch.nearestDepths, grid: grid))
+        }
+        let with = try run(tears: true)
+        let without = try run(tears: false)
+        XCTAssertGreaterThan(with.vertices.filter { $0.mask > 0.5 || $0.nearSide > 0.5 }.count, 20, "the planes' seam and the hole tear with the tears on")
+        XCTAssertGreaterThan(with.nearest.filter(\.rim).count, 10, "rim vertices either way")
+        for index in 0 ..< grid.vertexCount {
+            let where_ = "vertex \(index % grid.columns),\(index / grid.columns)"
+            XCTAssertEqual(without.vertices[index].mask, 0, "no far side with the tears off at \(where_)")
+            XCTAssertEqual(without.vertices[index].nearSide, 0, "no near side with the tears off at \(where_)")
+            XCTAssertEqual(without.vertices[index].position, with.vertices[index].position, "placed the same at \(where_)")
+            XCTAssertEqual(without.vertices[index].uv, with.vertices[index].uv, "the same uv at \(where_)")
+            XCTAssertEqual(without.nearest[index].depth, with.nearest[index].depth, "the same depth at \(where_)")
+            XCTAssertEqual(without.nearest[index].texel, with.nearest[index].texel, "the same texel at \(where_)")
+            XCTAssertEqual(without.nearest[index].rim, with.nearest[index].rim, "the same rim flag at \(where_)")
+        }
+    }
+
     /// A one-texel feature between two grid vertices is caught by one of them. By the rule: the
     /// footprints along a row take in every texel column and neighbouring ones overlap, and the
     /// same down a column. By the kernel: a one-texel line at each texel column and each texel
@@ -1842,6 +1881,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         presenter.settings.adaptiveDiagonal = true
         presenter.settings.skirtTexels = 0
         presenter.settings.tearThresholdMetres = 0.9
+        presenter.settings.tears = false
         presenter.settings.leadSeconds = 0.01
         presenter.settings.adaptiveLead = true
         presenter.settings.displayLatencySeconds = 0.012
@@ -1850,6 +1890,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         XCTAssertTrue(split.settings.adaptiveDiagonal)
         XCTAssertEqual(split.settings.skirtTexels, 0)
         XCTAssertEqual(split.settings.tearThresholdMetres, 0.9)
+        XCTAssertFalse(split.settings.tears)
         XCTAssertEqual(split.settings.leadSeconds, 0.01)
         XCTAssertTrue(split.settings.adaptiveLead)
         XCTAssertEqual(split.settings.displayLatencySeconds, 0.012)

@@ -109,6 +109,14 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// tear: a silhouette the grid stretches across. The vertices on its two sides are marked
     /// (far side, near side) and the material discards the triangles that span both.
     public var tearThresholdMetres: Float = 0.5
+    /// Whether the tear mask is written at all. Off, every vertex's mask is zero and the grid
+    /// stays one surface: the triangles stretched between an object's rim and what lies behind
+    /// it are drawn, reading the texels between the two (transparent but for the rim's partly
+    /// covered ones, which the material's alpha test cuts), so no cell is discarded or kept by
+    /// a per-frame decision. The placement is the same either way (the threshold still picks
+    /// the near side of a footprint's depth jump). The headset test for the shimmer along the
+    /// cubes' edges (2026-10-20): the tear decision as the mechanism, against the rest.
+    public var tears = true
     /// How far, in texels of the eye texture, a grid vertex at an object's rim is pushed outward
     /// past the edge texel it was placed on, so that the silhouette seen is where the filtered
     /// texture's alpha crosses the material's threshold rather than the mesh boundary through
