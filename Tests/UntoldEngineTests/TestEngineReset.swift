@@ -25,6 +25,8 @@
     reverseEntityNameMap.removeAll()
     globalEntityCounter = 0
     currentFrameTime = .zero
+    physicsAccumulator = 0
+    simulationStepping = .fixed
     needsFinalizeDestroys = false
     hasPendingDestroys = false
     EngineExtensionRegistry.shared.removeAll()
