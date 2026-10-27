@@ -2,7 +2,7 @@
 
 The XR rendering system is the visionOS counterpart to `UpdateRenderingSystem`. It drives the same deferred render graph used on macOS, but within a completely different frame lifecycle imposed by **CompositorServices** — Apple's low-latency compositor for spatial computing.
 
-The entry point is `UntoldEngineXR`, a class that owns the render loop, the ARKit session, and the spatial input bridge. Everything in this file is compiled only on visionOS (`#if os(visionOS)`).
+The entry point is `UntoldEngineXR`, which puts three pieces together: `XRRuntime` (the ARKit session and its providers, the device anchors, the lighting probe, the spatial input bridge), a frame source (`XRFrameSource`; `CompositorFrameSource` is the one for Compositor Services: the layer's frames and their timing, the pacing, the drawables, the foveation maps, the presentation and the deadlines) and `XRFrameLoop` (the generic driver: for each frame, the update, the wait, the culling once, each eye, the depth pyramid, the presentation and the stats). The runtime, the compositor source and `UntoldEngineXR` are compiled only on visionOS (`#if os(visionOS)`); the frame contract (`XRFrameSource.swift`) and the loop compile everywhere, which is how the loop is tested on macOS with a texture-backed source (`XRFrameLoopTests`).
 
 ---
 
@@ -10,7 +10,7 @@ The entry point is `UntoldEngineXR`, a class that owns the render loop, the ARKi
 
 On macOS, the MTKView delegate calls `draw(in:)` on the main thread at display refresh rate. The engine owns the timing.
 
-On visionOS, **the compositor owns the timing**. It tells you when to render, provides per-eye textures, and requires you to attach a device anchor (head pose) to every frame before presenting. If you miss the deadline or present without an anchor, the compositor either drops your frame or logs a warning. The `UntoldEngineXR` run loop is specifically structured to satisfy these compositor requirements frame by frame.
+On visionOS, **the compositor owns the timing**. It tells you when to render, provides per-eye textures, and requires you to attach a device anchor (head pose) to every frame before presenting. If you miss the deadline or present without an anchor, the compositor either drops your frame or logs a warning. The frame loop, fed by `CompositorFrameSource`, is specifically structured to satisfy these compositor requirements frame by frame.
 
 ---
 
@@ -20,7 +20,7 @@ On visionOS, **the compositor owns the timing**. It tells you when to render, pr
 UntoldEngineXR(layerRenderer: LayerRenderer, device: MTLDevice)
 ```
 
-At init time, three things happen in parallel:
+This makes an `XRRuntime` and a `CompositorFrameSource` for the layer and calls `init(frameSource:runtime:device:)`, the init another presenter uses with a frame source of its own. At init time, three things happen in parallel:
 
 **ARKit session startup** (async Task): Queries world sensing authorization, then launches `WorldTrackingProvider` and `PlaneDetectionProvider`. World tracking is what gives you the device anchor — the head pose needed to render correctly in the user's space. If world sensing is denied (e.g., the user blocked it in Settings), the engine still runs with world tracking only so rendering doesn't break, it just has no plane data.
 
@@ -28,20 +28,20 @@ At init time, three things happen in parallel:
 
 **Plane monitor** (background Task): A long-running Swift structured concurrency task that consumes the `planeDetection.anchorUpdates` async stream. Every time the system detects, updates, or removes a real-world surface (floor, wall, table, etc.), it maps the ARKit classification to the engine's `RealSurfaceKind` enum and forwards `TrackedPlane` snapshots to `RealSurfacePlaneStore`. Game code uses [`pickRealSurfacePosition`](../API/UsingSpatialInput.md#get-groundplane-hit-position) to query those planes for placement; the API guide covers filters, hit fields, diagnostics, and physical world coordinates under scene-root scaling.
 
-**Renderer creation**: `UntoldRenderer.createXR(...)` initializes the Metal device, command queue, G-Buffer textures, pipeline states, and all other GPU resources at the fixed visionOS viewport size (2048 × 1984 per eye).
+**Renderer creation**: `UntoldRenderer.createXR(...)` initializes the Metal device, command queue, G-Buffer textures, pipeline states, and all other GPU resources at the frame source's colour and depth formats and its nominal eye size (2048 × 1984 for Compositor Services, which says nothing of its drawables' size before it hands one out); the loop refits every sizeable resource to the first drawable's size.
 
 ---
 
 ## Step 1: The Run Loop
 
-`runLoop()` is called from a dedicated background thread (the compositor render thread) and runs for the lifetime of the XR session:
+`runLoop()` is called from a dedicated background thread (the compositor render thread) and runs `XRFrameLoop.run()` for the lifetime of the XR session: a frame from the source, drawn, until the source ends or `stop()` is called. The compositor source's `nextFrame()` holds the layer's state machine:
 
 ```swift
-while true {
+while !stopped {
     switch layerRenderer.state {
     case .paused:    layerRenderer.waitUntilRunning()
-    case .running:   renderNewFrame()
-    case .invalidated: break  // exit
+    case .running:   paceForHalfRate(); queryNextFrame(); predictTiming()   // a frame for the loop
+    case .invalidated: return nil   // the loop exits
     }
 }
 ```
@@ -52,9 +52,9 @@ The `.paused` state blocks the thread cheaply until the compositor is ready — 
 
 ---
 
-## Step 2: The Per-Frame Lifecycle — `renderNewFrame()`
+## Step 2: The Per-Frame Lifecycle — `XRFrameLoop.draw(_:)`
 
-CompositorServices frames follow a strict protocol. Every call to `renderNewFrame()` must progress through these phases in order:
+CompositorServices frames follow a strict protocol, which the `XRFrame` contract keeps: `beginUpdate`, `endUpdate`, `waitForDrawingTime`, `beginDrawing`, `acquireEyes`, `present`, `endDrawing`. Every frame the loop draws progresses through these phases in order, and `CompositorFrameSource.Frame` maps each to the compositor's call:
 
 ### 2a. Query + Predict
 
@@ -63,12 +63,12 @@ let frame = layerRenderer.queryNextFrame()
 let timing = frame.predictTiming()
 ```
 
-`queryNextFrame()` dequeues the next compositor frame. `predictTiming()` returns `optimalInputTime` — the deadline by which you must finish reading input and preparing CPU-side data for the frame. These are not suggestions; missing them causes judder. It also returns `presentationTime`, the instant the frame will be shown; the engine converts it to the media-time base (through the compositor clock's epoch, which is the boot, like `CACurrentMediaTime()`) and poses the whole update for it.
+Both happen inside the source's `nextFrame()`, before the loop sees the frame (and after the half-rate pacing's wait, see below). `queryNextFrame()` dequeues the next compositor frame. `predictTiming()` returns `optimalInputTime` — the deadline by which you must finish reading input and preparing CPU-side data for the frame. These are not suggestions; missing them causes judder. It also returns `presentationTime`, the instant the frame will be shown; the engine converts it to the media-time base (through the compositor clock's epoch, which is the boot, like `CACurrentMediaTime()`) and poses the whole update for it.
 
 ### 2b. Update Phase
 
 ```swift
-frame.startUpdate()
+frame.beginUpdate()   // startUpdate()
 // ... do CPU work ...
 frame.endUpdate()
 ```
@@ -77,7 +77,7 @@ Everything between `startUpdate` and `endUpdate` is CPU-side frame preparation:
 
 - **Progressive loading tick**: `ProgressiveAssetLoader.shared.tick()` is dispatched to the main thread via `DispatchQueue.main.async`. The run loop lives on the compositor thread, but `tick()` requires `@MainActor`. This mirrors what `UntoldEngine.swift`'s `draw()` does on macOS.
 
-- **Spatial input processing**: `updateSpatialInputState()` drains the queued `XRSpatialInputSnapshot` events and updates the `InputSystem`. If assets are loading or the scene isn't ready, input is cleared instead to avoid acting on stale state.
+- **Spatial input processing**: the runtime's `updateSpatialInput(allowed:)` drains the queued `XRSpatialInputSnapshot` events and updates the `InputSystem`. If assets are loading or the scene isn't ready, input is cleared instead to avoid acting on stale state.
 
 - **Game update**: `renderer.updateXR(presentationTime:)` calls the user's `gameUpdate` (or `frameUpdate`) and `handleInput` callbacks. This is where game logic runs — entity movement, animation state machines, physics steps. The frame is posed for the instant the compositor predicts it will be shown, the same instant the head pose is queried for at submission: the engine's delta is the time between two presentations, and the game receives the instant itself as a `FrameTime`, so a moving object steps by the display's period from frame to frame instead of by the varying time between two updates, which is what reads as judder against the head-tracked world (see [Presentation-time animation](../proposals/PresentationTimeAnimation.md)). It is skipped entirely while `AssetLoadingGate.shared.isLoadingAny` is true.
 
@@ -86,7 +86,7 @@ Everything between `startUpdate` and `endUpdate` is CPU-side frame preparation:
 ### 2c. Wait for Optimal Input Time
 
 ```swift
-LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
+frame.waitForDrawingTime()   // LayerRenderer.Clock().wait(until: timing.optimalInputTime, tolerance: .zero)
 ```
 
 The thread sleeps until the compositor says it's the best moment to submit GPU work. Submitting too early wastes GPU time on a stale pose; submitting too late misses the scanline. This one call is what makes visionOS rendering feel low-latency.
@@ -94,18 +94,20 @@ The thread sleeps until the compositor says it's the best moment to submit GPU w
 ### 2d. Submission Phase
 
 ```swift
-frame.startSubmission()
-defer { frame.endSubmission() }
+guard frame.beginDrawing() else { return }   // startSubmission()
+let targets = frame.acquireEyes()            // the drawables, with their device anchors
+// ... one pass per target ...
+frame.endDrawing()                           // endSubmission()
 ```
 
-The `defer` is important: `endSubmission()` **must** be called even if rendering fails partway through. If it isn't called, the compositor stalls. The `defer` guarantees this regardless of how the function exits.
+`endSubmission()` **must** be called once a frame's submission began, else the compositor stalls: the loop ends the drawing after its targets' passes, whatever happened in them, and leaves it out only when `acquireEyes()` returned no target.
 
-**Drawables.** On visionOS 26 the frame is queried with `frame.queryDrawables()`, which returns one drawable per target: the built-in display, plus a capture target while the view is being recorded or streamed. A layer configured with foveation or a render quality aborts the app ("BUG IN CLIENT: called cp_frame_query_drawable() which does not support setting render quality or fovea") if the older single-drawable `queryDrawable()` is used, which the engine still calls on visionOS 2. An empty array means the compositor cancelled the frame: it is left without `endSubmission()`. Every drawable is presented; the scene is drawn into the built-in one and into a capture drawable only while its textures are the size the frame's resources are allocated at — otherwise it is presented cleared, since every sizeable resource is sized to one viewport and a second size would reallocate them twice a frame.
+**Drawables.** On visionOS 26 the frame is queried with `frame.queryDrawables()`, which returns one drawable per target: the built-in display, plus a capture target while the view is being recorded or streamed. A layer configured with foveation or a render quality aborts the app ("BUG IN CLIENT: called cp_frame_query_drawable() which does not support setting render quality or fovea") if the older single-drawable `queryDrawable()` is used, which the engine still calls on visionOS 2. An empty array means the compositor cancelled the frame: it is left without `endSubmission()`. Every drawable is presented; the scene is drawn into the built-in one and into a capture drawable only while its textures are the size the frame's resources are allocated at — otherwise it is presented cleared, since every sizeable resource is sized to one viewport and a second size would reallocate them twice a frame. The source hands the loop one target (`XREyes`) per drawable it draws into, `primary` for the built-in display only, and presents the rest cleared at `endDrawing`.
 
 ### 2e. Device Anchor Acquisition
 
 ```swift
-let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTimeCA)
+let deviceAnchor = runtime.deviceAnchor(forPresentationAt: presentationTimeCA)
 drawable.deviceAnchor = anchor
 ```
 
@@ -122,9 +124,9 @@ The engine never skips presenting a drawable once it has been dequeued. Even wit
 
 ---
 
-## Step 3: GPU Encoding — `executeXRSystemPass()`
+## Step 3: GPU Encoding — `XRFrameLoop.submit(_:frame:loading:)`
 
-This is where the actual Metal work happens, split into three parts.
+This is where the actual Metal work happens, one pass per target of the frame, split into three parts.
 
 ### 3a. Pre-Render Compute (runs once for both eyes)
 
@@ -142,14 +144,14 @@ These are the **same compute passes** as the macOS path: frustum cull, Gaussian 
 ### 3b. Per-Eye Render Loop
 
 ```swift
-for (viewIndex, view) in drawable.views.enumerated() {
-    // compute view and projection matrices
+for (viewIndex, eye) in target.eyes.enumerated() {
+    // compute the view matrix; the projection is the eye's
     // configure pass descriptor
     // call renderer.renderXR(...)
 }
 ```
 
-The drawable provides two views (left eye, right eye). For each:
+The target provides two eyes (left, right), each with its textures, its place on the headset (`deviceFromView`, the drawable's `view.transform`) and its projection. For each:
 
 **View matrix construction**:
 ```swift
@@ -159,11 +161,11 @@ let cameraMatrix = simd_inverse(originFromDevice * deviceFromView)
 
 **Projection matrix**:
 ```swift
-let projection = drawable.computeProjection(convention: .rightUpBack, viewIndex: viewIndex)
+let projection = eye.projection   // drawable.computeProjection(convention: .rightUpBack, viewIndex: viewIndex)
 ```
 The compositor provides the exact asymmetric projection for each eye. This accounts for the different FOV angles per eye and the physical lens geometry of the headset — it cannot be constructed manually.
 
-**Pass descriptor**: Pre-allocated (`passDescriptorLeft`, `passDescriptorRight`) and reused every frame to avoid 180 allocations/second (2 eyes × 90 FPS). The color and depth textures are swapped in from `drawable.colorTextures[viewIndex]` and `drawable.depthTextures[viewIndex]`.
+**Pass descriptor**: Pre-allocated (`passDescriptorLeft`, `passDescriptorRight`) and reused every frame to avoid 180 allocations/second (2 eyes × 90 FPS). The color and depth textures are swapped in from the eye's `colorTexture` and `depthTexture` (the drawable's `colorTextures[viewIndex]` and `depthTextures[viewIndex]`).
 
 **`renderer.renderXR(...)`** calls `buildExecutableGameModeGraph()` + `executeGraph()` — the same validated render graph pipeline as macOS. Invalid graphs skip encoding for the affected frame. The only thing that changes is:
 - `renderInfo.currentEye = viewIndex` — tells uniform uploads which eye's matrices to use
@@ -171,7 +173,7 @@ The compositor provides the exact asymmetric projection for each eye. This accou
 
 **Foveation (rasterization rate maps).** With `isFoveationEnabled` in the app's `CompositorLayerConfiguration`, the compositor hands each eye a `MTLRasterizationRateMap` and colour/depth textures of the map's *physical* size, smaller than the *screen* the eye sees; the GPU draws through the map (dense where the eyes look, coarse in the periphery) and the compositor unwarps the texture for the display. It is also the only configuration in which the compositor accepts a `maxRenderQuality` above the platform default. The engine supports it as follows (`XRFoveation.swift`, on by default, `setRendering(.foveatedRendering(.disabled))` to ignore the maps for diagnosis):
 
-- `executeXRSystemPass` makes an `XRFoveationFrame` per eye (`renderInfo.xrFoveation`): the map, the eye's viewport in the map's screen space (`view.textureMap.viewport`), and the map's parameter data copied into a ring of shared buffers for the shaders. `renderInfo.viewPort` stays the texture size, the physical size, so every sizeable resource is allocated at it.
+- `CompositorFrameSource` makes an `XRFoveationFrame` per eye as the frame's eyes are acquired (`XREye.foveation`), and the loop hands it to the renderer before the eye is drawn (`renderInfo.xrFoveation`): the map, the eye's viewport in the map's screen space (`view.textureMap.viewport`), and the map's parameter data copied into a ring of shared buffers for the shaders. `renderInfo.viewPort` stays the texture size, the physical size, so every sizeable resource is allocated at it.
 - After the graph is built, `applyXRFoveationToSceneRenderPassDescriptors` attaches the map to the descriptors of the passes that rasterize the scene at drawable size (G-buffer + light, the deferred colour that transparency/wireframe/debug draw into, environment/sky/grid, splats, gizmos), and each of those encoders sets the eye's viewport (`applyXRFoveationViewport`) in the map's screen space. Under a map, Metal reads a descriptor's `renderTargetWidth/Height` and the viewport in *screen* pixels (measured on a Mac GPU, and seen on the headset as a screen-fixed rectangle outside which nothing was drawn), so the attached descriptors leave the target size at 0 — the attachments' own size — and get it back when the map is detached. The full-screen passes (SSAO, post-processing, anti-aliasing, the output transform into the compositor's texture) keep plain descriptors: they copy physical pixels one to one and the layout is already the map's.
 - Two kinds of shader decode the map (`rasterization_rate_map_decoder`): SSAO, which rebuilds view positions from a depth texel's UV and must use the texel's *screen* position; and the occlusion culls (`hzbCullVisibleEntities`, `gaussianChunkCull`, the per-splat test), which project boxes and splats to screen UV and sample a pyramid laid out in physical space — the rect or point goes through the map first (`HZBOcclusion.h`). The pyramid carries the map it was drawn through into the next frame's culls (`HZBPyramidFrame.rateMapData`).
 - The Gaussian fragment takes its offset from the splat centre from a varying rather than from `[[position]]`, which the rate map places in the physical texture. Fragment position is physical everywhere else too, which is what every one-to-one texture read wants; `SmallObjectCulling` measures its pixel threshold against the screen height.
@@ -191,19 +193,19 @@ After both eyes are encoded into the same command buffer, the HZB depth pyramid 
 ### 3d. Present and Commit
 
 ```swift
-drawable.encodePresent(commandBuffer: commandBuffer)
+frame.present(target, commandBuffer: commandBuffer)   // drawable.encodePresent(commandBuffer:)
 commandBuffer.commit()
 ```
 
 Note `encodePresent` vs. macOS's `commandBuffer.present(drawable)`. On visionOS, the present must be **encoded into the command buffer** as a GPU command so the compositor can precisely time when the drawable lands on screen relative to GPU work completion. It is not a CPU-side call.
 
-The completion handler signals `commandBufferSemaphore` when the GPU finishes, freeing a slot for the next frame.
+The completion handler signals `commandBufferSemaphore` when the GPU finishes, freeing a slot for the next frame; a handler of the compositor source's own, added at `present`, checks the GPU's finish against the frame's rendering deadline (the deadline counters and the half-rate pacing).
 
 ---
 
 ## Spatial Input Bridge
 
-`configureSpatialEventBridge()` registers a closure on `layerRenderer.onSpatialEvent`. Every time the compositor fires a pinch gesture or spatial tap, the closure:
+`CompositorFrameSource` registers a closure on `layerRenderer.onSpatialEvent` that hands the events to `XRRuntime.enqueueSpatialEvents`. Every time the compositor fires a pinch gesture or spatial tap, the runtime:
 
 1. Extracts the **selection ray** — origin and direction in world space — from the event's `selectionRay` field
 2. Extracts the **input device pose** (hand position and orientation) if available
@@ -221,48 +223,48 @@ Selection rays update from interaction events, not continuously as the user look
 ## The Full XR Frame in One Picture
 
 ```
-[Compositor thread] runLoop() → renderNewFrame()
+[Compositor thread] runLoop() → XRFrameLoop.run() → draw(frame)
         │
-        ├─ queryNextFrame() + predictTiming()
-        ├─ frame.startUpdate()
+        ├─ source.nextFrame(): paceForHalfRate(), queryNextFrame() + predictTiming()
+        ├─ frame.beginUpdate()                 (startUpdate)
         │       ├─ [Main thread async] ProgressiveAssetLoader.tick()
-        │       ├─ updateSpatialInputState()   (drain gesture queue)
+        │       ├─ runtime.updateSpatialInput()   (drain gesture queue)
         │       └─ renderer.updateXR()         (gameUpdate + handleInput)
         ├─ frame.endUpdate()
-        ├─ wait(until: optimalInputTime)       (sleep until compositor deadline)
-        ├─ frame.startSubmission()
-        ├─ queryDrawables()                    (one drawable per target; the old single query aborts a foveated layer)
-        ├─ queryDeviceAnchor() → fallback chain → drawable.deviceAnchor = anchor
+        ├─ frame.waitForDrawingTime()          (sleep until the optimal input time)
+        ├─ frame.beginDrawing()                (startSubmission)
+        ├─ frame.acquireEyes()                 (queryDrawables: one target per drawable;
+        │                                       runtime.deviceAnchor() → fallback chain → drawable.deviceAnchor)
         │
-        └─ executeXRSystemPass()
+        └─ submit(target)                      (one pass per target)
                 │
                 ├─ [GPU compute] frustumCulling    (once, covers both eyes)
                 ├─ [GPU compute] gaussianSplatCull + gaussianPreprocess
                 ├─ [GPU compute] radixSort
                 │
                 ├─ for eye in [left, right]:
-                │       ├─ compute view matrix (originFromDevice × deviceFromView)⁻¹
-                │       ├─ compute projection  (drawable.computeProjection)
+                │       ├─ compute view matrix (originFromDevice × eye.deviceFromView)⁻¹
+                │       ├─ projection = eye.projection (drawable.computeProjection)
                 │       ├─ configure passDescriptor (color + depth textures)
                 │       └─ renderer.renderXR() → buildGameModeGraph()
                 │                                  topologicalSortGraph()
                 │                                  executeGraph()
                 │                                  [same DAG as macOS]
                 │
-                ├─ [GPU compute] buildHZBDepthPyramid  (once, after both eyes)
-                ├─ drawable.encodePresent(commandBuffer)
+                ├─ [GPU compute] buildHZBDepthPyramid  (once, after both eyes; the display's target only)
+                ├─ frame.present(target)           (drawable.encodePresent + the deadline handler)
                 └─ commandBuffer.commit()
                         │
                         └─ [GPU→thread callback] semaphore.signal()
         │
-        └─ frame.endSubmission()
+        └─ frame.endDrawing()                  (endSubmission)
 ```
 
 ---
 
 ## Key Differences From the macOS Path
 
-| | macOS (`UpdateRenderingSystem`) | visionOS (`executeXRSystemPass`) |
+| | macOS (`UpdateRenderingSystem`) | visionOS (`XRFrameLoop`) |
 |---|---|---|
 | Frame timing | MTKView drives at display rate | CompositorServices dictates via `optimalInputTime` |
 | Eyes | 1 | 2 (per-eye loop over `drawable.views`) |

@@ -1041,30 +1041,50 @@ public func InitXRIBLCubeSpecularPreFilterPipeline() -> RenderPipeline? {
 }
 
 public func InitLookPipeline() -> RenderPipeline? {
+    InitLookPipeline(premultiplied: false)
+}
+
+/// The look pass on a premultiplied frame (`RenderPipelineType.lookPremultiplied`, mixed
+/// immersion): a texel's alpha is its coverage, and the grade and the tone map act on the
+/// colour behind it. Its own fragment function, so that the opaque pass's is untouched.
+public func InitLookPremultipliedPipeline() -> RenderPipeline? {
+    InitLookPipeline(premultiplied: true)
+}
+
+private func InitLookPipeline(premultiplied: Bool) -> RenderPipeline? {
     CreatePipeline(
         vertexShader: "vertexLookShader",
-        fragmentShader: "fragmentLookShader",
+        fragmentShader: premultiplied ? "fragmentLookPremultipliedShader" : "fragmentLookShader",
         vertexDescriptor: createPostProcessVertexDescriptor(),
         colorFormats: [wf.lookOutput],
         // The look pass draws into its own descriptor, colour alone: no depth to match.
         depthFormat: .invalid,
         depthEnabled: false,
-        name: "Look Pipeline"
+        name: premultiplied ? "Look Pipeline (premultiplied)" : "Look Pipeline"
     )
 }
 
 /// The look pass that presents as it grades: the look output, the frame encoded for the
 /// display and the opaque depth, in one pass, in place of the output transform pass.
 public func InitLookPresentPipeline() -> RenderPipeline? {
+    InitLookPresentPipeline(premultiplied: false)
+}
+
+/// The presenting look pass on a premultiplied frame (`RenderPipelineType.lookPresentPremultiplied`).
+public func InitLookPresentPremultipliedPipeline() -> RenderPipeline? {
+    InitLookPresentPipeline(premultiplied: true)
+}
+
+private func InitLookPresentPipeline(premultiplied: Bool) -> RenderPipeline? {
     CreatePipeline(
         vertexShader: "vertexLookShader",
-        fragmentShader: "fragmentLookPresentShader",
+        fragmentShader: premultiplied ? "fragmentLookPresentPremultipliedShader" : "fragmentLookPresentShader",
         vertexDescriptor: createPostProcessVertexDescriptor(),
         colorFormats: [wf.lookOutput, renderInfo.presentColorPixelFormat],
         depthFormat: renderInfo.presentDepthPixelFormat,
         depthCompareFunction: .always,
         depthEnabled: true,
-        name: "Look Pipeline (presents)"
+        name: premultiplied ? "Look Pipeline (presents, premultiplied)" : "Look Pipeline (presents)"
     )
 }
 
@@ -1339,6 +1359,8 @@ public func DefaultPipeLines() -> [(RenderPipelineType, RenderPipelineInitBlock)
         (.spatialDebug, InitSpatialDebugPipeline),
         (.look, InitLookPipeline),
         (.lookPresent, InitLookPresentPipeline),
+        (.lookPremultiplied, InitLookPremultipliedPipeline),
+        (.lookPresentPremultiplied, InitLookPresentPremultipliedPipeline),
         (.fxaa, InitFXAAPipeline),
         (.fxaaEdgeDebug, InitFXAAEdgeDebugPipeline),
         (.taa, InitTAAPipeline),

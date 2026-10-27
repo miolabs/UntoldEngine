@@ -10,6 +10,7 @@
 
 import Foundation
 import QuartzCore
+import simd
 
 /// The time the GPU spent on a frame's command buffer beyond the previous frame's: the part
 /// of its span (`gpuStartTime` to `gpuEndTime`) after the previous command buffer ended.
@@ -50,7 +51,24 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         private var _frameMsBuffer: [Double] = .init(repeating: 0.0, count: 30)
         private var _frameMsBufferIndex: Int = 0
         private var _frameMsFilled: Int = 0
+
+        // The frames' stages over a span of the loop's frames: the completed handlers add
+        // frames (async), beginFrame closes a span by the loop's timestamps, completeFrame()
+        // publishes the last closed one.
+        private var _frameStageSpanSeconds: Double = 1.0
+        private var _spanStart: Double? // the timestamp of the first frame begun in the open span
+        private var _spanLastBegun: Double = 0.0
+        private var _spanFramesBegun: Int = 0
+        private var _spanStats = EngineFrameStageStats()
+        private var _spanCompletions: [TimeInterval] = []
+        private var _latestFrameStages = EngineFrameStageStats()
+        private var _letGoTotal = 0
+        private var _eyes = EngineEyeStats()
     #endif
+
+    /// The most completions kept for a span's late count (eleven minutes at 100 frames/s):
+    /// past it, frames still enter the maxima and the worst frame but not the count.
+    public static let completionsKept = 65536
 
     private init() {
         #if ENGINE_STATS_ENABLED
@@ -115,6 +133,27 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         }
     }
 
+    /// Seconds of the loop's frames each span of `EngineStatsSnapshot.frameStages` covers,
+    /// one by default: the snapshot carries the last span closed. At least 0.1.
+    public var frameStageSpanSeconds: Double {
+        get {
+            #if ENGINE_STATS_ENABLED
+                lock.lock()
+                defer { lock.unlock() }
+                return _frameStageSpanSeconds
+            #else
+                return 1.0
+            #endif
+        }
+        set {
+            #if ENGINE_STATS_ENABLED
+                lock.lock()
+                _frameStageSpanSeconds = max(0.1, newValue)
+                lock.unlock()
+            #endif
+        }
+    }
+
     public func snapshot() -> EngineStatsSnapshot {
         #if ENGINE_STATS_ENABLED
             lock.lock()
@@ -146,7 +185,105 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             currentSnapshot.frameIndex &+= 1
             currentSnapshot.timestampSeconds = timestampSeconds
             currentSnapshot.timing = .init()
+            // The frames' cadence, and the span's end: a span runs from its first frame's
+            // timestamp to the first one at least the span's length later, which opens the next.
+            if let start = _spanStart {
+                if timestampSeconds - start >= _frameStageSpanSeconds {
+                    closeFrameStageSpan(at: timestampSeconds)
+                }
+            } else {
+                _spanStart = timestampSeconds
+            }
+            _spanLastBegun = timestampSeconds
+            _spanFramesBegun += 1
             lock.unlock()
+        #endif
+    }
+
+    #if ENGINE_STATS_ENABLED
+        /// The open span's numbers as of `end`, with the refresh period from its cadence and
+        /// the late count against it. Under the lock.
+        private func frameStageSpanStats(endingAt end: Double) -> EngineFrameStageStats {
+            var stats = _spanStats
+            stats.letGoTotal = _letGoTotal
+            stats.seconds = max(0, end - (_spanStart ?? end))
+            stats.framesBegun = _spanFramesBegun
+            if _spanFramesBegun > 0, stats.seconds > 0 {
+                let period = stats.seconds / Double(_spanFramesBegun)
+                stats.refreshMs = period * 1000
+                stats.lateFrames = _spanCompletions.reduce(0) { $0 + ($1 > period ? 1 : 0) }
+            }
+            return stats
+        }
+
+        /// Publishes the open span as the latest and opens the next at `end`. Under the lock.
+        private func closeFrameStageSpan(at end: Double) {
+            _latestFrameStages = frameStageSpanStats(endingAt: end)
+            _spanStart = end
+            _spanFramesBegun = 0
+            _spanStats = EngineFrameStageStats()
+            _spanCompletions.removeAll(keepingCapacity: true)
+        }
+    #endif
+
+    /// A frame's stages, as its command buffer's completion resolves them, into the open
+    /// span: each stage's maximum, the completions for the late count, the worst frame, and
+    /// whether the GPU ended past the presenter's deadline. Safe to call from any thread.
+    public func recordFrameCompletion(_ stages: EngineFrameStages, pastDeadline: Bool = false) {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            _spanStats.framesCompleted += 1
+            _spanStats.cpuMsMax = max(_spanStats.cpuMsMax, stages.cpuMs)
+            _spanStats.waitMsMax = max(_spanStats.waitMsMax, stages.waitMs)
+            _spanStats.gpuMsMax = max(_spanStats.gpuMsMax, stages.gpuMs)
+            _spanStats.completionMsMax = max(_spanStats.completionMsMax, stages.completionMs)
+            if stages.completion > _spanStats.worstFrame.completion {
+                _spanStats.worstFrame = stages
+            }
+            if pastDeadline {
+                _spanStats.pastDeadline += 1
+            }
+            if _spanCompletions.count < Self.completionsKept {
+                _spanCompletions.append(stages.completion)
+            }
+            lock.unlock()
+        #else
+            _ = stages
+            _ = pastDeadline
+        #endif
+    }
+
+    /// A frame's eyes, each transform from the device anchor to the eye, into the running
+    /// account since the reset (`EngineStatsSnapshot.eyes`). Safe to call from any thread.
+    public func recordEyes(deviceFromViews: [simd_float4x4]) {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            _eyes.add(deviceFromViews: deviceFromViews)
+            lock.unlock()
+        #else
+            _ = deviceFromViews
+        #endif
+    }
+
+    /// A frame the loop took and let go undrawn, into the open span's count.
+    public func recordFrameLetGo() {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            _spanStats.letGo += 1
+            _letGoTotal += 1
+            lock.unlock()
+        #endif
+    }
+
+    /// The span still open: its frames so far, as of the last frame begun. The snapshot
+    /// carries the last span closed; this is for a reader that cannot wait for one.
+    public func frameStagesInProgress() -> EngineFrameStageStats {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            defer { lock.unlock() }
+            return frameStageSpanStats(endingAt: _spanLastBegun)
+        #else
+            return .init()
         #endif
     }
 
@@ -198,6 +335,8 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             // Pull in latest GPU timing from async handler
             currentSnapshot.timing.gpuExecutionMs = _latestGPUExecutionMs
             currentSnapshot.timing.gpuFrameCadenceMs = _latestGPUFrameCadenceMs
+            currentSnapshot.frameStages = _latestFrameStages
+            currentSnapshot.eyes = _eyes
 
             // Update 30-frame rolling average for CPU frame time
             let frameMs = currentSnapshot.timing.frameTotalMs
@@ -238,6 +377,14 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             _frameMsBuffer = .init(repeating: 0.0, count: kSmoothingWindow)
             _frameMsBufferIndex = 0
             _frameMsFilled = 0
+            _spanStart = nil
+            _spanLastBegun = 0.0
+            _spanFramesBegun = 0
+            _spanStats = EngineFrameStageStats()
+            _spanCompletions.removeAll(keepingCapacity: true)
+            _latestFrameStages = EngineFrameStageStats()
+            _letGoTotal = 0
+            _eyes = EngineEyeStats()
             lock.unlock()
         #endif
     }

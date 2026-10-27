@@ -1,0 +1,252 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# The per-eye material of the RealityKit presenter (docs/proposals/XRRealityKitPresenter.md), written by hand.
+#
+# Parameters: colorTexture (that eye's frame) and eye (1 left, 2 right).
+# The Camera Index Switch yields 0 (mono), 1 (left) or 2 (right) for the view being drawn;
+# the surface is visible only when that matches `eye`, and in a mono view (the simulator,
+# a 2D preview) the left eye's grid stands in. The second uv set is the grid's tear mask: x is
+# 1 on the far side of a depth jump, y is 1 on its near side, both 0 elsewhere. A triangle
+# stretched from an object to what lies behind it has both above zero everywhere inside it
+# (x rises from the object, y falls), a triangle of the object's own surface has x = 0 and one
+# of the far surface has y = 0. The colour is divided by the alpha (the engine's frame is
+# premultiplied): with the grid's skirt the pixels shown between an object's rim texel and the
+# alpha threshold's crossing have alpha under 1, and undivided they would draw a dark line
+# along every edge. Opacity = texture alpha x that visibility, times 0 where
+# min(x, y) exceeds a small epsilon, through an Unlit Surface with the post-process tone map
+# off and an opacity threshold of 0.9: the other eye's grid is discarded, alpha below the
+# threshold shows passthrough, and the stretched triangles go while the object and the surface
+# behind it keep their outlines. The threshold is high so that only a silhouette's fully
+# covered texels are opaque here: the partly covered ones (the anti-aliasing's coverage,
+# quarter steps under MSAA) are left to the edge band (XRPresenterEdge.usda), which blends
+# them over the room; at 0.5 the core took every texel covered by half or more and the band
+# had nothing but a quarter-strength fringe to add, invisible. Measured on a Mac
+# (XRPresenterEdgeStraightnessTests: a top face seen as a sliver, its far edge crossing the
+# rows at a shallow slope, RealityKit's picture magnified), the edge through this cut and the
+# band deviates 0.066 texel rms about a line, the texture's own coverage 0.074 (the quarter
+# steps of 4x MSAA) and its staircase read as a hard edge 0.29; the cut alone, without the
+# band, 0.22. Cuts of 0.5, 0.25 and 0.1 read 0.09, 0.13 and 0.22 and grow the object over the
+# room by 0.2 to 0.6 texel; the band at twice the coverage 0.12, at full weight 0.30 with a
+# 0.9-texel halo. So the cut stays at 0.9 and the band at the coverage.
+# The stretch cut is at an epsilon rather than at 0.5 because the mask
+# is interpolated linearly in distance along the stretched triangle, whose midpoint lies far
+# behind the object: in a view shifted from the eye it was drawn for, the visible part of the
+# stretch is its first metre.
+
+def Xform "Root"
+{
+    def Material "XRPresenterMaterial"
+    {
+        asset inputs:colorTexture = @@
+        int inputs:eye = 1
+        token outputs:mtlx:surface.connect = </Root/XRPresenterMaterial/UnlitSurface.outputs:out>
+        token outputs:realitykit:vertex
+
+        def Shader "UnlitSurface"
+        {
+            uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+            bool inputs:applyPostProcessToneMap = 0
+            color3f inputs:color.connect = </Root/XRPresenterMaterial/StraightRGB.outputs:out>
+            bool inputs:hasPremultipliedAlpha = 0
+            float inputs:opacity.connect = </Root/XRPresenterMaterial/Opacity.outputs:out>
+            float inputs:opacityThreshold = 0.9
+            token outputs:out
+        }
+
+        def Shader "ProjectiveCoord"
+        {
+            uniform token info:id = "ND_texcoord_vector4"
+            int inputs:index = 2
+            float4 outputs:out
+        }
+
+        def Shader "ProjectiveParts"
+        {
+            uniform token info:id = "ND_separate4_vector4"
+            float4 inputs:in.connect = </Root/XRPresenterMaterial/ProjectiveCoord.outputs:out>
+            float outputs:outx
+            float outputs:outy
+            float outputs:outz
+            float outputs:outw
+        }
+
+        def Shader "CoordU"
+        {
+            uniform token info:id = "ND_divide_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/ProjectiveParts.outputs:outx>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/ProjectiveParts.outputs:outz>
+            float outputs:out
+        }
+
+        def Shader "CoordV"
+        {
+            uniform token info:id = "ND_divide_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/ProjectiveParts.outputs:outy>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/ProjectiveParts.outputs:outz>
+            float outputs:out
+        }
+
+        def Shader "TexCoord"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/CoordU.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/CoordV.outputs:out>
+            float2 outputs:out
+        }
+
+        def Shader "ColorImage"
+        {
+            uniform token info:id = "ND_RealityKitTexture2D_color4"
+            asset inputs:file.connect = </Root/XRPresenterMaterial.inputs:colorTexture>
+            string inputs:mag_filter = "linear"
+            string inputs:min_filter = "linear"
+            string inputs:mip_filter = "linear"
+            float2 inputs:texcoord.connect = </Root/XRPresenterMaterial/TexCoord.outputs:out>
+            string inputs:u_wrap_mode = "clamp_to_edge"
+            string inputs:v_wrap_mode = "clamp_to_edge"
+            color4f outputs:out
+        }
+
+        def Shader "ColorRGB"
+        {
+            uniform token info:id = "ND_convert_color4_color3"
+            color4f inputs:in.connect = </Root/XRPresenterMaterial/ColorImage.outputs:out>
+            color3f outputs:out
+        }
+
+        def Shader "Channels"
+        {
+            uniform token info:id = "ND_separate4_color4"
+            color4f inputs:in.connect = </Root/XRPresenterMaterial/ColorImage.outputs:out>
+            float outputs:outa
+            float outputs:outb
+            float outputs:outg
+            float outputs:outr
+        }
+
+        def Shader "Straight"
+        {
+            uniform token info:id = "ND_max_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Channels.outputs:outa>
+            float inputs:in2 = 0.001
+            float outputs:out
+        }
+
+        def Shader "StraightRGB"
+        {
+            uniform token info:id = "ND_divide_color3FA"
+            color3f inputs:in1.connect = </Root/XRPresenterMaterial/ColorRGB.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Straight.outputs:out>
+            color3f outputs:out
+        }
+
+        def Shader "CameraIndex"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_integer"
+            int inputs:left = 1
+            int inputs:mono = 0
+            int inputs:right = 2
+            int outputs:out
+        }
+
+        def Shader "EyeMatches"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterMaterial/CameraIndex.outputs:out>
+            int inputs:value2.connect = </Root/XRPresenterMaterial.inputs:eye>
+            float outputs:out
+        }
+
+        def Shader "CameraIsMono"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterMaterial/CameraIndex.outputs:out>
+            int inputs:value2 = 0
+            float outputs:out
+        }
+
+        def Shader "EyeIsLeft"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterMaterial.inputs:eye>
+            int inputs:value2 = 1
+            float outputs:out
+        }
+
+        def Shader "MonoShowsLeft"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/CameraIsMono.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/EyeIsLeft.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "Visible"
+        {
+            uniform token info:id = "ND_max_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/EyeMatches.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/MonoShowsLeft.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "Shown"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Channels.outputs:outa>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Visible.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "TearCoord"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 1
+            float2 outputs:out
+        }
+
+        def Shader "Tear"
+        {
+            uniform token info:id = "ND_separate2_vector2"
+            float2 inputs:in.connect = </Root/XRPresenterMaterial/TearCoord.outputs:out>
+            float outputs:outx
+            float outputs:outy
+        }
+
+        def Shader "Stretch"
+        {
+            uniform token info:id = "ND_min_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Tear.outputs:outx>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Tear.outputs:outy>
+            float outputs:out
+        }
+
+        def Shader "Kept"
+        {
+            uniform token info:id = "ND_ifgreater_float"
+            float inputs:in1 = 0
+            float inputs:in2 = 1
+            float inputs:value1.connect = </Root/XRPresenterMaterial/Stretch.outputs:out>
+            float inputs:value2 = 0.001
+            float outputs:out
+        }
+
+        def Shader "Opacity"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterMaterial/Shown.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterMaterial/Kept.outputs:out>
+            float outputs:out
+        }
+    }
+}

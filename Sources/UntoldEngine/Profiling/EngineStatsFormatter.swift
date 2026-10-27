@@ -32,6 +32,21 @@ public func formatEngineStatsOverlay(_ snapshot: EngineStatsSnapshot) -> String 
     formatEngineStats(snapshot, style: .expanded)
 }
 
+/// The frames' stages of the snapshot's last span, as a person reads them on a headset:
+/// "gpu span max 20.0 ms · late 3 of 100 (refresh 10.0 ms) · worst 24.8 = cpu 4.0 + wait 0.1 +
+/// gpu 20.0". The same numbers, with the same definitions, as the RealityKit presenter's
+/// line, for the loop's frames whoever presents them.
+public func formatEngineFrameStages(_ snapshot: EngineStatsSnapshot) -> String {
+    snapshot.frameStages.description
+}
+
+/// Where the frames' eyes have been in the device anchor's frame since the monitor was reset,
+/// as a person reads them on a headset: "eyes L (-31.7, -18.2, 12.4) ±(0.3, 0.8, 0.4) mm · R
+/// (31.9, -18.0, 12.6) ±(0.3, 0.7, 0.4) mm · IPD 63.6 mm · 2400 frames" (`EngineEyeStats`).
+public func formatEngineEyes(_ snapshot: EngineStatsSnapshot) -> String {
+    snapshot.eyes.description
+}
+
 private func compactEngineStatsString(_ snapshot: EngineStatsSnapshot) -> String {
     "frame=\(snapshot.frameIndex) " +
         "cpuFPS=\(formatFPS(frameMs: snapshot.timing.smoothedFrameMs)) " +
@@ -43,7 +58,11 @@ private func compactEngineStatsString(_ snapshot: EngineStatsSnapshot) -> String
         "cullMs=\(formatMs(snapshot.timing.cullingMs)) " +
         "drawCalls=\(snapshot.render.drawCallsTotal) " +
         "triangles=\(snapshot.render.trianglesTotal) " +
-        "visible=\(snapshot.render.visibleInstances)"
+        "visible=\(snapshot.render.visibleInstances) | " +
+        snapshot.frameStages.description +
+        // The eyes the frames were drawn from, when a presenter reports them: on the log line
+        // so they can be copied off a headset's console.
+        (snapshot.eyes.samples > 0 ? " | " + snapshot.eyes.description : "")
 }
 
 private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> String {
@@ -56,9 +75,12 @@ private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> Strin
     let texBudgetMB = formatMB(snapshot.memory.textureBudgetBytes)
     let memPct = String(format: "%.0f%%", snapshot.memory.utilizationPercent * 100)
     let pressure = snapshot.memory.isUnderPressure ? " PRESSURE" : ""
+    let stages = snapshot.frameStages
     return """
     Frame \(snapshot.frameIndex) | CPU \(formatMs(snapshot.timing.smoothedFrameMs))ms (\(formatFPS(frameMs: snapshot.timing.smoothedFrameMs)) fps, smoothed)  GPU \(formatMs(snapshot.timing.gpuExecutionMs))ms exec / \(formatFPS(frameMs: snapshot.timing.gpuFrameCadenceMs)) fps cadence  [\(bottleneck)]
     Timing: frame \(formatMs(snapshot.timing.frameTotalMs))ms (raw CPU) | update \(formatMs(snapshot.timing.updateMs))ms | render \(formatMs(snapshot.timing.renderTotalMs))ms | cull \(formatMs(snapshot.timing.cullingMs))ms | stream \(formatMs(snapshot.timing.streamingRegionMs + snapshot.timing.geometryStreamingMs))ms | batchTick \(formatMs(snapshot.timing.batchingTickMs))ms | batchRebuild \(formatMs(snapshot.timing.batchingRebuildMs))ms
+    Eyes: \(snapshot.eyes.description)
+    Stages: \(stages.description) | cpu max \(formatMs(stages.cpuMsMax))ms | wait max \(formatMs(stages.waitMsMax))ms | completion max \(formatMs(stages.completionMsMax))ms | worst's pacing \(formatMs(stages.worstFrame.pacingMs))ms | \(stages.framesCompleted) frames in \(String(format: "%.2f", stages.seconds))s
     Render: draws \(snapshot.render.drawCallsTotal) (opaque \(snapshot.render.drawCallsOpaque), transparent \(snapshot.render.drawCallsTransparent), shadow \(snapshot.render.drawCallsShadow), batched \(snapshot.render.drawCallsBatched)) | triangles \(snapshot.render.trianglesTotal) | visible \(snapshot.render.visibleInstances)
     Culling: frustum \(snapshot.culling.frustumPassed)/\(snapshot.culling.frustumTested) failed \(snapshot.culling.frustumFailed) | occlusion \(snapshot.culling.occlusionPassed)/\(snapshot.culling.occlusionTested) failed \(snapshot.culling.occlusionFailed) | usedHZB \(snapshot.culling.usedHZB) validHZB \(snapshot.culling.hzbIsValid)
     Streaming: loaded \(snapshot.streaming.loadedStreamingEntities) loading \(snapshot.streaming.loadingStreamingEntities) unloaded \(snapshot.streaming.unloadedStreamingEntities) | active \(snapshot.streaming.activeLoads) | nearby \(snapshot.streaming.nearbyEntitiesQueried) candidates \(snapshot.streaming.loadCandidates) slots \(snapshot.streaming.availableLoadSlots) | backlog \(snapshot.streaming.pendingLoadBacklog) | pendingUploads \(snapshot.streaming.pendingUploadCount) | gateMs \(formatMs(snapshot.streaming.blockedByGateMs))

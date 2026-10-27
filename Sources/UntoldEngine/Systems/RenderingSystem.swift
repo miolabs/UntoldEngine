@@ -1396,6 +1396,13 @@ private func debugSourceTexture(for mode: RenderDebugViewMode) -> MTLTexture? {
     }
 }
 
+/// The look pipelines for the frame: the premultiplied variants in mixed immersion, where a
+/// texel's alpha is its coverage and the grade and the tone map act on the colour behind it;
+/// elsewhere the pre-composite sets alpha 1 and the pass takes the frame as it is.
+private var lookPipelineTypes: (look: RenderPipelineType, present: RenderPipelineType) {
+    renderInfo.immersionStyle == .mixed ? (.lookPremultiplied, .lookPresentPremultiplied) : (.look, .lookPresent)
+}
+
 /// The look pass presenting the frame itself, when the output transform would only copy it
 /// (`renderInfo.lookMayPresent`): the display's colour and depth textures become the pass's
 /// second colour attachment and depth, as the temporal resolve does. Returns whether it ran;
@@ -1409,7 +1416,7 @@ private func lookPresentingPass(source: MTLTexture, destination: MTLTexture) -> 
               let presentDescriptor, let presentColor, let presentDepth,
               presentColor.width == destination.width, presentColor.height == destination.height,
               let sourceDepth = textureResources.depthMap,
-              let pipeline = PipelineManager.shared.renderPipelinesByType[.lookPresent],
+              let pipeline = PipelineManager.shared.renderPipelinesByType[lookPipelineTypes.present],
               pipeline.success, let pipelineState = pipeline.pipelineState
         else { return false }
 
@@ -1487,7 +1494,7 @@ public let lookRenderPass: RenderPasses.RenderPassExecution = { commandBuffer in
         if lookPresentingPass(source: sourceTexture, destination: destinationTexture)(commandBuffer) {
             return
         }
-        guard let pipeline = PipelineManager.shared.renderPipelinesByType[.look] else {
+        guard let pipeline = PipelineManager.shared.renderPipelinesByType[lookPipelineTypes.look] else {
             handleError(.pipelineStateNulled, "Look Pipeline is nil")
             return
         }

@@ -1,0 +1,330 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# The blended core of the RealityKit presenter (XRRealityKitPresenterConfiguration.silhouette
+# = .blendedCore): the band's graph (XRPresenterEdge.usda) on the grids themselves, with no
+# opacity threshold, so the whole picture blends instead of alpha-testing, loaded with the
+# material's writesDepth on, so the grid still writes its depth for the occlusion of what
+# RealityKit draws after it and of what the system composites with the layer's depth (Spatial
+# Personas, the hands). No band is drawn with it: a silhouette's partly covered texels blend
+# over the room through the core itself, and there is no alpha test anywhere along it. The
+# experiment this is for (docs/proposals/XRRealityKitPresenter.md, 2026-10-19): on the headset
+# the engine's cubes shimmer beside a plain RealityKit cube that does not, through the same
+# device render; the shipped core's hard cut is rasterized by the device without
+# anti-aliasing, and with a blended core there is no cut for the device to rasterize.
+#
+# With blending, every fragment rasterized writes depth, those of opacity 0 too, which the
+# alpha-tested core discarded: so a geometry modifier collapses the grid of the OTHER eye to a
+# point (its vertices moved by minus their position, zero-area triangles, nothing rasterized)
+# through the same Camera Index Switch in the vertex stage, where the surface's opacity alone
+# would have left that grid's depth in the eye it is invisible to (a hole in this eye's own
+# grid wherever the other's, drawn first, lay nearer, and an invisible occluder of RealityKit's
+# content). What still writes depth at opacity 0: the far shell (100 m, nothing of RealityKit's
+# lies behind it), the skirt's texels and the triangles stretched across a depth jump (a
+# sliver a few texels wide beside each silhouette, between the object and what lies behind
+# it, an invisible occluder of a RealityKit entity standing in that gap). The shipped chain
+# has the same sliver: its band blends over those cells and writes depth too (every shader
+# graph material does unless told not to), measured on the Mac as the same 921 texels of a
+# box behind the cubes hidden by either chain (XRRealityKitPresenterTests). Parameters as the
+# core's: colorTexture and eye; the colour divided by the alpha, the tear mask's cut, the mono
+# view showing the left eye, as there.
+
+def Xform "Root"
+{
+    def Material "XRPresenterBlendedMaterial"
+    {
+        asset inputs:colorTexture = @@
+        int inputs:eye = 1
+        token outputs:mtlx:surface.connect = </Root/XRPresenterBlendedMaterial/UnlitSurface.outputs:out>
+        token outputs:realitykit:vertex.connect = </Root/XRPresenterBlendedMaterial/GeometryModifier.outputs:out>
+
+        def Shader "UnlitSurface"
+        {
+            uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+            bool inputs:applyPostProcessToneMap = 0
+            color3f inputs:color.connect = </Root/XRPresenterBlendedMaterial/StraightRGB.outputs:out>
+            bool inputs:hasPremultipliedAlpha = 0
+            float inputs:opacity.connect = </Root/XRPresenterBlendedMaterial/Opacity.outputs:out>
+            token outputs:out
+        }
+
+        def Shader "ProjectiveCoord"
+        {
+            uniform token info:id = "ND_texcoord_vector4"
+            int inputs:index = 2
+            float4 outputs:out
+        }
+
+        def Shader "ProjectiveParts"
+        {
+            uniform token info:id = "ND_separate4_vector4"
+            float4 inputs:in.connect = </Root/XRPresenterBlendedMaterial/ProjectiveCoord.outputs:out>
+            float outputs:outx
+            float outputs:outy
+            float outputs:outz
+            float outputs:outw
+        }
+
+        def Shader "CoordU"
+        {
+            uniform token info:id = "ND_divide_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/ProjectiveParts.outputs:outx>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/ProjectiveParts.outputs:outz>
+            float outputs:out
+        }
+
+        def Shader "CoordV"
+        {
+            uniform token info:id = "ND_divide_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/ProjectiveParts.outputs:outy>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/ProjectiveParts.outputs:outz>
+            float outputs:out
+        }
+
+        def Shader "TexCoord"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/CoordU.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/CoordV.outputs:out>
+            float2 outputs:out
+        }
+
+        def Shader "ColorImage"
+        {
+            uniform token info:id = "ND_RealityKitTexture2D_color4"
+            asset inputs:file.connect = </Root/XRPresenterBlendedMaterial.inputs:colorTexture>
+            string inputs:mag_filter = "linear"
+            string inputs:min_filter = "linear"
+            string inputs:mip_filter = "linear"
+            float2 inputs:texcoord.connect = </Root/XRPresenterBlendedMaterial/TexCoord.outputs:out>
+            string inputs:u_wrap_mode = "clamp_to_edge"
+            string inputs:v_wrap_mode = "clamp_to_edge"
+            color4f outputs:out
+        }
+
+        def Shader "ColorRGB"
+        {
+            uniform token info:id = "ND_convert_color4_color3"
+            color4f inputs:in.connect = </Root/XRPresenterBlendedMaterial/ColorImage.outputs:out>
+            color3f outputs:out
+        }
+
+        def Shader "Channels"
+        {
+            uniform token info:id = "ND_separate4_color4"
+            color4f inputs:in.connect = </Root/XRPresenterBlendedMaterial/ColorImage.outputs:out>
+            float outputs:outa
+            float outputs:outb
+            float outputs:outg
+            float outputs:outr
+        }
+
+        def Shader "Straight"
+        {
+            uniform token info:id = "ND_max_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/Channels.outputs:outa>
+            float inputs:in2 = 0.001
+            float outputs:out
+        }
+
+        def Shader "StraightRGB"
+        {
+            uniform token info:id = "ND_divide_color3FA"
+            color3f inputs:in1.connect = </Root/XRPresenterBlendedMaterial/ColorRGB.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/Straight.outputs:out>
+            color3f outputs:out
+        }
+
+        def Shader "CameraIndex"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_integer"
+            int inputs:left = 1
+            int inputs:mono = 0
+            int inputs:right = 2
+            int outputs:out
+        }
+
+        def Shader "EyeMatches"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterBlendedMaterial/CameraIndex.outputs:out>
+            int inputs:value2.connect = </Root/XRPresenterBlendedMaterial.inputs:eye>
+            float outputs:out
+        }
+
+        def Shader "CameraIsMono"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterBlendedMaterial/CameraIndex.outputs:out>
+            int inputs:value2 = 0
+            float outputs:out
+        }
+
+        def Shader "EyeIsLeft"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterBlendedMaterial.inputs:eye>
+            int inputs:value2 = 1
+            float outputs:out
+        }
+
+        def Shader "MonoShowsLeft"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/CameraIsMono.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/EyeIsLeft.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "Visible"
+        {
+            uniform token info:id = "ND_max_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/EyeMatches.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/MonoShowsLeft.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "Shown"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/Channels.outputs:outa>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/Visible.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "TearCoord"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            int inputs:index = 1
+            float2 outputs:out
+        }
+
+        def Shader "Tear"
+        {
+            uniform token info:id = "ND_separate2_vector2"
+            float2 inputs:in.connect = </Root/XRPresenterBlendedMaterial/TearCoord.outputs:out>
+            float outputs:outx
+            float outputs:outy
+        }
+
+        def Shader "Stretch"
+        {
+            uniform token info:id = "ND_min_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/Tear.outputs:outx>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/Tear.outputs:outy>
+            float outputs:out
+        }
+
+        def Shader "Kept"
+        {
+            uniform token info:id = "ND_ifgreater_float"
+            float inputs:in1 = 0
+            float inputs:in2 = 1
+            float inputs:value1.connect = </Root/XRPresenterBlendedMaterial/Stretch.outputs:out>
+            float inputs:value2 = 0.001
+            float outputs:out
+        }
+
+        def Shader "Opacity"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/Shown.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/Kept.outputs:out>
+            float outputs:out
+        }
+        def Shader "GeometryModifier"
+        {
+            uniform token info:id = "ND_realitykit_geometrymodifier_2_0_vertexshader"
+            float3 inputs:modelPositionOffset.connect = </Root/XRPresenterBlendedMaterial/OtherEyeOffset.outputs:out>
+            token outputs:out
+        }
+
+        def Shader "ModelPosition"
+        {
+            uniform token info:id = "ND_position_vector3"
+            string inputs:space = "object"
+            float3 outputs:out
+        }
+
+        def Shader "CameraIndexV"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_integer"
+            int inputs:left = 1
+            int inputs:mono = 0
+            int inputs:right = 2
+            int outputs:out
+        }
+
+        def Shader "EyeMatchesV"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterBlendedMaterial/CameraIndexV.outputs:out>
+            int inputs:value2.connect = </Root/XRPresenterBlendedMaterial.inputs:eye>
+            float outputs:out
+        }
+
+        def Shader "CameraIsMonoV"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterBlendedMaterial/CameraIndexV.outputs:out>
+            int inputs:value2 = 0
+            float outputs:out
+        }
+
+        def Shader "EyeIsLeftV"
+        {
+            uniform token info:id = "ND_ifequal_floatI"
+            float inputs:in1 = 1
+            float inputs:in2 = 0
+            int inputs:value1.connect = </Root/XRPresenterBlendedMaterial.inputs:eye>
+            int inputs:value2 = 1
+            float outputs:out
+        }
+
+        def Shader "MonoShowsLeftV"
+        {
+            uniform token info:id = "ND_multiply_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/CameraIsMonoV.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/EyeIsLeftV.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "VisibleV"
+        {
+            uniform token info:id = "ND_max_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/EyeMatchesV.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/MonoShowsLeftV.outputs:out>
+            float outputs:out
+        }
+
+        def Shader "Collapse"
+        {
+            uniform token info:id = "ND_subtract_float"
+            float inputs:in1.connect = </Root/XRPresenterBlendedMaterial/VisibleV.outputs:out>
+            float inputs:in2 = 1
+            float outputs:out
+        }
+
+        def Shader "OtherEyeOffset"
+        {
+            uniform token info:id = "ND_multiply_vector3FA"
+            float3 inputs:in1.connect = </Root/XRPresenterBlendedMaterial/ModelPosition.outputs:out>
+            float inputs:in2.connect = </Root/XRPresenterBlendedMaterial/Collapse.outputs:out>
+            float3 outputs:out
+        }
+    }
+}
