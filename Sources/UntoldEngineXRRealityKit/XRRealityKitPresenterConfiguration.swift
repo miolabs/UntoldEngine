@@ -13,8 +13,18 @@ import simd
 
 /// How the RealityKit presenter renders and shows the engine's frame: the size of each eye's
 /// textures and the scale they are rendered at, the grids each eye is shown on, the eyes'
-/// frustum and distance, the lead the frame is posed ahead of its ticket, how many refreshes
-/// the engine has for a frame, and the depth rules of the grids.
+/// frustum and where they sit on the device, the lead the frame is posed ahead of its ticket,
+/// how many refreshes the engine has for a frame, and the depth rules of the grids.
+///
+/// The eyes: RealityKit renders the grids from the device's TRACKED eyes and tells the
+/// presenter nothing of where they are, so the engine renders from a nominal pair, the
+/// interpupillary distance apart at the ARKit device anchor plus a view offset, unless the
+/// app measures the tracked eyes and sets `eyeTransforms`. The headset showed why
+/// (2026-10-27): the tracked eyes sat 24.7 mm below the anchor, and a grid cell drawn at a
+/// wrong depth (a cube's top seen edge-on, a sphere's limb) seen from an eye that is not the
+/// engine's shows the texture displaced by that difference times the depth error, the kinks
+/// at rest and the shimmer with the gaze along every silhouette, which the measured eyes
+/// dialled in took almost to a native RealityKit cube's.
 public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// Pixels per eye: the headset's per-eye drawable size by default (the plan's D5). What
     /// the eyes are rendered at is this times `renderScale` (`renderedTextureSize`).
@@ -62,9 +72,20 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// few degrees wider than the headset's view, so that a head turn between the frame's pose
     /// and its display still finds pixels at the edges.
     public var frustumTangents = SIMD4<Float>(1.30, 1.30, 1.15, 1.30)
-    /// The distance between the eyes, metres. RealityKit tells the presenter nothing of the
-    /// eyes' places, so they sit a nominal half distance to each side of the device.
-    public var interpupillaryDistance: Float = 0.063
+    /// The distance between the eyes, metres: the nominal pair's, a half to each side of the
+    /// device anchor, unless `eyeTransforms` is set, when it reads as the distance between the
+    /// two measured eyes (for a settings line). Setting it sets the nominal pair's, which comes
+    /// back when `eyeTransforms` is cleared.
+    public var interpupillaryDistance: Float {
+        get {
+            guard let eyes = measuredEyes else { return nominalInterpupillaryDistance }
+            return simd_length(Self.translation(of: eyes.1) - Self.translation(of: eyes.0))
+        }
+        set { nominalInterpupillaryDistance = newValue }
+    }
+
+    /// The nominal pair's distance, metres, 63 mm by default.
+    private var nominalInterpupillaryDistance: Float = 0.063
     /// Seconds the frame is posed ahead of the moment its ticket is taken: an estimate of when
     /// RealityKit shows it (two refresh periods at 90 Hz), the fixed lead. With `adaptiveLead`
     /// the lead is measured instead and this is what it falls back on until a frame has
@@ -152,13 +173,46 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     public var silhouette: XRPresenterSilhouette = .cutAndBand
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50
-    /// An offset of both eyes' viewpoints on the device, metres, zero in use: a deliberate
-    /// offset (a few centimetres up) makes RealityKit show the grids from a point the engine did
+    /// An offset of both nominal eyes on the device, metres, in the device anchor's frame (x
+    /// right, y up, z back), zero by default: where the tracked eyes sit against the anchor
+    /// when an app knows it from a measurement it cannot carry whole, or a deliberate offset
+    /// (a few centimetres up) that makes RealityKit show the grids from a point the engine did
     /// not draw them from, so a silhouette defect that changes with it comes from a vertex at a
-    /// wrong depth, and one that does not from the texture or its mapping.
-    public var viewOffsetMetres = SIMD3<Float>(0, 0, 0)
+    /// wrong depth. With `eyeTransforms` set it reads as the midpoint of the two measured eyes
+    /// (for a settings line); setting it sets the nominal pair's, which comes back when
+    /// `eyeTransforms` is cleared.
+    public var viewOffsetMetres: SIMD3<Float> {
+        get {
+            guard let eyes = measuredEyes else { return nominalViewOffsetMetres }
+            return (Self.translation(of: eyes.0) + Self.translation(of: eyes.1)) / 2
+        }
+        set { nominalViewOffsetMetres = newValue }
+    }
+
+    /// The nominal pair's offset, metres, zero by default.
+    private var nominalViewOffsetMetres = SIMD3<Float>(0, 0, 0)
+
+    /// The device anchor to each eye (left, then right), as Compositor Services hands them out
+    /// per view (`LayerRenderer.Drawable.views[i].transform`, which the engine's Compositor
+    /// path renders from): the tracked eyes, measured by the app (`XREyeMeasurement` in
+    /// `UntoldEngineXR` runs a bare compositor layer for a moment and averages them). Set, the
+    /// engine renders each eye from its transform in place of the nominal pair, and
+    /// `interpupillaryDistance` and `viewOffsetMetres` report the pair's distance and midpoint;
+    /// nil, the default, is the nominal pair. An eye the array does not reach (fewer than two
+    /// transforms) stays nominal.
+    public var eyeTransforms: [simd_float4x4]?
 
     public init() {}
+
+    /// The two measured eyes when both are set.
+    private var measuredEyes: (simd_float4x4, simd_float4x4)? {
+        guard let eyeTransforms, eyeTransforms.count >= 2 else { return nil }
+        return (eyeTransforms[0], eyeTransforms[1])
+    }
+
+    private static func translation(of transform: simd_float4x4) -> SIMD3<Float> {
+        SIMD3<Float>(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
+    }
 
     /// The render scales accepted: 0.5 to 2 along each axis (a quarter to four times the
     /// pixels); a value outside is clamped, one that is not a number is 1.
@@ -213,11 +267,16 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
         XRPresenterProjection.reverseZ(tangents: frustumTangents, near: nearPlane, far: farPlane)
     }
 
-    /// Where an eye sits on the device: half the eye distance to its side (0 left, 1 right).
+    /// Where an eye sits on the device (0 left, 1 right): its measured transform when
+    /// `eyeTransforms` has one for it, else the nominal pair's, half the eye distance to its
+    /// side of the anchor plus the view offset, unrotated.
     public func deviceFromView(eye: Int) -> simd_float4x4 {
-        let x = eye == 0 ? -interpupillaryDistance / 2 : interpupillaryDistance / 2
+        if let eyeTransforms, eye >= 0, eye < eyeTransforms.count {
+            return eyeTransforms[eye]
+        }
+        let x = eye == 0 ? -nominalInterpupillaryDistance / 2 : nominalInterpupillaryDistance / 2
         var transform = matrix_identity_float4x4
-        transform.columns.3 = SIMD4<Float>(x + viewOffsetMetres.x, viewOffsetMetres.y, viewOffsetMetres.z, 1)
+        transform.columns.3 = SIMD4<Float>(x + nominalViewOffsetMetres.x, nominalViewOffsetMetres.y, nominalViewOffsetMetres.z, 1)
         return transform
     }
 }
