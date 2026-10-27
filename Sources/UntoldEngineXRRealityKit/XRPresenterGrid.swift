@@ -18,7 +18,8 @@ import simd
 /// vertex layout (40 bytes) is the kernel's `XRGridVertex`: a packed position, a packed uv with
 /// v = 0 at the texture's top row (affine, the fallback material's), a half2 tear mask (x the far
 /// side of a depth jump, y the near side), and the projective uv (u, v times the eye-space
-/// depth, that depth, 0) the shader graph divides per pixel. The edge band's mesh is a second
+/// depth, that depth, and a spare component the shader graph ignores: 0, or the vertex's kind
+/// under the alpha-crossing silhouette cells) the shader graph divides per pixel. The edge band's mesh is a second
 /// grid of the same layout and capacity whose index buffer the kernel fills per frame with the
 /// cells along silhouettes alone, every other cell degenerate (`degenerateIndices`).
 public struct XRPresenterGrid: Sendable, Equatable {

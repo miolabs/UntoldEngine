@@ -198,9 +198,10 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                     source.unproject.encode(
                         commandBuffer: commandBuffer,
                         depth: eye.depthTexture,
+                        color: eye.colorTexture,
                         scratch: source.unprojectScratch[index],
                         vertices: ticket.gridBuffers[index],
-                        indices: ticket.settings.adaptiveDiagonal && index < ticket.indexBuffers.count ? ticket.indexBuffers[index] : nil,
+                        indices: ticket.settings.rewritesIndices && index < ticket.indexBuffers.count ? ticket.indexBuffers[index] : nil,
                         bandVertices: index < ticket.bandBuffers.count ? ticket.bandBuffers[index] : nil,
                         bandIndices: index < ticket.bandIndexBuffers.count ? ticket.bandIndexBuffers[index] : nil,
                         originFromEye: simd_mul(originFromDevice, eye.deviceFromView),
@@ -212,6 +213,7 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                         rateMapData: source.foveation?.rateMapData,
                         cellTexels: Float(source.foveation?.cellTexels ?? 0),
                         tears: ticket.settings.tears,
+                        silhouetteCells: ticket.settings.silhouetteCells,
                         label: "XR grid unproject eye \(index)"
                     )
                 }

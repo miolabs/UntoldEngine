@@ -194,6 +194,25 @@ public struct XRGridUnprojectScratch {
 /// it). On a Mac the whole chain takes a thirteenth of what it took on scenes of a few objects
 /// and a seventh on a checkerboard of jumps every 100 texels.
 ///
+/// Under the alpha-crossing silhouette cells (`XRPresenterSilhouetteCells.alphaCrossing`, a
+/// function constant so the kernels without it are what they always were) the eye's colour is
+/// bound beside its depth and pass 2 places each rim vertex on the texture's alpha crossing
+/// instead of the skirt: along the line from its edge texel toward its own centre, the first
+/// point where the bilinearly filtered alpha (the engine's coverage) falls below one half,
+/// found to a sixteenth of a texel, at the surface's depth read at the covered texel nearest
+/// the crossing. A rim vertex with no crossing within reach (alpha at or above one half past
+/// its centre: an internal depth jump against another opaque surface) keeps the skirt. Pass 2
+/// writes each vertex's kind (plain, crossing, skirt, shell) into the projective coordinate's
+/// spare component, and passes 3 and 4 read it: every triangle that joins a crossing vertex to
+/// the shell is written degenerate, so the mesh boundary along a silhouette against the room is
+/// the chord through the crossings and nothing spans the jump (the caller hands the index
+/// buffer in every frame for that, as under the adaptive diagonal); a cell with a crossing
+/// vertex and one corner on the shell is split along the diagonal that does not touch that
+/// corner, so it is alone in its triangle; and the band keeps no cell whose four corners are
+/// on the shell. The skirt rule's kernels are what they were, the same code specialized without
+/// the constant (the crossing specialization places a skirt vertex the same way, to the few
+/// units in the last place the compiler's fused multiplies move).
+///
 /// The kernels are compiled from source once per device: the engine's prebuilt metallibs stay
 /// as they are, and the tests run them on a Mac.
 public final class XRGridUnprojectPass: @unchecked Sendable {
@@ -223,6 +242,27 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     // Whether pass 2 writes the edge band's vertex buffer too: a function constant, so the
     // kernel without a band is what it always was.
     constant bool kEdgeBand [[function_constant(1)]];
+    // Whether pass 2 places a rim vertex on the alpha crossing of the eye's colour, bound beside
+    // the depth, and passes 3 and 4 read the vertices' kinds to drop every triangle between a
+    // crossing vertex and the shell (XRPresenterSilhouetteCells.alphaCrossing): a function
+    // constant, so the kernels without it are what they always were.
+    constant bool kAlphaCrossing [[function_constant(2)]];
+    // The vertex kinds pass 2 writes into the projective coordinate's spare component under the
+    // alpha-crossing rule (0 under the skirt rule, as before): plain, a rim vertex on its
+    // crossing, a rim vertex kept on the skirt (no crossing within reach), on the far shell.
+    constant float kKindPlain = 0.0f;
+    constant float kKindCrossing = 1.0f;
+    constant float kKindSkirt = 2.0f;
+    constant float kKindShell = 3.0f;
+    // The alpha search: the filtered alpha read every kCrossingStepTexels along the line from
+    // the edge texel toward the vertex's centre, from kCrossingInsideTexels inside the edge
+    // texel to kCrossingBeyondCentreTexels past the centre, the fall below kCrossingAlpha
+    // refined by kCrossingBisections halvings of the step it fell in.
+    constant float kCrossingAlpha = 0.5f;
+    constant float kCrossingStepTexels = 0.5f;
+    constant float kCrossingInsideTexels = 1.5f;
+    constant float kCrossingBeyondCentreTexels = 1.5f;
+    constant int kCrossingBisections = 4;
     // The texels along each side of the blocks whose nearest depth the block dispatch writes.
     constant int kBlockTexels = 8;
     // The scan list's header, in uints: the scan dispatch's threadgroups (x, y, z, read by the
@@ -239,7 +279,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         packed_float3 position;   // the origin's space
         packed_float2 uv;         // v = 0 at the texture's top row (affine; the fallback material's)
         half2 mask;               // x: 1 on the far side of a depth jump, y: 1 on the near side
-        packed_float4 uvw;        // (u, v) times the eye-space depth, that depth, 0: the material divides
+        packed_float4 uvw;        // (u, v) times the eye-space depth, that depth, and the vertex's kind under the alpha-crossing rule (0 otherwise): the material divides by z
     };
     struct XRGridUnprojectUniforms {
         float4x4 originFromEye;
@@ -324,6 +364,9 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     // settled without a tie since x + 0.5 is exact). Past the texture's edge the sampler
     // repeats the edge texel, which leaves a maximum as it is and is masked off by the scan.
     constexpr sampler blockGather(coord::pixel, address::clamp_to_edge, filter::nearest);
+    // The alpha search reads the colour bilinearly between texel centres, in pixel coordinates,
+    // as the material's sampler reads it.
+    constexpr sampler alphaFilter(coord::pixel, address::clamp_to_edge, filter::linear);
     // Pass 0: the nearest depth (the largest, under reverse Z) of each block of
     // kBlockTexels × kBlockTexels texels, one thread per block: sixteen gathers of a quad each,
     // unrolled, their maxima taken four at a time (a read per texel took ten times as long on
@@ -572,6 +615,55 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         bool rim = zInFront(depth.read(uint2(f.centreTexel)), f.a, f.b) >= nearSideLimit;
         depths[index] = float4(chosen, texel, rim ? 1.0f : 0.0f);
     }
+    // Whether eyePoint puts a ray's point on the shell: the far plane, or further than the shell.
+    static bool beyondTheShell(float2 ndc, float depth, constant XRGridUnprojectUniforms &u) {
+        if (depth <= 0.0f) { return true; }
+        float4 eye = u.inverseProjection * float4(ndc, max(depth, 1e-6f), 1.0f);
+        return length(eye.xyz / eye.w) > u.farShell;
+    }
+    // The alpha crossing of a rim vertex whose edge texel is t and whose centre is c: along the
+    // line from t toward c (outward, off the surface), the filtered alpha of the eye's colour
+    // (the engine's coverage) read every half texel from kCrossingInsideTexels inside t to
+    // kCrossingBeyondCentreTexels past c. The surface must hold alpha at or above one half at
+    // some sample up to half a texel past t (else the line crosses a feature thinner than the
+    // filter: no crossing), and the crossing is the first fall below one half after that, the
+    // step it fell in halved kCrossingBisections times and the crossing interpolated within
+    // what is left. Alpha still at or above one half past c is an internal depth jump against
+    // another opaque surface: no crossing, and the vertex keeps the skirt. The crossing is in
+    // texels, clamped to the texture.
+    static bool alphaCrossing(texture2d<float, access::sample> color, float2 t, float2 c, float2 size, thread float2 &crossing) {
+        float2 away = c - t;
+        float len = length(away);
+        if (len <= 1e-3f) { return false; }
+        float2 direction = away / len;
+        float end = len + kCrossingBeyondCentreTexels;
+        float s = -kCrossingInsideTexels;
+        float previous = color.sample(alphaFilter, t + s * direction + 0.5f).a;
+        bool onSurface = previous >= kCrossingAlpha;
+        for (s += kCrossingStepTexels; s <= end + 1e-4f; s += kCrossingStepTexels) {
+            float a = color.sample(alphaFilter, t + s * direction + 0.5f).a;
+            if (!onSurface) {
+                if (a >= kCrossingAlpha) {
+                    onSurface = true;
+                } else if (s > 0.5f + 1e-4f) {
+                    return false;
+                }
+            } else if (a < kCrossingAlpha) {
+                float lo = s - kCrossingStepTexels, hi = s;
+                float aLo = previous, aHi = a;
+                for (int i = 0; i < kCrossingBisections; ++i) {
+                    float mid = 0.5f * (lo + hi);
+                    float am = color.sample(alphaFilter, t + mid * direction + 0.5f).a;
+                    if (am >= kCrossingAlpha) { lo = mid; aLo = am; } else { hi = mid; aHi = am; }
+                }
+                float f = (aLo - kCrossingAlpha) / max(aLo - aHi, 1e-6f);
+                crossing = clamp(t + (lo + f * (hi - lo)) * direction, float2(0.0f), size - 1.0f);
+                return true;
+            }
+            previous = a;
+        }
+        return false;
+    }
     // Where a vertex is placed: on its texel, or, for a rim vertex, the skirt past it: from the
     // edge texel toward the vertex's own centre (outward, off the surface), by skirtTexels, so
     // that the mesh boundary lies in texels the alpha test discards and the silhouette seen is
@@ -590,12 +682,16 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         return t;
     }
     // Pass 2: the vertex on the texel its nearest depth came from, and the tear mask from its
-    // neighbours' entries.
+    // neighbours' entries. Under the alpha-crossing rule the eye's colour and depth are bound
+    // too: a rim vertex goes onto the colour's alpha crossing at the surface's depth, and the
+    // vertex's kind is written for passes 3 and 4.
     kernel void xrGridUnproject(device XRGridVertex *vertices [[buffer(0)]],
                                 constant XRGridUnprojectUniforms &u [[buffer(1)]],
                                 const device float4 *depths [[buffer(2)]],
                                 constant rasterization_rate_map_data *rateMap [[buffer(3), function_constant(kFoveated)]],
                                 device XRGridVertex *bandVertices [[buffer(4), function_constant(kEdgeBand)]],
+                                depth2d<float, access::read> depth [[texture(0), function_constant(kAlphaCrossing)]],
+                                texture2d<float, access::sample> color [[texture(1), function_constant(kAlphaCrossing)]],
                                 uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= u.gridSize.x || gid.y >= u.gridSize.y) { return; }
@@ -604,11 +700,45 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         float4 own = depths[gid.y * u.gridSize.x + gid.x];
         float2 centre = vertexCentre(gid, u);
         float2 placed = placedTexel(own, centre, size, u.skirtTexels);
+        float ownDepth = own.x;
+        float kind = kKindPlain;
+        if (kAlphaCrossing) {
+            // The shell first (a vertex that sees nothing, or beyond the shell along its texel's
+            // ray), then the rim kinds: on the crossing when the colour has one along the line
+            // from the edge texel to the centre, at the surface's depth read at the covered texel
+            // nearest the crossing (half a texel inside it along the line, when that texel lies
+            // within the threshold of the edge texel's depth along this vertex's ray; else the
+            // edge texel's depth); else the skirt, as placed above.
+            float2 ownNDC = kFoveated ? texelToNDC(own.yz, u, rateMap) : uvToNDC(own.yz * texelToUVScale);
+            if (beyondTheShell(ownNDC, own.x, u)) {
+                kind = kKindShell;
+            } else if (own.w > 0.5f) {
+                float2 crossing;
+                if (alphaCrossing(color, own.yz, centre, size, crossing)) {
+                    placed = crossing;
+                    kind = kKindCrossing;
+                    float2 inward = own.yz - crossing;
+                    float inwardLength = length(inward);
+                    if (inwardLength > 1e-3f) {
+                        float2 covered = clamp(round(crossing + inward * (0.5f / inwardLength)), float2(0.0f), size - 1.0f);
+                        float coveredDepth = depth.read(uint2(covered));
+                        float2 centreNDC = kFoveated ? texelToNDC(centre, u, rateMap) : uvToNDC(centre / (size - 1.0f));
+                        float4 ra = u.inverseProjection * float4(centreNDC, 0.0f, 1.0f);
+                        float4 rb = u.inverseProjection * float4(0.0f, 0.0f, 1.0f, 0.0f);
+                        if (coveredDepth > 0.0f && fabs(zInFront(coveredDepth, ra, rb) - zInFront(own.x, ra, rb)) <= u.tearThreshold) {
+                            ownDepth = coveredDepth;
+                        }
+                    }
+                } else {
+                    kind = kKindSkirt;
+                }
+            }
+        }
         // The uv the material samples and the ray: through the map when foveated (the texel's
         // centre), else the texel over the texture's extent and the ray from that uv.
         float2 uv = kFoveated ? (placed + 0.5f) / size : placed * texelToUVScale;
         float2 ndc = kFoveated ? texelToNDC(placed, u, rateMap) : uvToNDC(uv);
-        float3 eye = eyePoint(ndc, own.x, u);
+        float3 eye = eyePoint(ndc, ownDepth, u);
         float distance = length(eye);
         // The tear mask against the eight neighbours: x when this vertex is further from the eye
         // than a neighbour by more than the threshold, y when it is nearer by that much. The
@@ -636,7 +766,7 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         // pixel, the texture is read where the engine drew it across every planar triangle,
         // whatever RealityKit's own camera (an affine uv keystones across a tilted cell).
         float ze = -eye.z;
-        v.uvw = packed_float4(uv.x * ze, uv.y * ze, ze, 0.0f);
+        v.uvw = packed_float4(uv.x * ze, uv.y * ze, ze, kAlphaCrossing ? kind : 0.0f);
         // The edge band's mesh has the same vertices: the same bytes into its own buffer.
         if (kEdgeBand) { bandVertices[gid.y * u.gridSize.x + gid.x] = v; }
     }
@@ -677,12 +807,56 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             t[3] = b; t[4] = c; t[5] = d;
         }
     }
+    // Under the alpha-crossing rule: the kind pass 2 wrote for a vertex.
+    static float kindOf(uint index, const device XRGridVertex *vertices) {
+        return vertices[index].uvw.w;
+    }
+    // Under the alpha-crossing rule: whether a triangle joins a crossing vertex to the shell,
+    // the stretch across the jump the rule removes.
+    static bool spansTheShell(float ka, float kb, float kc) {
+        bool shell = ka == kKindShell || kb == kKindShell || kc == kKindShell;
+        bool crossing = ka == kKindCrossing || kb == kKindCrossing || kc == kKindCrossing;
+        return shell && crossing;
+    }
+    // One triangle at t, or, degenerate, three copies of its first index.
+    static void writeTriangle(device uint *t, uint i, uint j, uint k, bool degenerate) {
+        t[0] = i;
+        t[1] = degenerate ? i : j;
+        t[2] = degenerate ? i : k;
+    }
+    // The cell's two triangles under the alpha-crossing rule: split as the core's rule says,
+    // except that a cell with a crossing vertex and exactly one corner on the shell is split
+    // along the diagonal that does not touch that corner, so it is alone in its triangle and
+    // the other three corners keep theirs whole (the fixed split would lose a quarter of the
+    // cell inside the silhouette); then each triangle that joins a crossing vertex to the
+    // shell is written degenerate. The other triangles, the shell's own among them, are as
+    // they were.
+    static void writeCellCrossing(device uint *t, uint2 gid, uint a, uint b, uint c, uint d, constant XRGridUnprojectUniforms &u, const device float4 *depths, constant rasterization_rate_map_data *rateMap, const device XRGridVertex *vertices) {
+        float ka = kindOf(a, vertices), kb = kindOf(b, vertices), kc = kindOf(c, vertices), kd = kindOf(d, vertices);
+        int shells = int(ka == kKindShell) + int(kb == kKindShell) + int(kc == kKindShell) + int(kd == kKindShell);
+        bool crossing = ka == kKindCrossing || kb == kKindCrossing || kc == kKindCrossing || kd == kKindCrossing;
+        bool otherWay;
+        if (crossing && shells == 1) {
+            otherWay = kb == kKindShell || kc == kKindShell;
+        } else {
+            otherWay = splitsTheOtherWay(gid, a, b, c, d, u, depths, rateMap);
+        }
+        if (otherWay) {
+            writeTriangle(t, a, c, d, spansTheShell(ka, kc, kd));
+            writeTriangle(t + 3, a, d, b, spansTheShell(ka, kd, kb));
+        } else {
+            writeTriangle(t, a, c, b, spansTheShell(ka, kc, kb));
+            writeTriangle(t + 3, b, c, d, spansTheShell(kb, kc, kd));
+        }
+    }
     // Pass 3: the cell's two triangles, split along the diagonal that does not cross a depth
-    // jump when the other does. One thread per cell.
+    // jump when the other does. One thread per cell. Under the alpha-crossing rule the
+    // vertices' kinds are read too (a barrier after pass 2), for the triangles to the shell.
     kernel void xrGridTriangulate(device uint *indices [[buffer(0)]],
                                   constant XRGridUnprojectUniforms &u [[buffer(1)]],
                                   const device float4 *depths [[buffer(2)]],
                                   constant rasterization_rate_map_data *rateMap [[buffer(3), function_constant(kFoveated)]],
+                                  const device XRGridVertex *vertices [[buffer(4), function_constant(kAlphaCrossing)]],
                                   uint2 gid [[thread_position_in_grid]])
     {
         uint2 cells = u.gridSize - 1;
@@ -692,7 +866,11 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         uint c = a + u.gridSize.x;
         uint d = c + 1;
         device uint *t = indices + (gid.y * cells.x + gid.x) * 6;
-        writeCell(t, splitsTheOtherWay(gid, a, b, c, d, u, depths, rateMap), a, b, c, d);
+        if (kAlphaCrossing) {
+            writeCellCrossing(t, gid, a, b, c, d, u, depths, rateMap, vertices);
+        } else {
+            writeCell(t, splitsTheOtherWay(gid, a, b, c, d, u, depths, rateMap), a, b, c, d);
+        }
     }
     // Whether a vertex lies along a silhouette or a depth jump: a rim vertex (the scratch
     // entry's flag: its own centre lies off the near surface its footprint reached) or one
@@ -723,17 +901,28 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         uint d = c + 1;
         device uint *t = indices + (gid.y * cells.x + gid.x) * 6;
         bool along = alongAnEdge(a, depths, vertices) || alongAnEdge(b, depths, vertices) || alongAnEdge(c, depths, vertices) || alongAnEdge(d, depths, vertices);
+        if (kAlphaCrossing) {
+            // Never a cell whose four corners are on the shell: the ring beyond a silhouette,
+            // marked by the mask, holds nothing to blend.
+            bool allShell = kindOf(a, vertices) == kKindShell && kindOf(b, vertices) == kKindShell && kindOf(c, vertices) == kKindShell && kindOf(d, vertices) == kKindShell;
+            along = along && !allShell;
+        }
         if (!along) {
             t[0] = a; t[1] = a; t[2] = a;
             t[3] = a; t[4] = a; t[5] = a;
             return;
         }
-        writeCell(t, splitsTheOtherWay(gid, a, b, c, d, u, depths, rateMap), a, b, c, d);
+        if (kAlphaCrossing) {
+            writeCellCrossing(t, gid, a, b, c, d, u, depths, rateMap, vertices);
+        } else {
+            writeCell(t, splitsTheOtherWay(gid, a, b, c, d, u, depths, rateMap), a, b, c, d);
+        }
     }
     """
 
     /// The six kernels, specialized for one value of `kFoveated`; the vertices' one twice, with
-    /// and without the edge band's vertex buffer (`kEdgeBand`).
+    /// and without the edge band's vertex buffer (`kEdgeBand`); and the vertices', the
+    /// triangulation and the band once more under the alpha-crossing rule (`kAlphaCrossing`).
     private struct Pipelines {
         let blockNearest: MTLComputePipelineState
         let nearestDepth: MTLComputePipelineState
@@ -742,6 +931,10 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         let unprojectWithBand: MTLComputePipelineState
         let triangulate: MTLComputePipelineState
         let edgeBand: MTLComputePipelineState
+        let unprojectCrossing: MTLComputePipelineState
+        let unprojectCrossingWithBand: MTLComputePipelineState
+        let triangulateCrossing: MTLComputePipelineState
+        let edgeBandCrossing: MTLComputePipelineState
     }
 
     /// The kernels for a uniform eye texture: the arithmetic as it always was.
@@ -755,15 +948,19 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         let library = try device.makeLibrary(source: Self.source, options: nil)
         func makePipelines(foveated: Bool) throws -> Pipelines {
             var foveated = foveated
-            func makeConstants(edgeBand: Bool) -> MTLFunctionConstantValues {
+            func makeConstants(edgeBand: Bool, alphaCrossing: Bool = false) -> MTLFunctionConstantValues {
                 var edgeBand = edgeBand
+                var alphaCrossing = alphaCrossing
                 let constants = MTLFunctionConstantValues()
                 constants.setConstantValue(&foveated, type: .bool, index: 0)
                 constants.setConstantValue(&edgeBand, type: .bool, index: 1)
+                constants.setConstantValue(&alphaCrossing, type: .bool, index: 2)
                 return constants
             }
             let constants = makeConstants(edgeBand: false)
             let bandConstants = makeConstants(edgeBand: true)
+            let crossingConstants = makeConstants(edgeBand: false, alphaCrossing: true)
+            let crossingBandConstants = makeConstants(edgeBand: true, alphaCrossing: true)
             func makePipeline(_ name: String, _ constants: MTLFunctionConstantValues) throws -> MTLComputePipelineState {
                 let function = try library.makeFunction(name: name, constantValues: constants)
                 return try device.makeComputePipelineState(function: function)
@@ -775,7 +972,11 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
                 unproject: makePipeline(Self.kernelName, constants),
                 unprojectWithBand: makePipeline(Self.kernelName, bandConstants),
                 triangulate: makePipeline(Self.triangulateKernelName, constants),
-                edgeBand: makePipeline(Self.edgeBandKernelName, constants)
+                edgeBand: makePipeline(Self.edgeBandKernelName, constants),
+                unprojectCrossing: makePipeline(Self.kernelName, crossingConstants),
+                unprojectCrossingWithBand: makePipeline(Self.kernelName, crossingBandConstants),
+                triangulateCrossing: makePipeline(Self.triangulateKernelName, crossingConstants),
+                edgeBandCrossing: makePipeline(Self.edgeBandKernelName, crossingConstants)
             )
         }
         uniformPipelines = try makePipelines(foveated: false)
@@ -819,10 +1020,16 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
     /// grid must then be the map's: `XRPresenterFoveation.grid`); nil, and the eye is a uniform
     /// texture. `fastPath` false sends every vertex to the scan dispatch, as the nearest-depth
     /// dispatch scanned them all before it had the blocks (the same entries, for a test to
-    /// compare against). A scratch made for another size than the depth's encodes nothing.
+    /// compare against). `silhouetteCells` `.alphaCrossing` places the rim vertices on the alpha
+    /// crossing of `color`, the eye's colour as the engine left it (premultiplied, its alpha the
+    /// coverage), and drops the triangles from there to the shell: `color` must then be bound
+    /// (without it the skirt rule stands in), and `indices` handed in every frame, since the
+    /// triangles are dropped there. A scratch made for another size than the depth's encodes
+    /// nothing.
     public func encode(
         commandBuffer: MTLCommandBuffer,
         depth: MTLTexture,
+        color: MTLTexture? = nil,
         scratch: XRGridUnprojectScratch,
         vertices: MTLBuffer,
         indices: MTLBuffer? = nil,
@@ -838,12 +1045,18 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         cellTexels: Float = 0,
         fastPath: Bool = true,
         tears: Bool = true,
+        silhouetteCells: XRPresenterSilhouetteCells = .skirt,
         label: String = "XR grid unproject"
     ) {
         let textureSize = SIMD2<Int>(depth.width, depth.height)
         guard scratch.textureSize == textureSize else {
             assertionFailure("the unprojection's scratch was made for a depth of \(scratch.textureSize), not \(textureSize)")
             return
+        }
+        var crossing = silhouetteCells == .alphaCrossing
+        if crossing, color == nil {
+            assertionFailure("the alpha-crossing silhouette cells need the eye's colour bound beside its depth")
+            crossing = false
         }
         // Timed with the engine's passes when the GPU pass timing is on.
         guard let encoder = GPUPassTiming.shared.makeComputeEncoder(commandBuffer, label) else { return }
@@ -871,6 +1084,9 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             encoder.setBuffer(rateMapData.buffer, offset: 0, index: 3)
         }
         encoder.setTexture(depth, index: 0)
+        if crossing, let color {
+            encoder.setTexture(color, index: 1)
+        }
         let nearestDepths = scratch.nearestDepths
         // The scan list twice: its count, atomic, and its indices past the header.
         encoder.setBuffer(scratch.scanList, offset: 0, index: 6)
@@ -895,8 +1111,14 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
         encoder.dispatchThreadgroups(indirectBuffer: scratch.scanList, indirectBufferOffset: 0, threadsPerThreadgroup: MTLSize(width: Self.scanThreadgroupThreads, height: 1, depth: 1))
         encoder.memoryBarrier(scope: .buffers)
 
-        // The vertices, and the edge band's copy of them when its buffer is handed in.
-        let unproject = bandVertices == nil ? pipelines.unproject : pipelines.unprojectWithBand
+        // The vertices, and the edge band's copy of them when its buffer is handed in; under
+        // the alpha-crossing rule the kernels that read the colour and write the kinds.
+        let unproject: MTLComputePipelineState
+        if crossing {
+            unproject = bandVertices == nil ? pipelines.unprojectCrossing : pipelines.unprojectCrossingWithBand
+        } else {
+            unproject = bandVertices == nil ? pipelines.unproject : pipelines.unprojectWithBand
+        }
         encoder.setComputePipelineState(unproject)
         encoder.setBuffer(vertices, offset: 0, index: 0)
         encoder.setBuffer(nearestDepths, offset: 0, index: 2)
@@ -904,22 +1126,30 @@ public final class XRGridUnprojectPass: @unchecked Sendable {
             encoder.setBuffer(bandVertices, offset: 0, index: 4)
         }
         dispatch(encoder, pipeline: unproject, columns: grid.columns, rows: grid.rows)
+        // The triangulation reads the vertices' kinds under the alpha-crossing rule.
+        if crossing {
+            encoder.memoryBarrier(scope: .buffers)
+        }
         // The cells' triangles for this frame, when the presenter hands the index buffer in
         // (nil keeps the mesh's indices as they are: the fixed split).
         if let indices {
-            encoder.setComputePipelineState(pipelines.triangulate)
+            let triangulate = crossing ? pipelines.triangulateCrossing : pipelines.triangulate
+            encoder.setComputePipelineState(triangulate)
             encoder.setBuffer(indices, offset: 0, index: 0)
             encoder.setBuffer(nearestDepths, offset: 0, index: 2)
-            dispatch(encoder, pipeline: pipelines.triangulate, columns: grid.columns - 1, rows: grid.rows - 1)
+            if crossing {
+                encoder.setBuffer(vertices, offset: 0, index: 4)
+            }
+            dispatch(encoder, pipeline: triangulate, columns: grid.columns - 1, rows: grid.rows - 1)
         }
         // The band's cells, from the vertices' tear mask and the rim flags: after the vertices.
         if let bandIndices {
             encoder.memoryBarrier(scope: .buffers)
-            encoder.setComputePipelineState(pipelines.edgeBand)
+            encoder.setComputePipelineState(crossing ? pipelines.edgeBandCrossing : pipelines.edgeBand)
             encoder.setBuffer(bandIndices, offset: 0, index: 0)
             encoder.setBuffer(nearestDepths, offset: 0, index: 2)
             encoder.setBuffer(vertices, offset: 0, index: 4)
-            dispatch(encoder, pipeline: pipelines.edgeBand, columns: grid.columns - 1, rows: grid.rows - 1)
+            dispatch(encoder, pipeline: crossing ? pipelines.edgeBandCrossing : pipelines.edgeBand, columns: grid.columns - 1, rows: grid.rows - 1)
         }
         encoder.endEncoding()
     }

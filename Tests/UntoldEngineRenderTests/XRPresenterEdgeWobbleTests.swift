@@ -551,7 +551,8 @@ final class XRPresenterEdgeWobbleTests: BaseRenderSetup {
         let output: MTLTexture
         let cameraOutput: RealityRenderer.CameraOutput
 
-        init(presenter: XRRealityKitPresenter, frames: Frames, multisampled: Bool, device: MTLDevice) throws {
+        /// `scene` in place of the presenter's root: a control drawn by RealityKit alone.
+        init(presenter: XRRealityKitPresenter?, scene: Entity? = nil, frames: Frames, multisampled: Bool, device: MTLDevice) throws {
             renderer = try RealityRenderer()
             renderer.cameraSettings.isToneMappingEnabled = false
             renderer.cameraSettings.antialiasing = multisampled ? .multisample4X : .none
@@ -559,7 +560,7 @@ final class XRPresenterEdgeWobbleTests: BaseRenderSetup {
             camera.components.set(PerspectiveCameraComponent(near: frames.configuration.nearPlane, far: frames.configuration.farPlane, fieldOfViewInDegrees: frames.fieldOfViewDegrees))
             camera.transform = Transform(matrix: frames.worldFromView)
             renderer.activeCamera = camera
-            renderer.entities.replaceAll([camera, presenter.root])
+            renderer.entities.replaceAll([camera] + [scene ?? presenter?.root].compactMap { $0 })
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: pictureSize.x, height: pictureSize.y, mipmapped: false)
             descriptor.usage = [.renderTarget, .shaderRead]
             descriptor.storageMode = .shared
@@ -1154,6 +1155,133 @@ final class XRPresenterEdgeWobbleTests: BaseRenderSetup {
         XCTAssertEqual(shipped.sphere.crossing.rms, floor.sphere.crossing.rms, accuracy: 0.1, "the shipped outline is as round as the eye resampled")
         XCTAssertLessThan(shipped.top.crossing.rms, 0.35, "the shipped top edges wobble under a third of a display pixel")
         XCTAssertLessThan(shipped.top.mask.rms, 0.45, "read by a mask the shipped top edges are within a raster's quantisation")
+    }
+
+    /// The silhouette cells on the sphere's outline, from the eye the engine drew from and from
+    /// eyes displaced by the pupil's half millimetre and by three millimetres (to the right, and
+    /// up): the shipped skirt against the alpha crossing (`XRPresenterSilhouetteCells`), the
+    /// shipped materials on both, RealityRenderer drawing with its 4x MSAA as the device draws
+    /// (the crossing's boundary is geometry, which the multisampling resolves; the skirt's is
+    /// the alpha test and the band, which it leaves as they are). Every reading is in picture
+    /// pixels along the ray from the sphere's projected centre, against the view's own
+    /// projection of the outline, so a cell drawn at the wrong depth shows as a shift of its
+    /// crossing between the drawing eye and the displaced one (the parallax of its depth error:
+    /// a texel a quarter of a metre behind the limb moves 0.6 picture pixels under 3 mm at
+    /// 1.6 m), while a cell at the true depth holds its crossing. Printed per rule and view:
+    /// where the outline lies against the projection (off), its wobble about the first two
+    /// harmonics (rms), and each angle's shift from the drawing eye's reading (mean, rms, the
+    /// worst), the shift being what breathes with the gaze on the headset; two rows without the
+    /// multisampling show the crossing's boundary as a plain raster. A third source is the
+    /// control: a RealityKit sphere of the same radius at the same place, geometry at the true
+    /// depth drawn by RealityKit alone (the headset's control sphere), read the same way, which
+    /// says how steady a geometric edge reads in this picture at all (the multisampling's
+    /// quarter steps quantise the one-half crossing of a hard edge, whatever its depth). The
+    /// crossing rule must hold the outline as the control holds it (within a twentieth of a
+    /// picture pixel rms of the control's shift), and both rules lie where the projection puts
+    /// the outline.
+    func test_theSilhouetteCells_holdTheSphereOutline_fromADisplacedEye() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        struct View {
+            let name: String
+            let offset: simd_float3
+            var multisampled = true
+            var crossingOnly = false
+        }
+        let views = [
+            View(name: "the drawing eye", offset: .zero),
+            View(name: "0.5 mm right", offset: simd_float3(0.0005, 0, 0)),
+            View(name: "3 mm right", offset: simd_float3(0.003, 0, 0)),
+            View(name: "3 mm up", offset: simd_float3(0, 0.003, 0)),
+            View(name: "the drawing eye, no MSAA", offset: .zero, multisampled: false, crossingOnly: true),
+            View(name: "3 mm right, no MSAA", offset: simd_float3(0.003, 0, 0), multisampled: false, crossingOnly: true),
+        ]
+        struct Reading {
+            let rule: String
+            let view: String
+            let offset: Float
+            let rms: Float
+            let shiftMean: Float
+            let shiftRms: Float
+            let shiftMax: Float
+        }
+        var readings: [Reading] = []
+        let pose = Self.headPose()
+        let controlName = "RealityKit sphere (control)"
+        let sources: [XRPresenterSilhouetteCells?] = XRPresenterSilhouetteCells.allCases + [nil]
+        for rule in sources {
+            let name = rule?.label ?? controlName
+            let setup = Setup(name: name) { $0.silhouetteCells = rule ?? .skirt }
+            var session: EyeSession?
+            var control: Entity?
+            if let rule {
+                let made = try await EyeSession(renderer: renderer, device: renderInfo.device, commandQueue: renderInfo.commandQueue, configuration: setup.configuration, pose: pose, reach: reach, readTexture: linearPixels(ofSRGB:))
+                _ = try made.draw()
+                XCTAssertEqual(made.presenter.settings.silhouetteCells, rule, "the rule rides in the settings")
+                XCTAssertEqual(made.presenter.lastTicket?.indexBuffers.count ?? 0, rule == .alphaCrossing ? 2 : 0, "the crossing rewrites the index buffers each frame, the skirt keeps the mesh's")
+                session = made
+            } else {
+                // The control: RealityKit's own sphere, unlit, at the engine sphere's place.
+                let sphere = ModelEntity(mesh: .generateSphere(radius: Self.sphereRadius), materials: [UnlitMaterial(color: .white)])
+                sphere.position = Self.sphereCentre
+                let root = Entity()
+                root.addChild(sphere)
+                control = root
+            }
+            let screenSize = session?.presenter.textureSize ?? setup.configuration.textureSize
+            var drawingEye: [Float]?
+            var drawingEyeUnsampled: [Float]?
+            for view in views where !view.crossingOnly || rule == .alphaCrossing {
+                let frames = Frames(configuration: setup.configuration, screenSize: screenSize, pose: pose, viewOffset: view.offset)
+                let outline = Self.outline(frames, samples: 720)
+                let camera = try Camera(presenter: session?.presenter, scene: control, frames: frames, multisampled: view.multisampled, device: renderInfo.device)
+                let black = try await camera.picture(background: 0)
+                let white = try await camera.picture(background: 1)
+                let shown = composite(black: black, white: white)
+                let reading = read(shown, around: outline)
+                let numbers = Self.numbers(of: reading, around: outline)
+                // Each view against the drawing eye's reading drawn the same way.
+                let reference: [Float]
+                if view.multisampled {
+                    reference = drawingEye ?? reading.crossings
+                    if drawingEye == nil { drawingEye = reading.crossings }
+                } else {
+                    reference = drawingEyeUnsampled ?? reading.crossings
+                    if drawingEyeUnsampled == nil { drawingEyeUnsampled = reading.crossings }
+                }
+                let shifts = zip(reading.crossings, reference).map { $0 - $1 }
+                let count = Float(shifts.count)
+                readings.append(Reading(
+                    rule: name, view: view.name, offset: numbers.offset, rms: numbers.crossing.rms,
+                    shiftMean: shifts.reduce(0, +) / count,
+                    shiftRms: sqrt(shifts.map { $0 * $0 }.reduce(0, +) / count),
+                    shiftMax: shifts.map { abs($0) }.max() ?? 0
+                ))
+                if let dumpFolder {
+                    try writePNG(black, to: dumpFolder.appendingPathComponent("silhouette-cells-\(slug(name))-\(slug(view.name)).png"))
+                }
+            }
+            try session?.stop()
+        }
+        print("XR presenter silhouette cells: the sphere's outline (radius 0.06 m at 1.6 m, 720 rays) at the display's scale, picture pixels: off = the one-half crossing's mean against the view's projection, rms = about its first two harmonics, shift = each ray's crossing against the drawing eye's reading (mean / rms / worst)")
+        print("  " + Self.pad("source", 28) + Self.pad("view", 26) + ["off", "rms", "shift mean", "shift rms", "shift max"].map { Self.pad($0, 12) }.joined())
+        for reading in readings {
+            print("  " + Self.pad(reading.rule, 28) + Self.pad(reading.view, 26) + [reading.offset, reading.rms, reading.shiftMean, reading.shiftRms, reading.shiftMax].map { Self.pad(Self.format($0, 3), 12) }.joined())
+        }
+        func reading(_ rule: String, _ view: String) throws -> Reading {
+            try XCTUnwrap(readings.first { $0.rule == rule && $0.view == view })
+        }
+        let skirtName = XRPresenterSilhouetteCells.skirt.label, crossingName = XRPresenterSilhouetteCells.alphaCrossing.label
+        let skirt = try reading(skirtName, "the drawing eye")
+        let crossing = try reading(crossingName, "the drawing eye")
+        let control = try reading(controlName, "the drawing eye")
+        XCTAssertEqual(skirt.offset, 0, accuracy: 1, "the skirt's outline lies where the projection puts it")
+        XCTAssertEqual(crossing.offset, 0, accuracy: 1, "the crossing's outline lies where the projection puts it")
+        XCTAssertEqual(control.offset, 0, accuracy: 1, "the control's outline lies where the projection puts it")
+        for view in views.dropFirst() where view.multisampled {
+            let displaced = try reading(crossingName, view.name)
+            let controlDisplaced = try reading(controlName, view.name)
+            XCTAssertLessThan(displaced.shiftRms, controlDisplaced.shiftRms + 0.05, "from \(view.name) the crossing rule holds the outline as RealityKit's own sphere holds its")
+        }
     }
 
     /// The core's cut, the band, RealityRenderer's own MSAA and a view off the drawing eye,

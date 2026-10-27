@@ -163,8 +163,9 @@ public final class XRRealityKitPresenter {
     public private(set) var hasEdgeBand = false
     /// Whether the edge band is drawn: it is there and the settings ask for it.
     public var drawsEdgeBand: Bool { hasEdgeBand && settings.edgeBlending }
-    /// Whether each set's last ticket's cells were split by the depth (the adaptive diagonal).
-    private var splitByDepth: [Bool]
+    /// Whether each set's last ticket's index buffers were rewritten by the kernel (the adaptive
+    /// diagonal, or the alpha-crossing silhouette cells: `XRPresenterSettings.rewritesIndices`).
+    private var indicesRewritten: [Bool]
     /// Each set's latest ticket.
     private var contents: [SetContent]
     /// The set whose entities show; the others are hidden.
@@ -328,7 +329,7 @@ public final class XRRealityKitPresenter {
         }
         hasEdgeBand = edgeGraph != nil
         self.sets = sets
-        splitByDepth = Array(repeating: false, count: sets.count)
+        indicesRewritten = Array(repeating: false, count: sets.count)
         contents = Array(repeating: SetContent(), count: sets.count)
         root.name = "Untold XR presenter"
     }
@@ -402,20 +403,21 @@ public final class XRRealityKitPresenter {
         let replaceStart = CACurrentMediaTime()
         let textures = set.colorTextures.map { $0.replace(using: presentation) }
         let buffers = set.meshes.map { $0.replace(bufferIndex: 0, using: presentation) }
-        // The cells' split per frame only when it is asked for; otherwise the mesh keeps its
-        // indices and the ticket carries none. RealityKit hands the index buffers out with no
-        // content, so each starts from the fixed split, blitted here on the frame's buffer:
-        // the kernel splits the cells over it later in that command buffer, and a frame that
-        // draws nothing (no pose yet, the stop path) still completes with every cell whole.
-        // Just turned off, the same blit writes the fixed split back once, so no cell stays
-        // split as the depth last left it.
+        // The index buffers per frame only when the kernel rewrites them (the cells' split by
+        // depth, or the alpha-crossing silhouette cells' triangles to the shell made
+        // degenerate); otherwise the mesh keeps its indices and the ticket carries none.
+        // RealityKit hands the index buffers out with no content, so each starts from the fixed
+        // split, blitted here on the frame's buffer: the kernel writes the cells over it later
+        // in that command buffer, and a frame that draws nothing (no pose yet, the stop path)
+        // still completes with every cell whole. Just turned off, the same blit writes the
+        // fixed split back once, so no cell stays as the kernel last left it.
         var indexBuffers: [MTLBuffer] = []
         var fixedSplitInto: [MTLBuffer] = []
-        if settings.adaptiveDiagonal || splitByDepth[setIndex] {
+        if settings.rewritesIndices || indicesRewritten[setIndex] {
             fixedSplitInto = set.meshes.map { $0.replaceIndices(using: presentation) }
-            if settings.adaptiveDiagonal { indexBuffers = fixedSplitInto }
+            if settings.rewritesIndices { indexBuffers = fixedSplitInto }
         }
-        splitByDepth[setIndex] = settings.adaptiveDiagonal
+        indicesRewritten[setIndex] = settings.rewritesIndices
         // The edge band's buffers while it is drawn: its vertices, which the kernel fills with
         // the grids' bytes, and its indices, handed out with no content like the grids' and
         // blitted degenerate here, so that a frame that draws nothing leaves the band empty;

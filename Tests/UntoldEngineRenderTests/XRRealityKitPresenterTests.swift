@@ -164,6 +164,27 @@ final class XRPresenterSilhouetteTests: XCTestCase {
         XCTAssertEqual(XRPresenterSilhouette.blendedCore.label, "blended core")
         XCTAssertEqual(XRPresenterSilhouette(rawValue: "blendedCore"), .blendedCore, "a launch argument's name")
     }
+
+    /// The silhouette cells: the skirt by default, the alpha crossing beside it, live in the
+    /// settings, which then ask for the index buffers each frame as the adaptive diagonal does.
+    func test_theSilhouetteCells_areTheSkirtByDefault_andTheCrossingRewritesTheIndices() {
+        var configuration = XRRealityKitPresenterConfiguration()
+        XCTAssertEqual(configuration.silhouetteCells, .skirt, "the shipped rule by default")
+        XCTAssertEqual(XRPresenterSilhouetteCells.allCases, [.skirt, .alphaCrossing])
+        XCTAssertEqual(XRPresenterSilhouetteCells.skirt.label, "skirt")
+        XCTAssertEqual(XRPresenterSilhouetteCells.alphaCrossing.label, "alpha crossing")
+        XCTAssertEqual(XRPresenterSilhouetteCells(rawValue: "alphaCrossing"), .alphaCrossing, "a launch argument's name")
+        var settings = XRPresenterSettings(configuration: configuration)
+        XCTAssertEqual(settings.silhouetteCells, .skirt)
+        XCTAssertFalse(settings.rewritesIndices, "the fixed split and the skirt keep the mesh's indices")
+        settings.silhouetteCells = .alphaCrossing
+        XCTAssertTrue(settings.rewritesIndices, "the crossing drops triangles in the index buffer each frame")
+        settings.silhouetteCells = .skirt
+        settings.adaptiveDiagonal = true
+        XCTAssertTrue(settings.rewritesIndices, "as the adaptive diagonal always did")
+        configuration.silhouetteCells = .alphaCrossing
+        XCTAssertEqual(XRPresenterSettings(configuration: configuration).silhouetteCells, .alphaCrossing, "the settings start from the configuration")
+    }
 }
 
 // MARK: - The mailbox
@@ -352,6 +373,137 @@ final class XRGridUnprojectTests: XCTestCase {
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+    }
+
+    /// The alpha the kernel's crossing search reads beside the synthetic depth: 1 on the planes,
+    /// 0 in the hole, and across the hole's rim a ramp a texel wide (the coverage the engine's
+    /// anti-aliasing would leave), so the one-half crossing lies at a sub-texel position.
+    private var alphaPipeline: MTLRenderPipelineState?
+
+    private func makeAlphaPipeline() throws -> MTLRenderPipelineState {
+        if let alphaPipeline { return alphaPipeline }
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct V { float4 position [[position]]; float2 uv; };
+        struct Alpha { float holeRadius; float texelsPerUnit; float2 padding; };
+        vertex V fullscreenAlpha(uint id [[vertex_id]]) {
+            float2 ndc = float2((id == 2) ? 3.0f : -1.0f, (id == 1) ? 3.0f : -1.0f);
+            V out; out.position = float4(ndc, 0, 1); out.uv = float2(ndc.x * 0.5f + 0.5f, 1.0f - (ndc.y * 0.5f + 0.5f));
+            return out;
+        }
+        fragment float4 alphas(V in [[stage_in]], constant Alpha &a [[buffer(0)]]) {
+            float2 centred = in.uv - 0.5f;
+            float alpha = clamp(0.5f + (length(centred) - a.holeRadius) * a.texelsPerUnit, 0.0f, 1.0f);
+            return float4(0.2f * alpha, 0.5f * alpha, 0.8f * alpha, alpha);
+        }
+        """
+        let library = try device.makeLibrary(source: source, options: nil)
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+        pipelineDescriptor.vertexFunction = library.makeFunction(name: "fullscreenAlpha")
+        pipelineDescriptor.fragmentFunction = library.makeFunction(name: "alphas")
+        pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+        let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        alphaPipeline = pipeline
+        return pipeline
+    }
+
+    /// A colour texture of the presenter's format, for the alpha.
+    private func makeAlphaTexture(width: Int, height: Int) throws -> MTLTexture {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: width, height: height, mipmapped: false)
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        return try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+    }
+
+    /// Draws the synthetic alpha into `texture`: the ramp across the hole's rim is a texel wide
+    /// along the texture's width.
+    private func drawAlpha(into texture: MTLTexture) throws {
+        let pipeline = try makeAlphaPipeline()
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeRenderCommandEncoder(descriptor: pass))
+        encoder.setRenderPipelineState(pipeline)
+        var alpha = (holeRadius: Self.holeRadius, texelsPerUnit: Float(texture.width), padding: SIMD2<Float>(0, 0))
+        encoder.setFragmentBytes(&alpha, length: MemoryLayout.stride(ofValue: alpha), index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+
+    /// The alpha texture's texels as the sampler holds them (8-bit, over 255), row by row.
+    private func readAlpha(_ texture: MTLTexture) throws -> [Float] {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: texture.pixelFormat, width: texture.width, height: texture.height, mipmapped: false)
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
+        let copy = try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let blit = try XCTUnwrap(commandBuffer.makeBlitCommandEncoder())
+        blit.copy(from: texture, to: copy)
+        blit.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        var bytes = [UInt8](repeating: 0, count: texture.width * texture.height * 4)
+        copy.getBytes(&bytes, bytesPerRow: texture.width * 4, from: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0)
+        return (0 ..< texture.width * texture.height).map { Float(bytes[$0 * 4 + 3]) / 255 }
+    }
+
+    /// The kernel's alpha search, in Swift, over the alpha read back from the texture: the
+    /// filtered alpha (bilinear between texel centres, the edge texel repeated outside) read
+    /// every half texel along the line from the edge texel `t` toward the centre `c`, from one
+    /// and a half texels inside `t` to one and a half past `c`; the surface must be found (alpha
+    /// at or above one half) by half a texel past `t`, the crossing is the first fall below one
+    /// half after that, its step halved four times and the crossing interpolated within what is
+    /// left. Nil when there is none within reach.
+    private func referenceCrossing(edgeTexel t: SIMD2<Float>, centre c: SIMD2<Float>, textureSize: SIMD2<Int>, alpha: [Float]) -> SIMD2<Float>? {
+        let size = SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
+        func filtered(_ p: SIMD2<Float>) -> Float {
+            let fx = min(max(p.x - 0.5, 0), size.x - 1)
+            let fy = min(max(p.y - 0.5, 0), size.y - 1)
+            let x0 = Int(fx), y0 = Int(fy)
+            let x1 = min(x0 + 1, textureSize.x - 1), y1 = min(y0 + 1, textureSize.y - 1)
+            let tx = fx - Float(x0), ty = fy - Float(y0)
+            func a(_ x: Int, _ y: Int) -> Float { alpha[y * textureSize.x + x] }
+            let top = a(x0, y0) * (1 - tx) + a(x1, y0) * tx
+            let bottom = a(x0, y1) * (1 - tx) + a(x1, y1) * tx
+            return top * (1 - ty) + bottom * ty
+        }
+        let away = c - t
+        let length = simd_length(away)
+        guard length > 1e-3 else { return nil }
+        let direction = away / length
+        let end = length + 1.5
+        var s: Float = -1.5
+        var previous = filtered(t + s * direction + 0.5)
+        var onSurface = previous >= 0.5
+        s += 0.5
+        while s <= end + 1e-4 {
+            let a = filtered(t + s * direction + 0.5)
+            if !onSurface {
+                if a >= 0.5 {
+                    onSurface = true
+                } else if s > 0.5 + 1e-4 {
+                    return nil
+                }
+            } else if a < 0.5 {
+                var lo = s - 0.5, hi = s, aLo = previous, aHi = a
+                for _ in 0 ..< 4 {
+                    let mid = 0.5 * (lo + hi)
+                    let am = filtered(t + mid * direction + 0.5)
+                    if am >= 0.5 { lo = mid; aLo = am } else { hi = mid; aHi = am }
+                }
+                let f = (aLo - 0.5) / max(aLo - aHi, 1e-6)
+                return simd_clamp(t + (lo + f * (hi - lo)) * direction, SIMD2<Float>(0, 0), size - 1)
+            }
+            previous = a
+            s += 0.5
+        }
+        return nil
     }
 
     /// The kernel's `eyePoint`, in Swift, of a texture position.
@@ -761,6 +913,217 @@ final class XRGridUnprojectTests: XCTestCase {
             XCTAssertEqual(without.nearest[index].depth, with.nearest[index].depth, "the same depth at \(where_)")
             XCTAssertEqual(without.nearest[index].texel, with.nearest[index].texel, "the same texel at \(where_)")
             XCTAssertEqual(without.nearest[index].rim, with.nearest[index].rim, "the same rim flag at \(where_)")
+        }
+    }
+
+    /// The alpha-crossing silhouette cells on the two planes and the hole, the alpha texture
+    /// beside the depth. The hole is a silhouette against the shell: its rim vertices sit on the
+    /// ramp's one-half crossing as the reference's search finds it (to a twentieth of a texel,
+    /// the sampler's filter against the reference's arithmetic) at the plane's depth, and are
+    /// kind 1; the seam's rim vertices find no crossing (alpha 1 across it) and keep the skirt,
+    /// kind 2, placed byte for byte as the skirt rule places them; every other vertex is placed
+    /// as under the skirt rule, kind 0, or 3 on the shell. In the core's index buffer no
+    /// triangle joins a crossing vertex to the shell (those are degenerate, and in this scene no
+    /// kept triangle mixes shell and surface at all), a cell with a crossing vertex and one
+    /// shell corner is split so that corner is alone in its triangle, and every other cell is
+    /// split as the fixed or adaptive rule says; the band keeps the cells with a rim vertex or a
+    /// mask channel but none whose four corners are on the shell, each the core's cell. Under the
+    /// skirt rule the colour bound changes no byte.
+    func test_withTheAlphaCrossing_theHolesRimSitsOnTheCrossing_theSeamKeepsTheSkirt_andNoTriangleSpansTheShell() throws {
+        let grid = XRPresenterGrid(columns: 33, rows: 25)
+        let textureSize = SIMD2<Int>(256, 192)
+        let size = SIMD2<Float>(Float(textureSize.x), Float(textureSize.y))
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.farShellMetres = 50
+        configuration.tearThresholdMetres = 0.9
+        let projection = configuration.projection
+        let inverseProjection = simd_inverse(projection)
+        let depthTexture = try makeDepthTexture(width: textureSize.x, height: textureSize.y)
+        try drawDepth(into: depthTexture, projection: projection)
+        let alphaTexture = try makeAlphaTexture(width: textureSize.x, height: textureSize.y)
+        try drawAlpha(into: alphaTexture)
+        let alpha = try readAlpha(alphaTexture)
+        XCTAssertEqual(alpha[12 * textureSize.x + 12], 1, "the planes are opaque")
+        XCTAssertEqual(alpha[96 * textureSize.x + 128], 0, "the hole is transparent")
+        let originFromEye = matrix4x4Translation(0.5, 1, 0)
+        let pass = try XRGridUnprojectPass(device: device)
+        let vertexLength = grid.vertexCount * XRPresenterGrid.vertexStride
+        let indexLength = grid.indexCount * MemoryLayout<UInt32>.stride
+
+        struct Run {
+            let vertices: [Vertex]
+            let vertexBytes: [UInt8]
+            let entries: [(depth: Float, texel: SIMD2<Float>, rim: Bool)]
+            let core: [UInt32]
+            let band: [UInt32]
+        }
+        func run(_ cells: XRPresenterSilhouetteCells, color: MTLTexture?, adaptiveDiagonal: Bool = false) throws -> Run {
+            let scratch = try makeScratch(grid: grid, textureSize: textureSize)
+            let vertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModeShared))
+            let indices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModeShared))
+            let bandVertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModeShared))
+            let bandIndices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModeShared))
+            memset(bandIndices.contents(), 0xFF, indexLength)
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            pass.encode(commandBuffer: commandBuffer, depth: depthTexture, color: color, scratch: scratch, vertices: vertices, indices: indices, bandVertices: bandVertices, bandIndices: bandIndices, originFromEye: originFromEye, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, adaptiveDiagonal: adaptiveDiagonal, silhouetteCells: cells)
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertEqual(commandBuffer.status, .completed)
+            XCTAssertEqual(
+                Array(UnsafeRawBufferPointer(start: bandVertices.contents(), count: vertexLength)),
+                Array(UnsafeRawBufferPointer(start: vertices.contents(), count: vertexLength)),
+                "the band's vertices are the core's bytes"
+            )
+            return Run(
+                vertices: readVertices(vertices, grid: grid),
+                vertexBytes: Array(UnsafeRawBufferPointer(start: vertices.contents(), count: vertexLength)),
+                entries: readNearestDepths(scratch.nearestDepths, grid: grid),
+                core: readIndices(indices, grid: grid),
+                band: readIndices(bandIndices, grid: grid)
+            )
+        }
+        let skirt = try run(.skirt, color: nil)
+        let skirtWithColour = try run(.skirt, color: alphaTexture)
+        XCTAssertEqual(skirtWithColour.vertexBytes, skirt.vertexBytes, "under the skirt rule the colour bound changes no vertex byte")
+        XCTAssertEqual(skirtWithColour.core, skirt.core, "nor an index")
+        XCTAssertEqual(skirtWithColour.band, skirt.band, "nor a band cell")
+        for vertex in skirt.vertices {
+            XCTAssertEqual(vertex.uvw.w, 0, "the skirt rule writes no kind")
+        }
+
+        for adaptiveDiagonal in [false, true] {
+            let crossing = try run(.alphaCrossing, color: alphaTexture, adaptiveDiagonal: adaptiveDiagonal)
+            let split = adaptiveDiagonal ? "adaptive" : "fixed"
+            var kinds = [Float](repeating: 0, count: grid.vertexCount)
+            var crossings = 0, skirts = 0, shells = 0
+            var worstCrossingTexels: Float = 0
+            for row in 0 ..< grid.rows {
+                for column in 0 ..< grid.columns {
+                    let index = row * grid.columns + column
+                    let where_ = "vertex \(column),\(row) (\(split) split)"
+                    let vertex = crossing.vertices[index]
+                    let entry = crossing.entries[index]
+                    let before = skirt.entries[index]
+                    XCTAssertEqual(entry.depth, before.depth, "the entries are the skirt rule's at \(where_)")
+                    XCTAssertEqual(entry.texel, before.texel, "the entries are the skirt rule's at \(where_)")
+                    XCTAssertEqual(entry.rim, before.rim, "the entries are the skirt rule's at \(where_)")
+                    let kind = vertex.uvw.w
+                    kinds[index] = kind
+                    let centre = referenceCentre(column: column, row: row, grid: grid, textureSize: textureSize, map: nil)
+                    let onShell = entry.depth <= 0 || simd_length(referenceEyePoint(uv: uvOfTexel(entry.texel, textureSize: textureSize), depth: entry.depth, inverseProjection: inverseProjection, farShell: 1e9)) > configuration.farShellMetres
+                    let reference = entry.rim && !onShell ? referenceCrossing(edgeTexel: entry.texel, centre: centre, textureSize: textureSize, alpha: alpha) : nil
+                    let expectedKind: Float = onShell ? 3 : (entry.rim ? (reference != nil ? 1 : 2) : 0)
+                    XCTAssertEqual(kind, expectedKind, "the kind of \(where_)")
+                    if let reference, kind == 1 {
+                        crossings += 1
+                        // On the crossing, within a twentieth of a texel of the reference's.
+                        let placed = vertex.uv * (size - 1)
+                        let off = simd_length(placed - reference)
+                        worstCrossingTexels = max(worstCrossingTexels, off)
+                        XCTAssertLessThan(off, 0.05, "\(where_) sits on the alpha crossing (\(placed) against \(reference))")
+                        // At the surface's depth: the covered texel half a texel inside the
+                        // crossing when it lies within the threshold of the edge texel's depth
+                        // along this vertex's ray, else the edge texel's.
+                        var ownDepth = entry.depth
+                        let inward = entry.texel - reference
+                        if simd_length(inward) > 1e-3 {
+                            let covered = simd_clamp((reference + inward * (0.5 / simd_length(inward))).rounded(.toNearestOrAwayFromZero), SIMD2<Float>(0, 0), size - 1)
+                            let coveredDepth = syntheticDepth(texel: SIMD2<Int>(Int(covered.x), Int(covered.y)), textureSize: textureSize, projection: projection)
+                            let ndc = referenceNDC(ofTexel: centre, textureSize: textureSize, map: nil)
+                            let ra = inverseProjection * SIMD4<Float>(ndc.x, ndc.y, 0, 1)
+                            let rb = inverseProjection * SIMD4<Float>(0, 0, 1, 0)
+                            func zInFront(_ d: Float) -> Float {
+                                let dd = max(d, 1e-6)
+                                return -(ra.z + dd * rb.z) / (ra.w + dd * rb.w)
+                            }
+                            if coveredDepth > 0, abs(zInFront(coveredDepth) - zInFront(entry.depth)) <= configuration.tearThresholdMetres {
+                                ownDepth = coveredDepth
+                            }
+                        }
+                        XCTAssertEqual(vertex.uvw.z, -simd_mul(simd_inverse(originFromEye), SIMD4<Float>(vertex.position, 1)).z, accuracy: 1e-3, "the projective depth is the vertex's at \(where_)")
+                        let eye = referenceEyePoint(uv: uvOfTexel(reference, textureSize: textureSize), depth: ownDepth, inverseProjection: inverseProjection, farShell: configuration.farShellMetres)
+                        let expected = originFromEye * SIMD4<Float>(eye, 1)
+                        XCTAssertEqual(vertex.position.x, expected.x, accuracy: 0.002, "x of \(where_), on the crossing at the plane's depth")
+                        XCTAssertEqual(vertex.position.y, expected.y, accuracy: 0.002, "y of \(where_)")
+                        XCTAssertEqual(vertex.position.z, expected.z, accuracy: 0.002, "z of \(where_)")
+                        let onAPlane = abs(-eye.z - Self.nearPlaneDistance) < 0.01 || abs(-eye.z - Self.farPlaneDistance) < 0.02
+                        XCTAssertTrue(onAPlane, "\(where_) lies at the depth of the plane the hole is cut in (\(-eye.z) m)")
+                    } else {
+                        if kind == 2 { skirts += 1 }
+                        if kind == 3 { shells += 1 }
+                        // Everything but the kind as the skirt rule left it: the same arithmetic in
+                        // the kernel's other specialization, to the rounding the compiler's fused
+                        // multiplies move (a few units in the last place).
+                        let before = skirt.vertices[index]
+                        XCTAssertEqual(simd_length(vertex.position - before.position), 0, accuracy: 2e-6 * max(1, simd_length(before.position)), "placed as under the skirt rule at \(where_)")
+                        XCTAssertEqual(simd_length(vertex.uv - before.uv), 0, accuracy: 1e-6, "the skirt rule's uv at \(where_)")
+                        XCTAssertEqual(vertex.mask, before.mask, "the skirt rule's mask at \(where_)")
+                        XCTAssertEqual(vertex.nearSide, before.nearSide, "the skirt rule's mask at \(where_)")
+                        let uvw = SIMD3<Float>(vertex.uvw.x, vertex.uvw.y, vertex.uvw.z), uvwBefore = SIMD3<Float>(before.uvw.x, before.uvw.y, before.uvw.z)
+                        XCTAssertEqual(simd_length(uvw - uvwBefore), 0, accuracy: 2e-6 * max(1, simd_length(uvwBefore)), "the skirt rule's projective uv at \(where_)")
+                    }
+                }
+            }
+            print("XR presenter silhouette cells (\(split) split): \(crossings) crossing vertices around the hole (the worst \(String(format: "%.3f", worstCrossingTexels)) texel from the reference's), \(skirts) skirt vertices along the seam, \(shells) on the shell")
+            XCTAssertGreaterThan(crossings, 10, "the hole's rim vertices sit on the crossing")
+            XCTAssertGreaterThan(skirts, 10, "the seam's rim vertices keep the skirt")
+            XCTAssertGreaterThan(shells, 20, "the hole sees the shell")
+
+            /// The core's triangles, from the kinds pass 2 wrote: on the shell, on the crossing.
+            func isShell(_ i: UInt32) -> Bool { kinds[Int(i)] == 3 }
+            func isCrossing(_ i: UInt32) -> Bool { kinds[Int(i)] == 1 }
+            func spansTheShell(_ i: UInt32, _ j: UInt32, _ k: UInt32) -> Bool {
+                (isShell(i) || isShell(j) || isShell(k)) && (isCrossing(i) || isCrossing(j) || isCrossing(k))
+            }
+            var degenerate = 0, singleShellCells = 0
+            for row in 0 ..< grid.rows - 1 {
+                for column in 0 ..< grid.columns - 1 {
+                    let a = UInt32(row * grid.columns + column), b = a + 1, c = a + UInt32(grid.columns), d = c + 1
+                    let cell = (row * (grid.columns - 1) + column) * 6
+                    let written = Array(crossing.core[cell ..< cell + 6])
+                    let where_ = "cell \(column),\(row) (\(split) split)"
+                    let shellCorners = [a, b, c, d].filter(isShell).count
+                    let hasCrossing = [a, b, c, d].contains(where: isCrossing)
+                    let otherWay: Bool
+                    if hasCrossing, shellCorners == 1 {
+                        singleShellCells += 1
+                        otherWay = isShell(b) || isShell(c)
+                    } else {
+                        otherWay = adaptiveDiagonal && referenceSplitsTheOtherWay(column: column, row: row, grid: grid, entries: crossing.entries, projection: projection, tearThreshold: configuration.tearThresholdMetres)
+                    }
+                    let triangles: [[UInt32]] = otherWay ? [[a, c, d], [a, d, b]] : [[a, c, b], [b, c, d]]
+                    var expected: [UInt32] = []
+                    for triangle in triangles {
+                        if spansTheShell(triangle[0], triangle[1], triangle[2]) {
+                            degenerate += 1
+                            expected += [triangle[0], triangle[0], triangle[0]]
+                        } else {
+                            expected += triangle
+                            let shell = triangle.filter(isShell).count
+                            XCTAssertTrue(shell == 0 || shell == 3, "a kept triangle of \(where_) lies on the shell or off it, never across")
+                        }
+                    }
+                    XCTAssertEqual(written, expected, "the core's \(where_)")
+                    // The band: the cells along an edge that are not all shell, each the core's.
+                    let along = [a, b, c, d].contains { i in
+                        crossing.entries[Int(i)].rim || crossing.vertices[Int(i)].mask > 0 || crossing.vertices[Int(i)].nearSide > 0
+                    }
+                    let allShell = shellCorners == 4
+                    let band = Array(crossing.band[cell ..< cell + 6])
+                    if along, !allShell {
+                        XCTAssertEqual(band, written, "the band's \(where_) is the core's")
+                    } else {
+                        XCTAssertEqual(band, [UInt32](repeating: a, count: 6), "the band's \(where_) is degenerate")
+                    }
+                }
+            }
+            print("XR presenter silhouette cells (\(split) split): \(degenerate) triangles from the hole's rim to the shell written degenerate, \(singleShellCells) cells with one shell corner split around it")
+            XCTAssertGreaterThan(degenerate, 20, "the triangles from the crossing vertices to the shell are gone")
+            XCTAssertGreaterThan(singleShellCells, 4, "cells with one shell corner occur around the hole")
+            // The hole's centre: the core keeps the shell there, the band draws nothing.
+            let centreCell = (12 * (grid.columns - 1) + 16) * 6
+            XCTAssertEqual(Set(crossing.core[centreCell ..< centreCell + 6]).count, 4, "the core keeps the shell at the hole's centre")
+            XCTAssertEqual(Set(crossing.band[centreCell ..< centreCell + 6]).count, 1, "the band has nothing at the hole's centre")
         }
     }
 
@@ -1211,12 +1574,15 @@ final class XRGridUnprojectTests: XCTestCase {
         let vertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModePrivate))
         let bandVertices = try XCTUnwrap(device.makeBuffer(length: vertexLength, options: .storageModePrivate))
         let bandIndices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModePrivate))
+        let indices = try XCTUnwrap(device.makeBuffer(length: indexLength, options: .storageModePrivate))
+        let alphaTexture = try makeAlphaTexture(width: textureSize.x, height: textureSize.y)
+        try drawAlpha(into: alphaTexture)
         let pass = try XRGridUnprojectPass(device: device)
-        func time(fastPath: Bool) throws -> (median: Double, mean: Double, min: Double) {
+        func time(fastPath: Bool, cells: XRPresenterSilhouetteCells = .skirt, triangulate: Bool = false) throws -> (median: Double, mean: Double, min: Double) {
             var milliseconds: [Double] = []
             for frame in 0 ..< 64 {
                 let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
-                pass.encode(commandBuffer: commandBuffer, depth: depthTexture, scratch: scratch, vertices: vertices, bandVertices: bandVertices, bandIndices: bandIndices, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, adaptiveDiagonal: false, fastPath: fastPath)
+                pass.encode(commandBuffer: commandBuffer, depth: depthTexture, color: alphaTexture, scratch: scratch, vertices: vertices, indices: triangulate ? indices : nil, bandVertices: bandVertices, bandIndices: bandIndices, originFromEye: matrix_identity_float4x4, projection: projection, farShell: configuration.farShellMetres, tearThreshold: configuration.tearThresholdMetres, skirtTexels: configuration.skirtTexels, adaptiveDiagonal: false, fastPath: fastPath, silhouetteCells: cells)
                 commandBuffer.commit()
                 commandBuffer.waitUntilCompleted()
                 XCTAssertEqual(commandBuffer.status, .completed)
@@ -1229,10 +1595,15 @@ final class XRGridUnprojectTests: XCTestCase {
         let fast = try time(fastPath: true)
         // How many of the headset-sized grid's vertices the blocks settled on the last frame.
         let settled = grid.vertexCount - scratch.scannedVertexCount
+        // The index buffer rewritten each frame (as under the adaptive diagonal), under the
+        // skirt and under the alpha crossing, which reads the colour for the rim vertices and
+        // the kinds for the triangles.
+        let fastTriangulated = try time(fastPath: true, triangulate: true)
+        let crossing = try time(fastPath: true, cells: .alphaCrossing, triangulate: true)
         func format(_ t: (median: Double, mean: Double, min: Double)) -> String {
             String(format: "median %.3f ms, mean %.3f ms, min %.3f ms", t.median, t.mean, t.min)
         }
-        print("XR presenter kernels at \(textureSize.x)×\(textureSize.y), grid \(grid.columns)×\(grid.rows), 60 frames on \(device.name): every vertex scanned \(format(scanned)); fast path \(format(fast)); \(settled) of \(grid.vertexCount) vertices settled from the blocks (\(String(format: "%.1f", Double(settled) / Double(grid.vertexCount) * 100)) %)")
+        print("XR presenter kernels at \(textureSize.x)×\(textureSize.y), grid \(grid.columns)×\(grid.rows), 60 frames on \(device.name): every vertex scanned \(format(scanned)); fast path \(format(fast)); \(settled) of \(grid.vertexCount) vertices settled from the blocks (\(String(format: "%.1f", Double(settled) / Double(grid.vertexCount) * 100)) %); with the index buffer rewritten: skirt \(format(fastTriangulated)), alpha crossing \(format(crossing))")
         XCTAssertGreaterThan(Double(settled) / Double(grid.vertexCount), 0.8, "at the headset's size most of the two planes' vertices are settled from the blocks")
     }
 

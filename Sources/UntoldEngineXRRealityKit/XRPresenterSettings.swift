@@ -19,6 +19,10 @@ import Foundation
 public struct XRPresenterSettings: Sendable, Equatable {
     /// See `XRRealityKitPresenterConfiguration.skirtTexels`.
     public var skirtTexels: Float
+    /// See `XRRealityKitPresenterConfiguration.silhouetteCells`. Changed while running, the
+    /// next frame places the rim vertices by the new rule; the grids' index buffers are
+    /// rewritten each frame under the alpha crossing (`rewritesIndices`).
+    public var silhouetteCells: XRPresenterSilhouetteCells
     /// See `XRRealityKitPresenterConfiguration.tearThresholdMetres`.
     public var tearThresholdMetres: Float
     /// See `XRRealityKitPresenterConfiguration.tears`.
@@ -43,8 +47,15 @@ public struct XRPresenterSettings: Sendable, Equatable {
     /// past the first.
     public var pipelineDepth: Int
 
+    /// Whether the grids' index buffers are rewritten each frame: under the adaptive diagonal
+    /// (the cells split by depth) or the alpha-crossing silhouette cells (the triangles to the
+    /// shell written degenerate). The presenter hands the kernel the index buffers while it is
+    /// so, and writes the fixed split back once when it stops.
+    public var rewritesIndices: Bool { adaptiveDiagonal || silhouetteCells == .alphaCrossing }
+
     public init(configuration: XRRealityKitPresenterConfiguration = .init()) {
         skirtTexels = configuration.skirtTexels
+        silhouetteCells = configuration.silhouetteCells
         tearThresholdMetres = configuration.tearThresholdMetres
         tears = configuration.tears
         adaptiveDiagonal = configuration.adaptiveDiagonal

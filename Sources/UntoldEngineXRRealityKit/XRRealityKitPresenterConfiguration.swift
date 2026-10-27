@@ -152,6 +152,13 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// texture's alpha crosses the material's threshold rather than the mesh boundary through
     /// rim texels (which is quantised to the texel and flips with the predicted pose); 0 for none.
     public var skirtTexels: Float = 3
+    /// How the grid meets a silhouette against the room (`XRPresenterSilhouetteCells`): each
+    /// rim vertex on its edge texel pushed outward by the skirt, with the cells from there to
+    /// the far shell stretched across the jump, as shipped (`.skirt`); or each rim vertex on
+    /// the texture's alpha crossing at the surface's own depth, with no triangle from there to
+    /// the shell (`.alphaCrossing`). Live through `XRPresenterSettings`; `.skirt` by default
+    /// until the headset has judged the crossing against it.
+    public var silhouetteCells: XRPresenterSilhouetteCells = .skirt
     /// Whether each cell's diagonal follows the depth each frame (the fixed one unless it crosses
     /// a depth jump and the other does not), with the index buffer rewritten per frame. Off by
     /// default until the headset has judged it against the fixed split with the skirt; both are
@@ -335,6 +342,48 @@ public enum XRPresenterSilhouette: String, Sendable, Equatable, CaseIterable {
         switch self {
         case .cutAndBand: return "cut and band"
         case .blendedCore: return "blended core"
+        }
+    }
+}
+
+/// How the RealityKit presenter's grid meets a silhouette against the room
+/// (`XRRealityKitPresenterConfiguration.silhouetteCells`, live as
+/// `XRPresenterSettings.silhouetteCells`): where a rim vertex (one whose own centre texel lies
+/// off the near surface its footprint reached) is placed, and what becomes of the cells between
+/// it and the far shell.
+public enum XRPresenterSilhouetteCells: String, Sendable, Equatable, CaseIterable {
+    /// The shipped rule: a rim vertex sits on its edge texel pushed outward by the skirt
+    /// (`skirtTexels`), at that texel's depth, and the cells from there to the shell are
+    /// stretched across the depth jump, marked by the tear mask for the materials to discard
+    /// (or drawn, with the tears off). On a curved silhouette the headset showed those cells
+    /// (2026-10-27: the example's sphere beside a RealityKit sphere, the measured eyes in
+    /// force): the limb read as a polygon of cells whose segments breathed with the gaze, each
+    /// cell straddling the limb carrying texels on a plane from the rim vertex to the shell,
+    /// where a RealityKit sphere's limb is geometry resolved by the device's multisampling at
+    /// the true depth.
+    case skirt
+    /// A rim vertex sits on the texture's alpha crossing: along the line from its edge texel
+    /// toward its own centre, the first point where the bilinearly filtered alpha of the eye's
+    /// colour (the engine's coverage) falls below one half, found to a sixteenth of a texel, at
+    /// the surface's depth read at the covered texel nearest the crossing. The mesh boundary is
+    /// then the silhouette itself, a chord per cell through points on the texture's edge, which
+    /// the device's own multisampling resolves as it resolves a RealityKit sphere's, and the
+    /// core's alpha test trims only what the filter leaves inside the chord (alpha between one
+    /// half and the cut), which the band blends. No triangle joins a crossing vertex to the
+    /// shell: the triangulation writes them degenerate (so the grids' index buffers are
+    /// rewritten each frame, as under the adaptive diagonal), and a cell with a crossing vertex
+    /// and one corner on the shell is split so that corner is alone in its triangle. A rim
+    /// vertex with no crossing within reach (alpha at or above one half all the way past its
+    /// centre: an internal depth jump against another opaque surface) keeps the skirt rule,
+    /// with its tears. The kernel writes each vertex's kind into the projective coordinate's
+    /// spare component for the triangulation and the band (zero under the skirt rule).
+    case alphaCrossing
+
+    /// For a settings line.
+    public var label: String {
+        switch self {
+        case .skirt: return "skirt"
+        case .alphaCrossing: return "alpha crossing"
         }
     }
 }
