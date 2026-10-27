@@ -1713,6 +1713,72 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
         return Array(UnsafeRawBufferPointer(start: copy.contents(), count: copy.length))
     }
 
+    /// A full mip chain reaches one texel: 1920 × 1824 has eleven levels, 320 × 240 nine, a
+    /// texel one.
+    func test_theMipChain_reachesOneTexel() throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        XCTAssertEqual(XRRealityKitPresenter.mipLevelCount(width: 1920, height: 1824), 11)
+        XCTAssertEqual(XRRealityKitPresenter.mipLevelCount(width: 320, height: 240), 9)
+        XCTAssertEqual(XRRealityKitPresenter.mipLevelCount(width: 1, height: 1), 1)
+        XCTAssertEqual(XRRealityKitPresenter.mipLevelCount(width: 960, height: 912), 10)
+    }
+
+    /// With `mipmapped` on, the eye textures carry the full chain, and a frame fills it: after
+    /// the eyes are drawn, level 2 of the left eye (a quarter of the size) holds the cubes'
+    /// opaque pixels where the base level does, averaged down.
+    func test_withMipmapsOn_theEyeTexturesCarryTheChain_andAFrameFillsIt() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
+        var configuration = XRRealityKitPresenterConfiguration()
+        configuration.pipelineDepth = 1
+        configuration.textureSize = [320, 240]
+        configuration.gridColumns = 17
+        configuration.gridRows = 13
+        configuration.farShellMetres = 50
+        configuration.mipmapped = true
+        let presenter = try await XRRealityKitPresenter(device: renderInfo.device, configuration: configuration)
+        presenter.reportInterval = 0
+        XCTAssertTrue(presenter.mipmapped)
+
+        let source = RealityKitFrameSource(presenter: presenter) { _ in matrix4x4Translation(0, 0, 5) }
+        let loop = XRFrameLoop(renderer: renderer, source: source, runtime: nil)
+        loop.start()
+        let thread = Thread { loop.run() }
+        thread.start()
+        presenter.start(commandQueue: renderInfo.commandQueue)
+        try waitUntil {
+            presenter.update()
+            return loop.framesDrawn >= 6
+        }
+        let lastTicket = try XCTUnwrap(presenter.lastTicket)
+        try waitUntil { lastTicket.commandBuffer.status == .completed }
+        presenter.stop()
+        try waitUntil { thread.isFinished }
+
+        let color = lastTicket.colorTextures[0]
+        XCTAssertEqual(color.mipmapLevelCount, 9, "320 × 240 down to one texel")
+        // Level 2, 80 × 60, read back through a blit.
+        let level = 2
+        let width = color.width >> level
+        let height = color.height >> level
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: color.pixelFormat, width: width, height: height, mipmapped: false)
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
+        let copy = try XCTUnwrap(renderInfo.device.makeTexture(descriptor: descriptor))
+        let commandBuffer = try XCTUnwrap(renderInfo.commandQueue.makeCommandBuffer())
+        let blit = try XCTUnwrap(commandBuffer.makeBlitCommandEncoder())
+        blit.copy(from: color, sourceSlice: 0, sourceLevel: level, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: width, height: height, depth: 1), to: copy, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        commandBuffer.commit()
+        try waitUntil { commandBuffer.status == .completed }
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        copy.getBytes(&pixels, bytesPerRow: width * 4, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        let alphas = stride(from: 3, to: pixels.count, by: 4).map { Int(pixels[$0]) }
+        let opaque = alphas.filter { $0 == 255 }.count
+        XCTAssertGreaterThan(opaque, width * height / 20, "the cubes' pixels are opaque at level \(level) too (\(opaque) of \(width * height))")
+        let centre = alphas[(height / 2) * width + width / 2]
+        XCTAssertEqual(centre, 255, "the cube at the centre of view is opaque at level \(level)")
+    }
+
     func test_theLoop_drawsTheEyesIntoThePresenter_andPlacesTheGrids() async throws {
         guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
         var configuration = XRRealityKitPresenterConfiguration()

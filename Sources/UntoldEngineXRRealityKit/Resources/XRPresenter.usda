@@ -105,7 +105,7 @@ def Xform "Root"
             asset inputs:file.connect = </Root/XRPresenterMaterial.inputs:colorTexture>
             string inputs:mag_filter = "linear"
             string inputs:min_filter = "linear"
-            string inputs:mip_filter = "none"
+            string inputs:mip_filter = "linear"
             float2 inputs:texcoord.connect = </Root/XRPresenterMaterial/TexCoord.outputs:out>
             string inputs:u_wrap_mode = "clamp_to_edge"
             string inputs:v_wrap_mode = "clamp_to_edge"

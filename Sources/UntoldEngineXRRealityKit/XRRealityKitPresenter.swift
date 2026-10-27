@@ -70,6 +70,20 @@ public final class XRRealityKitPresenter {
     /// The render scale in force: the configuration's, clamped.
     public var renderScale: Float { configuration.clampedRenderScale }
 
+    /// Whether the eye textures carry a mip chain (`XRRealityKitPresenterConfiguration.mipmapped`).
+    public var mipmapped: Bool { configuration.mipmapped }
+
+    /// The levels of a full mip chain for a texture of this size: down to one texel.
+    public static func mipLevelCount(width: Int, height: Int) -> Int {
+        var size = max(width, height, 1)
+        var levels = 1
+        while size > 1 {
+            size /= 2
+            levels += 1
+        }
+        return levels
+    }
+
     /// Texels per degree at the centre of view, horizontally: the uniform texture's, or the
     /// rate map's screen's (the centre is drawn at the screen's density). 12.9 for the default
     /// configuration, 17.6 through its map; against the headset's some 34 display pixels per
@@ -262,6 +276,7 @@ public final class XRRealityKitPresenter {
             colorDescriptor.width = width
             colorDescriptor.height = height
             colorDescriptor.textureUsage = [.renderTarget, .shaderRead]
+            colorDescriptor.mipmapLevelCount = configuration.mipmapped ? Self.mipLevelCount(width: width, height: height) : 1
             let colorTextures = try (0 ..< stereoEyeCount).map { _ in try LowLevelTexture(descriptor: colorDescriptor) }
             let textureResources = try colorTextures.map { try TextureResource(from: $0) }
             let meshes = try (0 ..< stereoEyeCount).map { _ in try grid.makeMesh(farShell: configuration.farShellMetres) }

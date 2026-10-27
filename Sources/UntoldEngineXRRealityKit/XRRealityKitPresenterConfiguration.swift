@@ -102,6 +102,15 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     public var nearPlane: Float = 0.05
     /// The far plane of the eyes' projection, metres: depth 0 under reverse Z.
     public var farPlane: Float = 1000
+    /// Whether the eye textures carry a full mip chain, generated on the frame's command buffer
+    /// after the eyes are drawn, with the graphs' sampler filtering between levels. The device
+    /// rasterizes RealityKit content at a rate that follows the gaze, coarse away from it, and
+    /// samples the texture once per pixel it rasterizes: with the base level alone, a texel
+    /// density above that rate aliases the silhouettes (the kinks at rest and the waves with the
+    /// gaze or the head seen on the headset, 2026-10-27), while the mip chain lets the sampler
+    /// filter the texture down to the rate. Off by default until the headset has judged it;
+    /// fixed for the space (the textures are made with it).
+    public var mipmapped = false
     /// Where grid vertices that see nothing (the sky, passthrough) are placed: a shell this far
     /// from the eye, so that those areas keep a surface for the material to discard or show.
     public var farShellMetres: Float = 100

@@ -225,6 +225,18 @@ public final class RealityKitFrameSource: XRFrameSource, @unchecked Sendable {
                     commandBuffer.makeRenderCommandEncoder(descriptor: descriptor)?.endEncoding()
                 }
             }
+            // The mip chain of each eye drawn (or cleared) above, when the textures carry one
+            // (`XRRealityKitPresenterConfiguration.mipmapped`): the premultiplied colour
+            // averaged level by level, so RealityKit's sampler, filtering between levels, reads
+            // the texture at the rate the device rasterizes the grid, not above it.
+            let mipmapped = target.eyes.filter { $0.colorTexture.mipmapLevelCount > 1 }
+            if !mipmapped.isEmpty, let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "XR presenter eye mip chains"
+                for eye in mipmapped {
+                    blit.generateMipmaps(for: eye.colorTexture)
+                }
+                blit.endEncoding()
+            }
         }
 
         /// The commit's instant ends the CPU frame; the completed handler, added here so that
