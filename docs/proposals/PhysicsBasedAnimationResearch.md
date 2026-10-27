@@ -106,6 +106,7 @@ Load-bearing design decisions, with each engine's answer:
 ## 4. Common pitfalls (collected)
 
 - **Jitter**: motors fighting limits/contacts, or stepping physics at render rate. Fix: fixed timestep + render interpolation, never drive motors toward a pose that violates joint limits.
+    - Untold (2026-10): `SimulationStepping.perFrame` was chosen over fixed step + render interpolation because the engine has no transform interpolation (CoreEngineChangesForPluginSystems.md) and a kinematically tracked ragdoll must land on every frame of a 100 Hz display; the fixed default and this recommendation still hold for purely dynamic bodies.
 - **Constraint explosion**: huge impulses when a drive target teleports (animation snap, motion warp). Fix: clamp motor force/torque, snap with `SetPose` + `ResetWarmStart` on large discontinuities.
 - **Activation inside geometry** → first-frame explosion. Depenetrate / settle substeps.
 - **Retargeting**: motor gains tuned for one character misbehave on another — scale gains with inertia, don't hardcode torques. (Jolt's frequency-based `MotorSettings` already helps here.)

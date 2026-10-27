@@ -1136,6 +1136,7 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
     private var xrFoveatedRenderingEnabledValue: Bool = true
     private var xrOptimalInputWaitModeValue: XRInputWaitMode = .automatic
     private var xrFramePacingValue: XRFramePacing = .halfRateWhenLate
+    private var simulationSteppingValue: SimulationStepping = .fixed
     private var shadowSoftnessBeforeSystemValue: ShadowSoftnessSettings?
     private var antiAliasingModeValue: AntiAliasingMode = .fxaa
     private var renderDebugViewModeValue: RenderDebugViewMode = .lit
@@ -1684,6 +1685,20 @@ private final class RuntimeGlobalsStore: @unchecked Sendable {
         }
     }
 
+    var simulationStepping: SimulationStepping {
+        get {
+            lock.lock()
+            let value = simulationSteppingValue
+            lock.unlock()
+            return value
+        }
+        set {
+            lock.lock()
+            simulationSteppingValue = newValue
+            lock.unlock()
+        }
+    }
+
     var shadowSoftnessBeforeSystem: ShadowSoftnessSettings? {
         get {
             lock.lock()
@@ -2218,6 +2233,14 @@ public var xrOptimalInputWaitMode: XRInputWaitMode {
 public var xrFramePacing: XRFramePacing {
     get { RuntimeGlobalsStore.shared.xrFramePacing }
     set { RuntimeGlobalsStore.shared.xrFramePacing = newValue }
+}
+
+/// How the game-mode simulation loop is stepped against the frames: one fixed 1/60 s step per
+/// 1/60 s accumulated (the default), or one pass every frame with the frame's own delta. See
+/// `EngineProperty.simulationStepping`.
+public var simulationStepping: SimulationStepping {
+    get { RuntimeGlobalsStore.shared.simulationStepping }
+    set { RuntimeGlobalsStore.shared.simulationStepping = newValue }
 }
 
 /// The sun shadow's softness set while no shadow system existed, for the system the renderer
