@@ -33,6 +33,9 @@ public final class RenderStatsCollector: @unchecked Sendable {
     #if ENGINE_STATS_ENABLED
         private let lock = NSLock()
         private var stats = RenderDrawStats()
+        /// Sampled from the monitor at `reset()` (frame start, render thread) so the per-draw path
+        /// reads one Bool instead of taking a lock. Draw recording happens on the same thread.
+        private var isCollecting = false
     #endif
 
     private init() {}
@@ -41,6 +44,7 @@ public final class RenderStatsCollector: @unchecked Sendable {
         #if ENGINE_STATS_ENABLED
             lock.lock()
             stats = .init()
+            isCollecting = EngineStatsMonitor.shared.isCollecting
             lock.unlock()
         #endif
     }
@@ -96,6 +100,7 @@ public final class RenderStatsCollector: @unchecked Sendable {
         batched: Bool
     ) {
         #if ENGINE_STATS_ENABLED
+            guard isCollecting else { return }
             let safeElementCount = max(0, elementCount)
             let safeInstanceCount = max(1, instanceCount)
             let triangles = triangleCount(for: primitiveType, elementCount: safeElementCount) * safeInstanceCount

@@ -117,6 +117,7 @@
                 commandBufferSemaphore.signal()
                 return
             }
+            GPUPassTiming.shared.beginFrame(device: renderInfo.device)
 
             commandBuffer.label = "AR Command Buffer"
 
@@ -166,6 +167,7 @@
             EngineProfiler.shared.attach(to: commandBuffer, label: "ARFrame")
 
             // Finalize rendering here & push the command buffer to the GPU
+            GPUPassTiming.shared.endFrame(commandBuffer)
             commandBuffer.commit()
         }
 

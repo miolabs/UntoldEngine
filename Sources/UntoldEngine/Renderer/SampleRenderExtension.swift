@@ -74,6 +74,7 @@ public final class SampleRenderExtension: RenderExtension, @unchecked Sendable {
                 clearColor.w
             )
 
+            GPUPassTiming.shared.attach(descriptor, "SampleExtension")
             guard let encoder = context.commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
                 return
             }
