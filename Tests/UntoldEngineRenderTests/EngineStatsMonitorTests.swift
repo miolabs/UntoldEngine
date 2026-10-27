@@ -436,6 +436,7 @@ final class EngineStatsMonitorTests: XCTestCase {
         XCTAssertEqual(eyes.interpupillaryDistance, 0.0636, accuracy: 1e-5, "the distance between the two means")
         XCTAssertEqual(eyes.description, "eyes L (-31.4, -18.7, 12.4) ±(0.2, 0.5, 0.0) mm · R (32.2, -18.5, 12.6) ±(0.3, 0.5, 0.0) mm · IPD 63.6 mm · 2 frames")
         XCTAssertEqual(formatEngineEyes(getEngineStatsSnapshot()), eyes.description)
+        XCTAssertTrue(formatEngineStatsCompact(getEngineStatsSnapshot()).hasSuffix(" | " + eyes.description), "the eyes end the compact log line, to be copied off a console")
         XCTAssertTrue(formatEngineStatsOverlay(getEngineStatsSnapshot()).contains("Eyes: eyes L (-31.4"))
 
         EngineStatsMonitor.shared.reset()

@@ -59,7 +59,10 @@ private func compactEngineStatsString(_ snapshot: EngineStatsSnapshot) -> String
         "drawCalls=\(snapshot.render.drawCallsTotal) " +
         "triangles=\(snapshot.render.trianglesTotal) " +
         "visible=\(snapshot.render.visibleInstances) | " +
-        snapshot.frameStages.description
+        snapshot.frameStages.description +
+        // The eyes the frames were drawn from, when a presenter reports them: on the log line
+        // so they can be copied off a headset's console.
+        (snapshot.eyes.samples > 0 ? " | " + snapshot.eyes.description : "")
 }
 
 private func expandedEngineStatsString(_ snapshot: EngineStatsSnapshot) -> String {
