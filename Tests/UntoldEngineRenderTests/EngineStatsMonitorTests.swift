@@ -9,6 +9,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import QuartzCore
+import simd
 @testable import UntoldEngine
 import XCTest
 
@@ -403,5 +404,44 @@ final class EngineStatsMonitorTests: XCTestCase {
         let compact = formatEngineStatsCompact(EngineStatsSnapshot())
         XCTAssertTrue(compact.hasSuffix(" | gpu span max 0.0 ms · late 0 of 0 (refresh 0.0 ms) · worst 0.0 = cpu 0.0 + wait 0.0 + gpu 0.0"), compact)
         XCTAssertFalse(compact.contains("deadline"))
+    }
+
+    /// The eyes a presenter reports (each view's transform from the device anchor) accumulate
+    /// since the reset: the last, the mean, half the range of each axis, the distance between
+    /// the two means; the snapshot carries them from the next completed frame; the reset
+    /// forgets them.
+    func testEyes_accumulateFromTheDeviceAnchor_andReadInMillimetres() {
+        var left = matrix_identity_float4x4
+        var right = matrix_identity_float4x4
+        left.columns.3 = SIMD4<Float>(-0.0317, -0.0182, 0.0124, 1)
+        right.columns.3 = SIMD4<Float>(0.0319, -0.0180, 0.0126, 1)
+        EngineStatsMonitor.shared.recordEyes(deviceFromViews: [left, right])
+        // A glance: both eyes a millimetre lower and half a millimetre to the right.
+        left.columns.3 += SIMD4<Float>(0.0005, -0.001, 0, 0)
+        right.columns.3 += SIMD4<Float>(0.0005, -0.001, 0, 0)
+        EngineStatsMonitor.shared.recordEyes(deviceFromViews: [left, right])
+
+        XCTAssertEqual(getEngineStatsSnapshot().eyes.samples, 0, "the snapshot carries the eyes from the next completed frame")
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 10)
+        EngineStatsMonitor.shared.completeFrame()
+        let eyes = getEngineStatsSnapshot().eyes
+        XCTAssertEqual(eyes.samples, 2)
+        XCTAssertEqual(eyes.eyes.count, 2)
+        XCTAssertEqual(eyes.eyes[0].mean.x, -0.03145, accuracy: 1e-6)
+        XCTAssertEqual(eyes.eyes[0].mean.y, -0.0187, accuracy: 1e-6)
+        XCTAssertEqual(eyes.eyes[0].spread.x, 0.00025, accuracy: 1e-6)
+        XCTAssertEqual(eyes.eyes[0].spread.y, 0.0005, accuracy: 1e-6)
+        XCTAssertEqual(eyes.eyes[0].spread.z, 0, accuracy: 1e-6)
+        XCTAssertEqual(eyes.eyes[1].last.x, 0.0324, accuracy: 1e-6)
+        XCTAssertEqual(eyes.interpupillaryDistance, 0.0636, accuracy: 1e-5, "the distance between the two means")
+        XCTAssertEqual(eyes.description, "eyes L (-31.4, -18.7, 12.4) ±(0.2, 0.5, 0.0) mm · R (32.2, -18.5, 12.6) ±(0.3, 0.5, 0.0) mm · IPD 63.6 mm · 2 frames")
+        XCTAssertEqual(formatEngineEyes(getEngineStatsSnapshot()), eyes.description)
+        XCTAssertTrue(formatEngineStatsOverlay(getEngineStatsSnapshot()).contains("Eyes: eyes L (-31.4"))
+
+        EngineStatsMonitor.shared.reset()
+        EngineStatsMonitor.shared.beginFrame(timestampSeconds: 11)
+        EngineStatsMonitor.shared.completeFrame()
+        XCTAssertEqual(getEngineStatsSnapshot().eyes, EngineEyeStats(), "the reset forgets the eyes")
+        XCTAssertEqual(EngineEyeStats().description, "eyes: none reported")
     }
 }

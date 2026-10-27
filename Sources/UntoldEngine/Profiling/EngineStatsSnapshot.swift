@@ -377,6 +377,10 @@ public struct EngineStatsSnapshot {
     /// frames late against the refresh measured from the cadence, the worst frame's split.
     /// Filled by the XR loop; zeros elsewhere.
     public var frameStages: EngineFrameStageStats = .init()
+    /// Where the frames' eyes have been in the device anchor's frame since the monitor was
+    /// reset (`EngineEyeStats`): filled by presenters that hand the engine per-eye transforms
+    /// (Compositor Services); empty elsewhere.
+    public var eyes: EngineEyeStats = .init()
 
     public init(
         frameIndex: UInt64 = 0,
@@ -387,7 +391,8 @@ public struct EngineStatsSnapshot {
         streaming: EngineStreamingStats = .init(),
         batching: EngineBatchingStats = .init(),
         memory: EngineMemoryStats = .init(),
-        frameStages: EngineFrameStageStats = .init()
+        frameStages: EngineFrameStageStats = .init(),
+        eyes: EngineEyeStats = .init()
     ) {
         self.frameIndex = frameIndex
         self.timestampSeconds = timestampSeconds
@@ -398,5 +403,6 @@ public struct EngineStatsSnapshot {
         self.batching = batching
         self.memory = memory
         self.frameStages = frameStages
+        self.eyes = eyes
     }
 }

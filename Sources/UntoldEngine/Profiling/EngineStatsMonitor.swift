@@ -10,6 +10,7 @@
 
 import Foundation
 import QuartzCore
+import simd
 
 /// The time the GPU spent on a frame's command buffer beyond the previous frame's: the part
 /// of its span (`gpuStartTime` to `gpuEndTime`) after the previous command buffer ended.
@@ -62,6 +63,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         private var _spanCompletions: [TimeInterval] = []
         private var _latestFrameStages = EngineFrameStageStats()
         private var _letGoTotal = 0
+        private var _eyes = EngineEyeStats()
     #endif
 
     /// The most completions kept for a span's late count (eleven minutes at 100 frames/s):
@@ -251,6 +253,18 @@ public final class EngineStatsMonitor: @unchecked Sendable {
         #endif
     }
 
+    /// A frame's eyes, each transform from the device anchor to the eye, into the running
+    /// account since the reset (`EngineStatsSnapshot.eyes`). Safe to call from any thread.
+    public func recordEyes(deviceFromViews: [simd_float4x4]) {
+        #if ENGINE_STATS_ENABLED
+            lock.lock()
+            _eyes.add(deviceFromViews: deviceFromViews)
+            lock.unlock()
+        #else
+            _ = deviceFromViews
+        #endif
+    }
+
     /// A frame the loop took and let go undrawn, into the open span's count.
     public func recordFrameLetGo() {
         #if ENGINE_STATS_ENABLED
@@ -322,6 +336,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             currentSnapshot.timing.gpuExecutionMs = _latestGPUExecutionMs
             currentSnapshot.timing.gpuFrameCadenceMs = _latestGPUFrameCadenceMs
             currentSnapshot.frameStages = _latestFrameStages
+            currentSnapshot.eyes = _eyes
 
             // Update 30-frame rolling average for CPU frame time
             let frameMs = currentSnapshot.timing.frameTotalMs
@@ -369,6 +384,7 @@ public final class EngineStatsMonitor: @unchecked Sendable {
             _spanCompletions.removeAll(keepingCapacity: true)
             _latestFrameStages = EngineFrameStageStats()
             _letGoTotal = 0
+            _eyes = EngineEyeStats()
             lock.unlock()
         #endif
     }

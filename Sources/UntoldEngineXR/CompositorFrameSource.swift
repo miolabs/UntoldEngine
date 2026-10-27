@@ -795,6 +795,12 @@
                             )
                         )
                     }
+                    // The built-in display's eyes into the engine's stats: the tracked eyes
+                    // from the device anchor, which the RealityKit presenter's nominal eyes are
+                    // to be set to (`EngineEyeStats`).
+                    if primary {
+                        EngineStatsMonitor.shared.recordEyes(deviceFromViews: eyes.map(\.deviceFromView))
+                    }
                     targets.append(XREyes(
                         originFromDevice: deviceAnchor?.originFromAnchorTransform,
                         eyes: eyes,
