@@ -170,14 +170,14 @@ public struct XRRealityKitPresenterConfiguration: Sendable, Equatable {
     /// alpha: the engine's MSAA modes leave it, FXAA and SMAA do not. Under the `.cutAndBand`
     /// silhouette only: the blended core has no band to turn on.
     public var edgeBlending = true
-    /// How a silhouette reaches the room: the shipped core cut by its alpha test with the edge
-    /// band blended over the cells along silhouettes (`.cutAndBand`, the default), or the
-    /// whole core blended with its depth still written and no band (`.blendedCore`), an
-    /// experiment for the headset (see the cases). Fixed when the presenter is made: the
-    /// grids' materials and the band's entities are made for it. The presenter's `silhouette`
-    /// says which is in force (the blended core falls back to the shipped one when its graph
-    /// cannot be loaded).
-    public var silhouette: XRPresenterSilhouette = .cutAndBand
+    /// How a silhouette reaches the room: the whole core blended with its depth still written
+    /// and no band (`.blendedCore`, the default since 2026-10-27), or the core cut by its alpha
+    /// test with the edge band blended over the cells along silhouettes (`.cutAndBand`, the
+    /// chain as first shipped; see the cases). Fixed when the presenter is made: the grids'
+    /// materials and the band's entities are made for it. The presenter's `silhouette` says
+    /// which is in force (the blended core falls back to the cut and band when its graph cannot
+    /// be loaded).
+    public var silhouette: XRPresenterSilhouette = .blendedCore
     /// The radius of the sphere around the user that takes the gaze for pinches, metres.
     public var inputTargetRadius: Float = 50
     /// An offset of both nominal eyes on the device, metres, in the device anchor's frame (x
@@ -313,8 +313,10 @@ public enum XRPresenterSilhouette: String, Sendable, Equatable, CaseIterable {
     /// blended graph drawn on meshes of its own over the cells along silhouettes and depth
     /// jumps (`edgeBlending`), so that a silhouette's partly covered texels blend over the room
     /// where the cut would step texel by texel. On the Mac the band covers the cut to the
-    /// resampled texture's own floor (2026-10-19); on the headset the engine's cubes shimmer
-    /// beside a plain RealityKit cube that does not, through the same device render.
+    /// resampled texture's own floor (2026-10-19). On the headset (2026-10-27, the eyes
+    /// measured) the band's choice of cells, made per cell and per frame, showed on a curved
+    /// silhouette as a polygon of cells breathing with the gaze, which the blended core does
+    /// not have; the cut and band stays as the option.
     case cutAndBand
     /// The experiment that answers it: each eye's grid drawn through the band's blended graph
     /// itself (`XRPresenterBlended.usda`), with no alpha test anywhere along a silhouette, the

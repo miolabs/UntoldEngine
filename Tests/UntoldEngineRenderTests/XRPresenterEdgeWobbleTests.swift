@@ -1052,6 +1052,7 @@ final class XRPresenterEdgeWobbleTests: BaseRenderSetup {
             self.name = name
             var configuration = XRRealityKitPresenterConfiguration()
             configuration.pipelineDepth = 1 // one set: the picture is read at the first render
+            configuration.silhouette = .cutAndBand // the study reads the cut and its band; a variant may choose the blended core
             configure(&configuration)
             self.configuration = configuration
         }

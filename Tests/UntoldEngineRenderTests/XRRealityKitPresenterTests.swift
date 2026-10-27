@@ -153,12 +153,13 @@ final class XRPresenterRenderScaleTests: XCTestCase {
 
 // MARK: - The silhouette
 
-/// The configuration's silhouette choice, without Metal: the shipped cut and band by default.
+/// The configuration's silhouette choice, without Metal: the blended core by default
+/// (2026-10-27), the cut and band beside it.
 final class XRPresenterSilhouetteTests: XCTestCase {
-    func test_theCutAndBand_isTheDefault_andTheCasesHaveLabels() {
+    func test_theBlendedCore_isTheDefault_andTheCasesHaveLabels() {
         let configuration = XRRealityKitPresenterConfiguration()
-        XCTAssertEqual(configuration.silhouette, .cutAndBand, "the shipped chain by default")
-        XCTAssertTrue(configuration.edgeBlending, "with its band on")
+        XCTAssertEqual(configuration.silhouette, .blendedCore, "the blended core by default: no band choosing cells on a curved silhouette")
+        XCTAssertTrue(configuration.edgeBlending, "the band on when the cut and band is chosen")
         XCTAssertEqual(XRPresenterSilhouette.allCases, [.cutAndBand, .blendedCore])
         XCTAssertEqual(XRPresenterSilhouette.cutAndBand.label, "cut and band")
         XCTAssertEqual(XRPresenterSilhouette.blendedCore.label, "blended core")
@@ -2537,6 +2538,7 @@ final class RealityKitFrameSourceTests: BaseRenderSetup {
     private static var pictureConfiguration: XRRealityKitPresenterConfiguration {
         var configuration = XRRealityKitPresenterConfiguration()
         configuration.pipelineDepth = 1 // one set: the pictures are read at the first render, and the band test counts the entities
+        configuration.silhouette = .cutAndBand // the picture tests read the cut and its band, the chain as first shipped
         configuration.textureSize = [256, 256]
         configuration.frustumTangents = [1, 1, 1, 1]
         configuration.interpupillaryDistance = 0

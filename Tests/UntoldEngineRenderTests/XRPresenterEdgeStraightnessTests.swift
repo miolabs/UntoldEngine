@@ -689,6 +689,7 @@ final class XRPresenterEdgeStraightnessTests: BaseRenderSetup {
         guard #available(macOS 15.0, *) else { throw XCTSkip("the presenter needs macOS 15") }
         var configuration = XRRealityKitPresenterConfiguration()
         configuration.pipelineDepth = 1 // one set: the picture is read at the first render
+        configuration.silhouette = .cutAndBand // the test reads the cut and its band
         let pose = Self.headPose
         let frames = Frames(configuration: configuration, pose: pose)
         let segments = Self.segments(frames)
