@@ -711,10 +711,24 @@
 
                     switch layerRenderer.state {
                     case .paused:
+                        // The compositor shows nothing of this layer (the space hidden, the
+                        // headset off): the loop waits for it to run again, and the frame
+                        // after the pause lets no time pass.
+                        let pausedAt = CACurrentMediaTime()
+                        print("XR: the layer is paused; the loop waits for it to run again")
                         layerRenderer.waitUntilRunning()
+                        print("XR: the layer runs again after \(String(format: "%.1f", CACurrentMediaTime() - pausedAt)) s")
+                        renderer?.resetFrameTiming()
 
                     case .running:
-                        // Call the per-frame function here
+                        // The app is inactive or in the background (the headset taken off):
+                        // the GPU refuses work, so no frame is taken until the app is active
+                        // again. The wait wakes now and then to see the loop stopped or the
+                        // layer gone meanwhile.
+                        guard GPUSubmissionGate.shared.isOpen else {
+                            GPUSubmissionGate.shared.waitUntilOpen(timeout: 0.25)
+                            return
+                        }
                         renderNewFrame()
 
                     case .invalidated:
@@ -1019,6 +1033,7 @@
             }
             drawable.encodePresent(commandBuffer: commandBuffer)
             commandBuffer.commit()
+            GPUSubmissionGate.shared.noteCommitted(commandBuffer)
         }
 
         private func updateSpatialInputState() {
@@ -1346,6 +1361,7 @@
                 let submitStart = CACurrentMediaTime()
             #endif
             commandBuffer.commit()
+            GPUSubmissionGate.shared.noteCommitted(commandBuffer)
             #if ENGINE_STATS_ENABLED
                 let submitMs = (CACurrentMediaTime() - submitStart) * 1000.0
                 let renderTotalMs = (CACurrentMediaTime() - renderTotalStart) * 1000.0

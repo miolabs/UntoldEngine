@@ -100,6 +100,8 @@
         }
 
         public func draw(in view: MTKView) {
+            // The app is inactive or in the background: the GPU would refuse the frame.
+            guard GPUSubmissionGate.shared.isOpen else { return }
             guard let renderer else {
                 return
             }
@@ -167,6 +169,7 @@
 
             // Finalize rendering here & push the command buffer to the GPU
             commandBuffer.commit()
+            GPUSubmissionGate.shared.noteCommitted(commandBuffer)
         }
 
         func updateARStates(currentFrame: ARFrame) {
