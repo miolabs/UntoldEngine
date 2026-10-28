@@ -199,6 +199,8 @@ import XCTest
         // MARK: - A generated project
 
         func testGeneratedVisionOSProjectHasTheActivityAndTheIdentifier() async throws {
+            // The build runs `xcodegen generate` at the end; CI's runner has no xcodegen.
+            try XCTSkipIf(BuildSystem.xcodeGenPath() == nil, "xcodegen is not installed")
             let result = try await BuildSystem.shared.build(settings: Self.buildSettings(outputPath: tempDirectory, .visionOS(deployment: .v26), sharePlay: true))
             let projectDir = result.xcodeProjectPath.deletingLastPathComponent()
             let activity = projectDir.appendingPathComponent("Sources/MyGame/MyGameActivity.swift")
