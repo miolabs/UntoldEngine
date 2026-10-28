@@ -83,6 +83,23 @@
         /// Whether the loop has said that it takes no frame from a running layer while GPU
         /// work is paused (once per pause).
         private var loggedIdleWhilePaused = false
+        /// The frame account against the compositor's limit on frames in flight: frames taken
+        /// from it, frames ended with endSubmission, and frames let go without it.
+        private var framesTaken = 0
+        private var framesEnded = 0
+        private var framesLetGo = 0
+
+        private func frameAccount() -> String {
+            let state = layerRenderer.map { "\($0.state)" } ?? "none"
+            return "taken \(framesTaken), ended \(framesEnded), let go \(framesLetGo), layer \(state)"
+        }
+
+        /// Says that a taken frame was not ended, why, and how the account stands.
+        private func noteFrameLetGo(_ reason: String) {
+            framesLetGo += 1
+            print("XR [\(GPUSubmissionGate.logTimestamp())]: frame let go, \(reason); \(frameAccount())")
+        }
+
         /// Whether the compositor's frame timing budget has been printed (once per space).
         private var loggedFrameTimingBudget = false
         /// Whether the compositor clock's base has been checked against the media time (once).
@@ -718,9 +735,9 @@
                         // headset off): the loop waits for it to run again, and the frame
                         // after the pause lets no time pass.
                         let pausedAt = CACurrentMediaTime()
-                        print("XR [\(GPUSubmissionGate.logTimestamp())]: the layer is paused; the loop waits for it to run again")
+                        print("XR [\(GPUSubmissionGate.logTimestamp())]: the layer is paused; the loop waits for it to run again; \(frameAccount())")
                         layerRenderer.waitUntilRunning()
-                        print("XR [\(GPUSubmissionGate.logTimestamp())]: the layer runs again after \(String(format: "%.1f", CACurrentMediaTime() - pausedAt)) s, state \(layerRenderer.state)")
+                        print("XR [\(GPUSubmissionGate.logTimestamp())]: the layer runs again after \(String(format: "%.1f", CACurrentMediaTime() - pausedAt)) s; \(frameAccount())")
                         renderer?.resetFrameTiming()
 
                     case .running:
@@ -731,7 +748,7 @@
                         guard GPUSubmissionGate.shared.isOpen else {
                             if !loggedIdleWhilePaused {
                                 loggedIdleWhilePaused = true
-                                print("XR [\(GPUSubmissionGate.logTimestamp())]: the layer runs while GPU work is paused; the loop takes no frame")
+                                print("XR [\(GPUSubmissionGate.logTimestamp())]: the layer runs while GPU work is paused; the loop takes no frame; \(frameAccount())")
                             }
                             GPUSubmissionGate.shared.waitUntilOpen(timeout: 0.25)
                             return
@@ -767,12 +784,16 @@
 
             let queryStart = LayerRenderer.Clock().now
             guard let frame = layerRenderer.queryNextFrame() else { return }
+            framesTaken += 1
             let handedAt = LayerRenderer.Clock().now
             let loopMs = lastFrameHandedAt.map { Self.milliseconds($0.duration(to: queryStart)) } ?? 0
             lastFrameHandedAt = handedAt
 
             // 2. Call predictTiming to get the predicted render deadlines for code
-            guard let timing = frame.predictTiming() else { return }
+            guard let timing = frame.predictTiming() else {
+                noteFrameLetGo("no timing")
+                return
+            }
 
             // The instant the compositor predicts the frame will be shown, in the media-time
             // base: the game poses the frame for it in the update phase, and the head is posed
@@ -834,7 +855,10 @@
             }
 
             // 5. Perform any rendering-related work that doesn't rely on the device anchor info
-            guard let renderer else { return }
+            guard let renderer else {
+                noteFrameLetGo("no renderer")
+                return
+            }
 
             // Always sync the physical headset position into ECS camera components, even while
             // assets are loading. syncStreamingCameraPosition only writes three fields on the
@@ -878,7 +902,10 @@
 
             // The compositor or app state can transition while waiting. If not running anymore,
             // skip submission entirely to avoid using an invalid frame.
-            guard isRunning(), layerRenderer.state == .running else { return }
+            guard isRunning(), layerRenderer.state == .running else {
+                noteFrameLetGo("the loop stopped or the layer left running before the submission")
+                return
+            }
 
             // 8. Call startSubmission() to mark the start of submission phase
             frame.startSubmission()
@@ -887,8 +914,13 @@
             #endif
             var shouldEndSubmission = true
             defer {
-                if shouldEndSubmission, layerRenderer.state == .running {
-                    frame.endSubmission()
+                if shouldEndSubmission {
+                    if layerRenderer.state == .running {
+                        frame.endSubmission()
+                        framesEnded += 1
+                    } else {
+                        noteFrameLetGo("the layer left running during the submission")
+                    }
                 }
             }
 
@@ -910,6 +942,7 @@
                 #endif
                 // No drawables (shutdown/teardown, or the compositor cancelled the frame): the
                 // frame is already invalid and endSubmission() must not be called.
+                noteFrameLetGo("no drawables")
                 shouldEndSubmission = false
                 return
             }
@@ -1363,6 +1396,9 @@
                 #endif
                 if countsDeadline {
                     self?.noteGPUCompletion(at: cb.gpuEndTime, start: cb.gpuStartTime, deadline: deadline, presentation: presentation)
+                }
+                if cb.status == .error {
+                    print("XR [\(GPUSubmissionGate.logTimestamp())]: a frame's command buffer was aborted: \(cb.error.map { "\($0)" } ?? "no error given")")
                 }
                 commandBufferSemaphore.signal()
             }
