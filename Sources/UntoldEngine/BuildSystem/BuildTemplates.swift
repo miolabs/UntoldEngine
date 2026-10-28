@@ -1947,7 +1947,7 @@ import Foundation
         /// The SharePlay placeholders of the visionOS templates: the `on` lines with
         /// `--shareplay`, the `off` lines without (most have none).
         static let sharePlayBlocks: [String: (on: [String], off: [String])] = [
-            "{{SHAREPLAY_IMPORT}}": (on: ["import UntoldSharePlay"], off: []),
+            "{{SHAREPLAY_IMPORT}}": (on: ["import UntoldEngine", "import UntoldSharePlay"], off: []),
             "{{SHAREPLAY_MODEL}}": (on: [
                 "/// The SharePlay session and the one place that opens the immersive space.",
                 "@MainActor",
@@ -1970,14 +1970,18 @@ import Foundation
             "{{SHAREPLAY_SPACE_STARTED}}": (on: ["SharePlayModel.shared.space.spaceDidStart(rendering: true)"], off: []),
             "{{SHAREPLAY_SPACE_EMPTY}}": (on: ["SharePlayModel.shared.space.spaceDidStart(rendering: false)"], off: []),
             "{{SHAREPLAY_TEARDOWN}}": (on: [
-                "// The space closed (crown, the group's request, a cycle on the join): tear",
-                "// the engine down so the next open starts clean, then tell the coordinator.",
+                "// The space closed (crown, the group's request, a cycle on the join): release",
+                "// the engine now and tell the coordinator, so the next open starts clean. No",
+                "// deferred teardown here: once runLoop() has returned no frame runs again, and",
+                "// shutdownUntoldEngineXR's completion (from a frame's finalize pass) never comes.",
                 "Task { @MainActor in",
-                "    shutdownUntoldEngineXR(xr) {",
-                "        XRHolder.shared.xr = nil",
-                "        XRHolder.shared.renderThread = nil",
-                "        SharePlayModel.shared.space.spaceDidTearDown()",
-                "    }",
+                "    setRendering(.extensions(.removeAll))",
+                "    xr.clearSpatialInput()",
+                "    xr.stop()",
+                "    destroyAllEntities()",
+                "    XRHolder.shared.xr = nil",
+                "    XRHolder.shared.renderThread = nil",
+                "    SharePlayModel.shared.space.spaceDidTearDown()",
                 "}",
             ], off: []),
             "{{SHAREPLAY_FRAME_MODIFIER}}": (on: [".sharePlayFrame(SharePlayModel.shared.session)"], off: []),
