@@ -86,6 +86,7 @@ nav:
     - Physics Pose: API/UsingPhysicsPose.md
     - Physics System: API/UsingPhysicsSystem.md
     - Jolt Physics in XR: API/UsingJoltPhysicsXR.md
+    - SharePlay: API/UsingSharePlay.md
     - Steering System: API/UsingSteeringSystem.md
     - Scripting System: API/UsingScriptingSystem.md
     - Post Effects: API/UsingPostFX.md
