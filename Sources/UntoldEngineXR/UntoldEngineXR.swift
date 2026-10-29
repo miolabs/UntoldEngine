@@ -90,10 +90,14 @@
         private var framesTaken = 0
         private var framesEnded = 0
         private var framesLetGo = 0
+        /// Of the frames ended: those ended without drawing, and those whose submission was
+        /// ended after the layer had left running.
+        private var framesEndedUndrawn = 0
+        private var framesEndedOnPausedLayer = 0
 
         private func frameAccount() -> String {
             let state = layerRenderer.map { "\($0.state)" } ?? "none"
-            return "taken \(framesTaken), ended \(framesEnded), let go \(framesLetGo), layer \(state)"
+            return "taken \(framesTaken), ended \(framesEnded) (undrawn \(framesEndedUndrawn), on a paused layer \(framesEndedOnPausedLayer)), let go \(framesLetGo), layer \(state)"
         }
 
         /// Says that a taken frame was not ended, why, and how the account stands.
@@ -925,6 +929,10 @@
                 if shouldEndSubmission {
                     frame.endSubmission()
                     framesEnded += 1
+                    if layerRenderer.state != .running {
+                        framesEndedOnPausedLayer += 1
+                        print("XR [\(GPUSubmissionGate.logTimestamp())]: a frame's submission was ended after the layer left running; \(frameAccount())")
+                    }
                 }
             }
 
@@ -1074,6 +1082,7 @@
             }
             frame.endSubmission()
             framesEnded += 1
+            framesEndedUndrawn += 1
             print("XR [\(GPUSubmissionGate.logTimestamp())]: a frame was ended undrawn, \(reason); \(frameAccount())")
         }
 
@@ -1443,9 +1452,6 @@
                 #endif
                 if countsDeadline {
                     self?.noteGPUCompletion(at: cb.gpuEndTime, start: cb.gpuStartTime, deadline: deadline, presentation: presentation)
-                }
-                if cb.status == .error {
-                    print("XR [\(GPUSubmissionGate.logTimestamp())]: a frame's command buffer was aborted: \(cb.error.map { "\($0)" } ?? "no error given")")
                 }
                 commandBufferSemaphore.signal()
             }
