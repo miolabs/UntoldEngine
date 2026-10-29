@@ -43,6 +43,8 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     private var configuration: UntoldRendererConfig
     public var delegate: UntoldRendererDelegate?
     public var pendingResize = false
+    /// The GPU gate's resume count at the last frame: a change means the engine paused since.
+    private var resumeCountSeen: UInt64 = 0
 
     @MainActor
     init(configuration: UntoldRendererConfig? = nil) {
@@ -56,6 +58,8 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
         #endif
 
         super.init()
+        // The app's state gates the GPU where the system refuses a background app's work.
+        GPUSubmissionGate.shared.observeApplicationState()
     }
 
     @MainActor
@@ -267,6 +271,13 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     /// display's rate.
     static let defaultFramePeriod: TimeInterval = 1.0 / 60.0
 
+    /// Makes the next frame a first frame: no time passes to it. For a loop that paused on its
+    /// own, like the XR loop while its layer was paused; a pause of the GPU gate the clock sees
+    /// by itself.
+    public func resetFrameTiming() {
+        firstUpdateCall = false
+    }
+
     /// Advances the frame clock to the frame's predicted presentation time — the host's, or
     /// one period ahead of now for a loop that predicts none — and derives the frame's delta
     /// from it: the time between two presentations, not between two updates, so a path
@@ -274,6 +285,13 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     /// `nominalPeriod` is the host display's frame interval; nil lets the clock learn it from
     /// the presentation times.
     func calculateDeltaTime(presentationTime: TimeInterval?, nominalPeriod: TimeInterval?) {
+        // The engine paused since the last frame (the app inactive or in the background, the
+        // headset taken off): no time passes to the first frame after, as to a first frame.
+        let resumeCount = GPUSubmissionGate.shared.resumeCount
+        if resumeCount != resumeCountSeen {
+            resumeCountSeen = resumeCount
+            firstUpdateCall = false
+        }
         if !firstUpdateCall {
             // The first frame after a reset: no time has passed.
             frameClock.reset()
@@ -737,6 +755,9 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
     }
 
     public func draw(in view: MTKView) {
+        // The app is inactive or in the background: the GPU would refuse the frame, so none is
+        // drawn until the app is active again; the view keeps showing the last one.
+        guard GPUSubmissionGate.shared.isOpen else { return }
         // Not an XR eye: shading uses the camera's own position.
         renderInfo.xrEyeCameraPosition = nil
         if pendingResize {
