@@ -8,9 +8,12 @@ headsets, and the one place that opens and dismisses the immersive space. A
 game keeps three things of its own: its `GroupActivity`, its wire types, and
 what the messages do.
 
-This is a getting-started page. The plugin's README holds the full reference:
-the channels, the shared frame's precedence, the calibration, the coordinator
-and the lessons it encodes.
+This is a getting-started page. The plugin's
+[integration guide](https://github.com/miolabs/UntoldSharePlay/blob/develop/docs/GettingStarted.md)
+walks through a whole game, its [recipes](https://github.com/miolabs/UntoldSharePlay/blob/develop/docs/Recipes.md)
+take one task at a time, and its README holds the reference: the channels,
+the shared frame's precedence, the calibration, the coordinator and the
+lessons it encodes.
 
 ## 1. Create a Project With SharePlay
 
@@ -63,7 +66,8 @@ let events = SharePlayModel.shared.session.eventChannel(GameEvent.self)
 
 // Per frame, in GameScene.update, on the render thread:
 let frame = SharePlayModel.shared.session.frame
-poses.publish(Poses(head: frame.toShared(headPose)))
+frame.updateDevicePose(headPose) // pairs with the system's pose of this device
+poses.publish(Poses(head: headPose)) // our local frame, as it is
 for (participant, received) in poses.latestAll() where received.age < 0.5 {
     let local = frame.toLocal(received.message.head, from: participant)
     // place that participant's avatar at `local`
@@ -73,11 +77,14 @@ for event in events.drain() {
 }
 ```
 
-`frame.toShared` strips this device's displacement from a local pose before it
-goes on the wire; `frame.toLocal(_:from:)` maps a participant's wire pose into
-this device's frame through whatever alignment is in force for them: the
-manual calibration, their shared world anchor, the system's displacement, or a
-fallback stage in front of the player.
+Poses go on the wire in the sender's own local frame, as the engine reports
+them. `frame.toLocal(_:from:)` maps a participant's wire pose into this
+device's frame through whatever alignment is in force for them: the manual
+calibration, their shared world anchor, the system's placements of the two
+devices (from the system's pose of each, which `updateDevicePose` pairs with
+the device pose), or a fallback stage in front of the player. On two headsets
+nearby, or over FaceTime, the system's placements put the other player's
+avatar on their head with no manual step.
 
 ## 3. Who Is Here
 
@@ -112,9 +119,10 @@ Spatial Personas are drawn by the system around a scene that RealityKit
 renders, so a `CompositorLayer` game sees its remote participants only through
 what it draws itself from their poses (see the research note in
 `docs/proposals/SpatialPersonasResearch.md` and the RealityKit presenter plan).
-Nearby participants (visionOS 26) are real people seen through passthrough;
-shared world anchors align the devices once the engine's world-anchor API is
-in the plugin.
+Nearby participants (visionOS 26) are real people seen through passthrough.
+Either way the system's pose of each device aligns the two frames; shared
+world anchors add a second alignment once the engine's world-anchor API is in
+the plugin.
 
 ## 5. Try It
 
