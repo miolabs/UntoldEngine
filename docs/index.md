@@ -194,6 +194,7 @@ See [COMMERCIAL.md](https://github.com/untoldengine/UntoldEngine/blob/main/COMME
 - [Animation System](API/UsingAnimationSystem.md)
 - [Physics System](API/UsingPhysicsSystem.md)
 - [Jolt Physics in XR](API/UsingJoltPhysicsXR.md)
+- [SharePlay](API/UsingSharePlay.md)
 - [Steering System](API/UsingSteeringSystem.md)
 - [Post FX](API/UsingPostFX.md)
 - [LOD System](API/UsingLODSystem.md)

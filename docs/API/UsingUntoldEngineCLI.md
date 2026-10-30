@@ -95,6 +95,7 @@ untoldengine create CrossGame --platform multi --team-id ABCD1234EF
 | `--team-id` | Apple Developer Team ID | — |
 | `--optimization` | Optimization level (`none`, `speed`, `size`) | `none` |
 | `--debug / --no-debug` | Include debug information | yes |
+| `--shareplay` | Add SharePlay to a visionOS project: the UntoldSharePlay plugin, the game's activity, a session with its status row and the immersive-space coordinator; raises the visionOS target to 26 (see [SharePlay](UsingSharePlay.md)) | off |
 
 ---
 
