@@ -32,6 +32,16 @@ import Foundation
         case v1 = "1.0"
         case v2 = "2.0"
         case v26 = "26.0"
+
+        /// The first visionOS with `CompositorContent`, which the SharePlay pieces of a
+        /// generated app need.
+        public static var sharePlayMinimum: VisionOSVersion {
+            .v26
+        }
+
+        public var supportsSharePlay: Bool {
+            (Double(rawValue) ?? 0) >= (Double(Self.sharePlayMinimum.rawValue) ?? 0)
+        }
     }
 
     public enum BuildTarget: Codable {
@@ -64,6 +74,15 @@ import Foundation
             case .iOS: return ["iOS"]
             case .visionOS: return ["visionOS"]
             case .multi: return ["macOS", "iOS", "visionOS"]
+            }
+        }
+
+        /// The visionOS deployment version, where the target has a visionOS app.
+        public var visionOSDeployment: VisionOSVersion? {
+            switch self {
+            case let .visionOS(version): return version
+            case let .multi(_, _, version): return version
+            default: return nil
             }
         }
 
@@ -116,6 +135,13 @@ import Foundation
             requirement: .branch("develop")
         )
 
+        /// The SharePlay plugin from its repository's `develop`; `BuildSettings.sharePlayPackage`
+        /// overrides it.
+        public static let sharePlayDevelop = EnginePackageReference(
+            url: "https://github.com/miolabs/UntoldSharePlay.git",
+            requirement: .branch("develop")
+        )
+
         /// The `key: value` line of an XcodeGen `packages:` entry.
         var xcodeGenRequirement: String {
             switch requirement {
@@ -156,9 +182,20 @@ import Foundation
         /// project's plugins folder, `Sources/<Project>Plugins`, with a starter component. Needs
         /// an engine that ships the kit, so it is off unless the caller asks.
         public var includesCodeComponents: Bool
+        /// Link `UntoldSharePlay`, declare the game's `GroupActivity`, wire a session with its
+        /// status row and the immersive-space coordinator into the visionOS app, and add the
+        /// group-session entitlement. visionOS targets only, visionOS 26 at least; off unless
+        /// the caller asks.
+        public var includesSharePlay: Bool
+        /// The SharePlay plugin package the project depends on; `nil` keeps the default.
+        public var sharePlayPackage: EnginePackageReference?
 
         public var resolvedEnginePackage: EnginePackageReference {
             enginePackage ?? .upstreamDevelop
+        }
+
+        public var resolvedSharePlayPackage: EnginePackageReference {
+            sharePlayPackage ?? .sharePlayDevelop
         }
 
         public init(
@@ -172,7 +209,9 @@ import Foundation
             teamID: String? = nil,
             isIOSAR: Bool = false,
             enginePackage: EnginePackageReference? = nil,
-            includesCodeComponents: Bool = false
+            includesCodeComponents: Bool = false,
+            includesSharePlay: Bool = false,
+            sharePlayPackage: EnginePackageReference? = nil
         ) {
             self.projectName = projectName
             self.bundleIdentifier = bundleIdentifier
@@ -185,6 +224,8 @@ import Foundation
             self.isIOSAR = isIOSAR
             self.enginePackage = enginePackage
             self.includesCodeComponents = includesCodeComponents
+            self.includesSharePlay = includesSharePlay
+            self.sharePlayPackage = sharePlayPackage
         }
     }
 
@@ -360,6 +401,16 @@ import Foundation
         // MARK: - Private Helpers
 
         private func validateSettings(_ settings: BuildSettings) throws {
+            if settings.includesSharePlay {
+                guard let visionOS = settings.target.visionOSDeployment else {
+                    throw BuildError.invalidSettings("SharePlay is for visionOS projects (--platform visionos or multi); it needs visionOS 26")
+                }
+                guard visionOS.supportsSharePlay else {
+                    throw BuildError.invalidSettings(
+                        "SharePlay needs visionOS \(VisionOSVersion.sharePlayMinimum.rawValue) or later (--visionos-version 26); the project targets visionOS \(visionOS.rawValue)"
+                    )
+                }
+            }
             guard !settings.projectName.isEmpty else {
                 throw BuildError.invalidSettings("Project name cannot be empty")
             }
@@ -417,6 +468,9 @@ import Foundation
             var filesToWrite = templateFiles
             if settings.includesCodeComponents {
                 filesToWrite[BuildTemplates.starterComponentPath] = BuildTemplates.starterComponentSwift
+            }
+            if settings.includesSharePlay {
+                filesToWrite[BuildTemplates.sharePlayActivityPath(for: settings.target)] = BuildTemplates.sharePlayActivitySwift
             }
 
             for (relativePath, content) in filesToWrite {
