@@ -249,6 +249,10 @@
 
         /// Task handle for the plane-update monitor so we can cancel it on shutdown.
         private var planeMonitorTask: Task<Void, Never>?
+        /// World anchors the game asked for, and who listens to anchor updates.
+        /// Lives outside the provider so anchors survive provider restarts.
+        let worldAnchorStore = XRWorldAnchorStore()
+        var worldAnchorMonitorTask: Task<Void, Never>?
 
         /// Task handle for the ARKitSession event monitor (provider state changes,
         /// authorization changes) so we can cancel it on shutdown.
@@ -465,6 +469,8 @@
             lock.unlock()
             planeMonitorTask?.cancel()
             planeMonitorTask = nil
+            worldAnchorMonitorTask?.cancel()
+            worldAnchorMonitorTask = nil
             sessionEventMonitorTask?.cancel()
             sessionEventMonitorTask = nil
             xrEnvironmentLightingSystem.setEnabled(false)
@@ -598,6 +604,10 @@
                 let worldTracking = WorldTrackingProvider()
                 let planeDetection = PlaneDetectionProvider(alignments: [.horizontal, .vertical])
                 installFreshARKitProviders(worldTracking: worldTracking, planeDetection: planeDetection)
+                // Like the plane monitor: anchorUpdates is bound to this provider
+                // instance, so it is restarted for every run, before run() so no
+                // .added event is missed.
+                restartWorldAnchorMonitor(with: worldTracking)
 
                 let attempt = nextARKitProviderRunAttempt()
                 let startTime = CACurrentMediaTime()
@@ -640,6 +650,9 @@
                     print("XR ARKit providers run starting: t=\(xrLogTimestamp()), attempt=\(attempt), reason=\(reason), providers=\(providerList), worldSensingAllowed=\(worldSensingAllowed), authMs=\(String(format: "%.2f", authMs))")
                     try await arSession.run(providers)
                     xrEnvironmentLightingSystem.markProviderRunning(lightingProvider != nil)
+                    // The fresh provider knows no anchors: put back every one the
+                    // game still wants (shared anchors included).
+                    await installRequestedWorldAnchors(into: worldTracking)
                     let durationMs = (CACurrentMediaTime() - startTime) * 1000.0
                     let durationText = String(format: "%.2f", durationMs)
                     print("XR ARKit providers run completed: t=\(xrLogTimestamp()), attempt=\(attempt), durationMs=\(durationText), worldTrackingState=\(String(describing: worldTracking.state))")
@@ -671,7 +684,7 @@
                 arKitProviderRunLock.unlock()
             }
 
-            private func currentWorldTracking() -> WorldTrackingProvider {
+            func currentWorldTracking() -> WorldTrackingProvider {
                 arKitProviderRunLock.lock()
                 let provider = worldTracking
                 arKitProviderRunLock.unlock()
