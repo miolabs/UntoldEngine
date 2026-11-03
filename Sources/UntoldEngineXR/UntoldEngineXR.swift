@@ -758,7 +758,7 @@
                                 loggedIdleWhilePaused = true
                                 print("XR [\(GPUSubmissionGate.logTimestamp())]: the layer runs while GPU work is paused; the loop takes no frame; \(frameAccount())")
                             }
-                            GPUSubmissionGate.shared.waitUntilOpen(timeout: 0.25)
+                            _ = GPUSubmissionGate.shared.waitUntilOpen(timeout: 0.25)
                             return
                         }
                         if loggedIdleWhilePaused {
