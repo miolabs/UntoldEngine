@@ -228,7 +228,7 @@ public class UntoldRenderer: NSObject, MTKViewDelegate {
             BatchingSystem.shared.applyRuntimeBatchingTuning(.macOSBalanced)
         #endif
 
-        Logger.log(message: "Untold Engine Starting. Version 0.24.1")
+        Logger.log(message: "Untold Engine Starting. Version 0.25.0")
     }
 
     /// The default camera, made active, and with `sun` the default directional light, made
