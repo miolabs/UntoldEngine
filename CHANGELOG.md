@@ -1,4 +1,17 @@
 # Changelog
+## v0.26.0 - 2026-11-24
+### 🐞 Fixes
+- [Patch] Stop clear glass from writing its own depth over passthrough (#1412) (c5993dc…)
+- [Patch] Fix type-check timeout in GaussianSharedWorkingSet.residentBytesLocked (#1421) (dcd3d64…)
+### 📚 Docs
+- [Docs] Updated Readme (#1418) (89284e2…)
+### 🚀 Features
+- [Feature] The frame is posed for its predicted presentation time, and the game receives it (#1415) (31d3686…)
+## v0.25.1 - 2026-11-09
+### 🐞 Fixes
+- [Bugfix] Fix tile-streaming transform/material corruption from modifiers and merges (#1403) (38b95d9…)
+- [Patch] Reinstate .archviz texture streaming profile for interior walkthroughs (#1405) (b7ad5d5…)
+- [Patch] Persist TextureStreamingSystem profile in SceneSerializer (#1406) (6c5c37d…)
 ## v0.25.0 - 2026-11-01
 ### 🐞 Fixes
 - [Bugfix] Populate IBL bake cache from generateHDR so viewport resize doesn't re-bake (#1397) (329c4b43…)
