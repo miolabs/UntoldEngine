@@ -1,0 +1,160 @@
+// Scratch, not part of the engine: per-mesh triangle counts of two level files of one
+// model (LEVEL_A, LEVEL_B), to see which meshes a cook change made larger or smaller.
+import Foundation
+import simd
+@testable import UntoldEngine
+@testable import UntoldEngineMeshCook
+import XCTest
+
+final class ZZCarLevelMeshes: XCTestCase {
+    func testPerMesh() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let a = env["LEVEL_A"], let b = env["LEVEL_B"] else { throw XCTSkip("LEVEL_A/LEVEL_B not set") }
+        let (ma, _, _) = try UntoldMeshLODCooker.unpackedMeshes(ofModelAt: URL(fileURLWithPath: a))
+        let (mb, _, _) = try UntoldMeshLODCooker.unpackedMeshes(ofModelAt: URL(fileURLWithPath: b))
+        let decoded = try UntoldReader().readAsset(from: Data(contentsOf: URL(fileURLWithPath: a)))
+        var rows: [(name: String, a: Int, b: Int)] = []
+        for index in 0 ..< max(ma.count, mb.count) {
+            let name = decoded.meshes.indices.contains(index) ? ((try? decoded.string(at: decoded.meshes[index].meshNameOffset)) ?? "?") : "?"
+            rows.append((name, index < ma.count ? ma[index].triangleCount : 0, index < mb.count ? mb[index].triangleCount : 0))
+        }
+        print("LEVELMESH total A=\(rows.reduce(0) { $0 + $1.a }) B=\(rows.reduce(0) { $0 + $1.b })")
+        if let focus = env["FOCUS"], let original = env["LEVEL_0"] {
+            // Each level vertex against the original surface: a vertex the simplifier kept
+            // sits on it, a sunk one does not. Outward is against the original's normal
+            // (a lining's normals point into the cabin).
+            let (m0, _, _) = try UntoldMeshLODCooker.unpackedMeshes(ofModelAt: URL(fileURLWithPath: original))
+            for index in 0 ..< min(ma.count, mb.count, m0.count) where rows[index].name.lowercased().contains(focus.lowercased()) {
+                for (label, level) in [("plain", ma[index]), ("new", mb[index])] {
+                    var off = 0, outward = 0, inward = 0
+                    var farthest: Float = 0
+                    var examples: [String] = []
+                    for vb in 0 ..< level.vertexCount {
+                        let p = level.position(vb)
+                        var best: Float = .greatestFiniteMagnitude
+                        var nearest = 0
+                        for v0 in 0 ..< m0[index].vertexCount {
+                            let d = simd_distance(p, m0[index].position(v0))
+                            if d < best { best = d; nearest = v0 }
+                        }
+                        guard best > 0.02 else { continue }
+                        off += 1
+                        farthest = max(farthest, best)
+                        let n0 = SIMD3<Float>(m0[index].normals[nearest * 3], m0[index].normals[nearest * 3 + 1], m0[index].normals[nearest * 3 + 2])
+                        let move = p - m0[index].position(nearest)
+                        let along = simd_dot(move, n0) / best
+                        if along < -0.5 { outward += 1; if examples.count < 8 { examples.append(String(format: "OUT at (%.2f,%.2f,%.2f) move (%.3f,%.3f,%.3f) n0 (%.2f,%.2f,%.2f)", p.x, p.y, p.z, move.x, move.y, move.z, n0.x, n0.y, n0.z)) } }
+                        else if along > 0.5 { inward += 1 }
+                    }
+                    print("LEVELMESH origin \(rows[index].name) \(label): \(off) of \(level.vertexCount) vertices are over 2 cm off the original; \(inward) inward (along the normal), \(outward) outward; farthest \(farthest)")
+                    for example in examples { print("LEVELMESH origin   \(example)") }
+                }
+            }
+        }
+        if let focus = env["FOCUS"], let shellName = env["SHELL"] {
+            // Which vertices of the focus mesh lie outside the shell mesh (ray parity).
+            func crossings(_ point: SIMD3<Float>, _ mesh: UntoldLODMesh) -> Int {
+                let direction = simd_normalize(SIMD3<Float>(0.53, 0.71, 0.46))
+                var count = 0
+                for triangle in stride(from: 0, to: mesh.indices.count, by: 3) {
+                    let a = mesh.position(Int(mesh.indices[triangle])), b = mesh.position(Int(mesh.indices[triangle + 1])), c = mesh.position(Int(mesh.indices[triangle + 2]))
+                    let e1 = b - a, e2 = c - a
+                    let pv = simd_cross(direction, e2)
+                    let det = simd_dot(e1, pv)
+                    if abs(det) < 1e-9 { continue }
+                    let f = 1 / det
+                    let sv = point - a
+                    let u = f * simd_dot(sv, pv)
+                    if u < 0 || u > 1 { continue }
+                    let q = simd_cross(sv, e1)
+                    let v = f * simd_dot(direction, q)
+                    if v < 0 || u + v > 1 { continue }
+                    if f * simd_dot(e2, q) > 1e-6 { count += 1 }
+                }
+                return count
+            }
+            for (label, level) in [("plain", ma), ("new", mb)] {
+                guard let focusIndex = rows.indices.first(where: { rows[$0].name == focus }), let shellIndex = rows.indices.first(where: { rows[$0].name == shellName }),
+                      focusIndex < level.count, shellIndex < level.count else { continue }
+                let shell = level[shellIndex]
+                var outside = 0
+                var examples: [String] = []
+                for vb in 0 ..< level[focusIndex].vertexCount {
+                    let p = level[focusIndex].position(vb)
+                    if crossings(p, shell) % 2 == 0 {
+                        outside += 1
+                        if examples.count < 10 { examples.append(String(format: "(%.2f,%.2f,%.2f)", p.x, p.y, p.z)) }
+                    }
+                }
+                print("LEVELMESH shell \(label): \(outside) of \(level[focusIndex].vertexCount) \(focus) vertices are outside \(shellName): \(examples)")
+            }
+        }
+        if let focus = env["FOCUS"], env["PIECES"] != nil {
+            for (label, level) in [("plain", ma), ("new", mb)] {
+                guard let focusIndex = rows.indices.first(where: { rows[$0].name == focus }), focusIndex < level.count else { continue }
+                let parts = UntoldLODMeshParts(mesh: level[focusIndex])
+                var perPiece = [Int](repeating: 0, count: parts.componentCount)
+                for triangle in stride(from: 0, to: level[focusIndex].indices.count, by: 3) {
+                    perPiece[Int(parts.componentOfVertex[Int(level[focusIndex].indices[triangle])])] += 1
+                }
+                let sorted = perPiece.enumerated().sorted { $0.element > $1.element }.prefix(5).map { "piece \($0.offset): \($0.element)" }
+                print("LEVELMESH pieces \(label) \(focus): \(parts.componentCount) pieces, triangles \(sorted)")
+                var over50 = 0, over100 = 0, longest: Float = 0
+                var biggest: [(Float, SIMD3<Float>)] = []
+                for triangle in stride(from: 0, to: level[focusIndex].indices.count, by: 3) {
+                    let a = level[focusIndex].position(Int(level[focusIndex].indices[triangle])), b = level[focusIndex].position(Int(level[focusIndex].indices[triangle + 1])), c = level[focusIndex].position(Int(level[focusIndex].indices[triangle + 2]))
+                    let edge = max(simd_distance(a, b), simd_distance(b, c), simd_distance(c, a))
+                    if edge > 0.5 { over50 += 1 }
+                    if edge > 1.0 { over100 += 1 }
+                    longest = max(longest, edge)
+                    biggest.append((edge, (a + b + c) / 3))
+                }
+                biggest.sort { $0.0 > $1.0 }
+                let examples = biggest.prefix(5).map { String(format: "%.2f@(%.1f,%.1f,%.1f)", $0.0, $0.1.x, $0.1.y, $0.1.z) }
+                print("LEVELMESH pieces \(label) \(focus): edges over 0.5 m: \(over50), over 1 m: \(over100), longest \(longest); biggest \(examples)")
+            }
+        }
+        if let focus = env["FOCUS"], env["LEVEL_0"] == nil, env["SHELL"] == nil, env["PIECES"] == nil {
+            for index in 0 ..< min(ma.count, mb.count) where rows[index].name.lowercased().contains(focus.lowercased()) {
+                func describe(_ m: UntoldLODMesh) -> String {
+                    String(format: "tris=%d verts=%d box=(%.2f..%.2f, %.2f..%.2f, %.2f..%.2f)", m.triangleCount, m.vertexCount, m.boundsMin.x, m.boundsMax.x, m.boundsMin.y, m.boundsMax.y, m.boundsMin.z, m.boundsMax.z)
+                }
+                print("LEVELMESH focus \(rows[index].name): A \(describe(ma[index]))")
+                print("LEVELMESH focus \(rows[index].name): B \(describe(mb[index]))")
+                // How far B's vertices lie from A's nearest vertex, as a rough displacement.
+                var far = 0
+                var outward = 0
+                var maxDistance: Float = 0
+                let centre = (ma[index].boundsMin + ma[index].boundsMax) * 0.5
+                var examples: [String] = []
+                let sampleB = Array(stride(from: 0, to: mb[index].vertexCount, by: max(mb[index].vertexCount / 300, 1)))
+                for vb in sampleB {
+                    let p = mb[index].position(vb)
+                    var best: Float = .greatestFiniteMagnitude
+                    var nearest = SIMD3<Float>.zero
+                    for va in 0 ..< ma[index].vertexCount {
+                        let d = simd_distance(p, ma[index].position(va))
+                        if d < best { best = d; nearest = ma[index].position(va) }
+                    }
+                    maxDistance = max(maxDistance, best)
+                    if best > 0.05 {
+                        far += 1
+                        let move = p - nearest
+                        let radial = p - centre
+                        radial.y == 0 ? () : ()
+                        let out = simd_dot(simd_normalize(move), simd_normalize(SIMD3<Float>(radial.x, 0, radial.z)))
+                        if out > 0.3 {
+                            outward += 1
+                            if examples.count < 12 { examples.append(String(format: "OUTWARD at (%.2f,%.2f,%.2f) from (%.2f,%.2f,%.2f) moved (%.3f,%.3f,%.3f) |%.3f|", p.x, p.y, p.z, nearest.x, nearest.y, nearest.z, move.x, move.y, move.z, best)) }
+                        }
+                    }
+                }
+                print("LEVELMESH focus \(rows[index].name): of \(sampleB.count) B vertices, \(far) are over 5 cm from any A vertex (\(outward) of them outward, sideways); farthest \(maxDistance)")
+                for example in examples { print("LEVELMESH focus   \(example)") }
+            }
+        }
+        for row in rows.sorted(by: { abs($0.b - $0.a) > abs($1.b - $1.a) }).prefix(25) {
+            print("LEVELMESH \(row.name): \(row.a) -> \(row.b) (\(row.b - row.a))")
+        }
+    }
+}

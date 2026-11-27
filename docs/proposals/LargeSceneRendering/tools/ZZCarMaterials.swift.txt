@@ -1,0 +1,23 @@
+// Scratch, not part of the engine: the material of each mesh of a model (BIM_MODEL):
+// alpha, blend mode, transmission, so the cook can tell glass.
+import Foundation
+@testable import UntoldEngine
+@testable import UntoldEngineMeshCook
+import XCTest
+
+final class ZZCarMaterials: XCTestCase {
+    func testMaterials() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let path = env["BIM_MODEL"] else { throw XCTSkip("BIM_MODEL not set") }
+        let decoded = try UntoldReader().readAsset(from: Data(contentsOf: URL(fileURLWithPath: path)))
+        for (index, mesh) in decoded.meshes.enumerated() {
+            let name = (try? decoded.string(at: mesh.meshNameOffset)) ?? "?"
+            guard mesh.materialIndex != UntoldFormat.invalidIndex, Int(mesh.materialIndex) < decoded.materials.count else {
+                print("CARMAT \(index) \(name): no material"); continue
+            }
+            let m = decoded.materials[Int(mesh.materialIndex)]
+            let mname = (try? decoded.string(at: m.nameOffset)) ?? "?"
+            print("CARMAT \(index) \(name): material=\(mname) \(m)")
+        }
+    }
+}

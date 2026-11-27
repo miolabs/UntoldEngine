@@ -1,0 +1,36 @@
+// Scratch, not part of the engine: writes the synthetic models of the PR sheet (a
+// white shell over a dark lining) to SHEET_DIR, for the render sheet to cook and draw.
+import Foundation
+import simd
+@testable import UntoldEngine
+@testable import UntoldEngineMeshCook
+import XCTest
+
+final class ZZWriteSheetModels: XCTestCase {
+    func testWrite() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let out = env["SHEET_DIR"] else { throw XCTSkip("SHEET_DIR not set") }
+        let directory = URL(fileURLWithPath: out)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // A car-like body: a wavy roof with a dark lining a millimetre under it, over
+        // a box of sides. The roof is material 0 (white), the lining material 1 (dark).
+        let roof = LODTestMesh.wavySurface(cells: 120, material: 0)
+        let lining = LODTestMesh.wavySurface(cells: 120, origin: SIMD2<Float>(-4.8, -4.8), size: SIMD2<Float>(9.6, 9.6), offset: SIMD3<Float>(0, -0.012, 0), material: 1)
+        var roofModel = LODTestModel(meshes: [roof, lining])
+        roofModel.darkMaterials = [1]
+        for (name, model) in [("roof", roofModel)] {
+            let folder = directory.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let url = try model.write(to: folder, name: name)
+            print("SHEETMODEL \(url.path)")
+        }
+        let outer = LODTestMesh.sphere(radius: 1, rings: 120, segments: 240, material: 0)
+        let inner = LODTestMesh.sphere(radius: 0.985, rings: 120, segments: 240, material: 1)
+        let folder = directory.appendingPathComponent("shells")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var shellModel = LODTestModel(meshes: [outer, inner])
+        shellModel.darkMaterials = [1]
+        let url = try shellModel.write(to: folder, name: "shells")
+        print("SHEETMODEL \(url.path)")
+    }
+}

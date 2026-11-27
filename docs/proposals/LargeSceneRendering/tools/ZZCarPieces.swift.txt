@@ -1,0 +1,69 @@
+// Scratch, not part of the engine: the hidden pieces of a model (BIM_MODEL) and how
+// they are sunk at the coarsest allowance, plus the orientation of each mesh's normals.
+import Foundation
+import simd
+@testable import UntoldEngine
+@testable import UntoldEngineMeshCook
+import XCTest
+
+final class ZZCarPieces: XCTestCase {
+    func testPieces() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let path = env["BIM_MODEL"] else { throw XCTSkip("BIM_MODEL not set") }
+        let url = URL(fileURLWithPath: path)
+        let (meshes, transforms, diameter) = try UntoldMeshLODCooker.unpackedMeshes(ofModelAt: url)
+        let parts = meshes.map(UntoldLODMeshParts.init)
+        let decoded = try UntoldReader().readAsset(from: Data(contentsOf: url))
+        let names = decoded.meshes.map { (try? decoded.string(at: $0.meshNameOffset)) ?? "?" }
+        let glass = decoded.meshes.map { mesh -> Bool in
+            guard mesh.materialIndex != UntoldFormat.invalidIndex, Int(mesh.materialIndex) < decoded.materials.count else { return false }
+            let material = decoded.materials[Int(mesh.materialIndex)]
+            return material.transmissionFactor > 0 || material.baseColorFactor.w < 1
+        }
+        let triangles = meshes.reduce(0) { $0 + $1.triangleCount }
+        let coarsest = diameter / (Float(triangles) * 0.03).squareRoot()
+        // Normals: share pointing away from the model's centre, per mesh.
+        var centre = SIMD3<Float>.zero
+        var count: Float = 0
+        for (index, mesh) in meshes.enumerated() {
+            for vertex in 0 ..< mesh.vertexCount {
+                centre += simd_make_float3(simd_mul(transforms[index], SIMD4<Float>(mesh.position(vertex), 1)))
+                count += 1
+            }
+        }
+        centre /= max(count, 1)
+        let hidden = UntoldMeshLODHiddenParts(meshes: meshes, parts: parts, transforms: transforms, glass: glass, diameter: diameter, coarsestAllowance: coarsest)
+        let sunk = hidden.sunk(meshes, allowance: coarsest)
+        print("CARPIECES allowance=\(coarsest) hidden=\(hidden.count)")
+        for (index, mesh) in meshes.enumerated() {
+            let rotation = UntoldMeshLODHiddenParts.ModelGrid.normalTransform(of: transforms[index])
+            var outward = 0
+            for vertex in 0 ..< mesh.vertexCount {
+                let p = simd_make_float3(simd_mul(transforms[index], SIMD4<Float>(mesh.position(vertex), 1)))
+                let n = simd_mul(rotation, SIMD3<Float>(mesh.normals[vertex * 3], mesh.normals[vertex * 3 + 1], mesh.normals[vertex * 3 + 2]))
+                if simd_dot(n, p - centre) > 0 { outward += 1 }
+            }
+            let pieceCount = parts[index].componentCount
+            var perPiece: [Int: (vertices: Int, moved: Int, sum: SIMD3<Float>, lower: SIMD3<Float>, upper: SIMD3<Float>)] = [:]
+            for hiddenVertex in hidden.hiddenVertices[index] {
+                let piece = Int(parts[index].componentOfVertex[hiddenVertex.vertex])
+                let before = simd_make_float3(simd_mul(transforms[index], SIMD4<Float>(mesh.position(hiddenVertex.vertex), 1)))
+                let after = simd_make_float3(simd_mul(transforms[index], SIMD4<Float>(sunk[index].position(hiddenVertex.vertex), 1)))
+                var entry = perPiece[piece] ?? (0, 0, .zero, SIMD3<Float>(repeating: .greatestFiniteMagnitude), SIMD3<Float>(repeating: -.greatestFiniteMagnitude))
+                entry.vertices += 1
+                if simd_length(after - before) > 1e-6 { entry.moved += 1; entry.sum += after - before }
+                entry.lower = simd_min(entry.lower, before); entry.upper = simd_max(entry.upper, before)
+                perPiece[piece] = entry
+            }
+            guard !perPiece.isEmpty || mesh.triangleCount > 5000 else { continue }
+            var pieceSizes = [Int](repeating: 0, count: pieceCount)
+            for vertex in 0 ..< mesh.vertexCount where Int(mesh.positionRemap[vertex]) == vertex { pieceSizes[Int(parts[index].componentOfVertex[vertex])] += 1 }
+            let big = pieceSizes.enumerated().filter { $0.element > 50 }.map { "\($0.offset):\($0.element)" }
+            print("CARPIECES mesh \(index) \(names[index]): tris=\(mesh.triangleCount) pieces=\(pieceCount) bigPieces=\(big.prefix(12)) glass=\(glass[index]) outwardNormals=\(100 * outward / max(mesh.vertexCount, 1))%")
+            for (piece, entry) in perPiece.sorted(by: { $0.value.vertices > $1.value.vertices }).prefix(6) {
+                let mean = entry.moved > 0 ? entry.sum / Float(entry.moved) : .zero
+                print("CARPIECES    piece \(piece): hidden=\(entry.vertices) moved=\(entry.moved) meanMove=\(String(format: "%.3f,%.3f,%.3f", mean.x, mean.y, mean.z)) box=\(String(format: "%.2f..%.2f, %.2f..%.2f, %.2f..%.2f", entry.lower.x, entry.upper.x, entry.lower.y, entry.upper.y, entry.lower.z, entry.upper.z))")
+            }
+        }
+    }
+}

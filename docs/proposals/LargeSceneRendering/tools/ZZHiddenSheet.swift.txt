@@ -1,0 +1,66 @@
+// Scratch, not part of the engine: draws the synthetic sheet models (SHEET_PLAIN and
+// SHEET_NEW, two cooked copies of the same models) at their coarsest level, each from
+// one camera, and saves the frames to SHEET_OUT.
+@testable import UntoldEngine
+import Foundation
+import simd
+import XCTest
+
+final class ZZHiddenSheet: BaseRenderSetup {
+    override func initializeAssets() {}
+    private func waitForGPU() { renderInfo.lastCommandBuffer?.waitUntilCompleted() }
+    private func draw(_ n: Int) { for _ in 0 ..< n { renderer.draw(in: renderer.metalView); waitForGPU() } }
+    private func save(_ name: String, in dir: URL) {
+        if let texture = textureResources.antiAliasingTexture ?? textureResources.colorMap, let image = textureToCGImage(texture: texture) {
+            let url = dir.appendingPathComponent("\(name).png")
+            if let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+                CGImageDestinationAddImage(destination, image, nil); CGImageDestinationFinalize(destination)
+            }
+        }
+    }
+
+    func testSheet() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let out = env["SHEET_OUT"] else { throw XCTSkip("SHEET_OUT not set") }
+        let outputDir = URL(fileURLWithPath: out)
+        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        applyIBL = false; renderEnvironment = false; ambientIntensity = 0.5
+        let camera = createEntity(); createGameCamera(entityId: camera); CameraSystem.shared.activeCamera = camera
+        far = 200
+        for (tag, key) in [("plain", "SHEET_PLAIN"), ("new", "SHEET_NEW")] {
+            guard let root = env[key] else { continue }
+            for (model, eye, target, level) in [
+                ("roof/roof", simd_float3(9, 7, 11), simd_float3(0, -0.2, 0), 3),
+                ("shells/shells", simd_float3(1.8, 1.3, 2.2), simd_float3(0, 0, 0), 3),
+            ] {
+                let entity = createEntity()
+                let path = URL(fileURLWithPath: root).appendingPathComponent(model).path
+                let loaded = expectation(description: model)
+                setEntityMeshAsync(entityId: entity, filename: path, withExtension: "untold") { _ in loaded.fulfill() }
+                await fulfillment(of: [loaded], timeout: 600)
+                traverseSceneGraph()
+                // The chain's levels, from the files next to the model.
+                var levels: [String] = []
+                for index in 1 ... 3 {
+                    let url = URL(fileURLWithPath: "\(path)_LOD\(index).untold".replacingOccurrences(of: ".untold_LOD", with: "_LOD"))
+                    if FileManager.default.fileExists(atPath: url.path) { levels.append(url.path) }
+                }
+                print("SHEET \(tag) \(model): levels \(levels.count)")
+                if let last = levels.last {
+                    let coarse = createEntity()
+                    let loadedLevel = expectation(description: last)
+                    setEntityMeshAsync(entityId: coarse, filename: last, withExtension: "untold") { _ in loadedLevel.fulfill() }
+                    await fulfillment(of: [loadedLevel], timeout: 600)
+                    traverseSceneGraph()
+                    scene.get(component: RenderComponent.self, for: entity)?.isVisible = false
+                    for child in getEntityChildren(parentId: entity) { scene.get(component: RenderComponent.self, for: child)?.isVisible = false }
+                    cameraLookAt(entityId: camera, eye: eye, target: target, up: simd_float3(0, 1, 0))
+                    draw(6)
+                    save("\(tag)_\(model.split(separator: "/").last!)_lod\(level)", in: outputDir)
+                    destroyEntity(entityId: coarse)
+                }
+                destroyEntity(entityId: entity)
+            }
+        }
+    }
+}

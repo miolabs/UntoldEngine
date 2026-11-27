@@ -1,0 +1,36 @@
+// Scratch, not part of the engine: the meshes of a model (BIM_MODEL) whose bounds overlap
+// a region (REGION=x0,x1,y0,y1,z0,z1), with their material's brightness.
+import Foundation
+import simd
+@testable import UntoldEngine
+@testable import UntoldEngineMeshCook
+import XCTest
+
+final class ZZCarRegion: XCTestCase {
+    func testRegion() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let path = env["BIM_MODEL"], let region = env["REGION"] else { throw XCTSkip("BIM_MODEL/REGION not set") }
+        let r = region.split(separator: ",").compactMap { Float($0) }
+        let url = URL(fileURLWithPath: path)
+        let (meshes, transforms, _) = try UntoldMeshLODCooker.unpackedMeshes(ofModelAt: url)
+        let decoded = try UntoldReader().readAsset(from: Data(contentsOf: url))
+        for (index, mesh) in meshes.enumerated() {
+            var lower = SIMD3<Float>(repeating: .greatestFiniteMagnitude), upper = -lower
+            var inside = 0
+            for vertex in 0 ..< mesh.vertexCount {
+                let p = simd_make_float3(simd_mul(transforms[index], SIMD4<Float>(mesh.position(vertex), 1)))
+                lower = simd_min(lower, p); upper = simd_max(upper, p)
+                if p.x >= r[0], p.x <= r[1], p.y >= r[2], p.y <= r[3], p.z >= r[4], p.z <= r[5] { inside += 1 }
+            }
+            guard inside > 0 else { continue }
+            let record = decoded.meshes[index]
+            let name = (try? decoded.string(at: record.meshNameOffset)) ?? "?"
+            var lum: Float = -1
+            if record.materialIndex != UntoldFormat.invalidIndex, Int(record.materialIndex) < decoded.materials.count {
+                let c = decoded.materials[Int(record.materialIndex)].baseColorFactor
+                lum = 0.3 * c.x + 0.59 * c.y + 0.11 * c.z
+            }
+            print(String(format: "REGION %2d %@: tris=%d inRegion=%d/%d lum=%.3f box=(%.2f..%.2f, %.2f..%.2f, %.2f..%.2f)", index, name, mesh.triangleCount, inside, mesh.vertexCount, lum, lower.x, upper.x, lower.y, upper.y, lower.z, upper.z))
+        }
+    }
+}

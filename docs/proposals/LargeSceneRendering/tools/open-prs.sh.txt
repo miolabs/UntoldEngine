@@ -1,0 +1,65 @@
+#!/bin/bash
+# Opens the pull requests of the large-scene plan. Run ONLY after the user's yes. Usage: open-prs.sh [snapshot] [screensize] [hzb] [hidden] [instancing] [editorcook] (the first four were opened 2026-10-08)
+set -euo pipefail
+S=/private/tmp/claude-501/-Users-godshadow-Projects-Untold/7fa62dfe-a82f-410f-8264-10148a508842/scratchpad
+mkdir -p $S/rebase
+D=/Users/godshadow/Projects/Untold/UntoldEngine/docs/proposals/LargeSceneRendering
+G="git -C /Users/godshadow/Projects/Untold/UntoldEngine-batches"
+body() { # the draft without its header lines (title, branch note, rule)
+  awk 'f{print} /^---$/{f=1}' "$1" | sed '1{/^$/d;}'
+}
+for what in "$@"; do
+  case $what in
+  screensize)
+    # the sheet first, so the link resolves when the PR is rendered
+    $G push origin 6aaffae3:docs/proposal_drafts
+    curl -sfL -o /dev/null https://github.com/miolabs/UntoldEngine/raw/docs/proposal_drafts/docs/proposals/LargeSceneRendering/lod_screen_size.jpg && echo "sheet link ok"
+    $G push -u origin feature/lod_screen_size
+    body $D/pr-draft-lod-screen-size.md > $S/rebase/body-screensize.md
+    grep -ci 'claude\|anthropic' $S/rebase/body-screensize.md && { echo "attribution found"; exit 1; } || true
+    gh pr create --repo untoldengine/UntoldEngine --base develop --head miolabs:feature/lod_screen_size \
+      --title "[Feature] Select LOD levels by the size of the entity on screen" --body-file $S/rebase/body-screensize.md
+    ;;
+  snapshot)
+    $G push -u origin feature/render_scene_snapshot
+    body $D/pr-draft-render-scene-snapshot.md > $S/rebase/body-snapshot.md
+    grep -ci 'claude\|anthropic' $S/rebase/body-snapshot.md && { echo "attribution found"; exit 1; } || true
+    gh pr create --repo untoldengine/UntoldEngine --base develop --head miolabs:feature/render_scene_snapshot \
+      --title "[Performance] The render passes read the scene through a snapshot" --body-file $S/rebase/body-snapshot.md
+    ;;
+  hzb)
+    $G push -u origin bugfix/hzb_occlusion_reprojection
+    body $D/pr-draft-hzb-occlusion-camera.md > $S/rebase/body-hzb.md
+    grep -ci 'claude\|anthropic' $S/rebase/body-hzb.md && { echo "attribution found"; exit 1; } || true
+    gh pr create --repo untoldengine/UntoldEngine --base develop --head miolabs:bugfix/hzb_occlusion_reprojection \
+      --title "[Bugfix] Test occlusion from the camera the depth pyramid was built with" --body-file $S/rebase/body-hzb.md
+    ;;
+  instancing)
+    # the fork already holds the pre-rebase tip (merged there as #77): replace it (the lease needs the tracking ref)
+    $G fetch origin feature/instanced_draws
+    $G push --force-with-lease -u origin feature/instanced_draws
+    body $D/pr-draft-instanced-draws.md > $S/rebase/body-instancing.md
+    grep -ci 'claude\|anthropic\|TODO' $S/rebase/body-instancing.md && { echo "attribution or TODO found"; exit 1; } || true
+    gh pr create --repo untoldengine/UntoldEngine --base develop --head miolabs:feature/instanced_draws \
+      --title "[Performance] Draw entities that share their meshes and materials as one instanced draw" --body-file $S/rebase/body-instancing.md
+    ;;
+  editorcook)
+    # the editor repo: the fork holds the pre-rebase tip (merged there as #31), replace it
+    git -C /Users/godshadow/Projects/Untold/UntoldEditor-lodcook push --force-with-lease -u origin feature/cook_lod_chains
+    body $D/pr-draft-editor-cook-lod-chains.md > $S/rebase/body-editorcook.md
+    grep -ci 'claude\|anthropic\|TODO' $S/rebase/body-editorcook.md && { echo "attribution or TODO found"; exit 1; } || true
+    gh pr create --repo untoldengine/UntoldEditor --base develop --head miolabs:feature/cook_lod_chains \
+      --title "[Feature] Build the LOD chains of a cooked pack from the Cook sheet" --body-file $S/rebase/body-editorcook.md
+    ;;
+  hidden)
+    # the sheet first (875655d5 is on top of the screen-size sheet commit 6aaffae3)
+    $G push origin 875655d5:docs/proposal_drafts
+    curl -sfL -o /dev/null https://github.com/miolabs/UntoldEngine/raw/docs/proposal_drafts/docs/proposals/LargeSceneRendering/lod_hidden_parts.jpg && echo "sheet link ok"
+    $G push -u origin bugfix/lod_nested_shells
+    body $D/pr-draft-lod-hidden-parts.md > $S/rebase/body-hidden.md
+    grep -ci 'claude\|anthropic\|TODO' $S/rebase/body-hidden.md && { echo "attribution or TODO found"; exit 1; } || true
+    gh pr create --repo untoldengine/UntoldEngine --base develop --head miolabs:bugfix/lod_nested_shells \
+      --title "[Bugfix] Keep a model's hidden parts hidden at its coarse LOD levels" --body-file $S/rebase/body-hidden.md
+    ;;
+  esac
+done

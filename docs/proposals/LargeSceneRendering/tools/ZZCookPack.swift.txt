@@ -1,0 +1,22 @@
+// Scratch, not part of the engine: cooks the chains of a pack copy with this cook and
+// reports the time and one model's levels. BIM_PACK = the manifest path.
+import Foundation
+@testable import UntoldEngineMeshCook
+import XCTest
+
+final class ZZCookPack: XCTestCase {
+    func testCookPack() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let pack = env["BIM_PACK"] else { throw XCTSkip("BIM_PACK not set") }
+        let url = URL(fileURLWithPath: pack)
+        let start = CFAbsoluteTimeGetCurrent()
+        let report = try UntoldMeshLODCooker.cookChains(forPackAt: url)
+        let seconds = CFAbsoluteTimeGetCurrent() - start
+        print("COOKPACK seconds=\(String(format: "%.1f", seconds)) models=\(report.modelCount) chains=\(report.chainCount) levels=\(report.levelCount) failures=\(report.failures.count) coarsest=\(report.coarsestTriangleCount)")
+        let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        let chains = manifest?["lodChains"] as? [String: [[String: Any]]] ?? [:]
+        for (path, levels) in chains.sorted(by: { $0.key < $1.key }) where path.lowercased().contains("aparcado") {
+            print("COOKPACK \(path): \(levels.map { "\($0["triangles"] ?? 0) (err \($0["error"] ?? 0))" })")
+        }
+    }
+}
