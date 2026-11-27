@@ -269,6 +269,7 @@
         private func presentationLeadSeconds() -> TimeInterval {
             deadlineLock.withLock { pacingActiveNow ? Double(halfRate.landingRefreshes) * currentFrameTime.period : 0 }
         }
+
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
         /// The layer's depth format and the drawable's depth range (far, near), once a drawable
