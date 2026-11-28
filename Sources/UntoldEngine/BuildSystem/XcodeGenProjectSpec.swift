@@ -216,6 +216,21 @@ import Foundation
                 \(enginePackage.xcodeGenRequirement)
             """
 
+            // SharePlay: a second package and product, and the group-session entitlement, on the
+            // visionOS target only (the plugin's immersive-space pieces are visionOS 26).
+            let sharePlay = settings.includesSharePlay && settings.target.visionOSDeployment != nil
+            let sharePlayPackage = settings.resolvedSharePlayPackage
+            let sharePlayPackageEntry = sharePlay
+                ? "\n  UntoldSharePlay:\n    url: \(sharePlayPackage.url)\n    \(sharePlayPackage.xcodeGenRequirement)"
+                : ""
+            let sharePlayDependency = sharePlay
+                ? "\n      - package: UntoldSharePlay\n        product: UntoldSharePlay"
+                : ""
+            func sharePlayEntitlements(path: String) -> String {
+                guard sharePlay else { return "" }
+                return "\n    entitlements:\n      path: \(path)\n      properties:\n        com.apple.developer.group-session: true"
+            }
+
             // Dependencies section
             let dependenciesSection: String
             if case .visionOS = settings.target {
@@ -284,7 +299,7 @@ import Foundation
                 packages:
                   UntoldEngine:
                     url: \(enginePackage.url)
-                    \(enginePackage.xcodeGenRequirement)
+                    \(enginePackage.xcodeGenRequirement)\(sharePlayPackageEntry)
 
                 targets:
                   \(settings.projectName) macOS:
@@ -394,7 +409,7 @@ import Foundation
                       - package: UntoldEngine
                         product: UntoldEngineXR
                       - package: UntoldEngine
-                        product: UntoldEngineAR\(kitDependencyIfEnabled)
+                        product: UntoldEngineAR\(kitDependencyIfEnabled)\(sharePlayDependency)\(sharePlayEntitlements(path: "\(settings.projectName) visionOS/\(settings.projectName).entitlements"))
                     settings:
                       base:
                         PRODUCT_BUNDLE_IDENTIFIER: \(settings.bundleIdentifier)
@@ -417,7 +432,7 @@ import Foundation
                 yaml = """
                 name: \(settings.projectName)
 
-                \(packagesSection)
+                \(packagesSection)\(sharePlayPackageEntry)
 
                 targets:
                   \(settings.projectName):
@@ -425,7 +440,7 @@ import Foundation
                     platform: \(platformName)
                     deploymentTarget: \(deploymentTarget)
                 \(sourcesSection)
-                \(dependenciesWithKit)
+                \(dependenciesWithKit)\(sharePlayDependency)\(sharePlayEntitlements(path: "Sources/\(settings.projectName)/\(settings.projectName).entitlements"))
                     settings:
                       base:
                 \(indent(baseSettings, by: 16))

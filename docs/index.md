@@ -183,6 +183,7 @@ Full source for every demo above lives in the [UntoldArcade](https://github.com/
 - [Animation System](API/UsingAnimationSystem.md)
 - [Physics System](API/UsingPhysicsSystem.md)
 - [Jolt Physics in XR](API/UsingJoltPhysicsXR.md)
+- [SharePlay](API/UsingSharePlay.md)
 - [Steering System](API/UsingSteeringSystem.md)
 - [Post FX](API/UsingPostFX.md)
 - [LOD System](API/UsingLODSystem.md)

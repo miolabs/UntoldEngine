@@ -39,6 +39,9 @@ struct CreateCommand: AsyncParsableCommand {
 
           # Create multi-platform with custom deployment targets
           untoldengine create MyGame --platform multi --macos-version 14 --ios-version 17 --visionos-version 2
+
+          # Create a visionOS project with SharePlay (the UntoldSharePlay plugin; visionOS 26)
+          untoldengine create MyGame --platform visionos --shareplay
         """
     )
 
@@ -75,6 +78,9 @@ struct CreateCommand: AsyncParsableCommand {
 
     @Flag(name: .long, inversion: .prefixedNo, help: "Include debug information")
     var debug: Bool = true
+
+    @Flag(name: .long, help: "Add SharePlay to a visionOS project: the UntoldSharePlay plugin, the game's activity, a session with its status row, and the immersive-space coordinator (needs visionOS 26)")
+    var shareplay: Bool = false
 
     // MARK: - Execution
 
@@ -139,13 +145,13 @@ struct CreateCommand: AsyncParsableCommand {
             isIOSAR = true
 
         case "visionos":
-            let version = parseVisionOSVersion(visionosVersion)
+            let version = sharePlayVisionOSVersion(parseVisionOSVersion(visionosVersion))
             buildTarget = .visionOS(deployment: version)
 
         case "multi":
             let macOS = parseMacOSVersion(macosVersion)
             let iOS = parseIOSVersion(iosVersion)
-            let visionOS = parseVisionOSVersion(visionosVersion)
+            let visionOS = sharePlayVisionOSVersion(parseVisionOSVersion(visionosVersion))
             buildTarget = .multi(macOS: macOS, iOS: iOS, visionOS: visionOS)
 
         default:
@@ -173,8 +179,17 @@ struct CreateCommand: AsyncParsableCommand {
             includeDebugInfo: debug,
             optimizationLevel: optimizationLevel,
             teamID: teamId,
-            isIOSAR: isIOSAR
+            isIOSAR: isIOSAR,
+            includesSharePlay: shareplay
         )
+    }
+
+    /// SharePlay's immersive-space pieces need visionOS 26: with `--shareplay`, a lower
+    /// `--visionos-version` is raised, and said so.
+    private func sharePlayVisionOSVersion(_ version: VisionOSVersion) -> VisionOSVersion {
+        guard shareplay, !version.supportsSharePlay else { return version }
+        printInfo("SharePlay needs visionOS \(VisionOSVersion.sharePlayMinimum.rawValue): using it as the visionOS deployment target")
+        return .sharePlayMinimum
     }
 
     private func parseMacOSVersion(_ version: String) -> MacOSVersion {
@@ -226,6 +241,9 @@ struct CreateCommand: AsyncParsableCommand {
 
         if settings.isIOSAR {
             print("   AR Support:      Enabled")
+        }
+        if settings.includesSharePlay {
+            print("   SharePlay:       Enabled (\(settings.resolvedSharePlayPackage.url))")
         }
         print("   Project Dir:     \(projectDir.path)")
         print("   GameData Path:   \(gameDataPath.path)")
