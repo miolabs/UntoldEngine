@@ -119,9 +119,15 @@
         /// milliseconds past it is still shown on time; one past that margin has the display
         /// show the previous frame again and this one a refresh late, posed for an instant
         /// already past — a hop in a moving object that no counter of the loop's pacing sees.
-        public var deadlineMisses: Int { deadlineLock.withLock { deadlineMissCount } }
+        public var deadlineMisses: Int {
+            deadlineLock.withLock { deadlineMissCount }
+        }
+
         /// The longest a frame's GPU work finished after its deadline, in milliseconds.
-        public var worstDeadlineOverrunMs: Double { deadlineLock.withLock { worstOverrunMs } }
+        public var worstDeadlineOverrunMs: Double {
+            deadlineLock.withLock { worstOverrunMs }
+        }
+
         private let deadlineLock = NSLock()
         private var deadlineMissCount = 0
         private var worstOverrunMs = 0.0
@@ -177,10 +183,16 @@
         private var secondDeadlineMarginSumMs = 0.0
         private var secondTimedFrames = 0
         /// Whether the loop is rendering every other refresh at the moment.
-        public var halfRatePacingActive: Bool { deadlineLock.withLock { pacingActiveNow } }
+        public var halfRatePacingActive: Bool {
+            deadlineLock.withLock { pacingActiveNow }
+        }
+
         /// Whether the last frame waited for the compositor's optimal input time: the setting,
         /// or in the automatic mode what the measured deadline allowed.
-        public var optimalInputWaitActive: Bool { deadlineLock.withLock { lastFrameWaited } }
+        public var optimalInputWaitActive: Bool {
+            deadlineLock.withLock { lastFrameWaited }
+        }
+
         private var lastFrameWaited = true
 
         /// Whether this frame waits for the optimal input time, by the setting and, in the
@@ -257,6 +269,7 @@
         private func presentationLeadSeconds() -> TimeInterval {
             deadlineLock.withLock { pacingActiveNow ? Double(halfRate.landingRefreshes) * currentFrameTime.period : 0 }
         }
+
         /// Whether the layer's depth format and the drawable's depth range have been printed.
         private var loggedDepthSetup = false
         /// The layer's depth format and the drawable's depth range (far, near), once a drawable

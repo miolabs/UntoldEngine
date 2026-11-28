@@ -267,6 +267,7 @@ Selection rays update from interaction events, not continuously as the user look
 | | macOS (`UpdateRenderingSystem`) | visionOS (`executeXRSystemPass`) |
 |---|---|---|
 | Frame timing | MTKView drives at display rate | CompositorServices dictates via `optimalInputTime` |
+| Frame's time (`FrameTime`) | An estimate: one of the view's periods ahead of the draw, so the delta is the wall-clock spacing of the draws, jitter included. Exact only when the host sets `predictedPresentationTime` from its display link's target | The compositor's predicted presentation time: the delta is the display's period whatever the CPU did |
 | Eyes | 1 | 2 (per-eye loop over `drawable.views`) |
 | Compute passes | Once per frame | Once per frame (shared across both eyes) |
 | Default scene | A camera and a directional light, both active | A camera, the entity the head pose is written into, and no directional light unless the configuration asks for one (`UntoldRendererConfig.defaultSun`): the passthrough room is lit by its probe and the immersive environment by its own light, so a sun is the app's to add (`DirectionalLightNode`, or `createDirLight` and `setDirectionalLight(.active(_:))`), and it casts in one cascade by default (`setRendering(.shadowCascades(_:))`) |

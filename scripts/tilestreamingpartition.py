@@ -1008,6 +1008,39 @@ def classify_runtime_representation_detail(distance, unload_r, hlod_levels=None,
     return "full"
 
 
+def _build_collection_render_visibility_map(scene):
+    """Map collection name -> True if reachable from the scene's root
+    collection through at least one chain of collections that all have
+    hide_render == False.
+
+    Collection.hide_render (the camera icon on a collection in the
+    Outliner) is a data-block-level flag that applies across every view
+    layer. It is distinct from Object.hide_render (per-object) and from
+    LayerCollection.exclude/hide_viewport (per-view-layer overrides, which
+    Object.hide_get()/visible_get() already account for). Neither
+    Object.hide_render nor Object.hide_get()/visible_get() consults it, so
+    without this map a collection disabled this way (e.g. a background
+    "grass particles" collection an artist marked do-not-render) is
+    silently still included in world bounds and the tile partition.
+    """
+    visible = {}
+
+    def visit(coll, ancestor_hidden):
+        hidden_here = coll.hide_render or ancestor_hidden
+        visible[coll.name] = visible.get(coll.name, False) or (not hidden_here)
+        for child in coll.children:
+            visit(child, hidden_here)
+
+    visit(scene.collection, False)
+    return visible
+
+
+def _is_render_visible(obj, render_visibility_map):
+    if obj.hide_render:
+        return False
+    return any(render_visibility_map.get(c.name, False) for c in obj.users_collection)
+
+
 def get_candidate_objects():
     # Exclude objects in the "Tile Preview" collection — those are the wireframe
     # tile-bound boxes created by create_tile_preview() for visual debugging.
@@ -1020,13 +1053,19 @@ def get_candidate_objects():
 
     objs = []
     view_layer = bpy.context.view_layer
+    render_visibility_map = _build_collection_render_visibility_map(bpy.context.scene)
     for obj in bpy.context.scene.objects:
         if obj.type != "MESH":
             continue
         if obj in preview_objects:
             continue
+        # Render-excluded objects (object-level hide_render, or a containing
+        # collection disabled for render) must never contribute to world
+        # bounds or the tile partition, regardless of VISIBLE_ONLY.
+        if not _is_render_visible(obj, render_visibility_map):
+            continue
         if VISIBLE_ONLY:
-            if obj.hide_viewport or obj.hide_get(view_layer=view_layer):
+            if not obj.visible_get(view_layer=view_layer):
                 continue
         # Tiled scenes are static-only; skip skinned meshes rather than
         # failing the whole export (see warn_skipped_animated_objects()).
@@ -1036,10 +1075,12 @@ def get_candidate_objects():
     return objs
 
 
-def _is_visible_for_tiled_export(obj, view_layer):
+def _is_visible_for_tiled_export(obj, view_layer, render_visibility_map):
+    if not _is_render_visible(obj, render_visibility_map):
+        return False
     if not VISIBLE_ONLY:
         return True
-    return not obj.hide_viewport and not obj.hide_get(view_layer=view_layer)
+    return obj.visible_get(view_layer=view_layer)
 
 
 def _mesh_uses_armature(obj):
@@ -1059,10 +1100,11 @@ def warn_skipped_animated_objects():
     without a trace.
     """
     view_layer = bpy.context.view_layer
+    render_visibility_map = _build_collection_render_visibility_map(bpy.context.scene)
     armatures = []
     skinned_meshes = []
     for obj in bpy.context.scene.objects:
-        if not _is_visible_for_tiled_export(obj, view_layer):
+        if not _is_visible_for_tiled_export(obj, view_layer, render_visibility_map):
             continue
         if obj.type == "ARMATURE":
             armatures.append(obj.name)
@@ -1625,14 +1667,39 @@ def group_has_spanning_metadata(tile_objs, metadata_map):
     return any(meta.get("spatial_class") == "spanning" for meta in group_metadata(tile_objs, metadata_map))
 
 
-def group_cell_bounds_xy(tile_objs, metadata_map):
+# _collapse_underfilled_tile_tiers() merges a sparse (node_id, tier) group
+# into its parent node, one level at a time, to avoid a separate streaming
+# bucket for a near-empty leaf. Each merge overwrites the moved objects'
+# cell_bounds_xy with the parent's full rectangle, which can climb all the
+# way to the floor root for an isolated object. Past this ratio of cell
+# area to the group's own union-AABB area, the stored cell is treated as
+# misleading and callers fall back to the group's content AABB instead.
+CELL_BOUNDS_MAX_AREA_RATIO = 25.0
+
+
+def group_cell_bounds_xy(tile_objs, metadata_map, object_bounds=None):
     if group_has_spanning_metadata(tile_objs, metadata_map):
         return None
+    cell = None
     for meta in group_metadata(tile_objs, metadata_map):
-        cell = meta.get("cell_bounds_xy")
-        if cell:
-            return cell
-    return None
+        c = meta.get("cell_bounds_xy")
+        if c:
+            cell = c
+            break
+    if not cell:
+        return None
+
+    if object_bounds is not None:
+        x_min = min(object_bounds[o.name]["min"][0] for o in tile_objs)
+        y_min = min(object_bounds[o.name]["min"][1] for o in tile_objs)
+        x_max = max(object_bounds[o.name]["max"][0] for o in tile_objs)
+        y_max = max(object_bounds[o.name]["max"][1] for o in tile_objs)
+        union_area = max((x_max - x_min) * (y_max - y_min), 1e-6)
+        cell_area = (cell["max_x"] - cell["min_x"]) * (cell["max_y"] - cell["min_y"])
+        if cell_area > union_area * CELL_BOUNDS_MAX_AREA_RATIO:
+            return None
+
+    return cell
 
 
 # ============================================================
@@ -2552,8 +2619,10 @@ def bake_object_world_transform_to_mesh_data(obj, world_matrix=None):
 def duplicate_objects_to_scene(source_objects, temp_scene, bake_world=True):
     """Copy objects into a temporary scene, baking world transforms if requested.
 
-    Uses the evaluated depsgraph to capture matrix_world so that parent-chain
-    transforms (including USD import axis-correction empties) are fully resolved.
+    Evaluate geometry, material assignments and world transforms in the source
+    scene. Modifiers must run before the object's axes are reset or its mesh is
+    clipped/merged. Capture every snapshot before linking duplicates, which can
+    invalidate the source depsgraph.
     Passing the captured matrix directly to bake_object_world_transform avoids a
     set/read race where setting obj.matrix_world schedules a deferred depsgraph
     update that has not yet fired when we read it back.
@@ -2562,14 +2631,40 @@ def duplicate_objects_to_scene(source_objects, temp_scene, bake_world=True):
     src_collection = temp_scene.collection
     depsgraph = bpy.context.evaluated_depsgraph_get() if bake_world else None
 
+    snapshots = {}
+    if bake_world:
+        for src_obj in source_objects:
+            evaluated_obj = src_obj.evaluated_get(depsgraph)
+            world_mat = evaluated_obj.matrix_world.copy()
+            mesh = None
+            if src_obj.type == "MESH" and src_obj.data:
+                mesh = bpy.data.meshes.new_from_object(
+                    evaluated_obj, preserve_all_data_layers=True, depsgraph=depsgraph
+                )
+                # Freeze the material each slot actually shows, including object
+                # overrides and slots introduced by modifiers. Later split/merge
+                # operations consume mesh data rather than object-linked slots.
+                for index, slot in enumerate(evaluated_obj.material_slots):
+                    if index < len(mesh.materials):
+                        mesh.materials[index] = slot.material
+            snapshots[src_obj.as_pointer()] = (world_mat, mesh)
+
     for src_obj in source_objects:
         if bake_world:
-            world_mat = src_obj.evaluated_get(depsgraph).matrix_world.copy()
+            world_mat, evaluated_mesh = snapshots[src_obj.as_pointer()]
         else:
             world_mat = None
+            evaluated_mesh = None
 
         new_obj = src_obj.copy()
-        if src_obj.data:
+        if evaluated_mesh is not None:
+            new_obj.data = evaluated_mesh
+            new_obj.modifiers.clear()
+            new_obj.constraints.clear()
+            new_obj.animation_data_clear()
+            for slot in new_obj.material_slots:
+                slot.link = 'DATA'
+        elif src_obj.data:
             new_obj.data = src_obj.data.copy()
         new_obj["mesh_original_name"] = src_obj.name
         src_collection.objects.link(new_obj)
@@ -2824,85 +2919,17 @@ def build_usd_export_kwargs(filepath):
 # mesh before USD export, reducing per-tile draw calls.
 # ============================================================
 
-def _principled_bsdf_node(mat):
-    """Find the first Principled BSDF node in a material's node tree."""
-    node_tree = getattr(mat, "node_tree", None) if mat is not None else None
-    if not mat or node_tree is None:
-        return None
-    for node in node_tree.nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            return node
-    return None
-
-
-def _input_image_path(bsdf, input_name):
-    """Extract the resolved image filepath connected to a BSDF input.
-
-    Follows one level of indirection for Normal Map and Bump nodes.
-    Returns the filepath string, or None if no image is connected.
-    """
-    inp = bsdf.inputs.get(input_name)
-    if inp is None or not inp.is_linked:
-        return None
-    node = inp.links[0].from_node
-    # Direct image texture connection.
-    if node.type == 'TEX_IMAGE' and node.image:
-        return node.image.filepath_from_user()
-    # Normal Map → Color → Image Texture
-    if node.type == 'NORMAL_MAP':
-        color_inp = node.inputs.get('Color')
-        if color_inp and color_inp.is_linked:
-            inner = color_inp.links[0].from_node
-            if inner.type == 'TEX_IMAGE' and inner.image:
-                return inner.image.filepath_from_user()
-    # Bump → Height → Image Texture
-    if node.type == 'BUMP':
-        height_inp = node.inputs.get('Height')
-        if height_inp and height_inp.is_linked:
-            inner = height_inp.links[0].from_node
-            if inner.type == 'TEX_IMAGE' and inner.image:
-                return inner.image.filepath_from_user()
-    return None
-
-
-def _input_scalar_key(bsdf, input_name):
-    """Return a rounded scalar or colour tuple for a non-linked BSDF input."""
-    inp = bsdf.inputs.get(input_name)
-    if inp is None or inp.is_linked:
-        return None
-    val = getattr(inp, 'default_value', None)
-    if val is None:
-        return None
-    if hasattr(val, '__iter__'):
-        return tuple(round(float(v), 4) for v in val)
-    return round(float(val), 4)
-
-
 def _single_material_key(mat):
     """Hashable identity for one Blender material.
 
-    Two materials with identical keys produce identical visual output after
-    USD export and can safely share a merged mesh.
+    Only objects using the same material datablock may share a merged surface.
+    Comparing a few Principled inputs misses textures behind colour nodes, UV
+    mappings, transmission and other settings, discarding the other materials
+    when the meshes are merged.
     """
     if mat is None:
         return "__none__"
-    bsdf = _principled_bsdf_node(mat)
-    if bsdf is None:
-        # Non-node material or no Principled BSDF: fall back to datablock name.
-        return f"name:{mat.name_full}"
-    parts = []
-    for channel in ('Base Color', 'Metallic', 'Roughness', 'Normal',
-                    'Emission Color', 'Alpha'):
-        img = _input_image_path(bsdf, channel)
-        if img is not None:
-            parts.append(f"{channel}:img:{img}")
-        else:
-            scalar = _input_scalar_key(bsdf, channel)
-            if scalar is not None:
-                parts.append(f"{channel}:val:{scalar}")
-            else:
-                parts.append(f"{channel}:empty")
-    return "|".join(parts)
+    return f"material:{mat.as_pointer()}"
 
 
 def material_merge_key(obj):
@@ -3021,14 +3048,21 @@ def split_objects_by_material(objects, temp_scene):
                 bm.to_mesh(new_mesh)
                 new_mesh.update()
 
-                mat = mesh.materials[mat_idx] if mat_idx < len(mesh.materials) else None
+                if mat_idx < len(obj.material_slots):
+                    mat = obj.material_slots[mat_idx].material
+                else:
+                    mat = mesh.materials[mat_idx] if mat_idx < len(mesh.materials) else None
                 if mat:
                     new_mesh.materials.append(mat)
                     for p in new_mesh.polygons:
                         p.material_index = 0
 
-                new_obj = bpy.data.objects.new(f"{obj.name}_mat{mat_idx}", new_mesh)
-                new_obj["mesh_original_name"] = obj.get("mesh_original_name", obj.name)
+                source_name = obj.get("mesh_original_name", obj.name)
+                new_obj = bpy.data.objects.new(f"{source_name}_mat{mat_idx}", new_mesh)
+                # Entity names key the exporter's transform and geometry maps.
+                # Sibling fragments must not all reuse the source object's name,
+                # or the last material silently overwrites its siblings.
+                new_obj["mesh_original_name"] = new_obj.name
                 new_obj.matrix_world = obj.matrix_world.copy()
                 temp_scene.collection.objects.link(new_obj)
                 result.append(new_obj)
@@ -5139,7 +5173,7 @@ def run():
                 filepath  = os.path.join(output_dir, f"{tile_id}.{ext}")
                 aabb_usd  = compute_objects_aabb_usd(tile_objs, object_bounds)
                 cell_aabb_usd = node_cell_bounds_aabb_usd(
-                    group_cell_bounds_xy(tile_objs, metadata_map),
+                    group_cell_bounds_xy(tile_objs, metadata_map, object_bounds=object_bounds),
                     tile_objs,
                     object_bounds,
                 )
@@ -5421,7 +5455,7 @@ def run():
             filepath  = os.path.join(output_dir, f"{tile_id}.{ext}")
             aabb_usd  = compute_objects_aabb_usd(tile_objs, object_bounds)
             cell_aabb_usd = node_cell_bounds_aabb_usd(
-                group_cell_bounds_xy(tile_objs, metadata_map),
+                group_cell_bounds_xy(tile_objs, metadata_map, object_bounds=object_bounds),
                 tile_objs,
                 object_bounds,
             )

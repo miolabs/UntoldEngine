@@ -27,6 +27,7 @@
     currentFrameTime = .zero
     physicsAccumulator = 0
     simulationStepping = .fixed
+    currentFrameTime = .zero
     needsFinalizeDestroys = false
     hasPendingDestroys = false
     EngineExtensionRegistry.shared.removeAll()
